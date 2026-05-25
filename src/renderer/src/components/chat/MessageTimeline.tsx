@@ -175,6 +175,7 @@ export function MessageTimeline({
   const endRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  const historyExpansionRequestedRef = useRef(false)
   const pendingPrependRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
   const prependInFlightRef = useRef(false)
   const scrollFrameRef = useRef<number | null>(null)
@@ -194,8 +195,11 @@ export function MessageTimeline({
       ? Math.max(0, activeThread.forkedFromTurnCount)
       : undefined
 
-  const loadEarlierTurns = useCallback((): void => {
+  const loadEarlierTurns = useCallback((options?: { userInitiated?: boolean }): void => {
     if (hiddenTurnCount === 0 || prependInFlightRef.current) return
+    if (options?.userInitiated) {
+      historyExpansionRequestedRef.current = true
+    }
     const el = containerRef.current
     if (el) {
       pendingPrependRef.current = {
@@ -223,7 +227,7 @@ export function MessageTimeline({
       const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
       stickToBottomRef.current = distanceToBottom < 96
       if (hiddenTurnCount > 0 && el.scrollTop <= TOP_LOAD_TRIGGER_PX) {
-        loadEarlierTurns()
+        loadEarlierTurns({ userInitiated: true })
       }
     }
     el.addEventListener('scroll', onScroll, { passive: true })
@@ -246,6 +250,7 @@ export function MessageTimeline({
 
   useEffect(() => {
     stickToBottomRef.current = true
+    historyExpansionRequestedRef.current = false
     pendingPrependRef.current = null
     prependInFlightRef.current = false
     if (scrollFrameRef.current !== null) {
@@ -290,6 +295,7 @@ export function MessageTimeline({
   useEffect(() => {
     const el = containerRef.current
     if (!el || hiddenTurnCount === 0 || prependInFlightRef.current) return
+    if (!historyExpansionRequestedRef.current) return
     if (el.scrollHeight <= el.clientHeight + TOP_LOAD_TRIGGER_PX) {
       loadEarlierTurns()
     }
@@ -334,7 +340,7 @@ export function MessageTimeline({
           <div className="flex items-center justify-center">
             <button
               type="button"
-              onClick={loadEarlierTurns}
+              onClick={() => loadEarlierTurns({ userInitiated: true })}
               className="ds-chip rounded-full px-4 py-2 text-[13px] font-medium text-ds-muted transition hover:text-ds-ink"
             >
               {t('timelineShowEarlierTurns', { count: Math.min(hiddenTurnCount, TURN_PAGE_SIZE) })}
@@ -391,7 +397,10 @@ export function MessageTimeline({
           <div className="flex items-center justify-center">
             <button
               type="button"
-              onClick={() => setVisibleTurnCount(TURN_PAGE_SIZE)}
+              onClick={() => {
+                historyExpansionRequestedRef.current = false
+                setVisibleTurnCount(TURN_PAGE_SIZE)
+              }}
               className="rounded-full px-3 py-1.5 text-[12.5px] font-medium text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
             >
               {t('timelineCollapseEarlierTurns')}

@@ -35,6 +35,9 @@ export async function filterThreadsForSidebar(
     (thread) =>
       !hiddenIds.has(thread.id) && shouldInspectThreadForSidebarVisibility(thread)
   )
+  for (const thread of suspiciousThreads) {
+    hiddenIds.add(thread.id)
+  }
 
   if (suspiciousThreads.length > 0) {
     const results = await Promise.allSettled(
@@ -48,8 +51,12 @@ export async function filterThreadsForSidebar(
     )
 
     for (const result of results) {
-      if (result.status !== 'fulfilled' || !result.value.hide) continue
-      hiddenIds.add(result.value.threadId)
+      if (result.status !== 'fulfilled') continue
+      if (result.value.hide) {
+        hiddenIds.add(result.value.threadId)
+      } else {
+        hiddenIds.delete(result.value.threadId)
+      }
     }
   }
 

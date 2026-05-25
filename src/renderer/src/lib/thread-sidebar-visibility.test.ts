@@ -75,7 +75,17 @@ describe('thread-sidebar-visibility', () => {
     expect(getThreadDetail).toHaveBeenCalledWith('thr_279f3fef')
   })
 
-  it('keeps fallback titled threads when detail loading fails', async () => {
+  it('keeps fallback titled threads when detail shows real content', async () => {
+    const fallbackThread = thread({ id: 'thr_997f4104', title: 'thr_997f' })
+
+    const visible = await filterThreadsForSidebar([fallbackThread], {
+      getThreadDetail: async () => ({ blocks: [userBlock('real content')] })
+    })
+
+    expect(visible).toEqual([fallbackThread])
+  })
+
+  it('hides fallback titled threads when detail loading fails', async () => {
     const fallbackThread = thread({ id: 'thr_997f4104', title: 'thr_997f' })
 
     const visible = await filterThreadsForSidebar([fallbackThread], {
@@ -84,6 +94,6 @@ describe('thread-sidebar-visibility', () => {
       }
     })
 
-    expect(visible).toEqual([fallbackThread])
+    expect(visible).toEqual([])
   })
 })
