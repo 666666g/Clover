@@ -56,4 +56,43 @@ describe('markdown live preview', () => {
 
     expect(ranges).toHaveLength(0)
   })
+
+  it('keeps prose between adjacent language-less fences out of code blocks', () => {
+    const state = EditorState.create({
+      doc: [
+        '现代文本补全几乎全部基于**自回归语言模型**。',
+        '',
+        '```',
+        'P(w1, w2, ..., wn) = ∏ P(wt | w1, w2, ..., wt-1)',
+        '```',
+        '',
+        '你好',
+        '',
+        '```',
+        '输入: [我] [爱] [深] [度] [学] [习]',
+        '掩码: 1 0 0 0 0 0',
+        '```'
+      ].join('\n')
+    })
+    const firstClosingFence = state.doc.line(5)
+
+    const ranges = markdownLivePreviewTestInternals.collectMarkdownCodeBlockRangesFromState(
+      state,
+      firstClosingFence.from,
+      state.doc.length,
+      new Set()
+    )
+
+    expect(ranges).toHaveLength(2)
+    expect(ranges.map((range) => range.block)).toEqual([
+      {
+        language: '',
+        code: 'P(w1, w2, ..., wn) = ∏ P(wt | w1, w2, ..., wt-1)'
+      },
+      {
+        language: '',
+        code: '输入: [我] [爱] [深] [度] [学] [习]\n掩码: 1 0 0 0 0 0'
+      }
+    ])
+  })
 })

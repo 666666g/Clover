@@ -742,17 +742,23 @@ export class DeepseekRuntimeProvider implements AgentProvider {
       `/v1/user-input/${encodeURIComponent(requestId)}`
     ]
     let last: RuntimeErrorJson & { message: string } | null = null
+    let unsupported = true
     for (const path of paths) {
       const r = await window.dsGui.runtimeRequest(path, 'POST', body)
       if (r.ok) return
       last = readRuntimeError(r.body, `request_user_input response failed: ${r.status}`)
-      if (r.status !== 404 && r.status !== 405) break
+      if (r.status !== 404 && r.status !== 405) {
+        unsupported = false
+        break
+      }
     }
     throw toRuntimeError(
-      last ?? {
-        error: 'runtime_request_user_input_unsupported',
-        message: 'The runtime does not expose request_user_input responses over HTTP yet.'
-      }
+      unsupported
+        ? {
+            error: 'runtime_request_user_input_unsupported',
+            message: 'The runtime does not expose request_user_input responses over HTTP yet.'
+          }
+        : (last ?? { message: 'request_user_input response failed' })
     )
   }
 
@@ -762,17 +768,23 @@ export class DeepseekRuntimeProvider implements AgentProvider {
       `/v1/user-input/${encodeURIComponent(requestId)}`
     ]
     let last: RuntimeErrorJson & { message: string } | null = null
+    let unsupported = true
     for (const path of paths) {
       const r = await window.dsGui.runtimeRequest(path, 'POST', JSON.stringify({ cancelled: true }))
       if (r.ok) return
       last = readRuntimeError(r.body, `request_user_input cancel failed: ${r.status}`)
-      if (r.status !== 404 && r.status !== 405) break
+      if (r.status !== 404 && r.status !== 405) {
+        unsupported = false
+        break
+      }
     }
     throw toRuntimeError(
-      last ?? {
-        error: 'runtime_request_user_input_unsupported',
-        message: 'The runtime does not expose request_user_input cancellation over HTTP yet.'
-      }
+      unsupported
+        ? {
+            error: 'runtime_request_user_input_unsupported',
+            message: 'The runtime does not expose request_user_input cancellation over HTTP yet.'
+          }
+        : (last ?? { message: 'request_user_input cancel failed' })
     )
   }
 

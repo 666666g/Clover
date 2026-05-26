@@ -60,7 +60,9 @@ describe('write quoted selections', () => {
 
     expect(quote).not.toBeNull()
     const prompt = composeWritePrompt('Please revise it.', quote ? [quote] : [])
-    expect(prompt.startsWith('[引用片段] a.md')).toBe(true)
+    expect(prompt.startsWith('[写作上下文]')).toBe(true)
+    expect(prompt).toContain('不要调用 request_user_input')
+    expect(prompt.indexOf('[引用片段] a.md')).toBeGreaterThan(prompt.indexOf('[写作上下文]'))
     expect(prompt.endsWith('Please revise it.')).toBe(true)
     vi.restoreAllMocks()
   })
@@ -89,6 +91,7 @@ describe('write quoted selections', () => {
     expect(parsed?.userInput).toBe('帮我改成中文')
     expect(parsed?.context?.workspaceRoot).toBe('/tmp/workspace')
     expect(parsed?.context?.activeFile).toBe('welcome.md')
+    expect(parsed?.context?.lines.some((line) => line.includes('不要调用 request_user_input'))).toBe(true)
     expect(parsed?.quotes).toHaveLength(1)
     expect(parsed?.quotes[0]).toMatchObject({
       sourceTitle: 'welcome.md',

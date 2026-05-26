@@ -4,6 +4,7 @@ import type {
   NormalizedThread,
   ThreadDeltaEvent,
   ThreadEventSink,
+  UserInputQuestion,
   ToolEventPayload,
   ToolBlock,
   CompactionBlock
@@ -116,6 +117,35 @@ const COMPLETION_NOTIFICATION_DEDUPE_LIMIT = 200
 const completionNotificationKeys: string[] = []
 const completionNotificationKeySet = new Set<string>()
 const watchCompletionNotificationKeys = new Map<string, string>()
+
+function buildFollowupMessageFromUserInput(
+  questions: UserInputQuestion[],
+  answers: Array<{ id: string; label: string; value?: string }>
+): string {
+  const isZh = i18n.language.toLowerCase().startsWith('zh')
+  const title = isZh
+    ? '上一个回合请求了 request_user_input，但当前运行时无法通过 HTTP 直接提交该工具结果。请把下面的用户回答当作 request_user_input 的结果继续执行：'
+    : 'The previous turn requested request_user_input, but this runtime cannot submit that tool result over HTTP. Please treat the answers below as the request_user_input result and continue:'
+  const unansweredLabel = isZh ? '（未回答）' : '(not answered)'
+  const answerPrefix = isZh ? '回答: ' : 'Answer: '
+  const noAnswerLabel = isZh ? '用户未提供问题回答。' : 'User did not provide answers.'
+  if (questions.length === 0 || answers.length === 0) {
+    return noAnswerLabel
+  }
+  const answerById = new Map<string, string>(answers.map((answer) => [answer.id, answer.value || answer.label]))
+  const lines = [title]
+  for (const question of questions) {
+    const answerValue = answerById.get(question.id)
+    const responseLine = answerValue ? `${answerPrefix}${answerValue}` : unansweredLabel
+    lines.push(`${question.header}: ${question.question}`, responseLine)
+  }
+  return lines.join('\n')
+}
+
+function isUserInputInterruptError(message: string | undefined): boolean {
+  const lowered = message?.toLowerCase() ?? ''
+  return lowered.includes('cancel') && lowered.includes('awaiting user input')
+}
 
 async function readActiveWriteWorkspace(fallbackWorkspaceRoot: string): Promise<string> {
   try {
@@ -634,12 +664,14 @@ function buildThreadEventSink(
         error: s.error === i18n.t('common:runtimeStreamRecovering') ? null : s.error,
         blocks: s.blocks.map((b) =>
           b.kind === 'user_input' && b.id === ev.itemId
-            ? {
-                ...b,
-                status: ev.status,
-                answers: ev.answers ?? b.answers,
-                errorMessage: ev.errorMessage ?? b.errorMessage
-              }
+            ? b.status === 'submitted' && ev.status === 'error' && isUserInputInterruptError(ev.errorMessage)
+              ? b
+              : {
+                  ...b,
+                  status: ev.status,
+                  answers: ev.answers ?? b.answers,
+                  errorMessage: ev.errorMessage ?? b.errorMessage
+                }
             : b
         )
       }))
@@ -2146,10 +2178,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const p = getProvider(providerId)
     try {
       if (action.kind === 'submit') {
+        const state = get()
         if (typeof p.submitUserInputResponse !== 'function') {
           throw new Error(i18n.t('common:runtimeUserInputUnsupported'))
         }
-        await p.submitUserInputResponse(block.requestId, action.answers)
+        try {
+          await p.submitUserInputResponse(block.requestId, action.answers)
+        } catch (fallbackErr) {
+          const activeThreadId = state.activeThreadId
+          const currentTurnId = state.currentTurnId
+          if (
+            getRuntimeErrorCode(fallbackErr) === 'runtime_request_user_input_unsupported' &&
+            typeof p.interruptTurn === 'function' &&
+            activeThreadId &&
+            currentTurnId
+          ) {
+            const followupText = buildFollowupMessageFromUserInput(block.questions, action.answers)
+            set((s) => ({
+              queuedMessages: [
+                ...s.queuedMessages,
+                {
+                  id: `q-${Date.now()}-${s.queuedMessages.length}`,
+                  text: followupText
+                }
+              ],
+              blocks: s.blocks.map((b) =>
+                b.id === blockId && b.kind === 'user_input'
+                  ? { ...b, status: 'submitted' as const, answers: action.answers }
+                  : b
+              )
+            }))
+            await p.interruptTurn(activeThreadId, currentTurnId)
+            if (state.busy) armBusyWatchdog(set, get)
+            return
+          }
+          throw fallbackErr
+        }
         if (get().busy) armBusyWatchdog(set, get)
         set((s) => ({
           blocks: s.blocks.map((b) =>

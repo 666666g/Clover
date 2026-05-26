@@ -666,12 +666,12 @@ function addFencedCodeLineDecorations(
     }
   }
 
+  if (!blockActive) return
+
   for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
     const line = view.state.doc.line(lineNumber)
     ranges.push({ from: line.from, to: line.from, deco: codeBlockLineDeco })
   }
-
-  if (!blockActive) return
 
   if (startLine.from < startLine.to) {
     ranges.push({

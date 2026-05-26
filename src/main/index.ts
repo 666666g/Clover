@@ -62,6 +62,10 @@ const runningClawScheduleMcpServer = process.argv.includes('--claw-schedule-mcp-
 
 traceStartup('main module evaluated')
 
+if (runningClawScheduleMcpServer && process.platform === 'darwin') {
+  app.dock.hide()
+}
+
 if (!runningClawScheduleMcpServer && process.platform === 'win32') {
   app.setAppUserModelId(APP_USER_MODEL_ID)
 }

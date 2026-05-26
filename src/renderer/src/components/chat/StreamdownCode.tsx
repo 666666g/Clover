@@ -39,6 +39,7 @@ const COLLAPSE_HEIGHT = 200
 const COPY_RESET_MS = 2000
 
 type CodeProps = DetailedHTMLProps<HTMLAttributes<HTMLElement>, HTMLElement> & {
+  'data-block'?: string | boolean
   node?: Element | undefined
 }
 
@@ -297,10 +298,13 @@ function CodeComponent({ node, className, children, ...props }: CodeProps) {
   const startLine = node?.position?.start?.line
   const endLine = node?.position?.end?.line
   const hasLanguageClass = LANGUAGE_REGEX.test(className ?? '')
-  const inline =
-    typeof startLine === 'number' && typeof endLine === 'number'
+  const isFencedBlock = props['data-block'] !== undefined
+  const hasNodePosition = typeof startLine === 'number' && typeof endLine === 'number'
+  const inline = !isFencedBlock && (
+    hasNodePosition
       ? startLine === endLine
       : !hasLanguageClass && !text.includes('\n')
+  )
 
   if (inline) {
     const fileReference = inlineFileReference(text)

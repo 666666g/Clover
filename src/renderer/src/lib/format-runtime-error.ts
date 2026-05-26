@@ -53,6 +53,10 @@ export function formatRuntimeError(error: unknown): string {
     return i18n.t('common:runtimeAuthRequired')
   }
 
+  if (errorCode === 'runtime_request_user_input_unsupported') {
+    return i18n.t('common:runtimeUserInputUnsupported')
+  }
+
   if (errorCode === 'runtime_port_conflict') {
     return i18n.t('common:runtimePortConflict')
   }
