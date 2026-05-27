@@ -659,13 +659,8 @@ textarea {
 }
 
 .ds-composer-model-picker {
-  display: none;
-}
-
-@container (min-width: 560px) {
-  .ds-composer-model-picker {
-    display: inline-flex;
-  }
+  display: inline-flex;
+  min-width: 0;
 }
 
 @container (max-width: 640px) {
@@ -2276,6 +2271,36 @@ html[data-theme='dark'] .cm-write-md-code-block-html > pre span {
 
 .write-inline-agent-input::placeholder {
   color: var(--ds-text-faint);
+}
+
+.write-inline-agent-input:disabled {
+  opacity: 0.72;
+}
+
+.write-inline-agent-secondary {
+  display: inline-flex;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--ds-border) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ds-card) 84%, transparent);
+  color: var(--ds-text-muted);
+  transition: background-color 140ms ease, color 140ms ease, transform 140ms ease, opacity 140ms ease;
+}
+
+.write-inline-agent-secondary:hover {
+  background: color-mix(in srgb, var(--ds-accent) 10%, var(--ds-card));
+  color: var(--ds-accent);
+  transform: translateY(-1px);
+}
+
+.write-inline-agent-secondary:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+  transform: none;
 }
 
 .write-inline-agent-submit {

@@ -51,3 +51,22 @@ export type WriteInlineCompletionResult =
       mode?: WriteInlineCompletionMode
     }
   | { ok: false; message: string }
+
+export type WriteInlineCompletionDebugEntry = {
+  id: string
+  createdAt: string
+  durationMs: number
+  ok: boolean
+  model: string
+  mode: WriteInlineCompletionMode
+  currentFilePath?: string
+  prompt: string
+  suffix: string
+  rawResponse: string
+  completion: string
+  errorMessage?: string
+  referenceCount: number
+  promptChars: number
+  suffixChars: number
+  responseChars: number
+}

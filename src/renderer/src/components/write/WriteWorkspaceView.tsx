@@ -4,7 +4,6 @@ import {
   ChevronDown,
   Columns2,
   Copy,
-  CornerDownLeft,
   Download,
   Eye,
   ExternalLink,
@@ -36,6 +35,11 @@ import {
   writeRelativeToWorkspace
 } from '../../write/write-workspace-store'
 import { getWriteRenderSafety } from '../../write/write-render-safety'
+import {
+  applyWriteInlineEditReplacement,
+  buildWriteInlineEditDraft
+} from '../../write/inline-edit'
+import { createWriteRecentEdit } from '../../write/recent-edits'
 import { WriteMarkdownEditor } from './WriteMarkdownEditor'
 import { WriteMarkdownPreview } from './WriteMarkdownPreview'
 import { useWriteSplitScrollSync } from './use-write-split-scroll-sync'
@@ -54,6 +58,7 @@ const INLINE_AGENT_MIN_WIDTH = 280
 const INLINE_AGENT_MAX_WIDTH = 440
 const INLINE_AGENT_FALLBACK_HEIGHT = 56
 const WRITE_EXPORT_NOTICE_MS = 3_600
+const INLINE_EDIT_RECENT_CONTEXT_CHARS = 180
 const IMAGE_MIN_ZOOM = 25
 const IMAGE_MAX_ZOOM = 300
 const IMAGE_ZOOM_STEP = 25
@@ -322,6 +327,7 @@ export function WriteWorkspaceView({
     previewMode,
     assistantOpen,
     selection,
+    recentEdits,
     loadWriteSettings,
     addWriteWorkspace,
     setFileContent,
@@ -334,16 +340,20 @@ export function WriteWorkspaceView({
     setPreviewMode,
     setAssistantOpen,
     setSelection,
+    recordRecentEdits,
     quoteCurrentSelection
   } = useWriteWorkspaceStore()
   const saveTimerRef = useRef<number | null>(null)
   const exportMenuRef = useRef<HTMLDivElement | null>(null)
+  const modeMenuRef = useRef<HTMLDivElement | null>(null)
   const editorPaneRef = useRef<HTMLDivElement | null>(null)
   const previewPaneRef = useRef<HTMLDivElement | null>(null)
   const exportNoticeTimerRef = useRef<number | null>(null)
   const inlineAgentTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [inlineAgentValue, setInlineAgentValue] = useState('')
   const [inlineAgentOpen, setInlineAgentOpen] = useState(false)
+  const [inlineEditInFlight, setInlineEditInFlight] = useState(false)
+  const [modeMenuOpen, setModeMenuOpen] = useState(false)
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const [exportingFormat, setExportingFormat] = useState<WriteExportFormat | typeof WRITE_RICH_CLIPBOARD_ACTION | null>(null)
   const [exportNotice, setExportNotice] = useState<WriteNotice | null>(null)
@@ -420,15 +430,98 @@ export function WriteWorkspaceView({
     setInput(input.trim() ? `${input.trim()}\n\n${trimmed}` : trimmed)
   }
 
+  const submitInlineEdit = async (prompt: string): Promise<void> => {
+    const trimmed = prompt.trim()
+    if (!trimmed || !workspaceReady || !activeFilePath || inlineEditInFlight) return
+    if (renderSafety.readOnly) {
+      setFileError(t('writeReadOnlySaveDisabled'))
+      return
+    }
+    if (selection.ranges.length !== 1) {
+      setFileError(t(selection.ranges.length > 1 ? 'writeInlineEditMultiSelection' : 'writeInlineEditNoSelection'))
+      return
+    }
+    if (typeof window.dsGui?.requestWriteInlineEdit !== 'function') {
+      setFileError(t('writeInlineEditUnavailable'))
+      return
+    }
+
+    const draft = buildWriteInlineEditDraft(fileContent, selection.ranges[0], trimmed, {
+      workspaceRoot,
+      currentFilePath: activeFilePath,
+      model: inlineCompletion.model,
+      language: 'markdown',
+      recentEdits
+    })
+
+    setInlineEditInFlight(true)
+    try {
+      const result = await window.dsGui.requestWriteInlineEdit(draft.request)
+      if (!result.ok) {
+        setFileError(t('writeInlineEditFailed', { message: result.message }))
+        return
+      }
+
+      const latest = useWriteWorkspaceStore.getState()
+      if (
+        latest.activeFilePath !== activeFilePath ||
+        latest.activeFileKind !== 'text' ||
+        latest.fileContent.slice(draft.scope.from, draft.scope.to) !== draft.scope.text
+      ) {
+        setFileError(t('writeInlineEditChanged'))
+        return
+      }
+
+      const nextContent = applyWriteInlineEditReplacement(latest.fileContent, draft.scope, result.replacement)
+      const inlineEditRecord = createWriteRecentEdit({
+        source: 'inline-edit',
+        filePath: activeFilePath,
+        from: draft.scope.from,
+        to: draft.scope.to,
+        deletedText: draft.scope.text,
+        insertedText: result.replacement,
+        beforeContext: latest.fileContent.slice(
+          Math.max(0, draft.scope.from - INLINE_EDIT_RECENT_CONTEXT_CHARS),
+          draft.scope.from
+        ),
+        afterContext: nextContent.slice(
+          draft.scope.from + result.replacement.length,
+          Math.min(nextContent.length, draft.scope.from + result.replacement.length + INLINE_EDIT_RECENT_CONTEXT_CHARS)
+        ),
+        instruction: trimmed,
+        scopeKind: draft.scope.kind
+      })
+
+      setFileContent(nextContent)
+      if (inlineEditRecord) recordRecentEdits([inlineEditRecord])
+      setSelection({ text: '', ranges: [], charCount: 0 })
+      setInlineAgentValue('')
+      setInlineAgentOpen(false)
+      setFileError(null)
+      showExportNotice({ tone: 'success', message: t('writeInlineEditApplied') })
+    } catch (error) {
+      setFileError(t('writeInlineEditFailed', {
+        message: error instanceof Error ? error.message : String(error)
+      }))
+    } finally {
+      setInlineEditInFlight(false)
+    }
+  }
+
   const handleInlineAgentKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
     if (event.key === 'Escape') {
       event.preventDefault()
+      if (inlineEditInFlight) return
       setInlineAgentOpen(false)
       setInlineAgentValue('')
       return
     }
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
     event.preventDefault()
+    if (event.metaKey || event.ctrlKey) {
+      void submitInlineEdit(inlineAgentValue)
+      return
+    }
     submitInlineAgent(inlineAgentValue)
   }
 
@@ -537,6 +630,10 @@ export function WriteWorkspaceView({
   }, [activeFilePath])
 
   useEffect(() => {
+    setModeMenuOpen(false)
+  }, [activeFilePath, previewMode])
+
+  useEffect(() => {
     if (!selectionActionActive || !inlineAgentOpen) return
     window.requestAnimationFrame(() => inlineAgentTextareaRef.current?.focus())
   }, [inlineAgentOpen, selectionActionActive, selectionActionLeft, selectionActionTop])
@@ -547,17 +644,30 @@ export function WriteWorkspaceView({
   }, [selection.charCount, selection.text])
 
   useEffect(() => {
-    if (!exportMenuOpen) return
+    if (!exportMenuOpen && !modeMenuOpen) return
 
     const handlePointerDown = (event: PointerEvent): void => {
       const target = event.target
-      if (exportMenuRef.current && target instanceof Node && !exportMenuRef.current.contains(target)) {
+      if (
+        exportMenuRef.current &&
+        target instanceof Node &&
+        !exportMenuRef.current.contains(target)
+      ) {
         setExportMenuOpen(false)
+      }
+      if (
+        modeMenuRef.current &&
+        target instanceof Node &&
+        !modeMenuRef.current.contains(target)
+      ) {
+        setModeMenuOpen(false)
       }
     }
 
     const handleKeyDown = (event: globalThis.KeyboardEvent): void => {
-      if (event.key === 'Escape') setExportMenuOpen(false)
+      if (event.key !== 'Escape') return
+      setExportMenuOpen(false)
+      setModeMenuOpen(false)
     }
 
     window.addEventListener('pointerdown', handlePointerDown)
@@ -566,7 +676,7 @@ export function WriteWorkspaceView({
       window.removeEventListener('pointerdown', handlePointerDown)
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [exportMenuOpen])
+  }, [exportMenuOpen, modeMenuOpen])
 
   useEffect(() => {
     if (exportNoticeTimerRef.current) {
@@ -710,28 +820,29 @@ export function WriteWorkspaceView({
   const sourceModeActive = previewMode === 'source' || (previewMode === 'live' && !renderSafety.livePreviewEnabled)
   const editorAppearance = sourceModeActive ? 'source' : 'live'
 
-  const renderModeButton = (
-    nextMode: WritePreviewMode,
-    label: string,
-    icon: ReactElement
-  ): ReactElement => (
-    <button
-      type="button"
-      onClick={() => setPreviewMode(nextMode)}
-      disabled={!activeFileIsText}
-      className={modeButtonClass(
-        nextMode === 'source'
-          ? sourceModeActive
-          : nextMode === 'live'
-            ? liveModeActive
-            : previewMode === nextMode
-      ) + (!activeFileIsText ? ' cursor-not-allowed opacity-45' : '')}
-      title={label}
-      aria-label={label}
-    >
-      {icon}
-    </button>
-  )
+  const modeMenuItems: Array<{ mode: WritePreviewMode; label: string; shortLabel: string; icon: ReactElement; active: boolean }> = [
+    {
+      mode: 'source',
+      label: t('writeModeSource'),
+      shortLabel: t('writeModeSource'),
+      icon: <FileCode2 className="h-4 w-4" strokeWidth={1.85} />,
+      active: sourceModeActive
+    },
+    {
+      mode: 'split',
+      label: t('writeModeSplit'),
+      shortLabel: t('writeModeSplit'),
+      icon: <Columns2 className="h-4 w-4" strokeWidth={1.85} />,
+      active: previewMode === 'split'
+    },
+    {
+      mode: 'preview',
+      label: t('writeModePreview'),
+      shortLabel: t('writeModePreview'),
+      icon: <Eye className="h-4 w-4" strokeWidth={1.85} />,
+      active: previewMode === 'preview'
+    }
+  ]
 
   return (
     <div className="write-workspace-view ds-no-drag flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden px-3 sm:px-4 md:px-6 lg:px-8">
@@ -764,7 +875,10 @@ export function WriteWorkspaceView({
             </div>
           </div>
 
-          <div className="write-workspace-toolbar-modes flex min-w-0 items-center justify-start gap-1 rounded-xl border border-ds-border-muted bg-white/42 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] dark:bg-white/[0.035] dark:shadow-none">
+          <div
+            ref={modeMenuRef}
+            className="write-workspace-toolbar-modes relative flex min-w-0 items-center justify-start gap-1 rounded-xl border border-ds-border-muted bg-white/68 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.72)] dark:bg-white/[0.06] dark:shadow-none"
+          >
             <button
               type="button"
               onClick={() => setPreviewMode('live')}
@@ -776,18 +890,55 @@ export function WriteWorkspaceView({
               <BookOpen className="h-4 w-4" strokeWidth={1.85} />
               <span className="hidden text-[12.5px] font-semibold sm:inline">{t('writeModeLiveShort')}</span>
             </button>
-            {renderModeButton('source', t('writeModeSource'), <FileCode2 className="h-4 w-4" strokeWidth={1.85} />)}
-            {renderModeButton('split', t('writeModeSplit'), <Columns2 className="h-4 w-4" strokeWidth={1.85} />)}
             <button
               type="button"
-              onClick={() => setPreviewMode('preview')}
+              onClick={() => setModeMenuOpen((open) => !open)}
               disabled={!activeFileIsText}
-              className={`${modeButtonClass(previewMode === 'preview')} ${!activeFileIsText ? 'cursor-not-allowed opacity-45' : ''}`}
+              className={`${modeButtonClass(modeMenuOpen || !liveModeActive)} px-2 ${!activeFileIsText ? 'cursor-not-allowed opacity-45' : ''}`}
               title={t('writeModePreview')}
               aria-label={t('writeModePreview')}
+              aria-haspopup="menu"
+              aria-expanded={modeMenuOpen}
             >
-              <Eye className="h-4 w-4" strokeWidth={1.85} />
+              <ChevronDown
+                className={`h-4 w-4 transition ${modeMenuOpen ? 'rotate-180' : ''}`}
+                strokeWidth={1.9}
+              />
             </button>
+            {modeMenuOpen ? (
+              <div
+                role="menu"
+                className="absolute left-0 top-full z-30 mt-2 min-w-[188px] overflow-hidden rounded-2xl border border-slate-200 bg-white p-1.5 shadow-[0_18px_40px_rgba(15,23,42,0.12)] dark:border-white/10 dark:bg-[#131722]"
+              >
+                {modeMenuItems.map((item) => (
+                  <button
+                    key={item.mode}
+                    type="button"
+                    role="menuitem"
+                    disabled={!activeFileIsText}
+                    onClick={() => {
+                      setPreviewMode(item.mode)
+                      setModeMenuOpen(false)
+                    }}
+                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-[13px] transition ${
+                      item.active
+                        ? 'bg-accent/12 text-accent'
+                        : 'text-ds-ink hover:bg-slate-100'
+                    } ${!activeFileIsText ? 'cursor-not-allowed opacity-40' : ''}`}
+                  >
+                    <span className="flex items-center gap-2">
+                      {item.icon}
+                      <span>{item.shortLabel}</span>
+                    </span>
+                    {item.active ? (
+                      <span className="text-[11px] font-semibold uppercase tracking-[0.08em]">
+                        ON
+                      </span>
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
 
           <div className="write-workspace-toolbar-actions flex min-w-0 items-center justify-start gap-1.5">
@@ -1054,6 +1205,7 @@ export function WriteWorkspaceView({
                       completionLongDebounceMs={inlineCompletion.longDebounceMs}
                       completionLongMinAcceptScore={inlineCompletion.longMinAcceptScore}
                       onChange={setFileContent}
+                      onDocumentEdit={recordRecentEdits}
                       onSelectionChange={setSelection}
                       onSaveShortcut={() => {
                         if (renderSafety.readOnly) return
@@ -1109,30 +1261,46 @@ export function WriteWorkspaceView({
                 aria-label={t('writeInlineAgentPlaceholder')}
                 spellCheck={false}
                 className="write-inline-agent-input"
+                disabled={inlineEditInFlight}
                 onChange={(event) => setInlineAgentValue(event.target.value)}
                 onKeyDown={handleInlineAgentKeyDown}
               />
               <button
-                type="submit"
-                className="write-inline-agent-submit"
+                type="button"
+                className="write-inline-agent-secondary"
                 aria-label={t('writeInlineAgentSend')}
                 title={t('writeInlineAgentSend')}
-                disabled={!inlineAgentValue.trim()}
+                disabled={!inlineAgentValue.trim() || inlineEditInFlight}
+                onClick={() => submitInlineAgent(inlineAgentValue)}
               >
-                <CornerDownLeft className="h-4 w-4" strokeWidth={2} />
+                <MessageSquareQuote className="h-4 w-4" strokeWidth={1.9} />
+              </button>
+              <button
+                type="button"
+                className="write-inline-agent-submit"
+                aria-label={inlineEditInFlight ? t('writeInlineEditApplying') : t('writeInlineEditApply')}
+                title={inlineEditInFlight ? t('writeInlineEditApplying') : t('writeInlineEditApply')}
+                disabled={!inlineAgentValue.trim() || inlineEditInFlight}
+                onClick={() => void submitInlineEdit(inlineAgentValue)}
+              >
+                {inlineEditInFlight ? (
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+                ) : (
+                  <Sparkles className="h-4 w-4" strokeWidth={2} />
+                )}
               </button>
             </form>
           ) : (
             <button
               type="button"
               className="write-inline-agent-trigger"
-              aria-label={t('writeInlineAgentAskAi')}
-              title={t('writeInlineAgentAskAi')}
+              aria-label={t('writeInlineEditOpen')}
+              title={t('writeInlineEditOpen')}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => setInlineAgentOpen(true)}
             >
-              <MessageSquareQuote className="h-3.5 w-3.5" strokeWidth={1.9} />
-              <span>{t('writeInlineAgentAskAi')}</span>
+              <Sparkles className="h-3.5 w-3.5" strokeWidth={1.9} />
+              <span>{t('writeInlineEditOpen')}</span>
             </button>
           )}
         </div>

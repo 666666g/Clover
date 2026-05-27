@@ -10,6 +10,8 @@ import {
 import type { WriteInlineCompletionRequest } from '../../shared/write-inline-completion'
 import {
   buildWriteInlineCompletionPrompt,
+  clearWriteInlineCompletionDebugEntries,
+  listWriteInlineCompletionDebugEntries,
   requestWriteInlineCompletion
 } from './write-inline-completion-service'
 import { clearWriteRetrievalCache } from './write-retrieval-service'
@@ -101,6 +103,7 @@ function createRequest(): WriteInlineCompletionRequest {
 afterEach(() => {
   vi.unstubAllGlobals()
   clearWriteRetrievalCache()
+  clearWriteInlineCompletionDebugEntries()
 })
 
 describe('requestWriteInlineCompletion', () => {
@@ -133,6 +136,14 @@ describe('requestWriteInlineCompletion', () => {
       prompt: '# Draft\n\nThis is',
       suffix: ' a test.',
       max_tokens: 64
+    })
+    const debugEntries = listWriteInlineCompletionDebugEntries()
+    expect(debugEntries).toHaveLength(1)
+    expect(debugEntries[0]).toMatchObject({
+      ok: true,
+      completion: ' only a test',
+      mode: 'short',
+      model: 'deepseek-v4-flash'
     })
   })
 

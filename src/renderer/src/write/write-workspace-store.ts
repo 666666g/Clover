@@ -24,6 +24,8 @@ import type { WriteEditorSelectionState } from '../components/write/WriteMarkdow
 import type { WriteQuotedSelection } from './quoted-selection'
 import { quotedSelectionFromEditor } from './quoted-selection'
 import { writePathToFileUrl } from '@shared/write-markdown-resource'
+import type { WriteRecentEdit } from './recent-edits'
+import { trimWriteRecentEdits } from './recent-edits'
 
 export type WritePreviewMode = 'source' | 'live' | 'split' | 'preview'
 export type WriteSaveStatus = 'saved' | 'dirty' | 'saving' | 'error'
@@ -57,6 +59,7 @@ export type WriteWorkspaceState = {
   assistantModel: string
   selection: WriteEditorSelectionState
   quotedSelections: WriteQuotedSelection[]
+  recentEdits: WriteRecentEdit[]
   loadWriteSettings: () => Promise<void>
   selectWriteWorkspace: (workspaceRoot: string) => Promise<void>
   addWriteWorkspace: (workspaceRoot: string) => Promise<void>
@@ -90,6 +93,7 @@ export type WriteWorkspaceState = {
   setAssistantOpen: (open: boolean) => void
   setAssistantModel: (model: string) => void
   setSelection: (selection: WriteEditorSelectionState) => void
+  recordRecentEdits: (edits: WriteRecentEdit[]) => void
   quoteCurrentSelection: (workspaceRoot: string) => void
   removeQuotedSelection: (id: string) => void
   clearQuotedSelections: () => void
@@ -322,6 +326,7 @@ function initialState(): Pick<
   | 'saveStatus'
   | 'selection'
   | 'quotedSelections'
+  | 'recentEdits'
 > {
   return {
     workspaceRoot: '',
@@ -341,7 +346,8 @@ function initialState(): Pick<
     fileLoading: false,
     saveStatus: 'saved',
     selection: emptySelection(),
-    quotedSelections: []
+    quotedSelections: [],
+    recentEdits: []
   }
 }
 
@@ -1004,6 +1010,13 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
   },
 
   setSelection: (selection) => set({ selection }),
+
+  recordRecentEdits: (edits) => {
+    if (edits.length === 0) return
+    set((state) => ({
+      recentEdits: trimWriteRecentEdits([...state.recentEdits, ...edits])
+    }))
+  },
 
   quoteCurrentSelection: (workspaceRoot) => {
     const state = get()

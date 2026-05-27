@@ -4,9 +4,15 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirro
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { bracketMatching, indentOnInput } from '@codemirror/language'
 import { languages } from '@codemirror/language-data'
-import { drawSelection, EditorView, highlightActiveLine, keymap } from '@codemirror/view'
+import { drawSelection, EditorView, highlightActiveLine, keymap, type ViewUpdate } from '@codemirror/view'
 import { buildInlineCompletionExtension, buildInlineCompletionPayload } from '../../write/inline-completion'
 import { writeMarkdownLivePreviewExtensions } from '../../write/markdown-live-preview'
+import { createWriteRecentEdit, type WriteRecentEdit } from '../../write/recent-edits'
+import {
+  buildWriteCanonicalTermPropagationChanges,
+  buildWriteTermPropagationChanges,
+  type WriteTermReplacementSeed
+} from '../../write/term-propagation'
 
 export type WriteSelectionAnchorRect = {
   left: number
@@ -50,6 +56,7 @@ type Props = {
   completionLongDebounceMs: number
   completionLongMinAcceptScore: number
   onChange: (value: string) => void
+  onDocumentEdit?: (edits: WriteRecentEdit[]) => void
   onSelectionChange: (selection: WriteEditorSelectionState) => void
   onSaveShortcut: () => void
   onImagePasteSaved?: () => void
@@ -57,6 +64,8 @@ type Props = {
 }
 
 const externalValueSyncAnnotation = Annotation.define<boolean>()
+const termPropagationAnnotation = Annotation.define<boolean>()
+const RECENT_EDIT_CONTEXT_CHARS = 160
 
 function clampOffset(state: EditorState, offset = 0): number {
   const size = state.doc.length
@@ -141,6 +150,46 @@ function selectionState(view: EditorView): WriteEditorSelectionState {
   }
 }
 
+function recentEditsFromUpdate(update: ViewUpdate, filePath: string): WriteRecentEdit[] {
+  const path = filePath.trim()
+  if (!path || !update.docChanged) return []
+  const edits: WriteRecentEdit[] = []
+  const timestamp = Date.now()
+
+  update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+    const edit = createWriteRecentEdit({
+      source: 'user',
+      timestamp,
+      filePath: path,
+      from: fromA,
+      to: toA,
+      deletedText: update.startState.sliceDoc(fromA, toA),
+      insertedText: inserted.toString(),
+      beforeContext: update.startState.sliceDoc(Math.max(0, fromA - RECENT_EDIT_CONTEXT_CHARS), fromA),
+      afterContext: update.state.sliceDoc(toB, Math.min(update.state.doc.length, toB + RECENT_EDIT_CONTEXT_CHARS))
+    })
+    if (edit) edits.push(edit)
+  })
+
+  return edits
+}
+
+function termReplacementSeedFromUpdate(update: ViewUpdate): WriteTermReplacementSeed | null {
+  const changes: WriteTermReplacementSeed[] = []
+  update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+    changes.push({
+      from: fromB,
+      to: toB,
+      deletedText: update.startState.sliceDoc(fromA, toA),
+      insertedText: inserted.toString()
+    })
+  })
+  if (changes.length !== 1) return null
+  const [change] = changes
+  if (!change.deletedText || !change.insertedText) return null
+  return change
+}
+
 function buildEditorTheme(appearance: 'source' | 'live'): Extension {
   const sourceMode = appearance === 'source'
   return EditorView.theme({
@@ -219,6 +268,7 @@ export function WriteMarkdownEditor({
   completionLongDebounceMs,
   completionLongMinAcceptScore,
   onChange,
+  onDocumentEdit,
   onSelectionChange,
   onSaveShortcut,
   onImagePasteSaved,
@@ -242,6 +292,7 @@ export function WriteMarkdownEditor({
   const completionLongMinAcceptScoreRef = useRef(completionLongMinAcceptScore)
   const appearanceRef = useRef(appearance)
   const onChangeRef = useRef(onChange)
+  const onDocumentEditRef = useRef(onDocumentEdit)
   const onSelectionChangeRef = useRef(onSelectionChange)
   const onSaveShortcutRef = useRef(onSaveShortcut)
   const onImagePasteSavedRef = useRef(onImagePasteSaved)
@@ -261,6 +312,7 @@ export function WriteMarkdownEditor({
   completionLongMinAcceptScoreRef.current = completionLongMinAcceptScore
   appearanceRef.current = appearance
   onChangeRef.current = onChange
+  onDocumentEditRef.current = onDocumentEdit
   onSelectionChangeRef.current = onSelectionChange
   onSaveShortcutRef.current = onSaveShortcut
   onImagePasteSavedRef.current = onImagePasteSaved
@@ -389,11 +441,39 @@ export function WriteMarkdownEditor({
           const externalValueSync = update.transactions.some((transaction) =>
             transaction.annotation(externalValueSyncAnnotation)
           )
+          const termPropagationSync = update.transactions.some((transaction) =>
+            transaction.annotation(termPropagationAnnotation)
+          )
           if (update.docChanged && !externalValueSync) {
+            const recentEdits = recentEditsFromUpdate(update, filePathRef.current)
+            if (recentEdits.length > 0) onDocumentEditRef.current?.(recentEdits)
             onChangeRef.current(update.state.doc.toString())
           }
           if (update.docChanged || update.selectionSet) {
             onSelectionChangeRef.current(selectionState(update.view))
+          }
+          if (update.docChanged && !externalValueSync && !termPropagationSync) {
+            const seed = termReplacementSeedFromUpdate(update)
+            if (seed) {
+              const content = update.state.doc.toString()
+              const rawPropagationChanges = [
+                ...buildWriteTermPropagationChanges(content, seed),
+                ...buildWriteCanonicalTermPropagationChanges(content, seed)
+              ]
+              const seenPropagationChanges = new Set<string>()
+              const propagationChanges = rawPropagationChanges.filter((change) => {
+                const key = `${change.from}:${change.to}`
+                if (seenPropagationChanges.has(key)) return false
+                seenPropagationChanges.add(key)
+                return true
+              })
+              if (propagationChanges.length > 0) {
+                update.view.dispatch({
+                  changes: propagationChanges,
+                  annotations: termPropagationAnnotation.of(true)
+                })
+              }
+            }
           }
         })
       ]

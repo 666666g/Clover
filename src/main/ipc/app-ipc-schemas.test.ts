@@ -11,7 +11,8 @@ import {
   workspaceEntryRenamePayloadSchema,
   writeExportPayloadSchema,
   writeRichClipboardPayloadSchema,
-  writeInlineCompletionPayloadSchema
+  writeInlineCompletionPayloadSchema,
+  writeInlineEditPayloadSchema
 } from './app-ipc-schemas'
 
 describe('app-ipc-schemas', () => {
@@ -139,6 +140,56 @@ describe('app-ipc-schemas', () => {
     expect(payload.mode).toBe('long')
     expect(payload.workspaceRoot).toBe('/tmp/workspace')
     expect(payload.cursor.line).toBe(3)
+  })
+
+  it('accepts structured inline edit payloads', () => {
+    const payload = writeInlineEditPayloadSchema.parse({
+      prefix: '# Draft\n\n',
+      suffix: '\n\nNext paragraph.',
+      original: 'DeepSeek GUI keeps text editing local.',
+      instruction: 'Replace DeepSeek GUI with Write mode in this paragraph.',
+      workspaceRoot: '/tmp/workspace',
+      currentFilePath: '/tmp/workspace/notes.md',
+      scope: {
+        kind: 'paragraph',
+        from: 10,
+        to: 48,
+        startLine: 3,
+        startColumn: 1,
+        endLine: 3,
+        endColumn: 38
+      },
+      context: {
+        language: 'markdown',
+        selectedText: 'DeepSeek GUI',
+        previousLine: '',
+        previousNonEmptyLine: '# Draft',
+        nextLine: ''
+      },
+      preview: {
+        local: 'DeepSeek GUI keeps text editing local.',
+        documentTail: '# Draft'
+      },
+      recentEdits: [{
+        source: 'user',
+        ageMs: 1_200,
+        filePath: '/tmp/workspace/notes.md',
+        from: 12,
+        to: 24,
+        deletedText: 'DeepSeek GUI',
+        insertedText: 'Write mode',
+        beforeContext: 'Earlier: ',
+        afterContext: ' keeps text editing local.',
+        instruction: 'Rename the product.',
+        scopeKind: 'paragraph'
+      }],
+      model: 'deepseek-v4-flash'
+    })
+
+    expect(payload.scope.kind).toBe('paragraph')
+    expect(payload.context.selectedText).toBe('DeepSeek GUI')
+    expect(payload.recentEdits?.[0].insertedText).toBe('Write mode')
+    expect(payload.model).toBe('deepseek-v4-flash')
   })
 
   it('accepts write export payloads', () => {

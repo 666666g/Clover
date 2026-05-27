@@ -245,6 +245,70 @@ export const writeInlineCompletionPayloadSchema = z
   })
   .strict()
 
+export const writeInlineEditPayloadSchema = z
+  .object({
+    prefix: z.string().max(MAX_EDITOR_COMPLETION_TEXT),
+    suffix: z.string().max(MAX_EDITOR_COMPLETION_TEXT),
+    original: z.string().max(MAX_EDITOR_COMPLETION_TEXT),
+    instruction: z.string().trim().min(1).max(50_000),
+    workspaceRoot: optionalTrimmedString(MAX_PATH_LENGTH),
+    currentFilePath: optionalTrimmedString(MAX_PATH_LENGTH),
+    scope: z
+      .object({
+        kind: z.enum(['selection', 'paragraph']),
+        from: z.number().int().min(0).max(MAX_BODY_BYTES),
+        to: z.number().int().min(0).max(MAX_BODY_BYTES),
+        startLine: z.number().int().positive().max(1_000_000),
+        startColumn: z.number().int().positive().max(1_000_000),
+        endLine: z.number().int().positive().max(1_000_000),
+        endColumn: z.number().int().positive().max(1_000_000)
+      })
+      .strict()
+      .refine((scope) => scope.to >= scope.from, {
+        message: 'Edit scope end must be greater than or equal to start.'
+      }),
+    context: z
+      .object({
+        language: trimmedString(64),
+        selectedText: z.string().max(50_000),
+        previousLine: z.string().max(20_000),
+        previousNonEmptyLine: z.string().max(20_000),
+        nextLine: z.string().max(20_000)
+      })
+      .strict(),
+    preview: z
+      .object({
+        local: z.string().max(5_000),
+        documentTail: z.string().max(20_000)
+      })
+      .strict(),
+    recentEdits: z
+      .array(
+        z
+          .object({
+            source: z.enum(['user', 'inline-edit']),
+            ageMs: z.number().int().min(0).max(24 * 60 * 60 * 1_000),
+            filePath: optionalTrimmedString(MAX_PATH_LENGTH),
+            from: z.number().int().min(0).max(MAX_BODY_BYTES),
+            to: z.number().int().min(0).max(MAX_BODY_BYTES),
+            deletedText: z.string().max(8_000),
+            insertedText: z.string().max(8_000),
+            beforeContext: z.string().max(4_000),
+            afterContext: z.string().max(4_000),
+            instruction: z.string().trim().min(1).max(10_000).optional(),
+            scopeKind: z.enum(['selection', 'paragraph']).optional()
+          })
+          .strict()
+          .refine((edit) => edit.to >= edit.from, {
+            message: 'Recent edit end must be greater than or equal to start.'
+          })
+      )
+      .max(12)
+      .optional(),
+    model: optionalTrimmedString(128)
+  })
+  .strict()
+
 export const shellOpenExternalUrlSchema = trimmedString(MAX_URL_LENGTH).refine(
   isSafeOpenExternalUrl,
   { message: 'Only http, https, and mailto URLs are allowed.' }

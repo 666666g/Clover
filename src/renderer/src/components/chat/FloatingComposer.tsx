@@ -575,7 +575,7 @@ export function FloatingComposer({
                   modelPickerRef.current = node
                 }}
                 className={`ds-composer-model-picker ds-no-drag relative flex shrink-0 items-center ${
-                  compact ? 'max-w-[142px]' : 'max-w-[220px]'
+                  compact ? 'w-[92px] max-w-[92px]' : 'max-w-[220px]'
                 }`}
               >
                 <span className="sr-only">{t('composerModel')}</span>
@@ -639,7 +639,7 @@ export function FloatingComposer({
               </div>
             ) : (
               <label className={`ds-composer-model-picker ds-no-drag relative shrink-0 items-center ${
-                compact ? 'max-w-[112px]' : 'max-w-[220px]'
+                compact ? 'w-[92px] max-w-[92px]' : 'max-w-[220px]'
               }`} ref={(node) => {
                 modelPickerRef.current = node
               }}>

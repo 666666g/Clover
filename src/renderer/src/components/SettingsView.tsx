@@ -33,6 +33,8 @@ import type {
   GuiUpdateProgress,
   GuiUpdateState
 } from '@shared/gui-update'
+import type { WriteInlineCompletionDebugEntry } from '@shared/write-inline-completion'
+import type { WriteInlineEditDebugEntry } from '@shared/write-inline-edit'
 import {
   AlertCircle,
   Bot,
@@ -82,6 +84,7 @@ type InlineNotice = {
   tone: 'success' | 'error' | 'info'
   message: string
 }
+type WriteDebugLogTab = 'edit' | 'completion'
 type RendererSettingsShape = Partial<Omit<AppSettingsV1, 'deepseek' | 'log' | 'notifications' | 'write' | 'claw' | 'guiUpdate'>> & {
   deepseek?: Partial<AppSettingsV1['deepseek']>
   log?: Partial<AppSettingsV1['log']>
@@ -311,6 +314,14 @@ export function SettingsView(): ReactElement {
   const [mcpLoaded, setMcpLoaded] = useState(false)
   const [mcpBusy, setMcpBusy] = useState(false)
   const [mcpNotice, setMcpNotice] = useState<InlineNotice | null>(null)
+  const [writeDebugModalOpen, setWriteDebugModalOpen] = useState(false)
+  const [writeDebugTab, setWriteDebugTab] = useState<WriteDebugLogTab>('edit')
+  const [writeEditDebugEntries, setWriteEditDebugEntries] = useState<WriteInlineEditDebugEntry[]>([])
+  const [writeEditDebugSelectedId, setWriteEditDebugSelectedId] = useState<string | null>(null)
+  const [writeCompletionDebugEntries, setWriteCompletionDebugEntries] = useState<WriteInlineCompletionDebugEntry[]>([])
+  const [writeCompletionDebugSelectedId, setWriteCompletionDebugSelectedId] = useState<string | null>(null)
+  const [writeEditDebugLoading, setWriteEditDebugLoading] = useState(false)
+  const [writeEditDebugError, setWriteEditDebugError] = useState<string | null>(null)
   const initializedCategory = useRef(false)
   const saveTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null)
   const statusTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null)
@@ -357,6 +368,42 @@ export function SettingsView(): ReactElement {
     if (typeof window.dsGui?.getLogPath !== 'function') return
     void window.dsGui.getLogPath().then((p) => setLogPath(p))
   }, [category])
+
+  const loadWriteDebugEntries = useCallback(async (): Promise<void> => {
+    setWriteEditDebugLoading(true)
+    setWriteEditDebugError(null)
+    try {
+      const [editEntries, completionEntries] = await Promise.all([
+        typeof window.dsGui?.listWriteInlineEditDebugEntries === 'function'
+          ? window.dsGui.listWriteInlineEditDebugEntries()
+          : Promise.resolve([]),
+        typeof window.dsGui?.listWriteInlineCompletionDebugEntries === 'function'
+          ? window.dsGui.listWriteInlineCompletionDebugEntries()
+          : Promise.resolve([])
+      ])
+      setWriteEditDebugEntries(editEntries)
+      setWriteEditDebugSelectedId((current) =>
+        current && editEntries.some((entry) => entry.id === current)
+          ? current
+          : editEntries[0]?.id ?? null
+      )
+      setWriteCompletionDebugEntries(completionEntries)
+      setWriteCompletionDebugSelectedId((current) =>
+        current && completionEntries.some((entry) => entry.id === current)
+          ? current
+          : completionEntries[0]?.id ?? null
+      )
+    } catch (error) {
+      setWriteEditDebugError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setWriteEditDebugLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (category !== 'write') return
+    void loadWriteDebugEntries()
+  }, [category, loadWriteDebugEntries])
 
   useEffect(() => {
     if (!form || initializedCategory.current) return
@@ -977,6 +1024,29 @@ export function SettingsView(): ReactElement {
     })
   }
 
+  const clearWriteDebugEntries = async (): Promise<void> => {
+    setWriteEditDebugLoading(true)
+    setWriteEditDebugError(null)
+    try {
+      await Promise.all([
+        typeof window.dsGui?.clearWriteInlineEditDebugEntries === 'function'
+          ? window.dsGui.clearWriteInlineEditDebugEntries()
+          : Promise.resolve(true),
+        typeof window.dsGui?.clearWriteInlineCompletionDebugEntries === 'function'
+          ? window.dsGui.clearWriteInlineCompletionDebugEntries()
+          : Promise.resolve(true)
+      ])
+      setWriteEditDebugEntries([])
+      setWriteEditDebugSelectedId(null)
+      setWriteCompletionDebugEntries([])
+      setWriteCompletionDebugSelectedId(null)
+    } catch (error) {
+      setWriteEditDebugError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setWriteEditDebugLoading(false)
+    }
+  }
+
   const catCls = (c: SettingsCategory): string =>
     `flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[14px] font-medium transition ${
       category === c
@@ -1527,6 +1597,26 @@ export function SettingsView(): ReactElement {
                 <div className="px-3 py-3 text-[12.5px] leading-5 text-ds-muted">
                   {t('writeInlineCompletionApiNote')}
                 </div>
+              </SettingsCard>
+
+              <SettingsCard title={t('writeDebugLogTitle')} className="mt-5">
+                <SettingRow
+                  title={t('writeDebugLogOpen')}
+                  description={t('writeDebugLogDesc')}
+                  control={
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWriteDebugModalOpen(true)
+                        void loadWriteDebugEntries()
+                      }}
+                      className="inline-flex items-center gap-2 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-hover"
+                    >
+                      <PencilLine className="h-4 w-4" strokeWidth={1.75} />
+                      {t('writeDebugLogOpenButton')}
+                    </button>
+                  }
+                />
               </SettingsCard>
             </>
           )}
@@ -2113,6 +2203,24 @@ export function SettingsView(): ReactElement {
           )}
         </div>
       </div>
+      {writeDebugModalOpen ? (
+        <WriteDebugLogModal
+          tab={writeDebugTab}
+          onTabChange={setWriteDebugTab}
+          editEntries={writeEditDebugEntries}
+          editSelectedId={writeEditDebugSelectedId}
+          completionEntries={writeCompletionDebugEntries}
+          completionSelectedId={writeCompletionDebugSelectedId}
+          loading={writeEditDebugLoading}
+          error={writeEditDebugError}
+          onSelectEdit={setWriteEditDebugSelectedId}
+          onSelectCompletion={setWriteCompletionDebugSelectedId}
+          onRefresh={() => void loadWriteDebugEntries()}
+          onClear={() => void clearWriteDebugEntries()}
+          onClose={() => setWriteDebugModalOpen(false)}
+          t={t}
+        />
+      ) : null}
     </div>
   )
 }
@@ -2396,6 +2504,282 @@ function GuiUpdateControl({
           </button>
         ) : null}
       </div>
+    </div>
+  )
+}
+
+function formatWriteEditDebugTime(value: string): string {
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : value
+}
+
+function WriteInlineEditDebugText({
+  label,
+  value
+}: {
+  label: string
+  value: string
+}): ReactElement {
+  return (
+    <div className="min-w-0">
+      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-ds-faint">
+        {label}
+      </div>
+      <pre className="max-h-72 min-h-[88px] overflow-auto whitespace-pre-wrap rounded-xl border border-ds-border-muted bg-ds-main/72 p-3 font-mono text-[11.5px] leading-5 text-ds-ink">
+        {value || '—'}
+      </pre>
+    </div>
+  )
+}
+
+function WriteDebugLogModal({
+  tab,
+  onTabChange,
+  editEntries,
+  editSelectedId,
+  completionEntries,
+  completionSelectedId,
+  loading,
+  error,
+  onSelectEdit,
+  onSelectCompletion,
+  onRefresh,
+  onClear,
+  onClose,
+  t
+}: {
+  tab: WriteDebugLogTab
+  onTabChange: (tab: WriteDebugLogTab) => void
+  editEntries: WriteInlineEditDebugEntry[]
+  editSelectedId: string | null
+  completionEntries: WriteInlineCompletionDebugEntry[]
+  completionSelectedId: string | null
+  loading: boolean
+  error: string | null
+  onSelectEdit: (id: string | null) => void
+  onSelectCompletion: (id: string | null) => void
+  onRefresh: () => void
+  onClear: () => void
+  onClose: () => void
+  t: (key: string, values?: Record<string, unknown>) => string
+}): ReactElement {
+  const editSelected = editEntries.find((entry) => entry.id === editSelectedId) ?? editEntries[0] ?? null
+  const completionSelected =
+    completionEntries.find((entry) => entry.id === completionSelectedId) ?? completionEntries[0] ?? null
+  const entries = tab === 'edit' ? editEntries : completionEntries
+
+  return (
+    <div className="ds-no-drag fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-sm">
+      <div className="flex h-[min(86vh,820px)] w-[min(1180px,96vw)] min-w-0 flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-card shadow-[0_26px_80px_rgba(15,23,42,0.28)]">
+        <div className="flex min-h-[64px] shrink-0 items-center justify-between gap-3 border-b border-ds-border-muted px-4 py-3">
+          <div className="min-w-0">
+            <h2 className="text-[16px] font-semibold text-ds-ink">{t('writeDebugLogTitle')}</h2>
+            <p className="mt-1 text-[12.5px] text-ds-muted">{t('writeDebugLogModalDesc')}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button type="button" onClick={onRefresh} disabled={loading} className="inline-flex items-center gap-1.5 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[12.5px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-hover disabled:cursor-not-allowed disabled:opacity-50">
+              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} /> : <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.75} />}
+              {t('writeInlineEditDebugRefresh')}
+            </button>
+            <button type="button" onClick={onClear} disabled={loading || (editEntries.length === 0 && completionEntries.length === 0)} className="inline-flex items-center gap-1.5 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[12.5px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-hover disabled:cursor-not-allowed disabled:opacity-50">
+              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} />
+              {t('writeInlineEditDebugClear')}
+            </button>
+            <button type="button" onClick={onClose} className="rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[12.5px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-hover">
+              {t('close')}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 gap-2 border-b border-ds-border-muted px-4 py-2">
+          {(['edit', 'completion'] as const).map((nextTab) => (
+            <button
+              key={nextTab}
+              type="button"
+              onClick={() => onTabChange(nextTab)}
+              className={`rounded-xl px-3 py-1.5 text-[12.5px] font-semibold transition ${
+                tab === nextTab ? 'bg-ds-subtle text-ds-ink' : 'text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
+              }`}
+            >
+              {nextTab === 'edit'
+                ? t('writeDebugLogEditTab', { count: editEntries.length })
+                : t('writeDebugLogCompletionTab', { count: completionEntries.length })}
+            </button>
+          ))}
+        </div>
+
+        {error ? (
+          <div className="shrink-0 border-b border-red-200 bg-red-50 px-4 py-2 text-[12.5px] text-red-700 dark:border-red-900/60 dark:bg-red-950/25 dark:text-red-200">
+            {error}
+          </div>
+        ) : null}
+
+        {entries.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center px-6 py-10 text-center text-[13px] text-ds-muted">
+            {tab === 'edit' ? t('writeInlineEditDebugEmpty') : t('writeCompletionDebugEmpty')}
+          </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 grid-cols-1 divide-y divide-ds-border-muted lg:grid-cols-[260px_minmax(0,1fr)] lg:divide-x lg:divide-y-0">
+            <div className="min-h-0 overflow-auto py-2">
+              {tab === 'edit'
+                ? editEntries.map((entry) => (
+                    <WriteDebugLogListButton
+                      key={entry.id}
+                      active={editSelected?.id === entry.id}
+                      ok={entry.ok}
+                      title={entry.instruction || t('writeInlineEditDebugNoInstruction')}
+                      subtitle={formatWriteEditDebugTime(entry.createdAt)}
+                      durationMs={entry.durationMs}
+                      onClick={() => onSelectEdit(entry.id)}
+                      t={t}
+                    />
+                  ))
+                : completionEntries.map((entry) => (
+                    <WriteDebugLogListButton
+                      key={entry.id}
+                      active={completionSelected?.id === entry.id}
+                      ok={entry.ok}
+                      title={`${entry.mode} · ${entry.completion || entry.errorMessage || entry.model}`}
+                      subtitle={formatWriteEditDebugTime(entry.createdAt)}
+                      durationMs={entry.durationMs}
+                      onClick={() => onSelectCompletion(entry.id)}
+                      t={t}
+                    />
+                  ))}
+            </div>
+            <div className="min-h-0 min-w-0 overflow-auto px-4 py-4">
+              {tab === 'edit' && editSelected ? (
+                <WriteEditDebugDetail entry={editSelected} t={t} />
+              ) : tab === 'completion' && completionSelected ? (
+                <WriteCompletionDebugDetail entry={completionSelected} t={t} />
+              ) : null}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function WriteDebugLogListButton({
+  active,
+  ok,
+  title,
+  subtitle,
+  durationMs,
+  onClick,
+  t
+}: {
+  active: boolean
+  ok: boolean
+  title: string
+  subtitle: string
+  durationMs: number
+  onClick: () => void
+  t: (key: string, values?: Record<string, unknown>) => string
+}): ReactElement {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`block w-full px-3 py-2.5 text-left transition ${active ? 'bg-ds-hover text-ds-ink' : 'hover:bg-ds-hover/70'}`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className={`rounded-full px-2 py-0.5 text-[10.5px] font-semibold ${ok ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/12 text-red-700 dark:text-red-300'}`}>
+          {ok ? t('writeInlineEditDebugOk') : t('writeInlineEditDebugFailed')}
+        </span>
+        <span className="text-[10.5px] text-ds-faint">{durationMs}ms</span>
+      </div>
+      <div className="mt-1.5 truncate text-[12px] font-medium text-ds-ink">{title}</div>
+      <div className="mt-1 truncate text-[11px] text-ds-faint">{subtitle}</div>
+    </button>
+  )
+}
+
+function WriteEditDebugDetail({
+  entry,
+  t
+}: {
+  entry: WriteInlineEditDebugEntry
+  t: (key: string, values?: Record<string, unknown>) => string
+}): ReactElement {
+  return (
+    <div className="space-y-3">
+      <WriteDebugMeta
+        filePath={entry.currentFilePath}
+        model={entry.model}
+        context={t('writeInlineEditDebugContextCounts', {
+          references: entry.referenceCount,
+          edits: entry.recentEditCount
+        })}
+        error={entry.errorMessage}
+        t={t}
+      />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugOriginal')} value={entry.original} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugPrompt')} value={entry.prompt} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugSuffix')} value={entry.suffix} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugReplacement')} value={entry.replacement} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugRawResponse')} value={entry.rawResponse} />
+    </div>
+  )
+}
+
+function WriteCompletionDebugDetail({
+  entry,
+  t
+}: {
+  entry: WriteInlineCompletionDebugEntry
+  t: (key: string, values?: Record<string, unknown>) => string
+}): ReactElement {
+  return (
+    <div className="space-y-3">
+      <WriteDebugMeta
+        filePath={entry.currentFilePath}
+        model={`${entry.model} · ${entry.mode}`}
+        context={t('writeCompletionDebugContextCounts', { references: entry.referenceCount })}
+        error={entry.errorMessage}
+        t={t}
+      />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugPrompt')} value={entry.prompt} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugSuffix')} value={entry.suffix} />
+      <WriteInlineEditDebugText label={t('writeCompletionDebugCompletion')} value={entry.completion} />
+      <WriteInlineEditDebugText label={t('writeInlineEditDebugRawResponse')} value={entry.rawResponse} />
+    </div>
+  )
+}
+
+function WriteDebugMeta({
+  filePath,
+  model,
+  context,
+  error,
+  t
+}: {
+  filePath?: string
+  model: string
+  context: string
+  error?: string
+  t: (key: string, values?: Record<string, unknown>) => string
+}): ReactElement {
+  return (
+    <div className="grid gap-2 text-[11.5px] text-ds-muted sm:grid-cols-2">
+      <div className="rounded-xl border border-ds-border-muted bg-ds-main/45 px-3 py-2">
+        <span className="font-semibold text-ds-ink">{t('writeInlineEditDebugModel')}</span>
+        <span className="ml-2 font-mono">{model}</span>
+      </div>
+      <div className="rounded-xl border border-ds-border-muted bg-ds-main/45 px-3 py-2">
+        <span className="font-semibold text-ds-ink">{t('writeInlineEditDebugContext')}</span>
+        <span className="ml-2">{context}</span>
+      </div>
+      <div className="rounded-xl border border-ds-border-muted bg-ds-main/45 px-3 py-2 sm:col-span-2">
+        <span className="font-semibold text-ds-ink">{t('writeInlineEditDebugFile')}</span>
+        <span className="ml-2 break-all font-mono">{filePath || '—'}</span>
+      </div>
+      {error ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-red-700 dark:border-red-900/60 dark:bg-red-950/25 dark:text-red-200 sm:col-span-2">
+          {error}
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -50,6 +50,7 @@ import {
   writeExportPayloadSchema,
   writeRichClipboardPayloadSchema,
   writeInlineCompletionPayloadSchema,
+  writeInlineEditPayloadSchema,
   workspaceRootSchema
 } from './app-ipc-schemas'
 import type { JsonSettingsStore } from '../settings-store'
@@ -75,7 +76,16 @@ import {
   writeWorkspaceFile
 } from '../services/workspace-service'
 import type { createTerminalService } from '../services/terminal-service'
-import { requestWriteInlineCompletion } from '../services/write-inline-completion-service'
+import {
+  clearWriteInlineCompletionDebugEntries,
+  listWriteInlineCompletionDebugEntries,
+  requestWriteInlineCompletion
+} from '../services/write-inline-completion-service'
+import {
+  clearWriteInlineEditDebugEntries,
+  listWriteInlineEditDebugEntries,
+  requestWriteInlineEdit
+} from '../services/write-inline-edit-service'
 import { copyWriteDocumentAsRichText, exportWriteDocument } from '../services/write-export-service'
 
 type GuiUpdaterModule = typeof import('../gui-updater')
@@ -763,6 +773,22 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       parseIpcPayload('write:inline-completion', writeInlineCompletionPayloadSchema, payload)
     )
   )
+  ipcMain.handle('write:inline-completion-debug:list', async () => listWriteInlineCompletionDebugEntries())
+  ipcMain.handle('write:inline-completion-debug:clear', async () => {
+    clearWriteInlineCompletionDebugEntries()
+    return true
+  })
+  ipcMain.handle('write:inline-edit', async (_, payload: unknown) =>
+    requestWriteInlineEdit(
+      await store.load(),
+      parseIpcPayload('write:inline-edit', writeInlineEditPayloadSchema, payload)
+    )
+  )
+  ipcMain.handle('write:inline-edit-debug:list', async () => listWriteInlineEditDebugEntries())
+  ipcMain.handle('write:inline-edit-debug:clear', async () => {
+    clearWriteInlineEditDebugEntries()
+    return true
+  })
 
   ipcMain.handle('shell:open-external', async (_, url: unknown) => {
     const validatedUrl = parseIpcPayload('shell:open-external', shellOpenExternalUrlSchema, url)

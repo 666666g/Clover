@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   DEFAULT_WRITE_INLINE_COMPLETION_BASE_URL,
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
@@ -8,6 +9,7 @@ import {
 import { upstreamDeepSeekFimCompletionsUrl } from '../../shared/openai-compat-url'
 import type {
   WriteInlineCompletionMode,
+  WriteInlineCompletionDebugEntry,
   WriteInlineCompletionRequest,
   WriteInlineCompletionResult
 } from '../../shared/write-inline-completion'
@@ -17,6 +19,8 @@ import {
 } from './write-retrieval-service'
 
 const INLINE_COMPLETION_TIMEOUT_MS = 12_000
+const MAX_INLINE_COMPLETION_DEBUG_ENTRIES = 120
+const MAX_DEBUG_TEXT_CHARS = 80_000
 
 type ChatCompletionResponse = {
   choices?: Array<{
@@ -25,6 +29,37 @@ type ChatCompletionResponse = {
     }
     text?: string
   }>
+}
+
+const inlineCompletionDebugEntries: WriteInlineCompletionDebugEntry[] = []
+
+function clipDebugText(text = ''): string {
+  const source = String(text || '')
+  if (source.length <= MAX_DEBUG_TEXT_CHARS) return source
+  const head = Math.floor(MAX_DEBUG_TEXT_CHARS * 0.62)
+  const tail = MAX_DEBUG_TEXT_CHARS - head - 24
+  return `${source.slice(0, head)}\n\n... debug text clipped ...\n\n${source.slice(source.length - tail)}`
+}
+
+function appendInlineCompletionDebugEntry(entry: WriteInlineCompletionDebugEntry): void {
+  inlineCompletionDebugEntries.push({
+    ...entry,
+    prompt: clipDebugText(entry.prompt),
+    suffix: clipDebugText(entry.suffix),
+    rawResponse: clipDebugText(entry.rawResponse),
+    completion: clipDebugText(entry.completion)
+  })
+  if (inlineCompletionDebugEntries.length > MAX_INLINE_COMPLETION_DEBUG_ENTRIES) {
+    inlineCompletionDebugEntries.splice(0, inlineCompletionDebugEntries.length - MAX_INLINE_COMPLETION_DEBUG_ENTRIES)
+  }
+}
+
+export function listWriteInlineCompletionDebugEntries(): WriteInlineCompletionDebugEntry[] {
+  return [...inlineCompletionDebugEntries].reverse()
+}
+
+export function clearWriteInlineCompletionDebugEntries(): void {
+  inlineCompletionDebugEntries.length = 0
 }
 
 function resolveModel(request: WriteInlineCompletionRequest, settings: AppSettingsV1): string {
@@ -133,6 +168,7 @@ export async function requestWriteInlineCompletion(
   settings: AppSettingsV1,
   request: WriteInlineCompletionRequest
 ): Promise<WriteInlineCompletionResult> {
+  const startedAt = Date.now()
   if (settings.write.inlineCompletion.enabled === false) {
     return { ok: false, message: 'Inline completion is disabled.' }
   }
@@ -156,6 +192,18 @@ export async function requestWriteInlineCompletion(
         maxSnippets: mode === 'long' ? 5 : 3
       }).catch(() => null)
   const prompt = buildWriteInlineCompletionPrompt(request, retrieval)
+  const debugBase = {
+    id: randomUUID(),
+    createdAt: new Date(startedAt).toISOString(),
+    model,
+    mode,
+    currentFilePath: request.currentFilePath,
+    prompt,
+    suffix: request.suffix,
+    referenceCount: retrieval?.snippets.length ?? 0,
+    promptChars: prompt.length,
+    suffixChars: request.suffix.length
+  }
 
   try {
     const response = await fetch(url, {
@@ -175,19 +223,47 @@ export async function requestWriteInlineCompletion(
     })
     const text = await response.text()
     if (!response.ok) {
+      appendInlineCompletionDebugEntry({
+        ...debugBase,
+        durationMs: Date.now() - startedAt,
+        ok: false,
+        rawResponse: text,
+        completion: '',
+        responseChars: text.length,
+        errorMessage: `Inline completion request failed (${response.status})`
+      })
       return {
         ok: false,
         message: `Inline completion request failed (${response.status}): ${text.slice(0, 300)}`
       }
     }
 
+    const completion = extractCompletion(text)
+    appendInlineCompletionDebugEntry({
+      ...debugBase,
+      durationMs: Date.now() - startedAt,
+      ok: true,
+      rawResponse: text,
+      completion,
+      responseChars: text.length
+    })
+
     return {
       ok: true,
-      completion: extractCompletion(text),
+      completion,
       model,
       mode
     }
   } catch (error) {
+    appendInlineCompletionDebugEntry({
+      ...debugBase,
+      durationMs: Date.now() - startedAt,
+      ok: false,
+      rawResponse: '',
+      completion: '',
+      responseChars: 0,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    })
     return {
       ok: false,
       message: error instanceof Error ? error.message : String(error)
