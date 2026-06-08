@@ -60,6 +60,7 @@ function settingsWith(
     workspaceRoot: '/tmp/workspace',
     log: { enabled: true, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: mergeScheduleSettings(defaultScheduleSettings(), {
@@ -272,6 +273,159 @@ describe('ScheduleRuntime', () => {
     })
 
     expect(result).toMatchObject({ ok: true, text: 'scheduled task completed' })
+  })
+
+  it('waits for the current scheduled turn to complete before returning final text', async () => {
+    const task = makeTask()
+    let getCount = 0
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads') {
+        return { ok: true, status: 200, body: JSON.stringify({ id: 'thr_1' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'PATCH') {
+        return { ok: true, status: 200, body: '{}' }
+      }
+      if (path === '/v1/threads/thr_1/turns') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'GET') {
+        getCount += 1
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify(getCount === 1
+            ? {
+                id: 'thr_1',
+                status: 'running',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous scheduled reply' }]
+                  },
+                  {
+                    id: 'turn_current',
+                    status: 'running',
+                    items: [{ kind: 'assistant_text', text: 'intermediate scheduled reply' }]
+                  }
+                ]
+              }
+            : {
+                id: 'thr_1',
+                status: 'idle',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous scheduled reply' }]
+                  },
+                  {
+                    id: 'turn_current',
+                    status: 'completed',
+                    items: [
+                      { kind: 'assistant_text', text: 'intermediate scheduled reply' },
+                      { kind: 'assistant_text', text: 'final scheduled reply' }
+                    ]
+                  }
+                ]
+              })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const { runtime } = createRuntime(settingsWith([task]), runtimeRequest)
+
+    const result = await (runtime as unknown as {
+      runPrompt: (
+        settingsArg: AppSettingsV1,
+        options: {
+          prompt: string
+          title: string
+          workspaceRoot: string
+          model: string
+          reasoningEffort: ScheduledTaskV1['reasoningEffort']
+          mode: ScheduledTaskV1['mode']
+          waitForResult: boolean
+          responseTimeoutMs: number
+        }
+      ) => Promise<{ ok: boolean; text?: string }>
+    }).runPrompt(settingsWith([task]), {
+      prompt: 'hello',
+      title: 'demo',
+      workspaceRoot: '/tmp/workspace',
+      model: 'auto',
+      reasoningEffort: 'medium',
+      mode: 'agent',
+      waitForResult: true,
+      responseTimeoutMs: 2_500
+    })
+
+    expect(result).toMatchObject({ ok: true, text: 'final scheduled reply' })
+    expect(getCount).toBe(2)
+  })
+
+  it('does not return historical scheduled text when the current turn fails', async () => {
+    const task = makeTask()
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads') {
+        return { ok: true, status: 200, body: JSON.stringify({ id: 'thr_1' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'PATCH') {
+        return { ok: true, status: 200, body: '{}' }
+      }
+      if (path === '/v1/threads/thr_1/turns') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_1' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_1',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_previous',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: 'previous scheduled reply' }]
+              },
+              {
+                id: 'turn_current',
+                status: 'failed',
+                items: []
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const { runtime } = createRuntime(settingsWith([task]), runtimeRequest)
+
+    await expect((runtime as unknown as {
+      runPrompt: (
+        settingsArg: AppSettingsV1,
+        options: {
+          prompt: string
+          title: string
+          workspaceRoot: string
+          model: string
+          reasoningEffort: ScheduledTaskV1['reasoningEffort']
+          mode: ScheduledTaskV1['mode']
+          waitForResult: boolean
+          responseTimeoutMs: number
+        }
+      ) => Promise<{ ok: boolean; text?: string }>
+    }).runPrompt(settingsWith([task]), {
+      prompt: 'hello',
+      title: 'demo',
+      workspaceRoot: '/tmp/workspace',
+      model: 'auto',
+      reasoningEffort: 'medium',
+      mode: 'agent',
+      waitForResult: true,
+      responseTimeoutMs: 2_000
+    })).rejects.toThrow('Agent turn failed.')
   })
 
   it('disables one-time tasks after monitored completion', async () => {

@@ -259,7 +259,7 @@ export function InitialSetupDialog(): ReactElement {
               type="text"
               value={provider?.baseUrl ?? ''}
               onChange={(e) => updateProvider({ baseUrl: e.target.value })}
-              placeholder="https://api.deepseek.com/beta"
+              placeholder="https://api.deepseek.com"
               className={fieldClass}
             />
           </div>

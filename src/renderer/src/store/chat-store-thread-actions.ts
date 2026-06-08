@@ -227,7 +227,7 @@ export function createThreadActions(
 
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       void p.subscribeThreadEvents(activeThreadId, latestSeq, sink, ac.signal)
       if (busy) {
         armBusyWatchdog(set, get)
@@ -313,7 +313,7 @@ export function createThreadActions(
       syncTurnCompletionPoll(set, get)
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, { threadId: id, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, id, latestSeq, sink, ac.signal, get)
       if (busy) armBusyWatchdog(set, get)
     } catch (e) {
@@ -649,7 +649,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()
@@ -768,7 +768,7 @@ export function createThreadActions(
       set({ currentTurnId: turnId })
       const ac = new AbortController()
       sseAbortRef.current = ac
-      const sink = buildThreadEventSink(set, get)
+      const sink = buildThreadEventSink(set, get, { threadId: activeThreadId, signal: ac.signal })
       subscribeThreadEventsWithRecovery(p, activeThreadId, seqAtSend, sink, ac.signal, get)
       armBusyWatchdog(set, get)
       await get().refreshThreads()

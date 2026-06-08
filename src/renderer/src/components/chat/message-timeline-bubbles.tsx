@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import { useTranslation } from 'react-i18next'
 import { Check, ChevronDown, ChevronRight, Copy, FileEdit, ImageIcon, Loader2, MessageSquareQuote, PencilLine, Terminal, Wrench } from 'lucide-react'
 import type { AttachmentReference, ChatBlock, RuntimeDisclosureMetadata, ToolBlock, UserInputAnswer, UserInputQuestion } from '../../agent/types'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useChatStore } from '../../store/chat-store'
 import { getProvider } from '../../agent/registry'
 import { parseWritePromptForDisplay } from '../../write/quoted-selection'
@@ -876,7 +877,7 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
   const sessionStatus = metaString(block.meta, 'status')
 
   const hasDetail = !!(block.detail && block.detail.trim().length > 0)
-  const isPatch = block.toolKind === 'file_change' && hasDetail
+  const patchText = block.toolKind === 'file_change' ? extractUnifiedDiffText(block.detail) : undefined
   const canExpand = hasDetail || block.status === 'running'
 
   return (
@@ -942,8 +943,8 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
       </button>
       {effectiveOpen && hasDetail ? (
         <div className="ds-panel-strip min-w-0 border-t border-ds-border-muted/60 px-4 py-3">
-          {isPatch ? (
-            <DiffView patch={block.detail!} filePath={block.filePath} />
+          {patchText !== undefined ? (
+            <DiffView patch={patchText} filePath={block.filePath} />
           ) : (
             <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-6 text-ds-ink">
               {block.detail}

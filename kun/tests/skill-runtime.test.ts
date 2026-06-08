@@ -45,6 +45,48 @@ describe('SkillRuntime', () => {
     expect(diagnostics.validationErrors[0]?.message).toMatch(/expected string/i)
   })
 
+  it('uses Chinese legacy frontmatter names for diagnostics without changing folder ids', async () => {
+    const skillRoot = join(root, 'tdd')
+    await mkdir(skillRoot, { recursive: true })
+    await writeFile(join(skillRoot, 'SKILL.md'), [
+      '---',
+      'name: 测试驱动开发(TDD)',
+      'description: 用测试先行推进实现。',
+      '---',
+      '',
+      '# TDD',
+      '',
+      '先写失败测试，再实现。'
+    ].join('\n'), 'utf8')
+
+    const runtime = await createRuntime()
+    const diagnostics = runtime.diagnostics()
+
+    expect(diagnostics.skills).toContainEqual(expect.objectContaining({
+      id: 'tdd',
+      name: '测试驱动开发(TDD)',
+      description: '用测试先行推进实现。',
+      legacy: true
+    }))
+  })
+
+  it('keeps skill.json manifests with Chinese names from collapsing to one id', async () => {
+    await writeSkill('review-cn', {
+      name: '代码审查',
+      triggers: { commands: ['/review-cn'] }
+    }, 'review instructions')
+    await writeSkill('requirements-cn', {
+      name: '需求分析',
+      triggers: { commands: ['/requirements-cn'] }
+    }, 'requirements instructions')
+
+    const runtime = await createRuntime()
+    const diagnostics = runtime.diagnostics()
+
+    expect(diagnostics.skills.map((skill) => skill.id).sort()).toEqual(['代码审查', '需求分析'])
+    expect(diagnostics.validationErrors).toEqual([])
+  })
+
   it('matches triggers deterministically and respects injection budgets', async () => {
     await writeSkill('big', {
       id: 'big',

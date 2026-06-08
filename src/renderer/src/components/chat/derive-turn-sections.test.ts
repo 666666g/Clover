@@ -73,6 +73,36 @@ describe('deriveTurnSections', () => {
     expect(result.processBlocks.map((block) => block.kind)).toEqual(['tool'])
   })
 
+  it('extracts file changes from JSON-wrapped tool output diffs', () => {
+    const patch = [
+      'diff --git a/demo.ts b/demo.ts',
+      '--- a/demo.ts',
+      '+++ b/demo.ts',
+      '@@ -1,1 +1,1 @@',
+      '-old',
+      '+new'
+    ].join('\n')
+    const result = sections([
+      {
+        kind: 'tool',
+        id: 'tool_1',
+        summary: 'Edit',
+        status: 'success',
+        toolKind: 'file_change',
+        filePath: '/tmp/demo.ts',
+        detail: JSON.stringify({ path: '/tmp/demo.ts', diff: patch }, null, 2)
+      }
+    ])
+
+    expect(result.turnFileChanges).toMatchObject([
+      {
+        id: 'tool_1',
+        detail: patch,
+        filePath: 'demo.ts'
+      }
+    ])
+  })
+
   it('renders live assistant output inside the active process timeline', () => {
     const result = processingSections({
       liveProcessText: 'private reasoning',

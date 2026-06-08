@@ -139,6 +139,10 @@ function compactText(text = ''): string {
   return String(text || '').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim()
 }
 
+function normalizeRelativePath(value: string): string {
+  return value.replaceAll('\\', '/')
+}
+
 function clipTail(text = '', maxChars = 0): string {
   const source = String(text || '')
   if (!maxChars || source.length <= maxChars) return source
@@ -352,7 +356,7 @@ async function buildWorkspaceIndex(workspaceRoot: string): Promise<WorkspaceInde
     try {
       const content = await readIndexableFile(path, deadline)
       if (!content.trim()) continue
-      const relativePath = relative(workspaceRoot, path) || basename(path)
+      const relativePath = normalizeRelativePath(relative(workspaceRoot, path) || basename(path))
       const fileChunks = chunkMarkdown(path, relativePath, content)
       if (fileChunks.length > 0) indexedFiles += 1
       chunks.push(...fileChunks.slice(0, Math.max(0, MAX_INDEX_CHUNKS - chunks.length)))

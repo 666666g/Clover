@@ -45,6 +45,7 @@ export type ThreadRecordJson = {
 export type TurnRecordJson = {
   id: string
   status?: string
+  error?: string | null
   items?: TurnItemJson[]
 }
 
@@ -164,14 +165,14 @@ export function isRunningStatus(status: string | undefined): boolean {
   return status === 'queued' || status === 'in_progress' || status === 'started' || status === 'running'
 }
 
-export function latestAssistantText(detail: ThreadDetailJson): string {
-  const turnItems = Array.isArray(detail.turns)
-    ? detail.turns.flatMap((turn) => Array.isArray(turn.items) ? turn.items : [])
-    : []
-  const items = [
-    ...(Array.isArray(detail.items) ? detail.items : []),
-    ...turnItems
-  ]
+export function latestAssistantText(
+  detail: ThreadDetailJson,
+  options: { turnId?: string } = {}
+): string {
+  const turnId = options.turnId?.trim()
+  const items = turnId
+    ? threadItems(detail).filter((item) => item.turnId === turnId)
+    : threadItems(detail)
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index]
     if (item.kind !== 'assistant_text' && item.kind !== 'agent_message') continue
@@ -206,15 +207,18 @@ function generatedFileFromToolResult(
 }
 
 function threadItems(detail: ThreadDetailJson): TurnItemJson[] {
-  const turnItems = Array.isArray(detail.turns)
-    ? detail.turns.flatMap((turn) =>
-        Array.isArray(turn.items)
-          ? turn.items.map((item) => ({ ...item, turnId: item.turnId || turn.id }))
-          : []
-      )
+  const turns = Array.isArray(detail.turns) ? detail.turns : []
+  const singleTurnId = turns.length === 1 ? turns[0].id : ''
+  const topLevelItems = Array.isArray(detail.items)
+    ? detail.items.map((item) => ({ ...item, turnId: item.turnId || singleTurnId || undefined }))
     : []
+  const turnItems = turns.flatMap((turn) =>
+    Array.isArray(turn.items)
+      ? turn.items.map((item) => ({ ...item, turnId: item.turnId || turn.id }))
+      : []
+  )
   return [
-    ...(Array.isArray(detail.items) ? detail.items : []),
+    ...topLevelItems,
     ...turnItems
   ]
 }

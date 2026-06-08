@@ -25,6 +25,7 @@ import { createThreadRecord, toThreadSummary, touchThread } from '../domain/thre
 import type { AgentSession } from '../domain/session.js'
 import { repairModelHistoryItems } from '../domain/model-history-repair.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
+import { withFileMutationQueue } from '../adapters/tool/file-mutation-queue.js'
 import { DEFAULT_KUN_MODEL } from '../config/kun-config.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
 import {
@@ -336,18 +337,20 @@ export class ThreadService {
 
     for (const [relativePath, items] of byRelativePath) {
       const absolutePath = resolveWorkspaceRelativePath(current.workspace, relativePath)
-      let markdown = await readFile(absolutePath, 'utf-8')
-      let changed = false
-      for (const item of items) {
-        const patched = patchPlanTodoStatus(markdown, {
-          content: item.content,
-          status: item.status,
-          source: item.source
-        })
-        markdown = patched.markdown
-        changed ||= patched.changed
-      }
-      if (changed) await writeFile(absolutePath, markdown, 'utf-8')
+      await withFileMutationQueue(absolutePath, async () => {
+        let markdown = await readFile(absolutePath, 'utf-8')
+        let changed = false
+        for (const item of items) {
+          const patched = patchPlanTodoStatus(markdown, {
+            content: item.content,
+            status: item.status,
+            source: item.source
+          })
+          markdown = patched.markdown
+          changed ||= patched.changed
+        }
+        if (changed) await writeFile(absolutePath, markdown, 'utf-8')
+      })
     }
   }
 

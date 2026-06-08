@@ -17,6 +17,7 @@ import {
   mergeClawSettings,
   mergeScheduleSettings,
   mergeWriteSettings,
+  normalizeAppBehaviorSettings,
   migrateLegacyAppSettings,
   normalizeAppSettings,
   type AppSettingsPatch,
@@ -192,6 +193,7 @@ const defaultSettings = (): AppSettingsV1 => ({
   notifications: {
     turnComplete: true
   },
+  appBehavior: normalizeAppBehaviorSettings(),
   guiUpdate: {
     channel: DEFAULT_GUI_UPDATE_CHANNEL
   },
@@ -212,6 +214,10 @@ function buildMergedSettings(parsed: Partial<AppSettingsV1>): AppSettingsV1 {
     ),
     log: { ...defaults.log, ...migrated.log },
     notifications: { ...defaults.notifications, ...migrated.notifications },
+    appBehavior: normalizeAppBehaviorSettings({
+      ...defaults.appBehavior,
+      ...migrated.appBehavior
+    }),
     write: mergeWriteSettings(defaults.write, migrated.write),
     claw: mergeClawSettings(defaults.claw, migrated.claw),
     schedule: mergeScheduleSettings(defaults.schedule, migrated.schedule),
@@ -318,6 +324,10 @@ export class JsonSettingsStore {
       provider: mergeModelProviderSettings(cur.provider, providerPatch),
       log: { ...cur.log, ...(partial.log ?? {}) },
       notifications: { ...cur.notifications, ...(partial.notifications ?? {}) },
+      appBehavior: normalizeAppBehaviorSettings({
+        ...cur.appBehavior,
+        ...(partial.appBehavior ?? {})
+      }),
       write: mergeWriteSettings(cur.write, partial.write),
       claw: mergeClawSettings(cur.claw, partial.claw),
       schedule: mergeScheduleSettings(cur.schedule, partial.schedule),

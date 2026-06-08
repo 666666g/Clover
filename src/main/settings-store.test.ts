@@ -15,6 +15,11 @@ describe('JsonSettingsStore', () => {
 
     expect(loaded.guiUpdate.channel).toBe(DEFAULT_GUI_UPDATE_CHANNEL)
     expect(loaded.agents.kun.approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
+    expect(loaded.appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: false
+    })
   })
 
   it('creates a default write workspace with welcome.md', async () => {
@@ -28,7 +33,7 @@ describe('JsonSettingsStore', () => {
     expect(loaded.write.inlineCompletion.enabled).toBe(true)
     expect(loaded.write.inlineCompletion.retrievalEnabled).toBe(true)
     expect(loaded.write.inlineCompletion.longCompletionEnabled).toBe(true)
-    expect(loaded.provider.baseUrl).toBe('https://api.deepseek.com/beta')
+    expect(loaded.provider.baseUrl).toBe('https://api.deepseek.com')
     expect(loaded.write.inlineCompletion.apiKey).toBe('')
     expect(loaded.write.inlineCompletion.baseUrl).toBe('')
     expect(loaded.write.inlineCompletion.inheritModel).toBe(true)
@@ -214,6 +219,36 @@ describe('JsonSettingsStore', () => {
 
     expect(saved.agents.kun.model).toBe('deepseek-reasoner')
     expect(saved.agents.kun.approvalPolicy).toBe('on-request')
+  })
+
+  it('merges desktop behavior patches without keeping invalid startup state', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const store = new JsonSettingsStore(userDataDir)
+    await store.load()
+
+    const enabled = await store.patch({
+      appBehavior: {
+        openAtLogin: true,
+        startMinimized: true,
+        closeToTray: true
+      }
+    })
+    const disabled = await store.patch({
+      appBehavior: {
+        openAtLogin: false
+      }
+    })
+
+    expect(enabled.appBehavior).toEqual({
+      openAtLogin: true,
+      startMinimized: true,
+      closeToTray: true
+    })
+    expect(disabled.appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: true
+    })
   })
 
   it('omits agentProvider when writing normalized settings to disk', async () => {

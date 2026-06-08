@@ -275,11 +275,8 @@ function MessageTurn({
   }, [turn.blocks, isProcessing])
   const { think: liveThink, content: liveContent } = splitThink(live)
   const liveProcessText = [liveReasoning, liveThink].filter(Boolean).join('\n\n')
-  const [workExpanded, setWorkExpanded] = useState(isProcessing)
-
-  useEffect(() => {
-    setWorkExpanded(isProcessing)
-  }, [isProcessing])
+  const [workExpandedOverride, setWorkExpandedOverride] = useState<boolean | null>(null)
+  const workExpanded = workExpandedOverride ?? isProcessing
 
   const { processBlocks, assistantContentBlocks, turnFileChanges } = useMemo(
     () =>
@@ -298,8 +295,8 @@ function MessageTurn({
   )
 
   const processSections = useMemo(
-    () => (workExpanded || isProcessing ? groupProcessSections(processBlocks) : []),
-    [processBlocks, workExpanded, isProcessing]
+    () => (workExpanded ? groupProcessSections(processBlocks) : []),
+    [processBlocks, workExpanded]
   )
   const reasoningSectionCount = useMemo(
     () => processSections.filter((section) => section.kind === 'reasoning').length,
@@ -307,8 +304,8 @@ function MessageTurn({
   )
   const showLiveAssistant = !isProcessing && !!liveContent.trim()
 
-  // Keep reasoning/tool work as collapsed process status while the assistant
-  // text renders below as the visible message body.
+  // Keep completed reasoning/tool work tucked away, but make the active turn's
+  // work visible unless the user explicitly collapses it.
 
   const hasProcess = isProcessing || processBlocks.length > 0
 
@@ -324,7 +321,7 @@ function MessageTurn({
             durationMs={durationMs}
             reasoningDurationMs={reasoningDurationMs}
             expanded={workExpanded}
-            onToggle={() => setWorkExpanded((value) => !value)}
+            onToggle={() => setWorkExpandedOverride((value) => !(value ?? isProcessing))}
           />
           {workExpanded && processSections.length > 0 ? (
             <div className="flex flex-col gap-1">

@@ -112,9 +112,30 @@ summary,
 }
 
 .write-codemirror-host > .cm-editor {
+  --write-selection-bg: var(--ds-selection);
+  --write-selection-text: inherit;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+}
+
+.write-codemirror-host > .cm-editor .cm-selectionBackground {
+  background: var(--write-selection-bg);
+}
+
+.write-codemirror-host > .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: var(--write-selection-bg);
+}
+
+.write-codemirror-host > .cm-editor .cm-content::selection,
+.write-codemirror-host > .cm-editor .cm-content *::selection {
+  background: var(--write-selection-bg);
+  color: var(--write-selection-text);
+}
+
+[data-theme='dark'] .write-codemirror-host > .cm-editor {
+  --write-selection-bg: rgba(51, 156, 255, 0.58);
+  --write-selection-text: #f8fbff;
 }
 
 .write-markdown-preview {

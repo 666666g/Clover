@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { summarizeToolBlock } from './MessageTimeline'
+import type { ChatBlock, NormalizedThread, ToolBlock } from '../../agent/types'
+import { useChatStore } from '../../store/chat-store'
+import { MessageTimeline, summarizeToolBlock } from './MessageTimeline'
 import { MessageBubble } from './message-timeline-bubbles'
 import { ProcessSectionRow } from './message-timeline-process'
 
@@ -18,6 +19,15 @@ const labels: Record<string, string> = {
 }
 
 const t = (key: string) => labels[key] ?? (key === 'toolActionCommand' ? 'Ran command' : key)
+
+const activeThread: NormalizedThread = {
+  id: 'thr_1',
+  title: 'Thread',
+  updatedAt: '2026-06-07T00:00:00.000Z',
+  model: 'deepseek-chat',
+  mode: 'code',
+  workspace: '/tmp/project'
+}
 
 function toolBlock(overrides: Partial<ToolBlock>): ToolBlock {
   return {
@@ -113,6 +123,23 @@ describe('MessageTimeline tool summaries', () => {
 })
 
 describe('MessageTimeline Kun runtime metadata smoke', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      route: 'chat',
+      workspaceRoot: '/tmp/project',
+      activeThreadId: 'thr_1',
+      threads: [activeThread],
+      busy: false,
+      currentTurnUserId: null,
+      turnStartedAtByUserId: {},
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {},
+      clawChannels: [],
+      activeClawChannelId: ''
+    })
+  })
+
   it('renders user image attachments as thumbnails instead of attachment chips', () => {
     const block: ChatBlock = {
       kind: 'user',
@@ -235,7 +262,7 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('Sources 1')
   })
 
-  it('expands running tool calls so partial details stay visible', () => {
+  it('keeps running tool calls collapsed by default while showing active status', () => {
     const block: ChatBlock = toolBlock({
       summary: 'read: file',
       status: 'running',
@@ -257,7 +284,7 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('/tmp/readme.md')
     expect(html).not.toContain('ds-work-logo')
     expect(html).toContain('ds-shiny-text')
-    expect(html).toContain('partial tool output while running')
+    expect(html).not.toContain('partial tool output while running')
     expect(html).toContain('ds-process-file-reference')
   })
 
@@ -313,5 +340,44 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).not.toContain('needle')
     expect(html).not.toContain('read detail should stay tucked away')
     expect(html).not.toContain('grep detail should stay tucked away')
+  })
+
+  it('expands the live work timeline by default while keeping tool details collapsed', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        text: 'inspect this file'
+      },
+      toolBlock({
+        summary: 'read: file',
+        status: 'running',
+        detail: 'running timeline detail should stay collapsed',
+        meta: { toolName: 'read' },
+        filePath: '/tmp/project/src/app.ts'
+      })
+    ]
+    useChatStore.setState({
+      busy: true,
+      currentTurnUserId: 'user_1',
+      turnStartedAtByUserId: { user_1: Date.now() }
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('aria-expanded="true"')
+    expect(html).toContain('Read')
+    expect(html).toContain('/tmp/project/src/app.ts')
+    expect(html).not.toContain('running timeline detail should stay collapsed')
   })
 })

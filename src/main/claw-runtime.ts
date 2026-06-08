@@ -222,6 +222,9 @@ export class ClawRuntime {
 
     const parsedTurn = parseJsonObject(turn.body)
     const turnId = asString(parsedTurn?.turnId) || asString(nestedRecord(parsedTurn?.turn).id)
+    if (!turnId) {
+      return { ok: false, message: 'Failed to start turn: missing turn id.' }
+    }
     if (turnId && options.onTurnStarted) {
       await options.onTurnStarted({ threadId: thread.id, turnId })
     }
@@ -274,14 +277,17 @@ export class ClawRuntime {
       }
       const detail = JSON.parse(detailRes.body) as ThreadDetailJson
       lastDetail = detail
-      lastText = latestAssistantText(detail) || lastText
+      lastText = latestAssistantText(detail, { turnId }) || lastText
       const targetTurn = Array.isArray(detail.turns)
         ? detail.turns.find((turn) => turn.id === turnId)
         : undefined
-      const threadStatus = detail.thread?.status ?? detail.status
-      const threadDone = threadStatus ? !isRunningStatus(threadStatus) : Boolean(lastText)
-      const turnDone = targetTurn ? !isRunningStatus(targetTurn.status) : threadDone
-      if (turnDone && lastText) {
+      if (!targetTurn) continue
+      if (isRunningStatus(targetTurn.status)) continue
+      if (targetTurn.status === 'failed' || targetTurn.status === 'aborted') {
+        const error = targetTurn.error?.trim()
+        throw new Error(error || `Agent turn ${targetTurn.status}.`)
+      }
+      if (targetTurn.status === 'completed' && lastText) {
         return {
           text: lastText,
           files: latestGeneratedFiles(detail, { turnId, workspaceRoot })

@@ -42,6 +42,7 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
@@ -139,6 +140,38 @@ describe('kun defaults', () => {
           maxStringBytes: 524288
         }
       }
+    })
+  })
+})
+
+describe('app behavior settings', () => {
+  it('defaults desktop behavior to off', () => {
+    const raw = {
+      ...settings(),
+      appBehavior: undefined
+    } as unknown as AppSettingsV1
+
+    expect(normalizeAppSettings(raw).appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: false
+    })
+  })
+
+  it('only keeps start minimized when open at login is enabled', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      appBehavior: {
+        openAtLogin: false,
+        startMinimized: true,
+        closeToTray: true
+      }
+    })
+
+    expect(normalized.appBehavior).toEqual({
+      openAtLogin: false,
+      startMinimized: false,
+      closeToTray: true
     })
   })
 })

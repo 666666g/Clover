@@ -156,6 +156,10 @@ export type ComposerImageTransferSource = {
   items?: ArrayLike<ComposerTransferItem> | null
 }
 
+export type ComposerClipboardImageSource = ComposerImageTransferSource & {
+  getData?: (format: string) => string
+}
+
 function arrayLikeValues<T>(value: ArrayLike<T> | null | undefined): T[] {
   if (!value) return []
   const out: T[] = []
@@ -391,6 +395,36 @@ export function imageTransferHasImages(source: ComposerImageTransferSource | nul
   return arrayLikeValues(source.items).some((item) =>
     (!item.kind || item.kind === 'file') && isImageMimeType(item.type)
   )
+}
+
+export function handleComposerImagePaste({
+  canPickAttachment,
+  clipboardData,
+  preventDefault,
+  onPickAttachments,
+  onPasteClipboardImage
+}: {
+  canPickAttachment: boolean
+  clipboardData: ComposerClipboardImageSource
+  preventDefault: () => void
+  onPickAttachments?: (files: File[]) => void
+  onPasteClipboardImage?: (options?: { silentNoImage?: boolean }) => void | Promise<void>
+}): boolean {
+  if (!canPickAttachment || (!onPickAttachments && !onPasteClipboardImage)) return false
+  const files = imageFilesFromTransfer(clipboardData)
+  const hasPlainText = Boolean(clipboardData.getData?.('text/plain'))
+  const hasImageTransfer = imageTransferHasImages(clipboardData)
+  if (files.length > 0) {
+    preventDefault()
+    onPickAttachments?.(files)
+    return true
+  }
+  if (!onPasteClipboardImage) return false
+
+  const shouldPreventDefault = !hasPlainText || hasImageTransfer
+  if (shouldPreventDefault) preventDefault()
+  void onPasteClipboardImage({ silentNoImage: !shouldPreventDefault })
+  return shouldPreventDefault
 }
 
 export function formatGoalElapsedSeconds(seconds: number): string {
@@ -1130,20 +1164,13 @@ export function FloatingComposer({
   }
 
   const handleComposerPaste = (event: ReactClipboardEvent<HTMLElement>): void => {
-    if (!canPickAttachment || (!onPickAttachments && !onPasteClipboardImage)) return
-    const files = imageFilesFromTransfer(event.clipboardData)
-    const hasPlainText = Boolean(event.clipboardData.getData('text/plain'))
-    const hasImageTransfer = imageTransferHasImages(event.clipboardData)
-    if (files.length > 0) {
-      event.preventDefault()
-      onPickAttachments?.(files)
-      return
-    }
-    if (!onPasteClipboardImage) return
-
-    const shouldPreventDefault = !hasPlainText || hasImageTransfer
-    if (shouldPreventDefault) event.preventDefault()
-    void onPasteClipboardImage({ silentNoImage: !shouldPreventDefault })
+    handleComposerImagePaste({
+      canPickAttachment,
+      clipboardData: event.clipboardData,
+      preventDefault: () => event.preventDefault(),
+      onPickAttachments,
+      onPasteClipboardImage
+    })
   }
 
   const handleComposerDragOver = (event: ReactDragEvent<HTMLDivElement>): void => {

@@ -42,6 +42,7 @@ import {
   findReusableEmptyThreadId,
   hasPendingRuntimeWork,
   reconcileOptimisticUserBlock,
+  settlePendingRuntimeWorkAfterInterrupt,
   threadSnapshotLooksRunning,
   threadBelongsToWorkspace
 } from './chat-store-runtime-helpers'
@@ -130,6 +131,22 @@ function applyTodosSnapshot(
         : thread
     )
   }))
+}
+
+function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
+  resetBusyRecoveryAttempts()
+  clearBusyWatchdog()
+  set((s) => {
+    const out = flushLiveBlocks(s, {
+      ...finalizeTurnTiming(s),
+      busy: false,
+      currentTurnId: null,
+      currentTurnUserId: null,
+      error: null
+    })
+    const blocks = settlePendingRuntimeWorkAfterInterrupt(out.blocks ?? s.blocks)
+    return { ...out, blocks }
+  })
 }
 
 export function createMaintenanceActions(
@@ -703,7 +720,9 @@ export function createMaintenanceActions(
               )
             }))
             await p.interruptTurn(activeThreadId, currentTurnId)
-            if (state.busy) armBusyWatchdog(set, get)
+            settleInterruptedTurn(set, get)
+            void get().refreshThreads()
+            void get().drainQueuedMessages()
             return
           }
           throw fallbackErr
@@ -756,14 +775,9 @@ export function createMaintenanceActions(
     const p = getProvider()
     try {
       await p.interruptTurn(activeThreadId, currentTurnId, { discard: options?.discard === true })
-      clearBusyWatchdog()
-      set((s) =>
-        flushLiveBlocks(s, {
-          ...finalizeTurnTiming(s),
-          busy: false,
-          currentTurnId: null
-        })
-      )
+      settleInterruptedTurn(set, get)
+      void get().refreshThreads()
+      void get().drainQueuedMessages()
     } catch (e) {
       const msg = formatRuntimeError(e)
       void window.dsGui.logError('interrupt', 'Failed to interrupt turn', { message: msg }).catch(() => undefined)

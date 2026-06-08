@@ -94,6 +94,10 @@ export function GeneralSettingsSection({ ctx }: { ctx: Record<string, any> }): R
     splitSettingsList,
     listSettingsText
   } = ctx
+  const platform = typeof window !== 'undefined' ? window.dsGui?.platform ?? '' : ''
+  const openAtLoginSupported = platform === 'win32' || platform === 'darwin'
+  const startMinimizedSupported = platform === 'win32'
+  const desktopBehavior = form.appBehavior
 
   return (
             <>
@@ -232,6 +236,56 @@ export function GeneralSettingsSection({ ctx }: { ctx: Record<string, any> }): R
                         </p>
                       ) : null}
                     </div>
+                  }
+                />
+              </SettingsCard>
+
+              <SettingsCard title={t('desktopBehavior')} className="mt-6">
+                <SettingRow
+                  title={t('desktopOpenAtLogin')}
+                  description={
+                    openAtLoginSupported
+                      ? t('desktopOpenAtLoginDesc')
+                      : t('desktopOpenAtLoginUnsupportedDesc')
+                  }
+                  control={
+                    <Toggle
+                      checked={desktopBehavior.openAtLogin}
+                      disabled={!openAtLoginSupported}
+                      onChange={(v) =>
+                        update({
+                          appBehavior: {
+                            openAtLogin: v,
+                            startMinimized: v ? desktopBehavior.startMinimized : false
+                          }
+                        })
+                      }
+                    />
+                  }
+                />
+                <SettingRow
+                  title={t('desktopStartMinimized')}
+                  description={
+                    desktopBehavior.openAtLogin && startMinimizedSupported
+                      ? t('desktopStartMinimizedDesc')
+                      : t('desktopStartMinimizedDisabledDesc')
+                  }
+                  control={
+                    <Toggle
+                      checked={desktopBehavior.startMinimized}
+                      disabled={!desktopBehavior.openAtLogin || !startMinimizedSupported}
+                      onChange={(v) => update({ appBehavior: { startMinimized: v } })}
+                    />
+                  }
+                />
+                <SettingRow
+                  title={t('desktopCloseToTray')}
+                  description={t('desktopCloseToTrayDesc')}
+                  control={
+                    <Toggle
+                      checked={desktopBehavior.closeToTray}
+                      onChange={(v) => update({ appBehavior: { closeToTray: v } })}
+                    />
                   }
                 />
               </SettingsCard>

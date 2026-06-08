@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readdir, rename, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path'
 import { LocalToolHost, type LocalTool } from './local-tool-host.js'
+import { withFileMutationQueue } from './file-mutation-queue.js'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import {
   GUI_PLAN_RELATIVE_DIR,
@@ -161,17 +162,19 @@ async function defaultWritePlan(
   target: { workspaceRoot: string; relativePath: string; absolutePath: string; markdown: string },
   signal: AbortSignal
 ): Promise<{ path: string; savedAt: string }> {
-  if (signal.aborted) {
-    throw new Error('plan write aborted before start')
-  }
-  await mkdir(dirname(target.absolutePath), { recursive: true })
-  const tempPath = buildTempPath(target.absolutePath)
-  await writeFile(tempPath, target.markdown, 'utf8')
-  if (signal.aborted) {
-    throw new Error('plan write aborted before atomic rename')
-  }
-  await rename(tempPath, target.absolutePath)
-  return { path: target.absolutePath, savedAt: new Date().toISOString() }
+  return withFileMutationQueue(target.absolutePath, async () => {
+    if (signal.aborted) {
+      throw new Error('plan write aborted before start')
+    }
+    await mkdir(dirname(target.absolutePath), { recursive: true })
+    const tempPath = buildTempPath(target.absolutePath)
+    await writeFile(tempPath, target.markdown, 'utf8')
+    if (signal.aborted) {
+      throw new Error('plan write aborted before atomic rename')
+    }
+    await rename(tempPath, target.absolutePath)
+    return { path: target.absolutePath, savedAt: new Date().toISOString() }
+  })
 }
 
 /**

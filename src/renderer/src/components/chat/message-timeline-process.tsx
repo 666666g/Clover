@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ChevronDown, ChevronRight, Minimize2 } from 'lucide-react'
 import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { looksLikeUnifiedDiff } from '../../lib/diff-stats'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useDeferredRender } from '../../hooks/use-deferred-render'
 import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
 import { previewWorkspaceFile } from '../../lib/workspace-file-preview'
@@ -115,7 +115,7 @@ export function ProcessSectionRow({
       (block.kind === 'approval' && block.status === 'error') ||
       (block.kind === 'user_input' && block.status === 'error')
   )
-  const defaultExpanded = active || hasError
+  const defaultExpanded = hasError || (active && section.kind === 'reasoning')
   const expanded = hasDetails && (userExpanded ?? defaultExpanded)
   const title = describeProcessSection(section, t, {
     processing,
@@ -262,10 +262,10 @@ function ProcessStackRows({
         const detail = getProcessDetail(block, summary)
         const isRunningTool = processBlockIsRunningTool(block, processing)
         const canExpand = detail.kind !== 'none'
-        const open = canExpand && (isRunningTool || processBlockHasError(block) || openBlockId === block.id)
+        const open = canExpand && (processBlockHasError(block) || openBlockId === block.id)
         const rowActive = processBlockIsActive(block, processing)
         const isError = processBlockHasError(block)
-        const canToggle = canExpand && !isRunningTool
+        const canToggle = canExpand
         const handleToggle = (): void => {
           if (!canToggle) return
           setOpenBlockId((id) => (id === block.id ? null : block.id))
@@ -293,7 +293,7 @@ function ProcessStackRows({
               <span className={`min-w-0 flex-1 truncate ${rowActive && !isError ? 'ds-shiny-text' : ''}`}>
                 <ProcessSummaryText block={block} summary={summary} />
               </span>
-              {canExpand && !isRunningTool ? (
+              {canExpand ? (
                 open ? (
                   <ChevronDown className="h-3 w-3 shrink-0 opacity-35" strokeWidth={2} />
                 ) : (
@@ -339,12 +339,12 @@ function ProcessEntryRow({
   const isError = processBlockHasError(block)
   const open =
     canExpand &&
-    (isRunningTool || isError || isAssistantProcessText || isAutoOpenPending || isStreamingAssistant || userOpen)
+    (isError || isAssistantProcessText || isAutoOpenPending || isStreamingAssistant || userOpen)
 
   const { verb, rest } = splitVerb(summary)
   const rowActive = isRunningTool || isAutoOpenPending || isStreamingAssistant
   const wrapSummary = (block.kind === 'system' && !canExpand) || isAssistantProcessText
-  const canToggle = canExpand && !isRunningTool && !isAutoOpenPending && !isAssistantProcessText
+  const canToggle = canExpand && !isAutoOpenPending && !isAssistantProcessText
   const handleToggle = (): void => {
     if (!canToggle) return
     setUserOpen((v) => !v)
@@ -392,7 +392,7 @@ function ProcessEntryRow({
             </span>
           ) : null}
         </span>
-        {canExpand && !isRunningTool ? (
+        {canExpand ? (
           open ? (
             <ChevronDown className="mt-1 h-3 w-3 shrink-0 opacity-40" strokeWidth={2} />
           ) : (
@@ -823,12 +823,14 @@ function getProcessDetail(block: ChatBlock, summaryText?: string): ProcessDetail
       return { kind: 'none' }
     }
     const isError = block.status === 'error'
-    const isPatch =
-      block.toolKind === 'file_change' && !isError && looksLikeUnifiedDiff(detailText)
+    const patchText =
+      block.toolKind === 'file_change' && !isError
+        ? extractUnifiedDiffText(detailText)
+        : undefined
     return {
       kind: 'tool',
-      text: block.detail!,
-      isPatch,
+      text: patchText ?? block.detail!,
+      isPatch: patchText !== undefined,
       isError,
       filePath: block.filePath
     }

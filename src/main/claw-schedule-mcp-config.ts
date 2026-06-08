@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, posix } from 'node:path'
 import type { AppSettingsV1 } from '../shared/app-settings'
 
 const CLAW_SCHEDULE_MCP_MARKER_START = '# DeepSeek GUI plugin:mcp:claw-schedule START'
@@ -61,6 +61,9 @@ export function buildClawScheduleMcpArgs(
 }
 
 export function resolveClawScheduleMcpNodeEntryPath(launch: ClawScheduleMcpLaunchConfig): string {
+  if (launch.appPath.includes('/') && !launch.appPath.includes('\\')) {
+    return posix.join(launch.appPath, GUI_SCHEDULE_MCP_NODE_ENTRY)
+  }
   return join(launch.appPath, GUI_SCHEDULE_MCP_NODE_ENTRY)
 }
 
@@ -71,10 +74,10 @@ export function resolveClawScheduleMcpCommand(
   if (platform !== 'darwin') return launch.execPath
   if (!launch.execPath.includes('/Contents/MacOS/')) return launch.execPath
 
-  const appContentsDir = dirname(dirname(launch.execPath))
-  const appName = basename(launch.execPath)
+  const appContentsDir = posix.dirname(posix.dirname(launch.execPath))
+  const appName = posix.basename(launch.execPath)
   const helperName = `${appName} Helper`
-  return join(
+  return posix.join(
     appContentsDir,
     'Frameworks',
     `${helperName}.app`,

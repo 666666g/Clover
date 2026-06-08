@@ -41,6 +41,7 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
@@ -221,11 +222,13 @@ describe('syncGuiManagedKunConfig', () => {
     settings.schedule.internal.secret = 'top-secret'
 
     await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
-      settings,
-      launch: {
-        appPath: '/tmp/deepseek-gui-test-app',
-        execPath: '/tmp/electron',
-        isPackaged: false
+      scheduleMcp: {
+        settings,
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
       }
     })
 
@@ -262,11 +265,13 @@ describe('syncGuiManagedKunConfig', () => {
     mkdirSync(join(workspaceRoot, '.codex', 'skills'), { recursive: true })
 
     await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
-      settings,
-      launch: {
-        appPath: '/tmp/deepseek-gui-test-app',
-        execPath: '/tmp/electron',
-        isPackaged: false
+      scheduleMcp: {
+        settings,
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
       }
     })
 
@@ -457,6 +462,58 @@ describe('syncGuiManagedKunConfig', () => {
     })
   })
 
+  it('imports GUI-managed MCP servers into runtime capabilities', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const mcpConfigPath = join(tempRoot, 'mcp.json')
+    writeFileSync(mcpConfigPath, JSON.stringify({
+      servers: {
+        'stata-mcp': {
+          command: 'uvx',
+          args: ['stata-mcp'],
+          env: {
+            STATA_CLI: 'D:\\stata\\StataMP-64.exe'
+          },
+          enabled: true,
+          disabled: false
+        },
+        'docs-mcp': {
+          url: 'https://mcp.example.test/mcp',
+          headers: {
+            Authorization: 'Bearer docs-token'
+          }
+        }
+      }
+    }), 'utf8')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
+      mcpConfigPath
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.mcp.enabled).toBe(true)
+    expect(parsed.capabilities.mcp.servers['stata-mcp']).toMatchObject({
+      enabled: true,
+      transport: 'stdio',
+      command: 'uvx',
+      args: ['stata-mcp'],
+      env: {
+        STATA_CLI: 'D:\\stata\\StataMP-64.exe'
+      },
+      trustScope: 'user'
+    })
+    expect(parsed.capabilities.mcp.servers['docs-mcp']).toMatchObject({
+      enabled: true,
+      transport: 'streamable-http',
+      url: 'https://mcp.example.test/mcp',
+      headers: {
+        Authorization: 'Bearer docs-token'
+      },
+      trustScope: 'user'
+    })
+  })
+
   it('replaces unparsable historical Kun config with a valid GUI-managed config', async () => {
     if (!tempRoot) throw new Error('temp root not initialized')
     const configPath = join(tempRoot, 'config.json')
@@ -482,11 +539,13 @@ describe('syncGuiManagedKunConfig', () => {
     const module = await import('./kun-process')
 
     await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
-      settings: createSettings('/tmp/fake-kun-child.js'),
-      launch: {
-        appPath: '/tmp/deepseek-gui-test-app',
-        execPath: '/tmp/electron',
-        isPackaged: false
+      scheduleMcp: {
+        settings: createSettings('/tmp/fake-kun-child.js'),
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
       }
     })
 

@@ -21,6 +21,7 @@ import { isClawThread } from './chat-store-helpers'
 import {
   collectAssistantTextForTurn,
   reconcileOptimisticUserBlock,
+  settlePendingRuntimeWorkAfterInterrupt,
   threadSnapshotLooksRunning,
   upsertUserBlock
 } from './chat-store-runtime-helpers'
@@ -150,6 +151,17 @@ export function buildFollowupMessageFromUserInput(
 function isUserInputInterruptError(message: string | undefined): boolean {
   const lowered = message?.toLowerCase() ?? ''
   return lowered.includes('cancel') && lowered.includes('awaiting user input')
+}
+
+function isInterruptSettledError(error: unknown, message: string): boolean {
+  const code = getRuntimeErrorCode(error)
+  if (code === 'aborted') return true
+  if (isUserInputInterruptError(message)) return true
+  const lowered = message.toLowerCase()
+  return lowered.includes('interrupted') ||
+    lowered.includes('aborted') ||
+    lowered.includes('cancelled') ||
+    lowered.includes('canceled')
 }
 
 export async function readActiveWriteWorkspace(fallbackWorkspaceRoot: string): Promise<string> {
@@ -468,12 +480,25 @@ export function syncTurnCompletionPoll(
   })
 }
 
+export type ThreadEventSinkBinding = {
+  threadId?: string
+  signal?: AbortSignal
+}
+
 export function buildThreadEventSink(
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
-  get: () => ChatState
+  get: () => ChatState,
+  binding: ThreadEventSinkBinding = {}
 ): ThreadEventSink {
+  const boundThreadId = binding.threadId?.trim() ?? ''
+  const isCurrentStream = (): boolean => {
+    if (binding.signal?.aborted) return false
+    return !boundThreadId || get().activeThreadId === boundThreadId
+  }
+
   return {
     onSeq: (seq) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       set((s) => ({
         lastSeq: seq,
@@ -482,6 +507,7 @@ export function buildThreadEventSink(
     },
     onUserMessage: (ev) =>
       set((s) => {
+        if (!isCurrentStream()) return {}
         resetBusyRecoveryAttempts()
         const flushed = flushLiveBlocks(s)
         const baseBlocks = flushed.blocks ?? s.blocks
@@ -516,6 +542,7 @@ export function buildThreadEventSink(
       }),
     onDeltas: (deltas) =>
       set((s) => {
+        if (!isCurrentStream()) return {}
         if (deltas.length === 0) return {}
         resetBusyRecoveryAttempts()
         const nextError = clearRuntimeStreamRecoveringError(s.error)
@@ -572,6 +599,7 @@ export function buildThreadEventSink(
         }
       }),
     onTool: (ev) => {
+      if (!isCurrentStream()) return
       notifyWriteWorkspaceFileRefresh(get, ev)
       set((s) => {
         resetBusyRecoveryAttempts()
@@ -627,6 +655,7 @@ export function buildThreadEventSink(
       })
     },
     onCompaction: (ev) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -678,6 +707,7 @@ export function buildThreadEventSink(
       })
     },
     onReview: (ev: ReviewEventPayload) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -728,6 +758,7 @@ export function buildThreadEventSink(
     },
     onApproval: (req) =>
       set((s) => {
+        if (!isCurrentStream()) return {}
         resetBusyRecoveryAttempts()
         if (s.blocks.some((b) => b.kind === 'approval' && b.approvalId === req.approvalId)) {
           return {}
@@ -753,6 +784,7 @@ export function buildThreadEventSink(
         }
       }),
     onUserInput: (req) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       set((s) => {
@@ -779,6 +811,7 @@ export function buildThreadEventSink(
       })
     },
     onUserInputStatus: (ev) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       if (ev.status === 'submitted' && get().busy) {
         armBusyWatchdog(set, get)
@@ -800,6 +833,7 @@ export function buildThreadEventSink(
       }))
     },
     onRuntimeStatus: (ev) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -829,6 +863,7 @@ export function buildThreadEventSink(
       })
     },
     onGoal: (ev) => {
+      if (!isCurrentStream()) return
       if (!ev.threadId) return
       resetBusyRecoveryAttempts()
       set((s) => {
@@ -864,6 +899,7 @@ export function buildThreadEventSink(
       })
     },
     onTodos: (ev) => {
+      if (!isCurrentStream()) return
       if (!ev.threadId) return
       resetBusyRecoveryAttempts()
       set((s) => {
@@ -889,6 +925,7 @@ export function buildThreadEventSink(
       })
     },
     onTurnComplete: () => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const completedState = get()
@@ -939,23 +976,28 @@ export function buildThreadEventSink(
       void get().drainQueuedMessages()
     },
     onError: (err) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const state = get()
+      const message = formatRuntimeError(err)
+      const interrupted = isInterruptSettledError(err, message)
       takePendingClawFeishuMirror(state.currentTurnId)
       set((s) => {
         const wasBusy = s.busy
         const out = flushLiveBlocks(s, {
           ...finalizeTurnTiming(s),
-          error: formatRuntimeError(err)
+          error: interrupted ? null : message
         })
         // Keep the busy flag if the turn was active — the interrupt button
         // should stay visible so the user can interrupt a stuck turn. The
         // watchdog (re-armed below) will eventually time out if the turn
         // never recovers.
-        if (!wasBusy) {
+        if (!wasBusy || interrupted) {
           out.busy = false
           out.currentTurnId = null
+          out.currentTurnUserId = null
+          out.blocks = settlePendingRuntimeWorkAfterInterrupt(out.blocks ?? s.blocks)
         }
         return out
       })
@@ -964,6 +1006,7 @@ export function buildThreadEventSink(
       if (get().busy) armBusyWatchdog(set, get)
     },
     onUsage: () => {
+      if (!isCurrentStream()) return
       set((s) => ({ usageRefreshKey: s.usageRefreshKey + 1 }))
     }
   }

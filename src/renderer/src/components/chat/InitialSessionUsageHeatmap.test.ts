@@ -246,7 +246,7 @@ describe('InitialSessionUsageHeatmap', () => {
     expect(html).toContain('Expand calendar')
     expect(html).toContain('ds-runtime-wake-stage')
     expect(html).toContain('ds-work-logo')
-    expect(html).toContain('Keep the canvas clear')
+    expect(html).not.toContain('Keep the canvas clear')
     expect(html).not.toContain('Daily Kun usage calendar')
   })
 

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { NormalizedThread, ThreadGoal, ThreadGoalStatus } from '../agent/types'
+import type { ChatBlock, NormalizedThread, ThreadGoal, ThreadGoalStatus } from '../agent/types'
 import type { ChatState, ChatStoreGet, ChatStoreSet, SendMessageOverrides } from './chat-store-types'
 
 const registryMock = vi.hoisted(() => ({
@@ -21,10 +21,12 @@ type GoalPatch = {
 type Harness = {
   actions: ReturnType<typeof createMaintenanceActions>
   createThread: ReturnType<typeof vi.fn>
+  drainQueuedMessages: ReturnType<typeof vi.fn>
   get: ChatStoreGet
   provider: {
     setThreadGoal: ReturnType<typeof vi.fn>
     clearThreadGoal: ReturnType<typeof vi.fn>
+    interruptTurn: ReturnType<typeof vi.fn>
   }
   refreshThreads: ReturnType<typeof vi.fn>
   sendMessage: ReturnType<typeof vi.fn>
@@ -79,7 +81,8 @@ function buildHarness(options: {
         patch.status ?? state.activeThreadGoal?.status ?? initialGoal?.status ?? 'active'
       )
     ),
-    clearThreadGoal: vi.fn(async () => true)
+    clearThreadGoal: vi.fn(async () => true),
+    interruptTurn: vi.fn(async () => undefined)
   }
   registryMock.getProvider.mockReturnValue(provider)
 
@@ -90,6 +93,7 @@ function buildHarness(options: {
     state.threads = [created, ...state.threads]
   })
   const refreshThreads = vi.fn(async () => undefined)
+  const drainQueuedMessages = vi.fn(async () => undefined)
   const sendMessage = vi.fn(async (
     _text: string,
     _mode?: string,
@@ -101,6 +105,7 @@ function buildHarness(options: {
     activeThreadId,
     createThread,
     error: null,
+    drainQueuedMessages,
     refreshThreads,
     runtimeConnection: 'ready',
     sendMessage,
@@ -119,7 +124,7 @@ function buildHarness(options: {
     sseAbortRef: { current: null }
   })
 
-  return { actions, createThread, get, provider, refreshThreads, sendMessage, state }
+  return { actions, createThread, drainQueuedMessages, get, provider, refreshThreads, sendMessage, state }
 }
 
 describe('chat-store-maintenance-actions goal actions', () => {
@@ -232,5 +237,63 @@ describe('chat-store-maintenance-actions goal actions', () => {
     expect(state.activeThreadGoal).toBeNull()
     expect(state.threads[0]?.goal).toBeNull()
     expect(refreshThreads).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles local runtime work after interrupt succeeds', async () => {
+    const { actions, drainQueuedMessages, provider, refreshThreads, state } = buildHarness()
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user-1', text: 'run command' },
+      {
+        kind: 'tool',
+        id: 'tool-1',
+        summary: 'Running command',
+        status: 'running',
+        toolKind: 'command_execution'
+      },
+      {
+        kind: 'approval',
+        id: 'approval-1',
+        approvalId: 'approval-1',
+        summary: 'Approve command',
+        status: 'pending'
+      },
+      {
+        kind: 'user_input',
+        id: 'input-1',
+        requestId: 'input-1',
+        questions: [],
+        status: 'pending'
+      }
+    ]
+    Object.assign(state, {
+      blocks,
+      busy: true,
+      currentTurnId: 'turn-1',
+      currentTurnUserId: 'user-1',
+      liveAssistant: 'partial answer',
+      liveReasoning: '',
+      queuedMessages: [],
+      turnStartedAtByUserId: { 'user-1': Date.now() - 1000 },
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {}
+    })
+
+    await actions.interrupt()
+
+    expect(provider.interruptTurn).toHaveBeenCalledWith('thr_existing', 'turn-1', { discard: false })
+    expect(state.busy).toBe(false)
+    expect(state.currentTurnId).toBeNull()
+    expect(state.currentTurnUserId).toBeNull()
+    expect(state.liveAssistant).toBe('')
+    expect(state.blocks.map((block) => ('status' in block ? block.status : block.kind))).toEqual([
+      'user',
+      'error',
+      'error',
+      'cancelled',
+      'assistant'
+    ])
+    expect(refreshThreads).toHaveBeenCalledTimes(1)
+    expect(drainQueuedMessages).toHaveBeenCalledTimes(1)
   })
 })

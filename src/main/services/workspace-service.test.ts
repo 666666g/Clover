@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, mkdtemp, readFile, realpath, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 vi.mock('electron', () => ({
   app: {
@@ -173,7 +173,7 @@ describe('workspace-service boundary checks', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) return
 
-    expect(result.path).toContain(join(workspaceRoot, 'img'))
+    expect(await realpath(dirname(result.path))).toBe(await realpath(join(workspaceRoot, 'img')))
     expect(result.markdownPath.startsWith('../img/pasted-image-')).toBe(true)
     await expect(readFile(result.path)).resolves.toEqual(Buffer.from('fake-png-bytes'))
   })
@@ -216,7 +216,7 @@ describe('workspace-service boundary checks', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) return
 
-    expect(result.path).toContain(join(workspaceRoot, '.kunsdd', 'img'))
+    expect(await realpath(dirname(result.path))).toBe(await realpath(join(workspaceRoot, '.kunsdd', 'img')))
     expect(result.markdownPath.startsWith('../../img/pasted-image-')).toBe(true)
     await expect(readFile(result.path)).resolves.toEqual(Buffer.from('sdd-png-bytes'))
   })

@@ -171,10 +171,10 @@ async function loadSkillSummary(root: string, scope: GuiSkillScope): Promise<Gui
   if (!existsSync(entryPath)) return null
   const content = await readFile(entryPath, 'utf8')
   const frontmatter = readFrontmatter(content)
-  const name = frontmatter.name || titleFromSlug(basename(root))
+  const name = displaySkillName(frontmatter.name, basename(root))
   return {
-    id: slug(frontmatter.name || basename(root)),
-    name: titleFromSlug(name),
+    id: slug(frontmatter.id || basename(root)),
+    name,
     ...(frontmatter.description ? { description: frontmatter.description } : {}),
     root,
     entryPath,
@@ -183,11 +183,12 @@ async function loadSkillSummary(root: string, scope: GuiSkillScope): Promise<Gui
   }
 }
 
-function readFrontmatter(content: string): { name?: string; description?: string } {
+function readFrontmatter(content: string): { id?: string; name?: string; description?: string } {
   const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content)
   if (!match) return { description: firstMarkdownParagraph(content) }
   const yaml = match[1] ?? ''
   return {
+    id: frontmatterString(yaml, 'id'),
     name: frontmatterString(yaml, 'name'),
     description: frontmatterString(yaml, 'description') || firstMarkdownParagraph(content.slice(match[0].length))
   }
@@ -228,8 +229,19 @@ function titleFromSlug(value: string): string {
     .replace(/\b\w/g, (char) => char.toUpperCase())
 }
 
+function displaySkillName(frontmatterName: string | undefined, folderName: string): string {
+  const value = frontmatterName?.trim() ?? ''
+  if (!value) return titleFromSlug(folderName)
+  return /^[a-z0-9][a-z0-9_-]*$/i.test(value) ? titleFromSlug(value) : value
+}
+
 function slug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'skill'
+  return value
+    .trim()
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+    .replace(/^-+|-+$/g, '') || 'skill'
 }
 
 function dedupeSkills(skills: GuiSkillSummary[]): GuiSkillSummary[] {

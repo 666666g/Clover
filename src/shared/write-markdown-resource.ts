@@ -29,7 +29,10 @@ export function writePathToFileUrl(pathname: string): string {
   const normalized = normalizeJoinedPath(pathname)
   const encoded = normalized
     .split('/')
-    .map((part) => encodeURIComponent(part))
+    .map((part) => {
+      if (/^[a-zA-Z]:$/.test(part)) return part
+      return encodeURIComponent(part).replaceAll('~', '%7E')
+    })
     .join('/')
   return `file://${encoded.startsWith('/') ? encoded : `/${encoded}`}`
 }

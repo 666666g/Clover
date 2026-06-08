@@ -11,11 +11,43 @@ function trimTrailingSlash(path: string): string {
   return path.replace(/\/+$/, '')
 }
 
-export function looksLikeUnifiedDiff(text: string | undefined): boolean {
-  if (!text) return false
+function textHasUnifiedDiffMarkers(text: string): boolean {
   return text
     .split('\n')
     .some((line) => /^(@@|diff --git |--- |\+\+\+ |index )/.test(line))
+}
+
+function parseJsonRecord(text: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function extractUnifiedDiffText(text: string | undefined): string | undefined {
+  const raw = text?.trim()
+  if (!raw) return undefined
+  if (textHasUnifiedDiffMarkers(raw)) return raw
+
+  const record = parseJsonRecord(raw)
+  if (!record) return undefined
+
+  for (const key of ['diff', 'patch', 'unified_diff', 'unifiedDiff']) {
+    const value = record[key]
+    if (typeof value !== 'string') continue
+    const patch = value.trim()
+    if (patch && textHasUnifiedDiffMarkers(patch)) return patch
+  }
+
+  return undefined
+}
+
+export function looksLikeUnifiedDiff(text: string | undefined): boolean {
+  return extractUnifiedDiffText(text) !== undefined
 }
 
 export function extractDiffFilePath(

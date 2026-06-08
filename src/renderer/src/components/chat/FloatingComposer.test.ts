@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   FloatingComposer,
   formatGoalElapsedSeconds,
+  handleComposerImagePaste,
   imageFilesFromTransfer,
   imageTransferHasImages,
   parseCompactCommand,
@@ -13,9 +14,8 @@ import {
 import {
   FloatingComposerModelPicker,
   calculateFloatingMenuPlacement,
+  calculateFloatingSubmenuPlacement,
   composerReasoningEffortRequestValue,
-  normalizeComposerProviderExpansion,
-  toggleComposerProviderExpansion
 } from './FloatingComposerModelPicker'
 import { getGoalPanelDraftObjective } from './floating-composer-commands'
 import { useChatStore } from '../../store/chat-store'
@@ -169,12 +169,28 @@ describe('FloatingComposer model controls', () => {
     expect(placement.top).toBe(633)
   })
 
-  it('keeps provider model groups collapsed until a provider is toggled', () => {
-    expect(normalizeComposerProviderExpansion(null, ['deepseek'])).toBeNull()
-    expect(normalizeComposerProviderExpansion('missing', ['deepseek'])).toBeNull()
-    expect(normalizeComposerProviderExpansion('deepseek', ['deepseek'])).toBe('deepseek')
-    expect(toggleComposerProviderExpansion(null, 'deepseek')).toBe('deepseek')
-    expect(toggleComposerProviderExpansion('deepseek', 'deepseek')).toBeNull()
+  it('places the model submenu beside the active provider row', () => {
+    const placement = calculateFloatingSubmenuPlacement({
+      anchorRect: { top: 650, right: 700, bottom: 686, left: 492 },
+      submenuHeight: 140,
+      viewportHeight: 900,
+      viewportWidth: 1000
+    })
+
+    expect(placement.left).toBe(706)
+    expect(placement.top).toBe(642)
+  })
+
+  it('flips the model submenu left when there is not enough room on the right', () => {
+    const placement = calculateFloatingSubmenuPlacement({
+      anchorRect: { top: 650, right: 920, bottom: 686, left: 712 },
+      submenuHeight: 140,
+      viewportHeight: 900,
+      viewportWidth: 1000
+    })
+
+    expect(placement.left).toBe(474)
+    expect(placement.top).toBe(642)
   })
 
   it('keeps the reasoning strength visible in the model control', () => {
@@ -253,6 +269,65 @@ describe('FloatingComposer image transfer helpers', () => {
     expect(file?.type).toBe('image/png')
     expect(file?.name).toBe('shot')
     expect(imageTransferHasImages(source)).toBe(true)
+  })
+
+  it('handles pasted image files through the attachment picker', () => {
+    const screenshot = new File([new Uint8Array([1])], 'shot.png', { type: 'image/png' })
+    const preventDefault = vi.fn()
+    const onPickAttachments = vi.fn()
+    const onPasteClipboardImage = vi.fn()
+    const handled = handleComposerImagePaste({
+      canPickAttachment: true,
+      clipboardData: {
+        getData: () => '',
+        items: {
+          length: 1,
+          0: { kind: 'file', type: 'image/png', getAsFile: () => screenshot }
+        }
+      },
+      preventDefault,
+      onPickAttachments,
+      onPasteClipboardImage
+    })
+
+    expect(handled).toBe(true)
+    expect(preventDefault).toHaveBeenCalledTimes(1)
+    expect(onPickAttachments).toHaveBeenCalledWith([screenshot])
+    expect(onPasteClipboardImage).not.toHaveBeenCalled()
+  })
+
+  it('does not intercept ordinary text paste', () => {
+    const preventDefault = vi.fn()
+    const onPasteClipboardImage = vi.fn()
+    const handled = handleComposerImagePaste({
+      canPickAttachment: true,
+      clipboardData: {
+        getData: (format) => format === 'text/plain' ? 'hello' : ''
+      },
+      preventDefault,
+      onPasteClipboardImage
+    })
+
+    expect(handled).toBe(false)
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(onPasteClipboardImage).toHaveBeenCalledWith({ silentNoImage: true })
+  })
+
+  it('falls back to the Electron clipboard image bridge when files are unavailable', () => {
+    const preventDefault = vi.fn()
+    const onPasteClipboardImage = vi.fn()
+    const handled = handleComposerImagePaste({
+      canPickAttachment: true,
+      clipboardData: {
+        getData: () => ''
+      },
+      preventDefault,
+      onPasteClipboardImage
+    })
+
+    expect(handled).toBe(true)
+    expect(preventDefault).toHaveBeenCalledTimes(1)
+    expect(onPasteClipboardImage).toHaveBeenCalledWith({ silentNoImage: false })
   })
 })
 

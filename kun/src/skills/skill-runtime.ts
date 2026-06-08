@@ -278,11 +278,13 @@ async function loadSkillPackage(root: string, allowLegacy: boolean): Promise<Loa
   const legacyPath = join(root, 'SKILL.md')
   if (!await exists(legacyPath)) return null
   const entry = await readFile(legacyPath, 'utf8')
-  const name = basename(root)
+  const frontmatter = readFrontmatter(entry)
+  const folderName = basename(root)
+  const name = frontmatter.name || folderName
   return {
-    id: slug(name),
+    id: slug(frontmatter.id || folderName),
     name,
-    description: firstMarkdownParagraph(entry),
+    description: frontmatter.description,
     version: 'legacy',
     root,
     entryPath: legacyPath,
@@ -400,8 +402,40 @@ function firstMarkdownParagraph(markdown: string): string | undefined {
     .find(Boolean)
 }
 
+function readFrontmatter(content: string): { id?: string; name?: string; description?: string } {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content)
+  if (!match) return { description: firstMarkdownParagraph(content) }
+  const yaml = match[1] ?? ''
+  return {
+    id: frontmatterString(yaml, 'id'),
+    name: frontmatterString(yaml, 'name'),
+    description: frontmatterString(yaml, 'description') || firstMarkdownParagraph(content.slice(match[0].length))
+  }
+}
+
+function frontmatterString(yaml: string, key: string): string | undefined {
+  const match = new RegExp(`^${key}:\\s*(.+?)\\s*$`, 'm').exec(yaml)
+  return match ? stripQuotes(match[1] ?? '').trim() || undefined : undefined
+}
+
+function stripQuotes(value: string): string {
+  const trimmed = value.trim()
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
 function slug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'skill'
+  return value
+    .trim()
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+    .replace(/^-+|-+$/g, '') || 'skill'
 }
 
 function errorMessage(error: unknown): string {

@@ -1,8 +1,8 @@
 import type { ChatBlock, ToolBlock } from '../../agent/types'
 import {
   extractDiffFilePath,
+  extractUnifiedDiffText,
   formatFilePathForDisplay,
-  looksLikeUnifiedDiff
 } from '../../lib/diff-stats'
 import {
   findTrailingAssistantContentStart,
@@ -103,8 +103,8 @@ export function deriveTurnSections({
           return []
         }
 
-        const detailText = block.detail?.trim() ?? ''
-        if (!looksLikeUnifiedDiff(detailText)) return []
+        const detailText = extractUnifiedDiffText(block.detail)
+        if (!detailText) return []
 
         const resolvedFilePath = formatFilePathForDisplay(
           extractDiffFilePath(detailText, block.filePath),
@@ -112,7 +112,7 @@ export function deriveTurnSections({
         )
         if (!resolvedFilePath) return []
 
-        return [{ ...block, filePath: resolvedFilePath }]
+        return [{ ...block, detail: detailText, filePath: resolvedFilePath }]
       })
 
   return { processBlocks, assistantContentBlocks, turnFileChanges }

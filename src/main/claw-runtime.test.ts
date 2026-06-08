@@ -27,6 +27,7 @@ function buildSettings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: true, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     write: defaultWriteSettings(),
     schedule: defaultScheduleSettings(),
     claw: {
@@ -849,6 +850,306 @@ describe('ClawRuntime', () => {
       senderId: 'wx_user_1',
       senderName: 'Alice',
       localThreadId: 'thr_weixin'
+    })
+  })
+
+  it('waits for the current WeChat turn to complete before returning the final reply', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_500
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: '',
+      conversations: []
+    })]
+    const { store } = mutableSettingsStore(settings)
+    let getCount = 0
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads' && init?.method === 'POST') {
+        return { ok: true, status: 201, body: JSON.stringify({ id: 'thr_weixin' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'PATCH') {
+        return { ok: true, status: 200, body: '{}' }
+      }
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_weixin' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        getCount += 1
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify(getCount === 1
+            ? {
+                id: 'thr_weixin',
+                status: 'running',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous reply' }]
+                  },
+                  {
+                    id: 'turn_weixin',
+                    status: 'running',
+                    items: [
+                      { kind: 'assistant_text', text: 'intermediate reply' },
+                      { kind: 'tool_call', detail: 'checking disk usage' }
+                    ]
+                  }
+                ]
+              }
+            : {
+                id: 'thr_weixin',
+                status: 'idle',
+                turns: [
+                  {
+                    id: 'turn_previous',
+                    status: 'completed',
+                    items: [{ kind: 'assistant_text', text: 'previous reply' }]
+                  },
+                  {
+                    id: 'turn_weixin',
+                    status: 'completed',
+                    items: [
+                      { kind: 'assistant_text', text: 'intermediate reply' },
+                      { kind: 'tool_result', detail: 'tool finished' },
+                      { kind: 'assistant_text', text: 'final result' }
+                    ]
+                  }
+                ]
+              })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'clean disk',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_1',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(200)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: true,
+      reply: 'final result'
+    })
+    expect(getCount).toBe(2)
+  })
+
+  it('does not return a previous WeChat session reply for a new turn', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 10
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: 'thr_weixin',
+      conversations: [buildConversation({
+        chatId: 'wx_user_1',
+        latestMessageId: 'wx_previous',
+        senderId: 'wx_user_1',
+        senderName: 'Alice',
+        localThreadId: 'thr_weixin'
+      })]
+    })]
+    const { store } = mutableSettingsStore(settings)
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_weixin',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_previous',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: 'previous reply' }]
+              },
+              {
+                id: 'turn_current',
+                status: 'completed',
+                items: []
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'new question',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_2',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(500)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: false,
+      message: 'Timed out waiting for agent response.'
+    })
+  })
+
+  it('does not return historical WeChat text when the current turn fails', async () => {
+    const settings = buildSettings()
+    settings.claw.im.enabled = true
+    settings.claw.im.responseTimeoutMs = 2_000
+    settings.claw.channels = [buildChannel({
+      provider: 'weixin' as const,
+      id: 'channel_weixin',
+      label: 'WeChat',
+      threadId: 'thr_weixin',
+      conversations: [buildConversation({
+        chatId: 'wx_user_1',
+        latestMessageId: 'wx_previous',
+        senderId: 'wx_user_1',
+        senderName: 'Alice',
+        localThreadId: 'thr_weixin'
+      })]
+    })]
+    const { store } = mutableSettingsStore(settings)
+    const runtimeRequest = vi.fn(async (_settings, path, init) => {
+      if (path === '/v1/threads/thr_weixin/turns' && init?.method === 'POST') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_current' }) }
+      }
+      if (path === '/v1/threads/thr_weixin' && init?.method === 'GET') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            id: 'thr_weixin',
+            status: 'idle',
+            turns: [
+              {
+                id: 'turn_previous',
+                status: 'completed',
+                items: [{ kind: 'assistant_text', text: 'previous reply' }]
+              },
+              {
+                id: 'turn_current',
+                status: 'failed',
+                items: []
+              }
+            ]
+          })
+        }
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const runtime = createClawRuntime({
+      store: store as never,
+      runtimeRequest: runtimeRequest as never,
+      logError: () => undefined,
+      createScheduledTaskFromText: vi.fn(async () => ({ kind: 'noop' as const }))
+    })
+    const body = JSON.stringify({
+      text: 'new question',
+      provider: 'weixin',
+      channelId: 'channel_weixin',
+      chatId: 'wx_user_1',
+      messageId: 'wx_msg_2',
+      senderId: 'wx_user_1',
+      senderName: 'Alice'
+    })
+    const req = {
+      method: 'POST',
+      url: settings.claw.im.path,
+      headers: {},
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(body)
+      }
+    }
+    let status = 0
+    let responseBody = ''
+    const res = {
+      writeHead: vi.fn((nextStatus: number) => {
+        status = nextStatus
+      }),
+      end: vi.fn((payload: string) => {
+        responseBody = payload
+      })
+    }
+
+    await (runtime as unknown as {
+      handleWebhook: (request: typeof req, response: typeof res) => Promise<void>
+    }).handleWebhook(req, res)
+
+    expect(status).toBe(500)
+    expect(JSON.parse(responseBody)).toMatchObject({
+      ok: false,
+      message: 'Agent turn failed.'
     })
   })
 

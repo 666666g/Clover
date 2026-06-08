@@ -219,8 +219,12 @@ function buildEditorTheme(appearance: 'source' | 'live'): Extension {
     '.cm-cursor, .cm-dropCursor': {
       borderLeftColor: 'var(--ds-text)'
     },
-    '.cm-selectionBackground, ::selection': {
-      backgroundColor: 'var(--ds-selection)'
+    '.cm-selectionBackground': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))'
+    },
+    '.cm-content::selection, .cm-content *::selection': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))',
+      color: 'var(--write-selection-text, inherit)'
     },
     '.cm-gutters': {
       display: 'none'

@@ -26,6 +26,7 @@ import {
 import {
   AttachmentsCapabilityConfig,
   McpCapabilityConfig,
+  McpServerConfig,
   MemoryCapabilityConfig,
   SkillsCapabilityConfig,
   SubagentsCapabilityConfig,
@@ -35,6 +36,7 @@ import {
   buildClawScheduleMcpArgs,
   GUI_SCHEDULE_MCP_SERVER_NAME,
   resolveClawScheduleMcpCommand,
+  resolveKunMcpJsonPath,
   type ClawScheduleMcpLaunchConfig
 } from './claw-schedule-mcp-config'
 import { defaultKunDataDir } from './runtime/kun-adapter'
@@ -209,11 +211,13 @@ export async function startKunChild(settings: AppSettingsV1): Promise<void> {
   }
   const dataDir = resolveKunDataDir(runtime)
   await syncGuiManagedKunConfig(dataDir, runtime, {
-    settings,
-    launch: {
-      appPath: app.getAppPath(),
-      execPath: process.execPath,
-      isPackaged: app.isPackaged
+    scheduleMcp: {
+      settings,
+      launch: {
+        appPath: app.getAppPath(),
+        execPath: process.execPath,
+        isPackaged: app.isPackaged
+      }
     }
   })
   lastResolvedBinary = resolution.command === process.execPath
@@ -271,13 +275,22 @@ export async function syncGuiManagedKunConfig(
     KunRuntimeSettingsV1,
     'mcpSearch' | 'tokenEconomy' | 'storage' | 'contextCompaction' | 'runtimeTuning'
   >,
-  scheduleMcp?: {
-    settings: AppSettingsV1
-    launch: ClawScheduleMcpLaunchConfig
+  options?: {
+    scheduleMcp?: {
+      settings: AppSettingsV1
+      launch: ClawScheduleMcpLaunchConfig
+    }
+    mcpConfigPath?: string
   }
 ): Promise<void> {
   const configPath = join(dataDir, 'config.json')
   const existing = sanitizeKunConfigSections(await readJsonObjectIfExists(configPath))
+  const importedMcpServers = await readGuiManagedMcpServers(
+    options?.mcpConfigPath ?? resolveKunMcpJsonPath()
+  )
+  const hasImportedEnabledMcpServer = Object.values(importedMcpServers).some(
+    (server) => objectValue(server).enabled !== false
+  )
 
   const serve = objectValue(existing?.serve)
   const existingTokenEconomy = objectValue(serve.tokenEconomy)
@@ -292,7 +305,7 @@ export async function syncGuiManagedKunConfig(
   const skills = objectValue(capabilities.skills)
   const storage = storageConfigForRuntime(runtime.storage)
   const mcpSearch = runtime.mcpSearch
-  const skillCapability = await skillCapabilityConfigForRuntime(skills, scheduleMcp?.settings)
+  const skillCapability = await skillCapabilityConfigForRuntime(skills, options?.scheduleMcp?.settings)
   const next = {
     serve: {
       ...serve,
@@ -316,15 +329,21 @@ export async function syncGuiManagedKunConfig(
       skills: skillCapability,
       mcp: {
         ...mcp,
-        ...(scheduleMcp || mcpSearch.enabled ? { enabled: mcp.enabled === false ? false : true } : {}),
-        ...(scheduleMcp
-          ? {
-              servers: {
-                ...objectValue(mcp.servers),
-                [GUI_SCHEDULE_MCP_SERVER_NAME]: buildGuiScheduleKunMcpServer(scheduleMcp.settings, scheduleMcp.launch)
-              }
-            }
+        ...(options?.scheduleMcp || mcpSearch.enabled || hasImportedEnabledMcpServer
+          ? { enabled: mcp.enabled === false ? false : true }
           : {}),
+        servers: {
+          ...objectValue(mcp.servers),
+          ...importedMcpServers,
+          ...(options?.scheduleMcp
+          ? {
+              [GUI_SCHEDULE_MCP_SERVER_NAME]: buildGuiScheduleKunMcpServer(
+                options.scheduleMcp.settings,
+                options.scheduleMcp.launch
+              )
+            }
+          : {})
+        },
         search: {
           ...search,
           enabled: mcpSearch.enabled,
@@ -397,6 +416,102 @@ function uniqueStrings(values: string[]): string[] {
     out.push(value)
   }
   return out
+}
+
+async function readGuiManagedMcpServers(path: string): Promise<Record<string, unknown>> {
+  const parsed = await readJsonObjectIfExists(path)
+  if (!parsed) return {}
+
+  const rawServers = mcpServersFromGuiConfig(parsed)
+  const normalizedEntries = Object.entries(rawServers)
+    .map(([serverId, server]) => {
+      const normalized = normalizeGuiManagedMcpServer(server)
+      return normalized ? [serverId, normalized] as const : null
+    })
+    .filter((entry): entry is readonly [string, Record<string, unknown>] => entry !== null)
+
+  return Object.fromEntries(normalizedEntries)
+}
+
+function mcpServersFromGuiConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const directServers = objectValue(config.servers)
+  if (Object.keys(directServers).length > 0) return directServers
+
+  const capabilities = objectValue(config.capabilities)
+  const mcp = objectValue(capabilities.mcp)
+  return objectValue(mcp.servers)
+}
+
+function normalizeGuiManagedMcpServer(server: unknown): Record<string, unknown> | null {
+  const raw = objectValue(server)
+  const command = scalarStringValue(raw.command)
+  const url = scalarStringValue(raw.url)
+  const args = stringArrayValue(raw.args)
+  const headers = stringRecordValue(raw.headers)
+  const env = stringRecordValue(raw.env)
+  const transport = normalizeMcpTransport(raw.transport, command, url)
+  if (!transport) return null
+
+  const trustedWorkspaceRoots = stringArrayValue(raw.trustedWorkspaceRoots)
+  const trustScope = normalizeMcpTrustScope(raw.trustScope, trustedWorkspaceRoots)
+  if (trustScope === 'workspace' && trustedWorkspaceRoots.length === 0) return null
+
+  const timeoutMs = positiveIntegerValue(raw.timeoutMs)
+  const parsed = McpServerConfig.safeParse({
+    enabled: raw.enabled === false || raw.disabled === true ? false : true,
+    transport,
+    ...(command ? { command } : {}),
+    ...(args.length > 0 ? { args } : {}),
+    ...(url ? { url } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(Object.keys(env).length > 0 ? { env } : {}),
+    trustScope,
+    ...(trustedWorkspaceRoots.length > 0 ? { trustedWorkspaceRoots } : {}),
+    ...(timeoutMs ? { timeoutMs } : {})
+  })
+
+  return parsed.success ? objectValue(parsed.data) : null
+}
+
+function normalizeMcpTransport(
+  value: unknown,
+  command: string | undefined,
+  url: string | undefined
+): 'stdio' | 'streamable-http' | 'sse' | null {
+  if (value === 'stdio' || value === 'streamable-http' || value === 'sse') return value
+  if (command) return 'stdio'
+  if (url) return 'streamable-http'
+  return null
+}
+
+function normalizeMcpTrustScope(
+  value: unknown,
+  trustedWorkspaceRoots: string[]
+): 'user' | 'workspace' {
+  if (value === 'user' || value === 'workspace') return value
+  return trustedWorkspaceRoots.length > 0 ? 'workspace' : 'user'
+}
+
+function scalarStringValue(value: unknown): string | undefined {
+  return typeof value === 'string'
+    ? value
+    : typeof value === 'number' || typeof value === 'boolean'
+      ? String(value)
+      : undefined
+}
+
+function stringRecordValue(value: unknown): Record<string, string> {
+  const record = objectValue(value)
+  const next: Record<string, string> = {}
+  for (const [key, item] of Object.entries(record)) {
+    const normalized = scalarStringValue(item)
+    if (normalized !== undefined) next[key] = normalized
+  }
+  return next
+}
+
+function positiveIntegerValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
 }
 
 function modelConfigForRuntime(existing: Record<string, unknown>): Record<string, unknown> {

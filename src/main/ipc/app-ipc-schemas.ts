@@ -250,6 +250,12 @@ const notificationsPatchSchema = z.object({
   turnComplete: z.boolean().optional()
 }).strict()
 
+const appBehaviorPatchSchema = z.object({
+  openAtLogin: z.boolean().optional(),
+  startMinimized: z.boolean().optional(),
+  closeToTray: z.boolean().optional()
+}).strict()
+
 const writeInlineCompletionPatchSchema = z.object({
   enabled: z.boolean().optional(),
   retrievalEnabled: z.boolean().optional(),
@@ -471,6 +477,7 @@ const settingsPatchObjectSchema = z.object({
   workspaceRoot: defaultPathSchema,
   log: logPatchSchema.optional(),
   notifications: notificationsPatchSchema.optional(),
+  appBehavior: appBehaviorPatchSchema.optional(),
   write: writeSettingsPatchSchema.optional(),
   claw: clawSettingsPatchSchema.optional(),
   schedule: scheduleSettingsPatchSchema.optional(),
@@ -712,7 +719,6 @@ export const guiUpdateChannelSchema = z.enum(GUI_UPDATE_CHANNELS).optional()
 
 export const desktopCommandSchema = z.enum(DESKTOP_COMMANDS)
 
-export const windowsTitleBarThemeSchema = z.enum(['light', 'dark'])
 
 export const logErrorPayloadSchema = z
   .object({

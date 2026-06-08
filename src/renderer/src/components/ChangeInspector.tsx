@@ -6,8 +6,8 @@ import type { ChatBlock, ToolBlock } from '../agent/types'
 import {
   countDiffStats,
   extractDiffFilePath,
+  extractUnifiedDiffText,
   formatFilePathForDisplay,
-  looksLikeUnifiedDiff
 } from '../lib/diff-stats'
 import { useChatStore } from '../store/chat-store'
 import { DiffView } from './DiffView'
@@ -36,12 +36,13 @@ export function ChangeInspector({
         return []
       }
 
-      const detailText = block.detail?.trim() ?? ''
-      if (!looksLikeUnifiedDiff(detailText)) return []
+      const detailText = extractUnifiedDiffText(block.detail)
+      if (!detailText) return []
 
       return [
         {
           ...block,
+          detail: detailText,
           filePath: extractDiffFilePath(detailText, block.filePath)
         }
       ]
