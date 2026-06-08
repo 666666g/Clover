@@ -1512,7 +1512,9 @@ export function Workbench(): ReactElement {
           {activeSddDraft ? (
             <SddDraftEditorView
               leftSidebarCollapsed={leftSidebarCollapsed}
+              assistantOpen={rightPanelMode === 'sdd-ai'}
               onToggleLeftSidebar={toggleLeftSidebar}
+              onToggleAssistant={() => toggleRightPanelMode('sdd-ai')}
               onNext={() => void handleSddNextStep()}
               onClose={() => {
                 void saveActiveSddDraftToDisk()
