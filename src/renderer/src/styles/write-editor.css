@@ -127,6 +127,10 @@ summary,
   background: var(--write-selection-bg);
 }
 
+.write-codemirror-host > .cm-editor.cm-write-live-preview.cm-focused > .cm-scroller > .cm-selectionLayer {
+  display: none;
+}
+
 .write-codemirror-host > .cm-editor .cm-content::selection,
 .write-codemirror-host > .cm-editor .cm-content *::selection {
   background: var(--write-selection-bg);
