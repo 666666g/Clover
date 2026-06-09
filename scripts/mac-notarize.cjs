@@ -1,4 +1,4 @@
-const { execFileSync } = require('node:child_process')
+const { execFileSync, spawnSync } = require('node:child_process')
 const { existsSync, mkdtempSync, rmSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join } = require('node:path')
@@ -42,6 +42,31 @@ function runNotaryToolJson(args) {
   }
 }
 
+function verifySecureTimestamp(appBundle) {
+  execFileSync('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appBundle], {
+    stdio: 'inherit'
+  })
+
+  const result = spawnSync('codesign', ['--display', '--verbose=4', appBundle], {
+    encoding: 'utf8'
+  })
+  if (result.error) {
+    throw result.error
+  }
+  const details = `${result.stdout || ''}${result.stderr || ''}`
+  console.log(details.trim())
+
+  if (result.status !== 0) {
+    throw new Error(`codesign --display failed with status ${result.status}`)
+  }
+
+  if (!/^Timestamp=/m.test(details)) {
+    throw new Error(
+      'The app signature is missing a secure timestamp. Ensure electron-builder mac.timestamp is enabled.'
+    )
+  }
+}
+
 exports.default = async function afterSign(context) {
   if (context.electronPlatformName !== 'darwin') {
     return
@@ -61,6 +86,8 @@ exports.default = async function afterSign(context) {
   const zipPath = join(context.appOutDir, `${context.packager.appInfo.productFilename}-notary.zip`)
 
   try {
+    verifySecureTimestamp(appBundle)
+
     execFileSync('ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', appBundle, zipPath], {
       stdio: 'inherit'
     })

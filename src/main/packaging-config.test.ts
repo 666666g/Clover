@@ -21,6 +21,34 @@ function touch(path: string): void {
   writeFileSync(path, '{}\n', 'utf8')
 }
 
+function loadBuilderConfigWithEnv(env: Record<string, string | undefined>): typeof builderConfig {
+  const configPath = require.resolve('../../electron-builder.config.cjs')
+  const previous = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key])
+    if (value === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+  }
+
+  delete require.cache[configPath]
+  try {
+    return require(configPath)
+  } finally {
+    delete require.cache[configPath]
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+    require(configPath)
+  }
+}
+
 function createMacPackContext(root: string): {
   appOutDir: string
   electronPlatformName: string
@@ -97,5 +125,15 @@ describe('electron-builder Kun packaging', () => {
       command: 'npm',
       args: ['prune']
     })
+  })
+
+  it('requires Apple secure timestamps when Developer ID signing is enabled', () => {
+    const signedConfig = loadBuilderConfigWithEnv({
+      MAC_SIGN: '1'
+    })
+
+    expect(signedConfig.mac.identity).toBeUndefined()
+    expect(signedConfig.mac.hardenedRuntime).toBe(true)
+    expect(signedConfig.mac.timestamp).toBe('http://timestamp.apple.com/ts01')
   })
 })
