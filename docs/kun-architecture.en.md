@@ -1,6 +1,6 @@
 # Kun GUI single-runtime architecture
 
-This document describes how DeepSeek GUI should now be organized around one dedicated runtime,
+This document describes how the Kun desktop app should now be organized around one dedicated runtime,
 `Kun`, that serves the GUI through a single HTTP/SSE boundary.
 The conclusion is clear up front: the GUI keeps one agent with the only ID
 `kun`; Code, Write, and Connect phone all flow through the same `kun serve`
@@ -277,7 +277,7 @@ npm run build
 
 Manual smoke checks:
 
-1. Open DeepSeek GUI.
+1. Open the Kun desktop app.
 2. Code can create a new session, send messages, stream output, and use approval/interruption.
 3. Write opens writing space; inline completion and inline selected-text assistant share API key.
 4. Connect phone can save settings, run manual tasks, and write thread IDs back to Kun mapping.

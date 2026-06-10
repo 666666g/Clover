@@ -5,7 +5,7 @@
 # invented. Anything not in this block is editorial, not authoritative.
 
 schema_version: 1
-project: DeepSeek-GUI
+project: Kun
 single_runtime: kun
 themes: [light, dark, system]
 
@@ -286,7 +286,7 @@ i18n:
 
 # ---------- 13. Brand & voice ----------
 brand:
-  product_name: "DeepSeek GUI"
+  product_name: "Kun"
   tagline: "把 Kun 的本地智能体能力带进桌面窗口"
   hero_kw: [Code, Write, Connect phone]
   pillars:
@@ -323,7 +323,7 @@ dont:
   - "Use a border radius smaller than 4px on a clickable surface."
 ---
 
-# DeepSeek GUI — DESIGN.md
+# Kun — DESIGN.md
 
 > 单一权威设计文档。所有屏幕、所有组件、所有视觉决策,都从这里出。
 
@@ -353,8 +353,8 @@ the frontmatter wins, and the markdown needs an update.
 
 ## 1. Project at a glance
 
-DeepSeek GUI is a local desktop workbench for the **Kun**
-runtime. The desktop shell is Electron; the runtime is a TypeScript
+Kun (formerly DeepSeek GUI) is a local desktop workbench built
+around its namesake **Kun** runtime. The desktop shell is Electron; the runtime is a TypeScript
 package that speaks HTTP/SSE; the renderer is React 19 + Zustand 5;
 the visual system is TailwindCSS 3 with a hand-built token layer on
 top.
@@ -588,7 +588,7 @@ containing many cells. Do not animate the composer.
 
 ### 3.9 Layout grammar
 
-Every screen in DeepSeek GUI follows the same macro-grammar:
+Every screen in Kun follows the same macro-grammar:
 
 - **Topbar**: a translucent strip with the back button, session
   title, mode switcher, and right-side action cluster. The topbar
@@ -619,7 +619,8 @@ first.
   Write, and Connect phone"), second person for the user. No emoji. No
   marketing language. Error messages are full sentences ending in
   punctuation; never a raw stack trace.
-- The product name is "DeepSeek GUI". The runtime is "Kun".
+- The product name is "Kun" (formerly "DeepSeek GUI"). The bundled
+  runtime shares the name; say "Kun runtime" when the distinction matters.
   The main workbenches are "Code" and "Write"; the phone/IM surface is
   "Connect phone" in English and "连接手机" in zh copy. Internal code may
   still say `claw`, but production copy should not expose it as the product name.
@@ -1118,7 +1119,8 @@ only which renderer and local workflow state the store pulls in.
 | GUI logs | OS app-data dir / `log/` | NDJSON | `logger.ts` |
 | Inline completion debug | OS app-data dir | NDJSON | `write-inline-completion-service.ts` |
 
-Default OS app-data paths:
+Default OS app-data paths (derived from the Electron `productName`,
+which current builds still ship as `DeepSeek GUI`):
 
 - macOS: `~/Library/Application Support/DeepSeek GUI`
 - Windows: `%APPDATA%\DeepSeek GUI`

@@ -1,6 +1,6 @@
 # Security Policy
 
-Thank you for helping keep DeepSeek GUI and its users safe.
+Thank you for helping keep Kun and its users safe.
 
 ## Supported Versions
 

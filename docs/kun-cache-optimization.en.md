@@ -1,6 +1,6 @@
 # Kun cache optimization technical documentation
 
-This article records the cache optimization design, implementation location, and implementation of the current Kun runtime of DeepSeek GUI.
+This article records the cache optimization design, implementation location, and implementation of the current Kun runtime.
 Statistical caliber and subsequent evolution direction. The goal is not to simply "get the cache numbers high" but to keep the GUI and
 the local agent's request prefix long-term stable, verifiable, and observable across Code, Write, and Connect phone.
 

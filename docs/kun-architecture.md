@@ -1,6 +1,6 @@
 # Kun GUI 单运行时方案
 
-本文记录 DeepSeek GUI 现在应该如何围绕一个专门服务 GUI 的
+本文记录 Kun 桌面应用现在应该如何围绕一个专门服务 GUI 的
 Kun 改造。结论先说清楚：GUI 只保留一个 agent，唯一 ID 是
 `kun`；Code、Write、连接手机都通过同一条 `kun serve`
 HTTP/SSE 边界工作；CodeWhale、Reasonix、绘画/设计类入口、运行时
@@ -270,7 +270,7 @@ npm run build
 
 手动冒烟：
 
-1. 打开 DeepSeek GUI。
+1. 打开 Kun 桌面应用。
 2. Code 新建会话，能创建 thread、发送消息、流式返回、审批/中断可用。
 3. Write 打开写作空间，inline completion 和选中文本助手能用同一个 API key。
 4. 连接手机能保存设置、运行手动 task、把 thread id 写回 Kun mapping。

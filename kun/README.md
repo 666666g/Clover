@@ -1,6 +1,6 @@
 # Kun
 
-Kun is the local HTTP/SSE agent runtime for DeepSeek-GUI. It exposes a
+Kun is the local HTTP/SSE agent runtime for the Kun desktop app. It exposes a
 TypeScript-typed agent loop with a stable, GUI-friendly contract:
 
 - `kun serve` starts a local HTTP server with `/v1/*` routes.
@@ -11,7 +11,7 @@ TypeScript-typed agent loop with a stable, GUI-friendly contract:
 
 The name Kun is inspired by the great fish in Zhuangzi's line,
 "In the northern sea there is a fish; its name is Kun." In
-DeepSeek-GUI, it means a deeper local runtime rather than a thin model
+this project, it means a deeper local runtime rather than a thin model
 UI: one agent loop that can carry project context, call tools
 reliably, resume sessions, and serve desktop chat, writing, phone
 connections, and scheduled tasks.
@@ -413,7 +413,7 @@ stay local to one thread, leave it as a pinned constraint.
 
 ## GUI integration
 
-After the legacy provider retirement, the DeepSeek-GUI main process
+After the legacy provider retirement, the desktop app main process
 starts Kun through `kun-process.ts` and routes all
 `runtimeRequest` calls to the active base URL with a bearer token.
 The renderer uses the same `AgentProvider` interface as the legacy

@@ -1,6 +1,6 @@
 # 代理运行时说明
 
-DeepSeek GUI 当前只有一个可运行的本地 Agent 运行时：**Kun**。
+Kun 桌面应用当前只有一个可运行的本地 Agent 运行时：仓库自带的同名 **Kun** 运行时。
 
 不要新增第二套运行时、运行时切换器、运行时诊断面板，或旧的 CodeWhale / Reasonix 进程路径。Code、Write、连接手机三个入口都统一走同一个 Kun HTTP/SSE 边界。连接手机在代码内部仍沿用 `claw` 命名作为兼容标识。
 

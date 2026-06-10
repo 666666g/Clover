@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src/asset/img/deepseek.png" width="96" alt="DeepSeek GUI icon">
+  <img src="src/asset/img/deepseek.png" width="96" alt="Kun icon">
 </p>
 
-# DeepSeek GUI
+# Kun
 
 [简体中文](./README.md) | English
 
@@ -10,10 +10,10 @@
 
 [Website](https://deepseek-gui.com) | [Download](https://deepseek-gui.com)
 
-[![GitHub release](https://img.shields.io/github/v/release/XingYu-Zhong/DeepSeek-GUI?label=github)](https://github.com/XingYu-Zhong/DeepSeek-GUI/releases)
-[![License](https://img.shields.io/github/license/XingYu-Zhong/DeepSeek-GUI)](./LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/KunAgent/Kun?label=github)](https://github.com/KunAgent/Kun/releases)
+[![License](https://img.shields.io/github/license/KunAgent/Kun)](./LICENSE)
 
-DeepSeek GUI is a local desktop workbench for developers and frequent AI users. It uses Kun as the only runtime and turns the terminal agent experience into an easier, longer-lived app: choose a workspace, start a task, watch reasoning and tool calls stream in, review file changes, and approve sensitive actions when needed.
+Kun (formerly DeepSeek GUI) is a local desktop workbench for developers and frequent AI users. It uses its namesake local runtime (shipped under `kun/`) as the only agent runtime and turns the terminal agent experience into an easier, longer-lived app: choose a workspace, start a task, watch reasoning and tool calls stream in, review file changes, and approve sensitive actions when needed.
 
 The goal is not to ship another chat wrapper. The goal is to make DeepSeek feel like a reliable desktop partner for real project work. Kun's core advantage is high token ROI: the same context budget spends less on repeated prefixes, giant tool catalogs, and runaway output, and more on the information that actually moves the task forward.
 
@@ -21,10 +21,10 @@ The goal is not to ship another chat wrapper. The goal is to make DeepSeek feel 
 
 <p align="center">
   <a href="src/asset/img/code.mp4">
-    <img src="src/asset/img/code.gif" width="410" alt="DeepSeek GUI Code mode demo">
+    <img src="src/asset/img/code.gif" width="410" alt="Kun Code mode demo">
   </a>
   <a href="src/asset/img/write.mp4">
-    <img src="src/asset/img/write.gif" width="410" alt="DeepSeek GUI Write mode demo">
+    <img src="src/asset/img/write.gif" width="410" alt="Kun Write mode demo">
   </a>
 </p>
 
@@ -102,8 +102,9 @@ The result: Kun is built for real project work with long tasks, long sessions, a
 
 ## Runtime: Kun
 
-The only active local agent runtime in DeepSeek-GUI today is
-**Kun** (shipped under `kun/`), a self-contained
+The only active local agent runtime in the Kun desktop app is the
+bundled runtime of the same name — **Kun** (shipped under `kun/`),
+which the whole project is named after. It is a self-contained
 TypeScript package that boots a local HTTP/SSE server as the
 single boundary between the GUI and the agent loop.
 
@@ -185,7 +186,7 @@ layout, and SSE event schema are documented in
 
 ## Workbench And Entry Points
 
-DeepSeek GUI is centered on two main workbenches, **Code** and **Write**,
+Kun is centered on two main workbenches, **Code** and **Write**,
 with additional entry points for **Connect phone**, **Scheduled tasks**,
 and **Plugins / Skills / MCP**. They share the same Kun runtime and
 settings, but keep sessions, workspaces, and layouts separate so you
@@ -196,7 +197,7 @@ can switch by task.
 The development workbench for real codebases: bind a local project directory, read and edit files, run commands, and review changes.
 
 <p align="center">
-  <img src="src/asset/img/codemode.png" alt="DeepSeek GUI Code mode" width="860">
+  <img src="src/asset/img/codemode.png" alt="Kun Code mode" width="860">
 </p>
 
 - Organize multiple agent sessions by workspace, with streamed reasoning, tool calls, and file changes in one view.
@@ -210,7 +211,7 @@ The development workbench for real codebases: bind a local project directory, re
 A dedicated Markdown writing workbench that keeps writing files, save state, and AI assistance separate from Code sessions.
 
 <p align="center">
-  <img src="src/asset/img/writemode.png" alt="DeepSeek GUI Write mode" width="860">
+  <img src="src/asset/img/writemode.png" alt="Kun Write mode" width="860">
 </p>
 
 - Manage `~/.deepseekgui/write_workspace` plus custom writing spaces from the left file tree.
@@ -223,7 +224,7 @@ A dedicated Markdown writing workbench that keeps writing files, save state, and
 Background automation and IM integration, so Kun can keep handling phone messages and scheduled jobs outside normal desktop chat.
 
 <p align="center">
-  <img src="src/asset/img/clawmode.png" alt="DeepSeek GUI Connect phone" width="860">
+  <img src="src/asset/img/clawmode.png" alt="Kun Connect phone" width="860">
 </p>
 
 - Configure dedicated agents for Feishu / Lark / WeChat and other channels, each with its own profile, default model, and workspace.
@@ -237,7 +238,7 @@ Background automation and IM integration, so Kun can keep handling phone message
 
 ### Download a Pre-built Package
 
-Download the latest build from [GitHub Releases](https://github.com/XingYu-Zhong/DeepSeek-GUI/releases):
+Download the latest build from [GitHub Releases](https://github.com/KunAgent/Kun/releases):
 
 | Platform | Package |
 | --- | --- |
@@ -252,8 +253,8 @@ On first launch, enter your [DeepSeek API key](https://platform.deepseek.com/api
 For contributors and local development:
 
 ```bash
-git clone https://github.com/XingYu-Zhong/DeepSeek-GUI.git
-cd DeepSeek-GUI
+git clone https://github.com/KunAgent/Kun.git
+cd Kun
 npm install
 npm run dev
 ```
@@ -274,7 +275,7 @@ npm install --registry=https://registry.npmmirror.com
 
 ## First Run
 
-1. Open DeepSeek GUI.
+1. Open Kun.
 2. Choose your interface language in the onboarding guide.
 3. Enter your DeepSeek API key; set a custom Base URL if needed.
 4. Choose a default workspace, or use the default directory created by the app.
@@ -298,7 +299,7 @@ See [Workbench And Entry Points](#workbench-and-entry-points) above for Connect 
 Settings manages:
 
 - DeepSeek API key, Base URL, runtime port, and runtime token.
-- Auto-start for the local runtime, plus optional custom `deepseek` path.
+- Auto-start for the local runtime, plus optional custom `kun` path.
 - Tool approval policy and filesystem access mode.
 - Default workspace, language, theme, font size, and completion notifications.
 - GUI updates and local error logs.
@@ -316,7 +317,7 @@ Keyboard shortcuts:
 
 ## Write Mode Design Notes
 
-Write mode extends DeepSeek GUI from a code/chat workbench into a long-form writing workspace. Its implementation borrows several ideas from the local `openhanako` reference project:
+Write mode extends Kun from a code/chat workbench into a long-form writing workspace. Its implementation borrows several ideas from the local `openhanako` reference project:
 
 - Markdown live editing: openhanako inspired the CodeMirror decorations approach where the active line stays editable as Markdown source while inactive lines render headings, tasks, images, dividers, and tables through widgets.
 - Selection inline agent: openhanako inspired the selection-capture and floating-input interaction, so selected text can be sent with file path, line numbers, and bounded original text as structured context.
@@ -326,6 +327,8 @@ Write mode extends DeepSeek GUI from a code/chat workbench into a long-form writ
 ---
 
 ## Uninstall
+
+> Published installers still use `DeepSeek GUI` as the application name; the steps and paths below follow the actual installed name.
 
 ### Windows
 
@@ -366,7 +369,7 @@ Kun data lives under `~/.deepseekgui/kun` or the configured Kun data dir. Check 
 
 ## Updates
 
-- For regular users: check GUI updates in Settings or download the latest installer from [GitHub Releases](https://github.com/XingYu-Zhong/DeepSeek-GUI/releases).
+- For regular users: check GUI updates in Settings or download the latest installer from [GitHub Releases](https://github.com/KunAgent/Kun/releases).
 
 ## Contributing
 
@@ -424,10 +427,10 @@ We are also grateful to:
 - **[LobsterAI](https://github.com/netease-youdao/LobsterAI)**: its IM management, QR binding, agent binding, and customizable agent-profile flows inspired the Connect phone integration in this project.
 - **OpenHanako**: its Markdown live editing, writing-space, and selection inline-agent patterns heavily informed Write mode.
 - **[DeepSeek](https://github.com/deepseek-ai)**: for the models and API.
-- Everyone who contributes issues, ideas, code, and documentation to DeepSeek GUI.
+- Everyone who contributes issues, ideas, code, and documentation to Kun.
 
-<a href="https://github.com/XingYu-Zhong/DeepSeek-GUI/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=XingYu-Zhong/DeepSeek-GUI" />
+<a href="https://github.com/KunAgent/Kun/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=KunAgent/Kun" />
 </a>
 
 > [!NOTE]
@@ -439,4 +442,4 @@ We are also grateful to:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/chart?repos=XingYu-Zhong/DeepSeek-GUI&type=date&legend=top-left)](https://www.star-history.com/?repos=XingYu-Zhong%2FDeepSeek-GUI&type=date&logscale=&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=KunAgent/Kun&type=date&legend=top-left)](https://www.star-history.com/?repos=KunAgent%2FKun&type=date&logscale=&legend=top-left)
