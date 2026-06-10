@@ -23,6 +23,16 @@ export type CapabilityToolSpec = {
   providerKind: ToolProviderKind
 }
 
+const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
+  'read',
+  'grep',
+  'find',
+  'ls',
+  'create_plan',
+  'user_input',
+  'request_user_input'
+])
+
 export class CapabilityRegistry {
   private readonly providers = new Map<string, CapabilityToolProvider>()
   private readonly tools = new Map<string, CapabilityToolRecord>()
@@ -110,9 +120,16 @@ export class CapabilityRegistry {
   }
 
   private canUseTool(toolName: string, context?: ToolHostContext): boolean {
+    if (isPlanModeContext(context) && !PLAN_MODE_ALLOWED_TOOL_NAMES.has(toolName)) {
+      return false
+    }
     const allowed = context?.allowedToolNames
     return !allowed || allowed.includes(toolName)
   }
+}
+
+function isPlanModeContext(context: ToolHostContext | undefined): boolean {
+  return context?.threadMode === 'plan' || Boolean(context?.guiPlan)
 }
 
 function providerPolicy(provider: ToolProviderPolicy): ToolProviderPolicy {

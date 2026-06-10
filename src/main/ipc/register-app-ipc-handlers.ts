@@ -28,6 +28,7 @@ import type { GuiUpdateDownloadResult, GuiUpdateInfo, GuiUpdateInstallResult, Gu
 import {
   clawMirrorPayloadSchema,
   clawImInstallPollPayloadSchema,
+  confirmDialogPayloadSchema,
   clawTaskFromTextPayloadSchema,
   deepseekConfigContentSchema,
   desktopCommandSchema,
@@ -475,6 +476,27 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       canceled: result.canceled,
       path: result.canceled ? null : (result.filePaths[0] ?? null)
     }
+  })
+
+  // Replaces window.confirm in the renderer: the synchronous native confirm
+  // leaves the WebContents unable to focus inputs after it closes
+  // (electron/electron#19977), which froze the composer after deleting threads.
+  ipcMain.handle('dialog:confirm', async (_, payload: unknown): Promise<boolean> => {
+    const request = parseIpcPayload('dialog:confirm', confirmDialogPayloadSchema, payload)
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      buttons: [request.confirmLabel ?? 'OK', request.cancelLabel ?? 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      message: request.message,
+      detail: request.detail,
+      noLink: true
+    }
+    const mainWindow = getMainWindow()
+    const result = mainWindow
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options)
+    return result.response === 0
   })
 
   ipcMain.handle(

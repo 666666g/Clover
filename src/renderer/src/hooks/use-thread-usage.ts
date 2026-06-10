@@ -73,47 +73,13 @@ export function formatPercent(value: number | null): string {
   return `${percent.toFixed(1)}%`
 }
 
-type CacheStats = {
-  hitTokens: number
-  missTokens: number
-}
-
-async function loadThreadCacheStats(threadId: string): Promise<CacheStats | null> {
-  if (typeof window.dsGui?.runtimeRequest !== 'function') return null
-  const r = await window.dsGui.runtimeRequest(
-    `/v1/threads/${encodeURIComponent(threadId)}`,
-    'GET'
-  )
-  if (!r.ok || !r.body.trim()) return null
-  const parsed = parseUsageResponse<{
-    turns?: Array<{ usage?: Record<string, unknown> | null }>
-  }>(r.body, 'thread detail')
-  let hitTokens = 0
-  let missTokens = 0
-  let hasCacheTelemetry = false
-
-  for (const turn of parsed.turns ?? []) {
-    const usage = turn.usage
-    if (!usage || typeof usage !== 'object') continue
-    const hasHit = hasFiniteNumber(usage, 'prompt_cache_hit_tokens')
-    const hasMiss = hasFiniteNumber(usage, 'prompt_cache_miss_tokens')
-    if (!hasHit && !hasMiss) continue
-    hasCacheTelemetry = true
-    const hit = hasHit ? usageNumber(usage.prompt_cache_hit_tokens) : 0
-    const miss = hasMiss ? usageNumber(usage.prompt_cache_miss_tokens) : 0
-    hitTokens += hit
-    missTokens += miss
-  }
-
-  return hasCacheTelemetry ? { hitTokens, missTokens } : null
-}
-
 export async function loadThreadUsage(threadId: string): Promise<ThreadUsageSummary | null> {
   if (typeof window.dsGui?.runtimeRequest !== 'function') return null
-  const [r, cacheStats] = await Promise.all([
-    window.dsGui.runtimeRequest('/v1/usage?group_by=thread', 'GET'),
-    loadThreadCacheStats(threadId).catch(() => null)
-  ])
+  const params = new URLSearchParams({
+    group_by: 'thread',
+    thread_id: threadId
+  })
+  const r = await window.dsGui.runtimeRequest(`/v1/usage?${params.toString()}`, 'GET')
   if (!r.ok || !r.body.trim()) return null
   const parsed = parseUsageResponse<{
     buckets?: Array<Record<string, unknown>>
@@ -128,20 +94,13 @@ export async function loadThreadUsage(threadId: string): Promise<ThreadUsageSumm
   const reasoningTokens = usageNumber(bucket.reasoning_tokens)
   const bucketCacheHitRate = usageRate(bucket.cache_hit_rate)
   const hasBucketCacheTelemetry = bucketCacheHitRate !== null
-  const cachedTokens = cacheStats
-    ? cacheStats.hitTokens
-    : hasBucketCacheTelemetry
+  const cachedTokens = hasBucketCacheTelemetry
       ? usageNumber(bucket.cached_tokens)
       : 0
-  const cacheMissTokens = cacheStats
-    ? cacheStats.missTokens
-    : hasBucketCacheTelemetry
+  const cacheMissTokens = hasBucketCacheTelemetry
       ? usageNumber(bucket.cache_miss_tokens)
       : 0
-  const cacheTotal = cachedTokens + cacheMissTokens
-  const cacheHitRate = cacheStats
-    ? cacheTotal > 0 ? cachedTokens / cacheTotal : null
-    : bucketCacheHitRate
+  const cacheHitRate = bucketCacheHitRate
   const totalTokens = inputTokens + outputTokens
   const costUsd = usageNumber(bucket.cost_usd)
   const costCny = hasFiniteNumber(bucket, 'cost_cny') ? usageNumber(bucket.cost_cny) : null

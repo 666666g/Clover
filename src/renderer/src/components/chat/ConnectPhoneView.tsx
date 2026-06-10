@@ -29,6 +29,7 @@ import type {
   ClawModel
 } from '@shared/app-settings'
 import type { ClawImInstallPollResult, ClawImInstallQrResult } from '@shared/ds-gui-api'
+import { confirmDialog } from '../../lib/confirm-dialog'
 import {
   type ClawInstallQrState,
   type ClawInstallTarget,
@@ -841,7 +842,7 @@ export function ConnectPhoneSidebarPanel({
 
   const disconnectChannel = async (): Promise<void> => {
     if (!connectedChannel || disconnecting) return
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       t('connectPhoneDisconnectConfirm', { name: connectedChannel.label })
     )
     if (!confirmed) return

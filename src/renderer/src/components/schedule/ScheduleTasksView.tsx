@@ -33,6 +33,7 @@ import {
   type ScheduledTaskV1
 } from '@shared/app-settings'
 import { rendererRuntimeClient } from '../../agent/runtime-client'
+import { confirmDialog } from '../../lib/confirm-dialog'
 import { formatWorkspacePickerError } from '../../lib/format-workspace-picker-error'
 import { SidebarTitlebarToggleButton } from '../sidebar/SidebarPrimitives'
 import { ScheduleDefaultsDialog } from './ScheduleDefaultsDialog'
@@ -356,7 +357,7 @@ export function ScheduleTasksView({
 
   const deleteTask = async (taskId: string): Promise<void> => {
     if (!schedule) return
-    if (!window.confirm(t('scheduleDeleteConfirm'))) return
+    if (!(await confirmDialog(t('scheduleDeleteConfirm')))) return
     await persistSchedule({ tasks: schedule.tasks.filter((task) => task.id !== taskId) })
   }
 

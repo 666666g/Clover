@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
+import { LocalToolHost, buildDefaultLocalTools } from '../src/adapters/tool/local-tool-host.js'
 import {
   CREATE_PLAN_INPUT_SCHEMA,
   CREATE_PLAN_TOOL_NAME,
@@ -75,6 +75,32 @@ describe('create_plan tool: advertisement', () => {
     const host = new LocalToolHost({ tools: [createCreatePlanTool()] })
     const tools = await host.listTools(buildContext({ threadMode: 'plan' }))
     expect(tools.map((t) => t.name)).toContain(CREATE_PLAN_TOOL_NAME)
+  })
+
+  it('limits default plan-mode tool advertisement to read-only investigation and create_plan', async () => {
+    const host = new LocalToolHost({ tools: buildDefaultLocalTools() })
+    const tools = await host.listTools(buildContext({ threadMode: 'plan' }))
+    const names = tools.map((tool) => tool.name)
+
+    expect(names).toEqual([
+      'read',
+      'grep',
+      'find',
+      'ls',
+      'user_input',
+      'request_user_input',
+      CREATE_PLAN_TOOL_NAME
+    ])
+    expect(names).not.toEqual(expect.arrayContaining(['bash', 'edit', 'write', 'echo']))
+  })
+
+  it('keeps the normal agent-mode default tool advertisement unchanged', async () => {
+    const host = new LocalToolHost({ tools: buildDefaultLocalTools() })
+    const tools = await host.listTools(buildContext({ threadMode: 'agent' }))
+    const names = tools.map((tool) => tool.name)
+
+    expect(names).toEqual(expect.arrayContaining(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'echo']))
+    expect(names).not.toContain(CREATE_PLAN_TOOL_NAME)
   })
 })
 
@@ -224,6 +250,50 @@ describe('create_plan tool: execution safety', () => {
       })
     )
     expect(result.isError).toBe(true)
+  })
+
+  it('rejects non-plan mutation tools through the tool host during plan mode', async () => {
+    const host = new LocalToolHost({ tools: buildDefaultLocalTools() })
+    const context = buildContext({ threadMode: 'plan' })
+
+    for (const toolName of ['write', 'edit', 'bash']) {
+      await expect(
+        host.execute(
+          {
+            callId: `call_${toolName}`,
+            toolName,
+            arguments: toolName === 'bash'
+              ? { command: 'touch forbidden.txt' }
+              : { path: 'forbidden.txt', content: 'nope', oldText: 'nope', newText: 'no' }
+          },
+          context
+        )
+      ).rejects.toThrow(/not advertised by active tool policy/)
+    }
+  })
+
+  it('still executes create_plan through the tool host during plan mode', async () => {
+    const host = new LocalToolHost({
+      tools: buildDefaultLocalTools({
+        listPlanFiles: () => [],
+        writePlan: async (target) => ({ path: target.absolutePath, savedAt: 'now' })
+      })
+    })
+    const result = await host.execute(
+      {
+        callId: 'call_plan',
+        toolName: CREATE_PLAN_TOOL_NAME,
+        arguments: { markdown: '# allowed', operation: 'draft', title: 'safe plan' }
+      },
+      buildContext({ threadMode: 'plan', workspace: '/tmp/ws' })
+    )
+
+    expect(result.item.kind).toBe('tool_result')
+    expect(result.item.kind === 'tool_result' ? result.item.isError : true).not.toBe(true)
+    expect(result.item.kind === 'tool_result'
+      ? (result.item.output as { relative_path?: string }).relative_path
+      : ''
+    ).toBe('.kunsdd/plan/safe-plan.md')
   })
 })
 

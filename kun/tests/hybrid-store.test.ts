@@ -13,6 +13,7 @@ import { InflightTracker } from '../src/loop/inflight-tracker.js'
 import { SteeringQueue } from '../src/loop/steering-queue.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
 import { SequentialIdGenerator } from '../src/ports/id-generator.js'
+import type { UsageSnapshot } from '../src/contracts/usage.js'
 
 describe('HybridThreadStore', () => {
   let dataDir = ''
@@ -61,6 +62,20 @@ describe('HybridThreadStore', () => {
     })
   })
 
+  it('lists existing SQLite rows without replaying damaged message or event logs', async () => {
+    const first = await createHybridStores()
+    const record = await seedThreadWithMessage(first.threadStore, first.sessionStore, 'indexed already')
+    first.threadStore.close()
+
+    await writeFile(join(dataDir, 'threads', record.id, 'messages.jsonl'), '{not-json\n', 'utf8')
+    await writeFile(join(dataDir, 'threads', record.id, 'events.jsonl'), '{not-json\n', 'utf8')
+
+    const reopened = await createHybridStores()
+    const summaries = await reopened.threadStore.list({ search: 'Hybrid demo' })
+
+    expect(summaries.map((thread) => thread.id)).toEqual([record.id])
+  })
+
   it('rebuilds the SQLite index from JSONL after the database is deleted', async () => {
     const first = await createHybridStores()
     const record = await seedThreadWithMessage(first.threadStore, first.sessionStore, 'recover me')
@@ -71,6 +86,7 @@ describe('HybridThreadStore', () => {
     await rm(join(dataDir, 'index.sqlite3-shm'), { force: true })
 
     const rebuilt = await createHybridStores()
+    await rebuilt.threadStore.waitForBackfill()
     const summaries = await rebuilt.threadStore.list({ search: 'Hybrid demo' })
     expect(summaries.map((thread) => thread.id)).toEqual([record.id])
 
@@ -79,6 +95,60 @@ describe('HybridThreadStore', () => {
       kind: 'user_message',
       text: 'recover me'
     })
+  })
+
+  it('indexes event high water and usage events as they are appended', async () => {
+    if (!sqliteAvailable) return
+    const { threadStore, sessionStore } = await createHybridStores()
+    const record = await seedThreadWithMessage(threadStore, sessionStore, 'track usage')
+    await sessionStore.appendEvent(record.id, {
+      kind: 'usage',
+      seq: 2,
+      timestamp: '2026-06-04T00:00:03.000Z',
+      threadId: record.id,
+      turnId: 'turn_hybrid',
+      model: 'deepseek-chat',
+      usage: usage({ promptTokens: 10, completionTokens: 5, totalTokens: 15, turns: 1 })
+    })
+    await sessionStore.appendEvent(record.id, {
+      kind: 'usage',
+      seq: 5,
+      timestamp: '2026-06-04T00:00:05.000Z',
+      threadId: record.id,
+      turnId: 'turn_hybrid',
+      model: 'deepseek-chat',
+      usage: usage({ promptTokens: 30, completionTokens: 10, totalTokens: 40, turns: 2 })
+    })
+
+    await writeFile(join(dataDir, 'threads', record.id, 'events.jsonl'), '{not-json\n', 'utf8')
+
+    await expect(sessionStore.highestSeq(record.id)).resolves.toBe(5)
+    await expect(sessionStore.loadLatestUsageSnapshots()).resolves.toMatchObject([
+      {
+        threadId: record.id,
+        seq: 5,
+        usage: {
+          promptTokens: 30,
+          completionTokens: 10,
+          totalTokens: 40,
+          turns: 2
+        }
+      }
+    ])
+    await expect(sessionStore.loadUsageRecords({ threadId: record.id })).resolves.toMatchObject([
+      {
+        threadId: record.id,
+        model: 'deepseek-chat',
+        completedAt: '2026-06-04T00:00:03.000Z',
+        usage: { totalTokens: 15, turns: 1 }
+      },
+      {
+        threadId: record.id,
+        model: 'deepseek-chat',
+        completedAt: '2026-06-04T00:00:05.000Z',
+        usage: { totalTokens: 25, turns: 1 }
+      }
+    ])
   })
 
   it('recovers turn attachment ids from user messages when metadata is stripped', async () => {
@@ -314,6 +384,24 @@ describe('HybridThreadStore', () => {
       return true
     } catch {
       return false
+    }
+  }
+
+  function usage(overrides: Partial<UsageSnapshot>): UsageSnapshot {
+    const promptTokens = overrides.promptTokens ?? 10
+    const completionTokens = overrides.completionTokens ?? 5
+    const cacheHitTokens = overrides.cacheHitTokens ?? 0
+    const cacheMissTokens = overrides.cacheMissTokens ?? Math.max(promptTokens - cacheHitTokens, 0)
+    const cacheTotal = cacheHitTokens + cacheMissTokens
+    return {
+      promptTokens,
+      completionTokens,
+      totalTokens: overrides.totalTokens ?? promptTokens + completionTokens,
+      cachedTokens: overrides.cachedTokens ?? cacheHitTokens,
+      cacheHitTokens,
+      cacheMissTokens,
+      cacheHitRate: cacheTotal === 0 ? null : cacheHitTokens / cacheTotal,
+      turns: overrides.turns ?? 1
     }
   }
 })

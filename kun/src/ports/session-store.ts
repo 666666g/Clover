@@ -1,6 +1,21 @@
 import type { AgentSession } from '../domain/session.js'
 import type { RuntimeEvent } from '../contracts/events.js'
 import type { TurnItem } from '../contracts/items.js'
+import type { UsageSnapshot } from '../contracts/usage.js'
+
+export type SessionUsageRecord = {
+  threadId: string
+  turnId?: string
+  model?: string
+  completedAt: string
+  usage: UsageSnapshot
+}
+
+export type SessionLatestUsageSnapshot = {
+  threadId: string
+  seq: number
+  usage: UsageSnapshot
+}
 
 /**
  * Port for persisted per-thread activity.
@@ -26,6 +41,13 @@ export interface SessionStore {
   upsertSession(session: AgentSession): Promise<void>
   /** Highest known per-thread `seq`. Returns 0 when no events have been recorded. */
   highestSeq(threadId: string): Promise<number>
+  /**
+   * Optional indexed usage query. Implementations may return per-event
+   * usage deltas without replaying the full event log.
+   */
+  loadUsageRecords?(options?: { threadId?: string }): Promise<SessionUsageRecord[]>
+  /** Optional indexed latest cumulative usage snapshot query. */
+  loadLatestUsageSnapshots?(options?: { threadIds?: string[] }): Promise<SessionLatestUsageSnapshot[]>
   /** Forget the per-thread in-memory state without touching disk. */
   resetMemory(): Promise<void>
 }

@@ -46,7 +46,10 @@ export function buildEventStreamResponse(input: {
       }
       input.request.signal.addEventListener('abort', close)
       try {
-        const backlog = await input.sessionStore.loadEventsSince(input.threadId, sinceSeq)
+        const highestSeq = await input.sessionStore.highestSeq(input.threadId).catch(() => 0)
+        const backlog = sinceSeq >= highestSeq
+          ? []
+          : await input.sessionStore.loadEventsSince(input.threadId, sinceSeq)
         for (const event of backlog) {
           controller.enqueue(encoder.encode(encodeSseEvent(event)))
         }

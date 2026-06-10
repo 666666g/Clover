@@ -16,8 +16,14 @@ import type { TurnItem } from '../../contracts/items.js'
 import type { Turn } from '../../contracts/turns.js'
 import type { ApprovalPolicy, SandboxMode } from '../../contracts/policy.js'
 import type { ThreadStore, ThreadStoreListOptions } from '../../ports/thread-store.js'
+import type { SessionLatestUsageSnapshot, SessionUsageRecord } from '../../ports/session-store.js'
 import { toThreadSummary } from '../../domain/thread.js'
 import { readJsonl } from '../file/file-thread-store.js'
+import {
+  emptyUsageSnapshot,
+  UsageSnapshotSchema,
+  type UsageSnapshot
+} from '../../contracts/usage.js'
 
 type ThreadMetadataLine = {
   kind: 'thread_metadata'
@@ -66,6 +72,15 @@ type ThreadIndexRecord = {
   preview: string
 }
 
+type UsageRow = {
+  thread_id: string
+  seq: number
+  timestamp: string
+  turn_id: string | null
+  model: string | null
+  usage_json: string
+}
+
 /**
  * Hybrid store inspired by Codex: JSONL files are canonical and SQLite
  * is a rebuildable index. SQLite writes always happen after metadata
@@ -77,6 +92,7 @@ export class HybridThreadStore implements ThreadStore {
   private readonly nowIso: () => string
   private readonly readyPromise: Promise<void>
   private readonly metadataQueues = new Map<string, Promise<void>>()
+  private backfillPromise: Promise<void> | null = null
   private db: BetterSqliteDatabase | null = null
 
   constructor(options: { dataDir: string; sqlitePath?: string; nowIso?: () => string }) {
@@ -96,6 +112,11 @@ export class HybridThreadStore implements ThreadStore {
     } finally {
       this.db = null
     }
+  }
+
+  async waitForBackfill(): Promise<void> {
+    await this.ready()
+    await this.backfillPromise
   }
 
   async list(options: ThreadStoreListOptions = {}): Promise<ThreadSummary[]> {
@@ -130,7 +151,7 @@ export class HybridThreadStore implements ThreadStore {
 
     const thread = await this.readThreadFromDisk(threadId)
     if (thread && this.db) {
-      this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
+      this.upsertIndexBestEffort(this.indexRecordForThread(thread))
     }
     return thread
   }
@@ -139,7 +160,7 @@ export class HybridThreadStore implements ThreadStore {
     await this.ready()
     await this.appendMetadata(thread)
     if (this.db) {
-      this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
+      this.upsertIndexBestEffort(this.indexRecordForThread(thread))
     }
     return thread
   }
@@ -158,21 +179,113 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   async noteEventSeq(threadId: string, seq: number): Promise<void> {
+    await this.noteEventHighWater(threadId, seq)
+  }
+
+  async noteEvent(event: RuntimeEvent): Promise<void> {
     await this.ready()
     if (!this.db) return
+    this.noteEventHighWaterSync(event.threadId, event.seq)
+    if (event.kind !== 'usage') return
     try {
       this.db
         .prepare(`
-          UPDATE threads
-          SET event_seq_high_water = CASE
-            WHEN event_seq_high_water > @seq THEN event_seq_high_water
-            ELSE @seq
-          END
-          WHERE id = @id
+          INSERT INTO usage_events (
+            thread_id, seq, timestamp, turn_id, model, usage_json
+          )
+          VALUES (
+            @thread_id, @seq, @timestamp, @turn_id, @model, @usage_json
+          )
+          ON CONFLICT(thread_id, seq) DO UPDATE SET
+            timestamp = excluded.timestamp,
+            turn_id = excluded.turn_id,
+            model = excluded.model,
+            usage_json = excluded.usage_json
         `)
-        .run({ id: threadId, seq })
+        .run(usageRowFromEvent(event))
     } catch (error) {
-      warnSqlite('note event seq', error)
+      warnSqlite('record usage event', error)
+    }
+  }
+
+  async getEventSeqHighWater(threadId: string): Promise<number | null> {
+    await this.ready()
+    if (!this.db) return null
+    try {
+      const row = this.db
+        .prepare('SELECT event_seq_high_water FROM threads WHERE id = ?')
+        .get(threadId) as { event_seq_high_water?: number } | undefined
+      return typeof row?.event_seq_high_water === 'number' ? row.event_seq_high_water : null
+    } catch (error) {
+      warnSqlite('read event high water', error)
+      return null
+    }
+  }
+
+  async loadUsageRecords(options: { threadId?: string } = {}): Promise<SessionUsageRecord[]> {
+    await this.ready()
+    if (!this.db) throw new Error('hybrid sqlite unavailable')
+    try {
+      const threadId = options.threadId?.trim()
+      const rows = threadId
+        ? this.db
+            .prepare(`
+              SELECT * FROM usage_events
+              WHERE thread_id = @thread_id
+              ORDER BY thread_id ASC, seq ASC
+            `)
+            .all({ thread_id: threadId }) as UsageRow[]
+        : this.db
+            .prepare('SELECT * FROM usage_events ORDER BY thread_id ASC, seq ASC')
+            .all() as UsageRow[]
+      return usageRecordsFromRows(rows)
+    } catch (error) {
+      warnSqlite('load usage records', error)
+      throw error
+    }
+  }
+
+  async loadLatestUsageSnapshots(options: { threadIds?: string[] } = {}): Promise<SessionLatestUsageSnapshot[]> {
+    await this.ready()
+    if (!this.db) throw new Error('hybrid sqlite unavailable')
+    try {
+      const threadIds = [...new Set((options.threadIds ?? []).map((id) => id.trim()).filter(Boolean))]
+      if (threadIds.length > 0) {
+        const placeholders = threadIds.map((_id, index) => `@id${index}`).join(', ')
+        const params = Object.fromEntries(threadIds.map((id, index) => [`id${index}`, id]))
+        const rows = this.db
+          .prepare(`
+            SELECT u.*
+            FROM usage_events u
+            JOIN (
+              SELECT thread_id, MAX(seq) AS seq
+              FROM usage_events
+              WHERE thread_id IN (${placeholders})
+              GROUP BY thread_id
+            ) latest
+              ON latest.thread_id = u.thread_id AND latest.seq = u.seq
+            ORDER BY u.thread_id ASC
+          `)
+          .all(params) as UsageRow[]
+        return latestUsageSnapshotsFromRows(rows)
+      }
+      const rows = this.db
+        .prepare(`
+          SELECT u.*
+          FROM usage_events u
+          JOIN (
+            SELECT thread_id, MAX(seq) AS seq
+            FROM usage_events
+            GROUP BY thread_id
+          ) latest
+            ON latest.thread_id = u.thread_id AND latest.seq = u.seq
+          ORDER BY u.thread_id ASC
+        `)
+        .all() as UsageRow[]
+      return latestUsageSnapshotsFromRows(rows)
+    } catch (error) {
+      warnSqlite('load latest usage snapshots', error)
+      throw error
     }
   }
 
@@ -186,7 +299,7 @@ export class HybridThreadStore implements ThreadStore {
       this.db.pragma('journal_mode = WAL')
       this.db.pragma('foreign_keys = ON')
       this.migrate()
-      await this.backfill()
+      this.startBackfill()
     } catch (error) {
       warnSqlite('initialize', error)
       try {
@@ -241,30 +354,85 @@ export class HybridThreadStore implements ThreadStore {
         ON threads(status, updated_at_ms DESC, id DESC);
       CREATE INDEX IF NOT EXISTS threads_relation_updated_idx
         ON threads(relation, updated_at_ms DESC, id DESC);
+      CREATE TABLE IF NOT EXISTS usage_events (
+        thread_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        turn_id TEXT,
+        model TEXT,
+        usage_json TEXT NOT NULL,
+        PRIMARY KEY(thread_id, seq)
+      );
+      CREATE INDEX IF NOT EXISTS usage_events_thread_seq_idx
+        ON usage_events(thread_id, seq);
+      CREATE INDEX IF NOT EXISTS usage_events_timestamp_idx
+        ON usage_events(timestamp);
     `)
     addColumnIfMissing(this.db, 'threads', 'todos_json TEXT')
   }
 
+  private startBackfill(): void {
+    if (this.backfillPromise) return
+    this.backfillPromise = this.backfill().catch((error) => {
+      warnSqlite('background backfill', error)
+    })
+  }
+
   private async backfill(): Promise<void> {
     if (!this.db) return
-    const discovered = new Set<string>()
+    const rows = this.db.prepare('SELECT id FROM threads').all() as Array<{ id: string }>
+    const indexed = new Set(rows.map((row) => row.id))
     for (const threadId of await this.threadIdsFromFilesystem()) {
+      if (indexed.has(threadId)) {
+        await this.backfillUsageEventsIfMissing(threadId)
+        await yieldToEventLoop()
+        continue
+      }
       const thread = await this.readThreadFromDisk(threadId)
       if (!thread) continue
-      discovered.add(thread.id)
-      this.upsertIndexBestEffort(await this.indexRecordForThread(thread))
+      this.upsertIndexBestEffort({
+        ...this.indexRecordForThread(thread),
+        eventSeqHighWater: await this.highestSeqFromEvents(thread.id)
+      })
+      await this.backfillUsageEventsIfMissing(thread.id)
+      await yieldToEventLoop()
     }
 
     try {
-      const rows = this.db.prepare('SELECT id FROM threads').all() as Array<{ id: string }>
       for (const row of rows) {
-        if (discovered.has(row.id)) continue
         if (!(await pathExists(this.threadDir(row.id)))) {
           this.deleteIndexRow(row.id)
         }
       }
     } catch (error) {
       warnSqlite('backfill cleanup', error)
+    }
+  }
+
+  private async backfillUsageEventsIfMissing(threadId: string): Promise<void> {
+    if (!this.db) return
+    try {
+      const existing = this.db
+        .prepare('SELECT 1 FROM usage_events WHERE thread_id = ? LIMIT 1')
+        .get(threadId)
+      if (existing) return
+      const events = await readJsonl<RuntimeEvent>(this.eventsPath(threadId))
+      for (const event of events) {
+        this.noteEventHighWaterSync(threadId, event.seq)
+        if (event.kind !== 'usage') continue
+        this.db
+          .prepare(`
+            INSERT OR REPLACE INTO usage_events (
+              thread_id, seq, timestamp, turn_id, model, usage_json
+            )
+            VALUES (
+              @thread_id, @seq, @timestamp, @turn_id, @model, @usage_json
+            )
+          `)
+          .run(usageRowFromEvent(event))
+      }
+    } catch (error) {
+      warnSqlite(`backfill usage events for ${threadId}`, error)
     }
   }
 
@@ -380,6 +548,7 @@ export class HybridThreadStore implements ThreadStore {
     if (!this.db) return
     try {
       this.db.prepare('DELETE FROM threads WHERE id = ?').run(threadId)
+      this.db.prepare('DELETE FROM usage_events WHERE thread_id = ?').run(threadId)
     } catch (error) {
       warnSqlite('delete index row', error)
     }
@@ -408,14 +577,12 @@ export class HybridThreadStore implements ThreadStore {
     }
   }
 
-  private async indexRecordForThread(thread: ThreadRecord): Promise<ThreadIndexRecord> {
-    const items = await this.loadItems(thread.id)
-    const itemSource = items.length > 0 ? items : thread.turns.flatMap((turn) => turn.items)
-    const eventSeqHighWater = await this.highestSeq(thread.id)
+  private indexRecordForThread(thread: ThreadRecord): ThreadIndexRecord {
+    const itemSource = thread.turns.flatMap((turn) => turn.items)
     return {
       thread,
       messageCount: itemSource.length,
-      eventSeqHighWater,
+      eventSeqHighWater: 0,
       preview: previewFromItems(itemSource)
     }
   }
@@ -471,9 +638,32 @@ export class HybridThreadStore implements ThreadStore {
     return ordered
   }
 
-  private async highestSeq(threadId: string): Promise<number> {
+  private async highestSeqFromEvents(threadId: string): Promise<number> {
     const events = await readJsonl<RuntimeEvent>(this.eventsPath(threadId))
     return events.reduce((max, event) => Math.max(max, event.seq), 0)
+  }
+
+  private async noteEventHighWater(threadId: string, seq: number): Promise<void> {
+    await this.ready()
+    this.noteEventHighWaterSync(threadId, seq)
+  }
+
+  private noteEventHighWaterSync(threadId: string, seq: number): void {
+    if (!this.db) return
+    try {
+      this.db
+        .prepare(`
+          UPDATE threads
+          SET event_seq_high_water = CASE
+            WHEN event_seq_high_water > @seq THEN event_seq_high_water
+            ELSE @seq
+          END
+          WHERE id = @id
+        `)
+        .run({ id: threadId, seq })
+    } catch (error) {
+      warnSqlite('note event seq', error)
+    }
   }
 
   private async listFromFilesystem(): Promise<ThreadSummary[]> {
@@ -832,6 +1022,143 @@ function previewFromItems(items: TurnItem[]): string {
   return ''
 }
 
+function usageRowFromEvent(event: RuntimeEvent & { kind: 'usage' }): UsageRow {
+  return {
+    thread_id: event.threadId,
+    seq: event.seq,
+    timestamp: event.timestamp,
+    turn_id: event.turnId ?? null,
+    model: event.model ?? null,
+    usage_json: JSON.stringify(event.usage)
+  }
+}
+
+function usageRecordsFromRows(rows: UsageRow[]): SessionUsageRecord[] {
+  const previousByThread = new Map<string, UsageSnapshot>()
+  const records: SessionUsageRecord[] = []
+  for (const row of rows) {
+    const usage = parseUsageSnapshot(row.usage_json)
+    if (!usage) continue
+    const previous = previousByThread.get(row.thread_id) ?? emptyUsageSnapshot()
+    const delta = diffUsage(usage, previous)
+    previousByThread.set(row.thread_id, usage)
+    if (!hasUsage(delta)) continue
+    records.push({
+      threadId: row.thread_id,
+      ...(row.turn_id ? { turnId: row.turn_id } : {}),
+      ...(row.model ? { model: row.model } : {}),
+      completedAt: row.timestamp,
+      usage: delta
+    })
+  }
+  return records
+}
+
+function latestUsageSnapshotsFromRows(rows: UsageRow[]): SessionLatestUsageSnapshot[] {
+  return rows.flatMap((row) => {
+    const usage = parseUsageSnapshot(row.usage_json)
+    if (!usage) return []
+    return [{
+      threadId: row.thread_id,
+      seq: row.seq,
+      usage
+    }]
+  })
+}
+
+function parseUsageSnapshot(raw: string): UsageSnapshot | null {
+  try {
+    const parsed = UsageSnapshotSchema.safeParse(JSON.parse(raw))
+    return parsed.success ? parsed.data : null
+  } catch {
+    return null
+  }
+}
+
+function diffUsage(current: UsageSnapshot, previous: UsageSnapshot): UsageSnapshot {
+  const promptTokens = diffNumber(current.promptTokens, previous.promptTokens)
+  const completionTokens = diffNumber(current.completionTokens, previous.completionTokens)
+  const reportedTotal = diffNumber(current.totalTokens, previous.totalTokens)
+  const totalTokens = reportedTotal || promptTokens + completionTokens
+  const cachedTokens = diffOptionalNumber(current.cachedTokens, previous.cachedTokens)
+  const cacheHitTokens = diffOptionalNumber(current.cacheHitTokens, previous.cacheHitTokens)
+  const cacheMissTokens = diffOptionalNumber(current.cacheMissTokens, previous.cacheMissTokens)
+  const cacheTotal = (cacheHitTokens ?? 0) + (cacheMissTokens ?? 0)
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(cacheHitTokens !== undefined ? { cacheHitTokens } : {}),
+    ...(cacheMissTokens !== undefined ? { cacheMissTokens } : {}),
+    cacheHitRate: cacheHitTokens !== undefined && cacheTotal > 0 ? cacheHitTokens / cacheTotal : null,
+    turns: diffNumber(current.turns, previous.turns),
+    ...(current.costUsd !== undefined || previous.costUsd !== undefined
+      ? { costUsd: diffNumber(current.costUsd ?? 0, previous.costUsd ?? 0) }
+      : {}),
+    ...(current.costCny !== undefined || previous.costCny !== undefined
+      ? { costCny: diffNumber(current.costCny ?? 0, previous.costCny ?? 0) }
+      : {}),
+    ...(current.cacheSavingsUsd !== undefined || previous.cacheSavingsUsd !== undefined
+      ? { cacheSavingsUsd: diffNumber(current.cacheSavingsUsd ?? 0, previous.cacheSavingsUsd ?? 0) }
+      : {}),
+    ...(current.cacheSavingsCny !== undefined || previous.cacheSavingsCny !== undefined
+      ? { cacheSavingsCny: diffNumber(current.cacheSavingsCny ?? 0, previous.cacheSavingsCny ?? 0) }
+      : {}),
+    ...(current.tokenEconomySavingsTokens !== undefined || previous.tokenEconomySavingsTokens !== undefined
+      ? {
+          tokenEconomySavingsTokens: diffNumber(
+            current.tokenEconomySavingsTokens ?? 0,
+            previous.tokenEconomySavingsTokens ?? 0
+          )
+        }
+      : {}),
+    ...(current.tokenEconomySavingsUsd !== undefined || previous.tokenEconomySavingsUsd !== undefined
+      ? {
+          tokenEconomySavingsUsd: diffNumber(
+            current.tokenEconomySavingsUsd ?? 0,
+            previous.tokenEconomySavingsUsd ?? 0
+          )
+        }
+      : {}),
+    ...(current.tokenEconomySavingsCny !== undefined || previous.tokenEconomySavingsCny !== undefined
+      ? {
+          tokenEconomySavingsCny: diffNumber(
+            current.tokenEconomySavingsCny ?? 0,
+            previous.tokenEconomySavingsCny ?? 0
+          )
+        }
+      : {}),
+    ...(current.hasError ? { hasError: true } : {})
+  }
+}
+
+function diffNumber(current: number, previous: number): number {
+  return Math.max(0, current - previous)
+}
+
+function diffOptionalNumber(current?: number, previous?: number): number | undefined {
+  if (current === undefined && previous === undefined) return undefined
+  return Math.max(0, (current ?? 0) - (previous ?? 0))
+}
+
+function hasUsage(usage: UsageSnapshot): boolean {
+  return usage.promptTokens > 0
+    || usage.completionTokens > 0
+    || usage.totalTokens > 0
+    || (usage.cachedTokens ?? 0) > 0
+    || (usage.cacheHitTokens ?? 0) > 0
+    || (usage.cacheMissTokens ?? 0) > 0
+    || usage.turns > 0
+    || (usage.costUsd ?? 0) > 0
+    || (usage.costCny ?? 0) > 0
+    || (usage.cacheSavingsUsd ?? 0) > 0
+    || (usage.cacheSavingsCny ?? 0) > 0
+    || (usage.tokenEconomySavingsTokens ?? 0) > 0
+    || (usage.tokenEconomySavingsUsd ?? 0) > 0
+    || (usage.tokenEconomySavingsCny ?? 0) > 0
+}
+
 function isoToMillis(value: string): number {
   const millis = Date.parse(value)
   return Number.isFinite(millis) ? millis : 0
@@ -871,6 +1198,10 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
 function warnSqlite(action: string, error: unknown): void {

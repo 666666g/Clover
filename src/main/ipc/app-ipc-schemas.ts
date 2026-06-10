@@ -73,6 +73,15 @@ export function isSafeOpenExternalUrl(value: string): boolean {
 
 export const defaultPathSchema = optionalTrimmedString(MAX_PATH_LENGTH)
 
+export const confirmDialogPayloadSchema = z
+  .object({
+    message: trimmedString(4_000),
+    detail: z.string().max(8_000).optional(),
+    confirmLabel: z.string().trim().max(200).optional(),
+    cancelLabel: z.string().trim().max(200).optional()
+  })
+  .strict()
+
 interface EndpointTemplate {
   /** Compiled path matcher. */
   match(path: string): boolean

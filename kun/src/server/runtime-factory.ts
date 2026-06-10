@@ -416,6 +416,17 @@ export async function seedUsageCarryover(input: {
   sessionStore: SessionStore
   usageService: UsageService
 }): Promise<void> {
+  if (typeof input.sessionStore.loadLatestUsageSnapshots === 'function') {
+    try {
+      const latest = await input.sessionStore.loadLatestUsageSnapshots()
+      for (const record of latest) {
+        input.usageService.seedThread(record.threadId, record.usage)
+      }
+      return
+    } catch {
+      // Fall through to JSONL replay when the optional index is unavailable.
+    }
+  }
   const threadSummaries = await input.threadStore.list()
   await Promise.all(threadSummaries.map(async (thread) => {
     const events = await input.sessionStore.loadEventsSince(thread.id, 0)

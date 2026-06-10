@@ -21,6 +21,8 @@ const api = {
     ipcRenderer.invoke('claw:im-install:poll', { provider, deviceCode }),
   pickWorkspaceDirectory: (defaultPath) =>
     ipcRenderer.invoke('workspace:pick-directory', defaultPath),
+  confirmDialog: (options) =>
+    ipcRenderer.invoke('dialog:confirm', options),
   listSkills: (workspaceRoot) =>
     ipcRenderer.invoke('skill:list', { workspaceRoot }),
   saveSkillFile: (rootPath, skillName, content) =>

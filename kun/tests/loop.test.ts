@@ -1439,6 +1439,120 @@ describe('AgentLoop', () => {
     }
   })
 
+  it('rejects forged write calls during plan mode without touching workspace files', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-forged-write-'))
+    const observedToolLists: string[][] = []
+    let calls = 0
+    try {
+      const h = makeHarness(
+        {
+          provider: 'planner',
+          model: 'planner',
+          async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+            observedToolLists.push(request.tools.map((tool) => tool.name))
+            calls += 1
+            if (calls === 1) {
+              yield {
+                kind: 'tool_call_complete',
+                callId: 'call_write',
+                toolName: 'write',
+                arguments: {
+                  path: 'forbidden.txt',
+                  content: 'should not exist'
+                }
+              }
+              yield { kind: 'completed', stopReason: 'tool_calls' }
+              return
+            }
+            yield { kind: 'assistant_text_delta', text: '## Plan\nStay read-only until build mode.\n' }
+            yield { kind: 'completed', stopReason: 'stop' }
+          }
+        },
+        { tools: buildDefaultLocalTools() }
+      )
+      await bootstrapThread(h, {
+        workspace,
+        request: {
+          prompt: 'Plan a safe change',
+          mode: 'plan'
+        }
+      })
+
+      const status = await h.loop.runTurn(h.threadId, h.turnId)
+      const items = await h.sessionStore.loadItems(h.threadId)
+      const writeCall = items.find((item) => item.kind === 'tool_call' && item.toolName === 'write')
+      const writeResult = items.find((item) => item.kind === 'tool_result' && item.toolName === 'write')
+
+      expect(status).toBe('completed')
+      expect(observedToolLists[0]).not.toEqual(expect.arrayContaining(['write', 'edit', 'bash']))
+      expect(writeCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+      expect(writeResult).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(writeResult?.kind === 'tool_result' ? JSON.stringify(writeResult.output) : '')
+        .toContain('not advertised by active tool policy')
+      await expect(readFile(join(workspace, 'forbidden.txt'), 'utf8')).rejects.toThrow()
+      await expect(readFile(join(workspace, '.kunsdd/plan/plan-a-safe-change.md'), 'utf8')).resolves.toBe(
+        '## Plan\nStay read-only until build mode.'
+      )
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects forged bash calls during plan mode without running mutating commands', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-forged-bash-'))
+    let calls = 0
+    try {
+      const h = makeHarness(
+        {
+          provider: 'planner',
+          model: 'planner',
+          async *stream(): AsyncIterable<ModelStreamChunk> {
+            calls += 1
+            if (calls === 1) {
+              yield {
+                kind: 'tool_call_complete',
+                callId: 'call_bash',
+                toolName: 'bash',
+                arguments: {
+                  command: 'touch forbidden.txt'
+                }
+              }
+              yield { kind: 'completed', stopReason: 'tool_calls' }
+              return
+            }
+            yield { kind: 'assistant_text_delta', text: '## Plan\nUse read-only inspection only.\n' }
+            yield { kind: 'completed', stopReason: 'stop' }
+          }
+        },
+        { tools: buildDefaultLocalTools() }
+      )
+      await bootstrapThread(h, {
+        workspace,
+        request: {
+          prompt: 'Plan without shell mutations',
+          mode: 'plan'
+        }
+      })
+
+      const status = await h.loop.runTurn(h.threadId, h.turnId)
+      const items = await h.sessionStore.loadItems(h.threadId)
+      const bashCall = items.find((item) => item.kind === 'tool_call' && item.toolName === 'bash')
+      const bashResult = items.find((item) => item.kind === 'tool_result' && item.toolName === 'bash')
+
+      expect(status).toBe('completed')
+      expect(bashCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+      expect(bashResult).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(bashResult?.kind === 'tool_result' ? JSON.stringify(bashResult.output) : '')
+        .toContain('not advertised by active tool policy')
+      await expect(readFile(join(workspace, 'forbidden.txt'), 'utf8')).rejects.toThrow()
+      await expect(readFile(join(workspace, '.kunsdd/plan/plan-without-shell-mutations.md'), 'utf8')).resolves.toBe(
+        '## Plan\nUse read-only inspection only.'
+      )
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('fails GUI plan turns only when neither create_plan nor plan text is returned', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-empty-'))
     try {

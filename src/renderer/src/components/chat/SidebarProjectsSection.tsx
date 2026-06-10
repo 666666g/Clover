@@ -17,6 +17,7 @@ import {
   Trash2
 } from 'lucide-react'
 import type { NormalizedThread } from '../../agent/types'
+import { confirmDialog } from '../../lib/confirm-dialog'
 import { formatRelativeTime } from '../../lib/format-relative-time'
 import { workspaceLabelFromPath } from '../../lib/workspace-label'
 import {
@@ -213,7 +214,7 @@ export function SidebarProjectsSection({
     const threadId = thread.id.trim()
     if (!threadId || deletingThreadIds[threadId]) return
     const confirmMessage = t('sidebarThreadDeleteConfirm', { title: thread.title })
-    if (!window.confirm(confirmMessage)) return
+    if (!(await confirmDialog(confirmMessage))) return
     setDeletingThreadIds((prev) => ({ ...prev, [threadId]: true }))
     try {
       await onDeleteThread(threadId)
@@ -230,7 +231,7 @@ export function SidebarProjectsSection({
     const threadId = thread.id.trim()
     if (!threadId || deletingThreadIds[threadId]) return
     const confirmMessage = t('sidebarThreadArchiveConfirm', { title: thread.title })
-    if (!window.confirm(confirmMessage)) return
+    if (!(await confirmDialog(confirmMessage))) return
     setDeletingThreadIds((prev) => ({ ...prev, [threadId]: true }))
     try {
       await onArchiveThread(threadId)
@@ -319,7 +320,7 @@ export function SidebarProjectsSection({
 
   const handleRemoveWorkspace = async (workspacePath: string): Promise<void> => {
     const confirmMessage = t('sidebarWorkspaceRemoveConfirm', { path: workspacePath })
-    if (!window.confirm(confirmMessage)) return
+    if (!(await confirmDialog(confirmMessage))) return
     await onRemoveWorkspace(workspacePath)
   }
 

@@ -1,7 +1,11 @@
 import type { RuntimeEvent } from '../../contracts/events.js'
 import type { TurnItem } from '../../contracts/items.js'
 import type { AgentSession } from '../../domain/session.js'
-import type { SessionStore } from '../../ports/session-store.js'
+import type {
+  SessionLatestUsageSnapshot,
+  SessionStore,
+  SessionUsageRecord
+} from '../../ports/session-store.js'
 import { FileSessionStore } from '../file/file-session-store.js'
 import type { HybridThreadStore } from './hybrid-thread-store.js'
 
@@ -28,7 +32,7 @@ export class HybridSessionStore implements SessionStore {
 
   async appendEvent(threadId: string, event: RuntimeEvent): Promise<void> {
     await this.delegate.appendEvent(threadId, event)
-    await this.index.noteEventSeq(threadId, event.seq)
+    await this.index.noteEvent(event)
   }
 
   async appendItem(threadId: string, item: TurnItem): Promise<void> {
@@ -60,7 +64,17 @@ export class HybridSessionStore implements SessionStore {
   }
 
   async highestSeq(threadId: string): Promise<number> {
+    const indexed = await this.index.getEventSeqHighWater(threadId)
+    if (indexed !== null) return indexed
     return this.delegate.highestSeq(threadId)
+  }
+
+  async loadUsageRecords(options?: { threadId?: string }): Promise<SessionUsageRecord[]> {
+    return this.index.loadUsageRecords(options)
+  }
+
+  async loadLatestUsageSnapshots(options?: { threadIds?: string[] }): Promise<SessionLatestUsageSnapshot[]> {
+    return this.index.loadLatestUsageSnapshots(options)
   }
 
   async resetMemory(): Promise<void> {

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { WorkspaceEntry } from '@shared/workspace-file'
+import { confirmDialog } from '../../lib/confirm-dialog'
 import { formatWorkspacePickerError } from '../../lib/format-workspace-picker-error'
 import { useChatStore, type SettingsRouteSection } from '../../store/chat-store'
 import {
@@ -222,7 +223,7 @@ export function WriteSidebar({
 
   const removeWorkspaceFromList = async (workspacePath: string): Promise<void> => {
     if (workspaceRoots.length <= 1) return
-    if (!window.confirm(t('writeRemoveWorkspaceConfirm', { name: writeBasenameFromPath(workspacePath) }))) return
+    if (!(await confirmDialog(t('writeRemoveWorkspaceConfirm', { name: writeBasenameFromPath(workspacePath) })))) return
     await removeWriteWorkspace(workspacePath)
   }
 

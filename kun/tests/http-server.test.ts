@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -681,6 +681,27 @@ describe('HTTP server', () => {
     expect(ids.every((id) => id > secondSeq)).toBe(true)
   })
 
+  it('skips SSE backlog replay when the client is already caught up', async () => {
+    const h = buildHarness()
+    const thread = await h.threadService.create(
+      { workspace: '/tmp', model: 'deepseek-chat', mode: 'agent' },
+      { id: 'thr_caught_up', title: 'Caught up' }
+    )
+    const latestSeq = await h.sessionStore.highestSeq(thread.id)
+    const loadEventsSince = vi.spyOn(h.sessionStore, 'loadEventsSince')
+
+    const eventStream = await dispatchRequest(
+      h.router,
+      new Request(`http://localhost/v1/threads/${thread.id}/events?since_seq=${latestSeq}`, {
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+    const events = await readSseEvents(eventStream)
+
+    expect(events).toEqual([])
+    expect(loadEventsSince).not.toHaveBeenCalled()
+  })
+
   it('resolves an approval through the HTTP endpoint', async () => {
     const h = buildHarness()
     const approval = createApprovalRequest({
@@ -963,6 +984,37 @@ describe('HTTP server', () => {
     const response = await dispatchRequest(
       h.router,
       new Request('http://localhost/v1/usage?group_by=thread', {
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+
+    expect(response.status).toBe(200)
+    const body = (await readJson(response)) as {
+      group_by: string
+      buckets: Array<{ thread_id: string; total_tokens: number; turns: number }>
+    }
+    expect(body.group_by).toBe('thread')
+    expect(body.buckets).toEqual([
+      expect.objectContaining({ thread_id: 'thr_live', total_tokens: 20, turns: 1 })
+    ])
+  })
+
+  it('filters thread-grouped usage buckets by thread_id', async () => {
+    const h = buildHarness()
+    await h.threadService.create(
+      { workspace: '/tmp/project', model: 'deepseek-chat', mode: 'agent' },
+      { id: 'thr_live', title: 'Live usage' }
+    )
+    await h.threadService.create(
+      { workspace: '/tmp/project', model: 'deepseek-chat', mode: 'agent' },
+      { id: 'thr_other', title: 'Other usage' }
+    )
+    h.runtime.usageService.record('thr_live', usageSnapshot({ promptTokens: 12, completionTokens: 8 }))
+    h.runtime.usageService.record('thr_other', usageSnapshot({ promptTokens: 90, completionTokens: 10 }))
+
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/usage?group_by=thread&thread_id=thr_live', {
         headers: { authorization: 'Bearer tok-1' }
       })
     )

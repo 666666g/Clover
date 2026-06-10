@@ -25,6 +25,7 @@ import type {
   ClawRunMode
 } from '@shared/app-settings'
 import type { ClawImInstallQrResult } from '@shared/ds-gui-api'
+import { confirmDialog } from '../../lib/confirm-dialog'
 import {
   ClawProviderLogo,
   clawProviderDisplayLabel
@@ -536,7 +537,7 @@ export function ClawAddImDialog({
   const handleDeleteChannel = async (channel: ClawImChannelV1): Promise<void> => {
     if (busy || typeof onDeleteChannel !== 'function') return
     const confirmMessage = t('clawDeleteImConfirm', { name: channel.label })
-    if (!window.confirm(confirmMessage)) return
+    if (!(await confirmDialog(confirmMessage))) return
     setBusy(true)
     setError(null)
     try {

@@ -119,6 +119,12 @@ export type ClawImInstallPollResult =
   | { done: true; kind: 'feishu'; appId: string; appSecret: string; domain: string }
   | { done: true; kind: 'weixin'; accountId: string; sessionKey: string }
   | { done: false; error?: string }
+export type ConfirmDialogOptions = {
+  message: string
+  detail?: string
+  confirmLabel?: string
+  cancelLabel?: string
+}
 export type SseEventPayload = { streamId: string; data: unknown }
 export type SseEndPayload = { streamId: string }
 export type SseErrorPayload = { streamId: string; status?: number; message?: string }
@@ -142,6 +148,7 @@ export type DsGuiApi = {
     deviceCode: string
   ) => Promise<ClawImInstallPollResult>
   pickWorkspaceDirectory: (defaultPath?: string) => Promise<WorkspacePickResult>
+  confirmDialog: (options: ConfirmDialogOptions) => Promise<boolean>
   listSkills: (workspaceRoot?: string) => Promise<SkillListResult>
   saveSkillFile: (rootPath: string, skillName: string, content: string) => Promise<SkillSaveResult>
   openSkillRoot: (rootPath: string) => Promise<PathOpenResult>
