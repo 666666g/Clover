@@ -58,6 +58,8 @@ type Props = {
   /** Configurable AI quick actions (edit ones rewrite in place, chat ones go to the sidebar). */
   quickActions?: ResolvedWriteQuickAction[]
   onQuickAction?: (action: ResolvedWriteQuickAction) => void
+  /** Adds the current selection to the writing assistant quote tray without sending a message. */
+  onQuoteSelection?: () => void
   /** Shown only when the image generation provider is configured. Generation
    * is async: the click inserts an animated placeholder and returns. */
   infographicEnabled?: boolean
@@ -163,6 +165,7 @@ export function WriteInlineAgent({
   onSetBlockType,
   quickActions = [],
   onQuickAction,
+  onQuoteSelection,
   infographicEnabled = false,
   onGenerateInfographic,
   designDraftEnabled = false,
@@ -178,6 +181,7 @@ export function WriteInlineAgent({
 
   const showBlockSelector = !imageMode && formattingEnabled && Boolean(onSetBlockType)
   const showFormatting = !imageMode && formattingEnabled && Boolean(onApplyFormat)
+  const showQuoteSelection = !imageMode && Boolean(onQuoteSelection)
   const showQuickActions = !imageMode && quickActions.length > 0 && Boolean(onQuickAction)
   const showInfographic = !imageMode && infographicEnabled && Boolean(onGenerateInfographic)
   const showDesignDraft = designDraftEnabled && Boolean(onGenerateDesignDraft)
@@ -210,6 +214,7 @@ export function WriteInlineAgent({
     inFlight,
     showFormatting,
     showBlockSelector,
+    showQuoteSelection,
     showInfographic,
     showDesignDraft,
     showPrototype,
@@ -319,9 +324,20 @@ export function WriteInlineAgent({
           </div>
         ) : null}
 
-        {showQuickActions || showInfographic || showDesignDraft || showPrototype ? (
+        {showQuoteSelection || showQuickActions || showInfographic || showDesignDraft || showPrototype ? (
           <div className="write-inline-agent-actions">
             <div className="write-inline-agent-section-label">{t('writeSelectionSkills')}</div>
+            {showQuoteSelection ? (
+              <ToolbarButton
+                className="write-inline-agent-action-row"
+                label={t('writeSelectionQuote')}
+                onActivate={() => onQuoteSelection?.()}
+              >
+                <MessageSquareQuote className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.85} />
+                <span className="min-w-0 flex-1 truncate text-left">{t('writeSelectionQuote')}</span>
+                <MessageSquareQuote className="write-inline-agent-action-hint h-3.5 w-3.5" strokeWidth={1.8} />
+              </ToolbarButton>
+            ) : null}
             {showQuickActions
               ? quickActions.map((quickAction) => {
                   const Icon = quickActionIcon(quickAction.id)

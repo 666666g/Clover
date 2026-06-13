@@ -1294,6 +1294,7 @@
   "writeQuickActionReformat": "Reformat",
   "writeQuickActionReformatPrompt": "Tidy up the layout and structure of this text: sensible paragraphing, consistent punctuation and spacing, and clean list and heading levels, without changing the meaning.",
   "writeSelectionSkills": "Skills",
+  "writeSelectionQuote": "Add quote",
   "writeBlockTypeLabel": "Block style",
   "writeBlockTypeParagraph": "Normal text",
   "writeBlockTypeHeading1": "Heading 1",

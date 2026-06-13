@@ -1294,6 +1294,7 @@
   "writeQuickActionReformat": "重新格式化",
   "writeQuickActionReformatPrompt": "整理这段文字的排版与结构：合理分段、统一标点与空格、规范列表和标题层级，不改变原意。",
   "writeSelectionSkills": "技能",
+  "writeSelectionQuote": "添加引用",
   "writeBlockTypeLabel": "段落样式",
   "writeBlockTypeParagraph": "普通文本",
   "writeBlockTypeHeading1": "标题 1",

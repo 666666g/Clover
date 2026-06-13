@@ -246,6 +246,12 @@ export function WriteWorkspaceView({
     setInput(input.trim() ? `${input.trim()}\n\n${trimmed}` : trimmed)
   }
 
+  const quoteSelectionToAssistant = (): void => {
+    if (!workspaceReady || !activeFilePath) return
+    quoteCurrentSelection(workspaceRoot)
+    setInlineAgentValue('')
+  }
+
   // Edit-mode quick actions rewrite the selection in place through the
   // inline-edit pipeline; chat-mode actions (润色/解释) quote the selection and
   // hand the prompt to the sidebar assistant (auto-expanding it).
@@ -970,6 +976,7 @@ export function WriteWorkspaceView({
           onSetBlockType={applyBlockType}
           quickActions={inlineQuickActions}
           onQuickAction={runQuickAction}
+          onQuoteSelection={quoteSelectionToAssistant}
           infographicEnabled={activeFileIsText && imageGenReady && isMarkdown && !renderSafety.readOnly}
           onGenerateInfographic={generateInfographic}
         />
