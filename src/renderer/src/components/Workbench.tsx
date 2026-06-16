@@ -95,9 +95,11 @@ import { useUiModeCameosEnabled, useUiPluginStore } from '../store/ui-plugin-sto
 import { readFocusModePreference, writeFocusModePreference } from '../lib/focus-mode'
 import {
   buildComposerFileContextPrompt,
+  isComposerDirectoryReference,
   mergeComposerFileReferences,
   type ComposerFileContextEntry
 } from '../lib/composer-file-references'
+import { filesUnderDirectory, loadWorkspaceFileIndex } from '../lib/workspace-file-index'
 import { resolveWriteRuntimeBannerMessage } from '../lib/write-runtime-banner'
 
 const ChangeInspector = lazy(() =>
@@ -135,6 +137,9 @@ type PendingSddPlanTarget = {
 
 const COMPOSER_FILE_CONTEXT_MAX_CHARS_PER_FILE = 60_000
 const COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS = 180_000
+// Upper bound on how many files a single `@directory` mention expands into, so a
+// large folder cannot flood the prompt (the char budget above is the hard cap).
+const COMPOSER_DIRECTORY_CONTEXT_MAX_FILES = 60
 const SDD_ASSISTANT_TITLE_SYNC_DELAY_MS = 900
 const DESKTOP_SHORTCUT_COMMANDS: Partial<Record<KeyboardShortcutCommandId, DesktopCommand>> = {
   quit: 'quit',
@@ -1682,19 +1687,33 @@ export function Workbench(): ReactElement {
     workspace: string
   ): Promise<ComposerFileContextEntry[]> => {
     const entries: ComposerFileContextEntry[] = []
+    const seen = new Set<string>()
     let remainingChars = COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS
-    for (const reference of references) {
-      if (remainingChars <= 0) break
+
+    const contextKey = (path: string): string =>
+      path.trim().replaceAll('\\', '/').replace(/\/+/g, '/').toLowerCase()
+
+    // strict=true (explicit file mention) surfaces read errors to the user;
+    // strict=false (directory expansion) silently skips files that vanished.
+    const appendFileEntry = async (
+      reference: ComposerFileReference,
+      strict: boolean
+    ): Promise<void> => {
+      if (remainingChars <= 0) return
+      const key = contextKey(reference.relativePath || reference.path)
+      if (seen.has(key)) return
       const result = await window.kunGui.readWorkspaceFile({
         workspaceRoot: workspace,
         path: reference.relativePath || reference.path
       })
       if (!result.ok) {
+        if (!strict) return
         throw new Error(t('composerFileReadFailed', {
           path: reference.relativePath,
           message: result.message
         }))
       }
+      seen.add(key)
       const clipped = clipComposerFileContext(result.content, remainingChars, result.truncated)
       remainingChars -= clipped.consumed
       entries.push({
@@ -1702,6 +1721,23 @@ export function Workbench(): ReactElement {
         content: clipped.content,
         ...(clipped.truncated ? { truncated: true } : {})
       })
+    }
+
+    for (const reference of references) {
+      if (remainingChars <= 0) break
+      if (isComposerDirectoryReference(reference)) {
+        const index = await loadWorkspaceFileIndex(workspace).catch(() => null)
+        const dirFiles = index
+          ? filesUnderDirectory(index.files, reference.relativePath)
+              .slice(0, COMPOSER_DIRECTORY_CONTEXT_MAX_FILES)
+          : []
+        for (const file of dirFiles) {
+          if (remainingChars <= 0) break
+          await appendFileEntry(file, false)
+        }
+        continue
+      }
+      await appendFileEntry(reference, true)
     }
     return entries
   }

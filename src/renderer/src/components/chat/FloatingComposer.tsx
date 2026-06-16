@@ -15,6 +15,7 @@ import {
   BarChart3,
   FileEdit,
   FileText,
+  Folder,
   GitFork,
   ImagePlus,
   ListTodo,
@@ -37,7 +38,6 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
-import type { WorkspaceEntry } from '@shared/workspace-file'
 import type { AttachmentReference, ChatBlock, ReviewTarget } from '../../agent/types'
 import { useChatStore } from '../../store/chat-store'
 import { normalizeWorkspaceRoot } from '../../lib/workspace-path'
@@ -45,12 +45,13 @@ import {
   filterWorkspaceFileMentionSuggestions,
   formatComposerFileMentionToken,
   getFileMentionAtCursor,
-  relativeWorkspacePath,
+  isComposerDirectoryReference,
   removeComposerFileMentionToken,
   replaceFileMentionInInput,
   type ComposerFileMention,
   type ComposerFileReference
 } from '../../lib/composer-file-references'
+import { loadWorkspaceFileIndex } from '../../lib/workspace-file-index'
 import {
   COMPACT_COMMAND_ALIASES,
   getGoalPanelDraftObjective,
@@ -190,11 +191,6 @@ type ComposerTransferItem = {
   getAsFile?: () => File | null
 }
 
-type WorkspaceFileIndexRecord = {
-  files: ComposerFileReference[]
-  loadedAt: number
-}
-
 export type ComposerImageTransferSource = {
   files?: ArrayLike<File> | null
   items?: ArrayLike<ComposerTransferItem> | null
@@ -319,158 +315,6 @@ function normalizedImageFile(file: File, mimeTypeHint?: string): File | null {
     type: mimeType,
     lastModified: file.lastModified
   })
-}
-
-const FILE_MENTION_MAX_DEPTH = 6
-const FILE_MENTION_MAX_DIRECTORIES = 140
-const FILE_MENTION_MAX_FILES = 1200
-const FILE_MENTION_CACHE_TTL_MS = 30_000
-const FILE_MENTION_IGNORED_DIRS = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  '.next',
-  '.turbo',
-  'build',
-  'coverage',
-  'dist',
-  'node_modules',
-  'out'
-])
-const FILE_MENTION_TEXT_EXTENSIONS = new Set([
-  '.astro',
-  '.bash',
-  '.c',
-  '.cc',
-  '.cjs',
-  '.cpp',
-  '.cs',
-  '.css',
-  '.csv',
-  '.dart',
-  '.env',
-  '.fish',
-  '.go',
-  '.h',
-  '.hpp',
-  '.html',
-  '.ini',
-  '.java',
-  '.js',
-  '.json',
-  '.jsx',
-  '.kt',
-  '.less',
-  '.lock',
-  '.log',
-  '.md',
-  '.mdx',
-  '.mjs',
-  '.php',
-  '.py',
-  '.rb',
-  '.rs',
-  '.sass',
-  '.scss',
-  '.sh',
-  '.sql',
-  '.svelte',
-  '.swift',
-  '.toml',
-  '.ts',
-  '.tsx',
-  '.txt',
-  '.vue',
-  '.xml',
-  '.yaml',
-  '.yml',
-  '.zsh'
-])
-const FILE_MENTION_TEXT_NAMES = new Set([
-  '.env',
-  '.gitignore',
-  'dockerfile',
-  'makefile',
-  'package-lock.json',
-  'pnpm-lock.yaml',
-  'readme'
-])
-const workspaceFileIndexCache = new Map<string, WorkspaceFileIndexRecord | Promise<WorkspaceFileIndexRecord>>()
-
-function isMentionableWorkspaceFile(entry: WorkspaceEntry): boolean {
-  if (entry.type !== 'file') return false
-  const name = entry.name.toLowerCase()
-  if (FILE_MENTION_TEXT_NAMES.has(name)) return true
-  if (!entry.ext) return false
-  return FILE_MENTION_TEXT_EXTENSIONS.has(entry.ext.toLowerCase())
-}
-
-function fileReferenceFromEntry(entry: WorkspaceEntry, workspaceRoot: string): ComposerFileReference {
-  const relativePath = relativeWorkspacePath(entry.path, workspaceRoot)
-  return {
-    path: entry.path,
-    relativePath,
-    name: entry.name
-  }
-}
-
-async function loadWorkspaceFileIndex(workspaceRoot: string): Promise<WorkspaceFileIndexRecord> {
-  const root = workspaceRoot.trim()
-  const cached = workspaceFileIndexCache.get(root)
-  const now = Date.now()
-  if (cached && !(cached instanceof Promise) && now - cached.loadedAt < FILE_MENTION_CACHE_TTL_MS) {
-    return cached
-  }
-  if (cached instanceof Promise) return cached
-
-  const task = (async (): Promise<WorkspaceFileIndexRecord> => {
-    const files: ComposerFileReference[] = []
-    const queue: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }]
-    let visitedDirectories = 0
-
-    while (
-      queue.length > 0 &&
-      visitedDirectories < FILE_MENTION_MAX_DIRECTORIES &&
-      files.length < FILE_MENTION_MAX_FILES
-    ) {
-      const current = queue.shift()
-      if (!current) break
-      visitedDirectories += 1
-      const result = await window.kunGui.listWorkspaceDirectory({
-        workspaceRoot: root,
-        path: current.path
-      })
-      if (!result.ok) continue
-
-      for (const entry of result.entries) {
-        if (entry.type === 'directory') {
-          if (
-            current.depth < FILE_MENTION_MAX_DEPTH &&
-            !FILE_MENTION_IGNORED_DIRS.has(entry.name.toLowerCase())
-          ) {
-            queue.push({ path: entry.path, depth: current.depth + 1 })
-          }
-          continue
-        }
-        if (isMentionableWorkspaceFile(entry)) {
-          files.push(fileReferenceFromEntry(entry, root))
-          if (files.length >= FILE_MENTION_MAX_FILES) break
-        }
-      }
-    }
-
-    return { files, loadedAt: Date.now() }
-  })()
-
-  workspaceFileIndexCache.set(root, task)
-  try {
-    const result = await task
-    workspaceFileIndexCache.set(root, result)
-    return result
-  } catch (error) {
-    workspaceFileIndexCache.delete(root)
-    throw error
-  }
 }
 
 export function imageFilesFromTransfer(source: ComposerImageTransferSource | null | undefined): File[] {
@@ -1104,7 +948,11 @@ export function FloatingComposer({
         .then((index) => {
           if (cancelled) return
           setFileMentionSuggestions(
-            filterWorkspaceFileMentionSuggestions(index.files, activeFileMention.query, fileReferences)
+            filterWorkspaceFileMentionSuggestions(
+              [...index.directories, ...index.files],
+              activeFileMention.query,
+              fileReferences
+            )
           )
         })
         .catch(() => {
@@ -1350,9 +1198,13 @@ export function FloatingComposer({
     })
   }
 
-  const removeFileReference = (relativePath: string): void => {
-    onRemoveFileReference?.(relativePath)
-    const nextInput = removeComposerFileMentionToken(input, relativePath)
+  const removeFileReference = (reference: ComposerFileReference): void => {
+    onRemoveFileReference?.(reference.relativePath)
+    const nextInput = removeComposerFileMentionToken(
+      input,
+      reference.relativePath,
+      isComposerDirectoryReference(reference)
+    )
     if (nextInput !== input) {
       setInput(nextInput)
       window.requestAnimationFrame(() => syncComposerCursor())
@@ -1798,10 +1650,13 @@ export function FloatingComposer({
             {fileMentionSuggestions.length > 0 ? (
               <div className="flex max-h-[min(280px,calc(100vh-260px))] flex-col gap-0.5 overflow-y-auto pr-1">
                 {fileMentionSuggestions.map((reference) => {
-                  const active = highlightedFileMention?.relativePath === reference.relativePath
+                  const isDirectory = isComposerDirectoryReference(reference)
+                  const active =
+                    highlightedFileMention?.relativePath === reference.relativePath &&
+                    highlightedFileMention?.type === reference.type
                   return (
                     <button
-                      key={reference.relativePath}
+                      key={`${reference.type ?? 'file'}:${reference.relativePath}`}
                       type="button"
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => applyFileMention(reference)}
@@ -1816,18 +1671,22 @@ export function FloatingComposer({
                           active ? 'bg-white text-accent shadow-sm dark:bg-ds-card' : 'bg-ds-hover text-ds-muted'
                         }`}
                       >
-                        <FileText className="h-4 w-4" strokeWidth={1.8} />
+                        {isDirectory ? (
+                          <Folder className="h-4 w-4" strokeWidth={1.8} />
+                        ) : (
+                          <FileText className="h-4 w-4" strokeWidth={1.8} />
+                        )}
                       </span>
                       <span className="min-w-0 flex-1">
                         <span className="block truncate text-[13.5px] font-semibold leading-5 text-inherit">
-                          {reference.name}
+                          {isDirectory ? `${reference.name}/` : reference.name}
                         </span>
                         <span className="mt-0.5 block truncate text-[12px] leading-4 text-ds-faint">
-                          {reference.relativePath}
+                          {isDirectory ? `${reference.relativePath}/` : reference.relativePath}
                         </span>
                       </span>
                       <span className="hidden max-w-[170px] shrink-0 truncate rounded-full border border-ds-border-muted px-2 py-0.5 text-[10.5px] font-semibold leading-4 text-ds-faint sm:block">
-                        {formatComposerFileMentionToken(reference.relativePath)}
+                        {formatComposerFileMentionToken(reference.relativePath, isDirectory)}
                       </span>
                     </button>
                   )
@@ -2013,27 +1872,35 @@ export function FloatingComposer({
           />
           {fileReferences.length > 0 ? (
             <div className="flex flex-wrap items-center gap-2 px-1">
-              {fileReferences.map((reference) => (
-                <span
-                  key={reference.relativePath}
-                  className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/80 px-2 text-[12px] font-medium text-ds-muted"
-                  title={reference.relativePath}
-                >
-                  <FileText className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
-                  <span className="max-w-52 truncate">{reference.relativePath}</span>
-                  {onRemoveFileReference ? (
-                    <button
-                      type="button"
-                      onClick={() => removeFileReference(reference.relativePath)}
-                      className="rounded-full p-0.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
-                      aria-label={t('composerRemoveFileReference')}
-                      title={t('composerRemoveFileReference')}
-                    >
-                      <X className="h-3 w-3" strokeWidth={2} />
-                    </button>
-                  ) : null}
-                </span>
-              ))}
+              {fileReferences.map((reference) => {
+                const isDirectory = isComposerDirectoryReference(reference)
+                const displayPath = isDirectory ? `${reference.relativePath}/` : reference.relativePath
+                return (
+                  <span
+                    key={`${reference.type ?? 'file'}:${reference.relativePath}`}
+                    className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/80 px-2 text-[12px] font-medium text-ds-muted"
+                    title={displayPath}
+                  >
+                    {isDirectory ? (
+                      <Folder className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
+                    ) : (
+                      <FileText className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
+                    )}
+                    <span className="max-w-52 truncate">{displayPath}</span>
+                    {onRemoveFileReference ? (
+                      <button
+                        type="button"
+                        onClick={() => removeFileReference(reference)}
+                        className="rounded-full p-0.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
+                        aria-label={t('composerRemoveFileReference')}
+                        title={t('composerRemoveFileReference')}
+                      >
+                        <X className="h-3 w-3" strokeWidth={2} />
+                      </button>
+                    ) : null}
+                  </span>
+                )
+              })}
             </div>
           ) : null}
           {attachments.length > 0 || attachmentUploadError ? (

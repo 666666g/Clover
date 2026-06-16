@@ -1,7 +1,10 @@
+export type ComposerFileReferenceKind = 'file' | 'directory'
+
 export type ComposerFileReference = {
   path: string
   relativePath: string
   name: string
+  type?: ComposerFileReferenceKind
 }
 
 export type ComposerFileMention = {
@@ -49,8 +52,22 @@ export function composerFileReferenceKey(reference: Pick<ComposerFileReference, 
   return normalizeForCompare(reference.relativePath)
 }
 
-export function formatComposerFileMentionToken(relativePath: string): string {
-  const path = normalizeSlashes(relativePath)
+export function isComposerDirectoryReference(
+  reference: Pick<ComposerFileReference, 'type'>
+): boolean {
+  return reference.type === 'directory'
+}
+
+export function isFileWithinDirectory(fileRelativePath: string, dirRelativePath: string): boolean {
+  const dir = normalizeForCompare(dirRelativePath)
+  if (!dir) return true
+  const file = normalizeForCompare(fileRelativePath)
+  return file === dir || file.startsWith(`${dir}/`)
+}
+
+export function formatComposerFileMentionToken(relativePath: string, isDirectory = false): string {
+  const base = normalizeSlashes(relativePath)
+  const path = isDirectory ? `${trimTrailingSlash(base)}/` : base
   if (!TOKEN_SPECIAL_CHARS.test(path)) return `@${path}`
   return `@"${path.replaceAll('"', '\\"')}"`
 }
@@ -75,9 +92,12 @@ export function getFileMentionAtCursor(input: string, cursor: number): ComposerF
 export function replaceFileMentionInInput(
   input: string,
   mention: ComposerFileMention,
-  reference: Pick<ComposerFileReference, 'relativePath'>
+  reference: Pick<ComposerFileReference, 'relativePath' | 'type'>
 ): { input: string; cursor: number } {
-  const token = formatComposerFileMentionToken(reference.relativePath)
+  const token = formatComposerFileMentionToken(
+    reference.relativePath,
+    isComposerDirectoryReference(reference)
+  )
   const replacement = `${token}${input[mention.end] && /\s/u.test(input[mention.end] ?? '') ? '' : ' '}`
   const nextInput = `${input.slice(0, mention.start)}${replacement}${input.slice(mention.end)}`
   return {
@@ -86,22 +106,42 @@ export function replaceFileMentionInInput(
   }
 }
 
-export function removeComposerFileMentionToken(input: string, relativePath: string): string {
-  const normalized = normalizeSlashes(relativePath)
-  const tokens = [
-    formatComposerFileMentionToken(normalized),
-    `@${normalized}`
-  ]
-  let next = input
-  for (const token of tokens) {
-    const index = next.indexOf(token)
-    if (index < 0) continue
-    const before = next.slice(0, index).replace(/[ \t]+$/u, '')
-    const after = next.slice(index + token.length).replace(/^[ \t]+/u, '')
-    next = `${before}${before && after ? ' ' : ''}${after}`
-    break
+// A character that can continue an unquoted mention token (path segment,
+// slash, dot, …). When it follows a matched token, the token is only a prefix
+// of a longer mention and must not be removed.
+const MENTION_TOKEN_CONTINUATION = /[^\s@"'([{)\]}，。；：、,;:]/u
+
+function isMentionTokenBoundary(char: string | undefined): boolean {
+  if (char === undefined) return true
+  return !MENTION_TOKEN_CONTINUATION.test(char)
+}
+
+export function removeComposerFileMentionToken(
+  input: string,
+  relativePath: string,
+  isDirectory = false
+): string {
+  const normalized = trimTrailingSlash(relativePath)
+  // Longest / most specific variants first so a directory token (`@dir/`) is
+  // matched before its prefix (`@dir`) and never clips a nested file mention.
+  const candidates = isDirectory
+    ? [`@"${normalized}/"`, `@"${normalized}"`, `@${normalized}/`, `@${normalized}`]
+    : [`@"${normalized}"`, `@${normalized}`]
+  for (const token of candidates) {
+    let from = 0
+    while (from <= input.length) {
+      const index = input.indexOf(token, from)
+      if (index < 0) break
+      const quoted = token.endsWith('"')
+      if (quoted || isMentionTokenBoundary(input[index + token.length])) {
+        const before = input.slice(0, index).replace(/[ \t]+$/u, '')
+        const after = input.slice(index + token.length).replace(/^[ \t]+/u, '')
+        return `${before}${before && after ? ' ' : ''}${after}`
+      }
+      from = index + token.length
+    }
   }
-  return next
+  return input
 }
 
 export function mergeComposerFileReferences(
@@ -115,7 +155,7 @@ export function mergeComposerFileReferences(
 }
 
 function scoreFileSuggestion(reference: ComposerFileReference, query: string): number {
-  const normalizedQuery = normalizeSlashes(query).toLowerCase()
+  const normalizedQuery = normalizeForCompare(query)
   if (!normalizedQuery) return 1
   const name = reference.name.toLowerCase()
   const relativePath = normalizeSlashes(reference.relativePath).toLowerCase()
@@ -131,6 +171,10 @@ function scoreFileSuggestion(reference: ComposerFileReference, query: string): n
   return 0
 }
 
+function directoryRank(reference: ComposerFileReference): number {
+  return reference.type === 'directory' ? 0 : 1
+}
+
 export function filterWorkspaceFileMentionSuggestions(
   files: ComposerFileReference[],
   query: string,
@@ -138,11 +182,18 @@ export function filterWorkspaceFileMentionSuggestions(
   limit = 20
 ): ComposerFileReference[] {
   const selectedKeys = new Set(selected.map(composerFileReferenceKey))
+  // A trailing slash (`@src/`) signals the user is reaching for a directory.
+  const wantsDirectory = /\/\s*$/u.test(query)
   return files
-    .map((file) => ({ file, score: scoreFileSuggestion(file, query) }))
+    .map((file) => {
+      let score = scoreFileSuggestion(file, query)
+      if (score > 0 && wantsDirectory && file.type === 'directory') score += 5
+      return { file, score }
+    })
     .filter((entry) => entry.score > 0 && !selectedKeys.has(composerFileReferenceKey(entry.file)))
     .sort((left, right) =>
       right.score - left.score ||
+      (wantsDirectory ? directoryRank(left.file) - directoryRank(right.file) : 0) ||
       left.file.relativePath.length - right.file.relativePath.length ||
       left.file.relativePath.localeCompare(right.file.relativePath)
     )
