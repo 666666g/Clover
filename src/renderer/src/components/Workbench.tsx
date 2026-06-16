@@ -64,6 +64,7 @@ import { listSddDraftHistory, titleFromSddDraftContent } from '../sdd/sdd-draft-
 import { saveActiveSddDraftToDisk } from '../sdd/sdd-draft-actions'
 import { restoreRememberedSddDraft, restoreSddDraft } from '../sdd/sdd-draft-restore'
 import { composeSddAssistantPrompt } from '../sdd/sdd-assistant-prompt'
+import { frameworkById } from '../sdd/pm-skill-frameworks'
 import { collectSddDraftImages, withAttachmentIds, type SddDraftImageReference } from '../sdd/sdd-draft-images'
 import { PENDING_INFOGRAPHIC_PROTOCOL } from '../write/infographic-pending'
 import { buildSddDraftToPlanPrompt } from '../sdd/sdd-plan-prompt'
@@ -479,6 +480,12 @@ export function Workbench(): ReactElement {
 
   const draftByThread = useRef<Record<string, string>>({})
   const prevThreadId = useRef<string | null>(null)
+  // PM-skill framework selected via an assistant-panel button. The id is only
+  // applied on send when its injected prompt text is still present in the
+  // composer (see sendSddAssistantPrompt) — so editing the prompt away, clearing
+  // the composer, or switching drafts all drop it without a stale-guidance leak.
+  const pendingSddFrameworkRef = useRef<string | null>(null)
+  const pendingSddFrameworkPromptRef = useRef<string | null>(null)
   const inputRef = useRef('')
   const sddUpgradeInFlightRef = useRef(false)
   const sddUpgradeTargetRef = useRef<PendingSddPlanTarget | null>(null)
@@ -1387,6 +1394,20 @@ export function Workbench(): ReactElement {
   // flow; they just no longer hijack startup. See the workspace picker below
   // the composer for switching directories.
 
+  // Inject a PM-skill framework prompt (see pm-skill-frameworks.ts) into the
+  // Requirement AI composer and remember it so the next send applies the
+  // framework's guidance. Frameworks without guidance (the generic
+  // clarify/research actions) only set the composer text.
+  const applySddFramework = (frameworkId: string): void => {
+    const framework = frameworkById(frameworkId)
+    if (!framework?.promptKey) return
+    const promptText = t(framework.promptKey)
+    setInput(input.trim() ? `${input.trim()}\n\n${promptText}` : promptText)
+    // Arm the framework only when it carries guidance; the latest click wins.
+    pendingSddFrameworkRef.current = framework.guidance ? framework.id : null
+    pendingSddFrameworkPromptRef.current = framework.guidance ? promptText : null
+  }
+
   const sendSddAssistantPrompt = async (value: string): Promise<void> => {
     const v = value.trim()
     const draft = useSddDraftStore.getState().activeDraft
@@ -1402,11 +1423,20 @@ export function Workbench(): ReactElement {
     const snapshot = useSddDraftStore.getState()
     void saveActiveSddDraftToDisk()
     const userPrompt = v || t('composerImageOnlyPrompt')
+    // Apply the armed framework only if its injected prompt is still in the
+    // message being sent — editing it away, clearing the composer, or switching
+    // drafts all leave a value that no longer contains it, so it is dropped.
+    const pendingPrompt = pendingSddFrameworkPromptRef.current
+    const frameworkId =
+      pendingSddFrameworkRef.current && pendingPrompt && value.includes(pendingPrompt)
+        ? pendingSddFrameworkRef.current
+        : null
     const prompt = composeSddAssistantPrompt({
       userPrompt,
       draftMarkdown: snapshot.content,
       draftRelativePath: draft.relativePath,
-      workspaceRoot: draft.workspaceRoot
+      workspaceRoot: draft.workspaceRoot,
+      ...(frameworkId ? { frameworkIds: [frameworkId] } : {})
     })
     setInput('')
     const model = writeAssistantModel.trim()
@@ -1420,8 +1450,12 @@ export function Workbench(): ReactElement {
       ...(attachmentIds.length ? { attachmentIds, attachments } : {})
     })
     if (sent) {
+      pendingSddFrameworkRef.current = null
+      pendingSddFrameworkPromptRef.current = null
       if (attachmentIds.length > 0) clearComposerAttachments()
     } else {
+      // Restore the composer (incl. any framework prompt) so a retry re-applies
+      // the same guidance the user still sees; the refs are intentionally kept.
       setInput(v)
     }
   }
@@ -2152,8 +2186,11 @@ export function Workbench(): ReactElement {
                 onRetryConnection={() => void probeRuntime('user', { restart: true })}
                 onOpenSettings={() => openSettings('agents')}
                 onConfigureProviders={() => openSettings('providers')}
+                onApplyFramework={applySddFramework}
                 onNewConversation={() => {
                   setInput('')
+                  pendingSddFrameworkRef.current = null
+                  pendingSddFrameworkPromptRef.current = null
                   void createSddAssistantThreadForDraft(activeSddDraft)
                 }}
                 onCollapse={closeRightPanel}

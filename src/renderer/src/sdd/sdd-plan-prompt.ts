@@ -1,4 +1,5 @@
 import type { SddDraftImageReference } from './sdd-draft-images'
+import { composeFrameworkGuidance } from './pm-skill-frameworks'
 
 export type SddPlanImageMode = 'attachments' | 'base64' | 'none'
 
@@ -99,6 +100,8 @@ export function buildSddDraftToPlanPrompt(options: {
     '- The draft may contain structured requirement blocks: level-3 headings like `### R-1: title {status}` followed by a description and an acceptance checklist.',
     '- When requirement blocks exist, every actionable `- [ ]` step in the plan MUST end with a covers tag linking it to the requirement ids it implements, e.g. `- [ ] Implement export API (covers: R-1)` or `(covers: R-1, R-3)`.',
     '- Together the steps must cover every requirement id present in the draft. Do not leave any R-id uncovered, and do not invent R-ids that are not in the draft.',
-    '- Steps that are pure scaffolding may omit the covers tag, but prefer attaching them to the closest requirement.'
+    '- Steps that are pure scaffolding may omit the covers tag, but prefer attaching them to the closest requirement.',
+    '',
+    composeFrameworkGuidance(['pre-mortem', 'prioritization-frameworks'])
   ].join('\n')
 }

@@ -67,4 +67,20 @@ describe('buildSddDraftToPlanPrompt', () => {
     expect(prompt).toContain('Requirement AI conversation context:')
     expect(prompt).toContain('Confirm OAuth edge cases.')
   })
+
+  it('injects pre-mortem and prioritization framework guidance', () => {
+    const prompt = buildSddDraftToPlanPrompt({
+      workspaceRoot: '/tmp/ws',
+      draftRelativePath: '.kunsdd/draft/draft-1/requirement.md',
+      planRelativePath: '.kunsdd/plan/sdd-draft-1.md',
+      draftMarkdown: '# Need login',
+      imageMode: 'none',
+      images: []
+    })
+
+    expect(prompt).toContain('## Pre-mortem')
+    expect(prompt).toContain('Tigers')
+    expect(prompt).toContain('## Sequencing & prioritization')
+    expect(prompt).toContain('RICE')
+  })
 })

@@ -1,3 +1,5 @@
+import { composeFrameworkGuidance } from './pm-skill-frameworks'
+
 export const SDD_VERIFY_INTRO =
   'Kun is asking you to verify an implemented SDD requirement draft against its acceptance criteria.'
 
@@ -24,6 +26,8 @@ export function buildSddVerifyPrompt(options: {
     '2. Edit the requirement file in place: change `- [ ]` to `- [x]` for every criterion you verified as satisfied. Leave unsatisfied criteria unchecked.',
     '3. Update the status token on the requirement heading: set `{verified}` when all of its criteria passed, otherwise leave the existing status in place.',
     '4. Do not rewrite descriptions or titles; only update checkboxes and status tokens.',
+    '',
+    composeFrameworkGuidance(['intended-vs-implemented', 'test-scenarios']),
     '',
     'Finish with a concise report: which requirements are verified, which criteria failed and why, and the smallest follow-up needed to close the gaps.'
   ].join('\n')

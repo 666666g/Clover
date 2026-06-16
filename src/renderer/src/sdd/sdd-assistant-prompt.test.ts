@@ -27,4 +27,30 @@ describe('composeSddAssistantPrompt', () => {
       })
     ).toContain('```markdown\n(empty draft)\n```')
   })
+
+  it('injects PM-skill framework guidance when frameworkIds are provided', () => {
+    const prompt = composeSddAssistantPrompt({
+      workspaceRoot: '/tmp/app',
+      draftRelativePath: '.kunsdd/requirements/123e4567-e89b-12d3-a456-426614174000/requirement.md',
+      draftMarkdown: '# Requirement',
+      userPrompt: '帮我结构化',
+      frameworkIds: ['wwa']
+    })
+
+    expect(prompt).toContain('Apply the following product-management framework(s):')
+    expect(prompt).toContain('Why-What-Acceptance')
+    // The draft + user request stay intact alongside the framework guidance.
+    expect(prompt).toContain('User request:\n帮我结构化')
+  })
+
+  it('omits framework guidance for free-form turns', () => {
+    const prompt = composeSddAssistantPrompt({
+      workspaceRoot: '/tmp/app',
+      draftRelativePath: '.kunsdd/requirements/123e4567-e89b-12d3-a456-426614174000/requirement.md',
+      draftMarkdown: '# Requirement',
+      userPrompt: 'just chatting'
+    })
+
+    expect(prompt).not.toContain('Apply the following product-management framework')
+  })
 })
