@@ -295,13 +295,23 @@ async function startKunChildOnce(
     tokenEconomyMode: runtime.tokenEconomyMode,
     insecure: isKunRuntimeInsecure(runtime)
   })
+  // On macOS, libnut links AppKit and calls `[NSApplication sharedApplication]`
+  // on its first screen-grab/mouse/keyboard call. That promotes a pure-Node
+  // (ELECTRON_RUN_AS_NODE) child to a regular Cocoa app and a second Kun icon
+  // appears in the Dock. When computer-use is enabled we instead spawn kun as
+  // a real Electron instance so it can call `app.dock.hide()` itself (see
+  // kun/src/cli/serve-entry.ts). The extra Chromium overhead is only paid
+  // when the user actually opted into host control.
+  const runAsElectron = process.platform === 'darwin' && runtime.computerUse?.enabled === true
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    KUN_RUNTIME_TOKEN: runtime.runtimeToken,
+    DEEPSEEK_API_KEY: runtime.apiKey || process.env.DEEPSEEK_API_KEY || ''
+  }
+  if (!runAsElectron) childEnv.ELECTRON_RUN_AS_NODE = '1'
+  else delete childEnv.ELECTRON_RUN_AS_NODE
   child = spawn(resolution.command, args, {
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: '1',
-      KUN_RUNTIME_TOKEN: runtime.runtimeToken,
-      DEEPSEEK_API_KEY: runtime.apiKey || process.env.DEEPSEEK_API_KEY || ''
-    },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false
   })

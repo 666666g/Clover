@@ -89,7 +89,31 @@ async function serveMain(argv: readonly string[]): Promise<number> {
   return ServeExitCode.ok
 }
 
+/**
+ * When the GUI launches kun without `ELECTRON_RUN_AS_NODE` (the host
+ * computer-use mode on darwin), the child runs as a real Electron instance.
+ * libnut's first screen-grab / mouse / keyboard call invokes
+ * `[NSApplication sharedApplication]`, which promotes the process to a
+ * regular Cocoa app and macOS adds a second Dock icon. Hiding it via
+ * `app.dock.hide()` is the official Electron API; we never open a window
+ * here so the icon serves no purpose. A no-op when running as Node.
+ */
+async function hideMacosDockIfRunningAsElectron(): Promise<void> {
+  if (process.platform !== 'darwin') return
+  if (!process.versions.electron) return
+  try {
+    const electron = (await import(/* @vite-ignore */ 'electron')) as {
+      app?: { dock?: { hide?: () => void } }
+    }
+    electron.app?.dock?.hide?.()
+  } catch {
+    // Best-effort: when the electron module is unavailable (pure Node
+    // fallback), leave the dock alone. The user still gets host control.
+  }
+}
+
 export async function main(argv: readonly string[]): Promise<number> {
+  await hideMacosDockIfRunningAsElectron()
   const command = splitKunCliCommand(argv)
   if (command.command === 'help') {
     if (command.error) {
