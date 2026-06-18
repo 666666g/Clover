@@ -242,7 +242,7 @@ export function SidebarSearchField({
   onChange
 }: SidebarSearchFieldProps): ReactElement {
   return (
-    <label className="relative min-w-0 flex-1">
+    <label data-cursor-spotlight-target className="relative min-w-0 flex-1 rounded-[8px]">
       <Search
         className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ds-faint"
         strokeWidth={1.8}
@@ -256,6 +256,7 @@ export function SidebarSearchField({
       {value.trim() ? (
         <button
           type="button"
+          data-cursor-spotlight-target
           onClick={() => onChange('')}
           className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-[#9a9a9a] transition hover:bg-[var(--ds-sidebar-row-hover)] hover:text-[#1f1f1f] dark:hover:text-white"
           title={clearLabel}

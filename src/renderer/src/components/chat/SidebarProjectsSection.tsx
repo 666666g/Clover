@@ -723,6 +723,7 @@ export function SidebarProjectsSection({
                       {!showArchived && !searchQuery.trim() ? (
                         <button
                           type="button"
+                          data-cursor-spotlight-target
                           onClick={() => onCreateThreadInWorkspace(workspacePath)}
                           className="shrink-0 rounded-md px-2 py-1 text-[12px] font-medium text-ds-faint transition hover:bg-[var(--ds-sidebar-row-hover)] hover:text-ds-ink"
                         >
@@ -758,6 +759,7 @@ export function SidebarProjectsSection({
                   {hasOverflow ? (
                     <button
                       type="button"
+                      data-cursor-spotlight-target
                       onClick={() =>
                         setExpandedWorkspaces((current) => ({
                           ...current,
@@ -938,6 +940,7 @@ export function SddDraftHistoryRows({
       {!collapsed && remainingCount > 0 ? (
         <button
           type="button"
+          data-cursor-spotlight-target
           onClick={() =>
             setVisibleCount((count) => Math.min(items.length, count + SDD_DRAFT_HISTORY_PAGE_SIZE))
           }

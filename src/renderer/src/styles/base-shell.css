@@ -617,6 +617,17 @@ html {
   background-repeat: no-repeat;
 }
 
+[data-cursor-spotlight='on'] .ds-windows-titlebar[data-cursor-spotlight-target]:hover {
+  background-image:
+    radial-gradient(
+      260px circle at var(--spotlight-x) var(--spotlight-y),
+      var(--ds-cursor-spotlight),
+      var(--ds-cursor-spotlight-edge) 38%,
+      transparent 72%
+    ),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.8), rgba(246, 248, 251, 0.72));
+}
+
 [data-cursor-spotlight='off'] [data-cursor-spotlight-target] {
   background-image: none;
 }
@@ -625,6 +636,17 @@ html {
   background:
     linear-gradient(180deg, rgba(22, 29, 47, 0.92), rgba(14, 19, 32, 0.82)),
     var(--ds-bg-main);
+}
+
+[data-theme='dark'][data-cursor-spotlight='on'] .ds-windows-titlebar[data-cursor-spotlight-target]:hover {
+  background-image:
+    radial-gradient(
+      260px circle at var(--spotlight-x) var(--spotlight-y),
+      var(--ds-cursor-spotlight),
+      var(--ds-cursor-spotlight-edge) 38%,
+      transparent 72%
+    ),
+    linear-gradient(180deg, rgba(22, 29, 47, 0.92), rgba(14, 19, 32, 0.82));
 }
 
 [data-theme='dark'] .ds-window-control-btn--close:hover {

@@ -40,6 +40,7 @@ describe('WindowsTitleBar', () => {
     )
 
     expect(winHtml).toContain('ds-windows-titlebar')
+    expect(winHtml).toContain('data-cursor-spotlight-target')
     expect(linuxHtml).toContain('ds-windows-titlebar')
     expect(winHtml).toContain('File')
     expect(linuxHtml).toContain('File')

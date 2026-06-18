@@ -113,5 +113,6 @@ describe('ArchivedThreadsSettingsSection', () => {
     expect(agentsIndex).toBeGreaterThanOrEqual(0)
     expect(archivesIndex).toBeGreaterThan(agentsIndex)
     expect(permissionsIndex).toBeGreaterThan(archivesIndex)
+    expect(html.match(/data-cursor-spotlight-target/g)?.length).toBe(17)
   })
 })

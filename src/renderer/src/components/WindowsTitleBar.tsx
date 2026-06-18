@@ -277,7 +277,7 @@ export function WindowsTitleBar({ platform, actions }: Props): ReactElement | nu
   }
 
   return (
-    <div ref={rootRef} className="ds-windows-titlebar ds-drag">
+    <div ref={rootRef} data-cursor-spotlight-target className="ds-windows-titlebar ds-drag">
       <div className="ds-windows-titlebar-content">
         <img src={kunLogo} alt="" aria-hidden="true" className="ds-windows-titlebar-icon" />
         <nav className="ds-windows-menu ds-no-drag" aria-label={t('windowsMenuAriaLabel')}>
@@ -328,6 +328,7 @@ export function WindowsTitleBar({ platform, actions }: Props): ReactElement | nu
       <div className="ds-window-controls ds-no-drag">
         <button
           type="button"
+          data-cursor-spotlight-target
           className="ds-window-control-btn"
           aria-label={t('windowsMenuMinimize')}
           onClick={handleMinimize}
@@ -336,6 +337,7 @@ export function WindowsTitleBar({ platform, actions }: Props): ReactElement | nu
         </button>
         <button
           type="button"
+          data-cursor-spotlight-target
           className="ds-window-control-btn"
           aria-label={t('windowsMenuToggleMaximize')}
           onClick={handleToggleMaximize}
@@ -344,6 +346,7 @@ export function WindowsTitleBar({ platform, actions }: Props): ReactElement | nu
         </button>
         <button
           type="button"
+          data-cursor-spotlight-target
           className="ds-window-control-btn ds-window-control-btn--close"
           aria-label={t('windowsMenuClose')}
           onClick={handleClose}
