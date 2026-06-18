@@ -2,11 +2,13 @@ import { spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { URL } from 'node:url'
-import { runInNewContext } from 'node:vm'
+import { compileFunction, runInNewContext } from 'node:vm'
 import type {
   AppSettingsV1,
+  WorkflowCodeCheckResult,
+  WorkflowCodeLanguage,
   WorkflowConditionConfigV1,
   WorkflowConnectionV1,
   WorkflowHttpRequestConfigV1,
@@ -453,6 +455,90 @@ function resolveWorkflowImageGen(
     }
   }
   return resolveKunImageGenerationSettings(patched)
+}
+
+/**
+ * Editor-time syntax check for a Code node. JavaScript compiles in-process
+ * (never executed); python/bash are parse-checked with the local interpreter
+ * (`ast.parse` / `bash -n`). A missing interpreter returns `unavailable` rather
+ * than a hard error so the editor can show a soft note.
+ */
+export function checkWorkflowCode(language: WorkflowCodeLanguage, code: string): Promise<WorkflowCodeCheckResult> {
+  if (!code.trim()) return Promise.resolve({ status: 'ok' })
+  if (language === 'javascript') {
+    try {
+      // Compiles the function body without running it — surfaces SyntaxError only.
+      compileFunction(code, ['$json', '$text'])
+      return Promise.resolve({ status: 'ok' })
+    } catch (error) {
+      return Promise.resolve({ status: 'error', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  const bin = language === 'python' ? PYTHON_BIN : 'bash'
+  const args = language === 'python' ? ['-c', 'import ast, sys; ast.parse(sys.stdin.read())'] : ['-n']
+  return new Promise((resolveResult) => {
+    let settled = false
+    const done = (result: WorkflowCodeCheckResult): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveResult(result)
+    }
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(bin, args)
+    } catch {
+      done({ status: 'unavailable', message: `${bin} is not available — cannot check ${language} syntax.` })
+      return
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL')
+      } catch {
+        /* already exited */
+      }
+      done({ status: 'error', message: 'Syntax check timed out.' })
+    }, 8_000)
+    let stderr = ''
+    child.stderr?.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    child.on('error', (error) => {
+      done(
+        (error as NodeJS.ErrnoException).code === 'ENOENT'
+          ? { status: 'unavailable', message: `${bin} was not found — cannot check ${language} syntax.` }
+          : { status: 'error', message: error.message }
+      )
+    })
+    child.on('close', (exitCode) => {
+      done(
+        exitCode === 0
+          ? { status: 'ok' }
+          : { status: 'error', message: stderr.trim().slice(0, 800) || `Exited with code ${exitCode}.` }
+      )
+    })
+    child.stdin?.on('error', () => {})
+    child.stdin?.write(code)
+    child.stdin?.end()
+  })
+}
+
+/**
+ * Resolve where a generate-image node saves its file. Absolute paths are used
+ * as-is; relative paths resolve against the workspace; empty defaults to
+ * <workspace>/workflow-images.
+ */
+function resolveImageOutputDir(workspace: string, configuredRaw: string): string {
+  const configured = configuredRaw.trim()
+  if (configured) {
+    if (isAbsolute(configured)) return resolve(configured)
+    if (!workspace) throw new Error('Output folder is relative but no workspace is configured.')
+    return resolve(join(workspace, configured))
+  }
+  if (!workspace) {
+    throw new Error('No workspace configured to save the image — set an output folder on the node.')
+  }
+  return join(workspace, 'workflow-images')
 }
 
 function summarizeRun(results: WorkflowNodeRunResultV1[]): string {
@@ -1024,7 +1110,7 @@ export class WorkflowRuntime {
           throw new Error('Image generation is missing a provider, API key, or model.')
         }
         const workspace = (settings.workflow.defaultWorkspaceRoot.trim() || settings.workspaceRoot).trim()
-        if (!workspace) throw new Error('No workspace configured to save the image.')
+        const outputDir = resolveImageOutputDir(workspace, interpolate(node.config.outputDir, payload))
         // Lazy import keeps the kun image module out of the unit-test graph.
         const { createImageGenClient } = await import('../../kun/src/adapters/tool/image-gen-tool-provider.js')
         const client = createImageGenClient(imageGen)
@@ -1037,10 +1123,9 @@ export class WorkflowRuntime {
           signal: AbortSignal.timeout(imageGen.timeoutMs)
         })
         const ext = image.mimeType === 'image/jpeg' ? 'jpg' : image.mimeType === 'image/webp' ? 'webp' : 'png'
-        const dir = join(workspace, 'workflow-images')
-        await mkdir(dir, { recursive: true })
+        await mkdir(outputDir, { recursive: true })
         const fileName = `image-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}.${ext}`
-        const filePath = join(dir, fileName)
+        const filePath = join(outputDir, fileName)
         await writeFile(filePath, image.data)
         return {
           payload: { json: { imagePath: filePath, mimeType: image.mimeType }, text: filePath },

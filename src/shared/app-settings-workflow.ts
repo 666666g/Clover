@@ -188,7 +188,8 @@ export function normalizeWorkflowNode(value: unknown, index: number): WorkflowNo
           prompt: asText(config.prompt),
           providerId: asTrimmed(config.providerId),
           model: asTrimmed(config.model),
-          size: asTrimmed(config.size)
+          size: asTrimmed(config.size),
+          outputDir: asTrimmed(config.outputDir)
         }
       }
     case 'condition':

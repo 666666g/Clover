@@ -9,6 +9,8 @@ import type {
   ScheduleRunResult,
   ScheduleRuntimeStatus,
   ScheduleTaskFromTextResult,
+  WorkflowCodeCheckResult,
+  WorkflowCodeLanguage,
   WorkflowRunResult,
   WorkflowRuntimeStatus
 } from './app-settings'
@@ -276,6 +278,7 @@ export type KunGuiApi = {
   runWorkflow: (workflowId: string) => Promise<WorkflowRunResult>
   stopWorkflow: (workflowId: string) => Promise<WorkflowRunResult>
   runWorkflowNode: (workflowId: string, nodeId: string) => Promise<WorkflowRunResult>
+  checkWorkflowCode: (language: WorkflowCodeLanguage, code: string) => Promise<WorkflowCodeCheckResult>
   startClawImInstallQr: (
     provider: 'feishu' | 'weixin',
     options?: { isLark?: boolean }

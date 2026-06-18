@@ -1,4 +1,4 @@
-import type { ReactElement, ReactNode } from 'react'
+import { useEffect, useState, type ReactElement, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Trash2 } from 'lucide-react'
 import { ModelPicker } from './ModelPicker'
@@ -6,6 +6,7 @@ import {
   SCHEDULE_REASONING_EFFORT_IDS,
   getModelProviderSettings,
   type AppSettingsV1,
+  type WorkflowCodeCheckResult,
   type WorkflowCodeLanguage,
   type WorkflowConditionOperator,
   type WorkflowHttpMethod,
@@ -61,6 +62,32 @@ function Field({ label, children }: { label: string; children: ReactNode }): Rea
 
 export function NodeConfigPanel({ node, settings, lastResult, onChange, onDelete }: Props): ReactElement {
   const { t } = useTranslation('common')
+
+  // Debounced editor-time syntax check for the Code node (runs in the main process).
+  const [codeCheck, setCodeCheck] = useState<WorkflowCodeCheckResult | null>(null)
+  const codeValue = node && node.type === 'code' ? node.config.code : ''
+  const codeLanguage = node && node.type === 'code' ? node.config.language : 'javascript'
+  useEffect(() => {
+    if (node?.type !== 'code' || !codeValue.trim()) {
+      setCodeCheck(null)
+      return
+    }
+    let cancelled = false
+    const handle = setTimeout(() => {
+      window.kunGui
+        .checkWorkflowCode(codeLanguage, codeValue)
+        .then((result) => {
+          if (!cancelled) setCodeCheck(result)
+        })
+        .catch(() => {
+          if (!cancelled) setCodeCheck(null)
+        })
+    }, 500)
+    return () => {
+      cancelled = true
+      clearTimeout(handle)
+    }
+  }, [node?.type, codeValue, codeLanguage])
 
   if (!node) {
     return (
@@ -293,6 +320,14 @@ export function NodeConfigPanel({ node, settings, lastResult, onChange, onDelete
                 value={node.config.size}
                 placeholder="1024x1024"
                 onChange={(event) => onChange({ ...node, config: { ...node.config, size: event.target.value } })}
+              />
+            </Field>
+            <Field label={t('workflowImageOutputDir')}>
+              <input
+                className={INPUT_CLASS}
+                value={node.config.outputDir}
+                placeholder={t('workflowImageOutputDirPlaceholder')}
+                onChange={(event) => onChange({ ...node, config: { ...node.config, outputDir: event.target.value } })}
               />
             </Field>
             <p className="text-[11.5px] leading-5 text-ds-faint">{t('workflowImageHint')}</p>
@@ -666,6 +701,18 @@ export function NodeConfigPanel({ node, settings, lastResult, onChange, onDelete
             <p className="text-[11.5px] leading-5 text-ds-faint">
               {t(node.config.language === 'javascript' ? 'workflowCodeHintJs' : 'workflowCodeHintCmd')}
             </p>
+            {codeCheck?.status === 'error' ? (
+              <div className="rounded-lg border border-red-500/40 bg-red-500/5 px-3 py-2">
+                <div className="text-[11.5px] font-semibold text-red-600">{t('workflowCodeSyntaxError')}</div>
+                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-4 text-red-600/90">
+                  {codeCheck.message}
+                </pre>
+              </div>
+            ) : codeCheck?.status === 'ok' ? (
+              <div className="text-[11.5px] font-medium text-emerald-600">✓ {t('workflowCodeSyntaxOk')}</div>
+            ) : codeCheck?.status === 'unavailable' ? (
+              <div className="text-[11.5px] text-ds-faint">{codeCheck.message}</div>
+            ) : null}
           </>
         ) : null}
 

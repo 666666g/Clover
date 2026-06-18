@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { normalizeWorkflow } from '../shared/app-settings-workflow'
 import type { WorkflowV1 } from '../shared/app-settings'
-import { computeWorkflowNextRunAt, cronNextRun, workflowHasScheduleTrigger } from './workflow-runtime'
+import {
+  checkWorkflowCode,
+  computeWorkflowNextRunAt,
+  cronNextRun,
+  workflowHasScheduleTrigger
+} from './workflow-runtime'
 
 function buildWorkflow(partial: Partial<WorkflowV1>): WorkflowV1 {
   return normalizeWorkflow(partial, 0, '2026-06-18T00:00:00.000Z')
@@ -77,5 +82,27 @@ describe('computeWorkflowNextRunAt', () => {
       connections: []
     })
     expect(workflowHasScheduleTrigger(workflow)).toBe(true)
+  })
+})
+
+describe('checkWorkflowCode', () => {
+  it('accepts valid JavaScript', async () => {
+    expect(await checkWorkflowCode('javascript', 'return { value: $json }')).toEqual({ status: 'ok' })
+  })
+
+  it('reports a JavaScript syntax error', async () => {
+    const result = await checkWorkflowCode('javascript', 'return {{{ broken')
+    expect(result.status).toBe('error')
+    if (result.status === 'error') expect(result.message.length).toBeGreaterThan(0)
+  })
+
+  it('treats empty code as ok', async () => {
+    expect(await checkWorkflowCode('python', '   ')).toEqual({ status: 'ok' })
+  })
+
+  it('accepts valid bash and rejects a syntax error', async () => {
+    expect(await checkWorkflowCode('bash', 'echo "$WORKFLOW_TEXT"')).toEqual({ status: 'ok' })
+    const bad = await checkWorkflowCode('bash', 'if [ 1 ]; then echo hi')
+    expect(bad.status).toBe('error')
   })
 })

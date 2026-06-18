@@ -14,6 +14,7 @@ import {
   type ScheduleRunResult,
   type ScheduleRuntimeStatus,
   type ScheduleTaskFromTextResult,
+  type WorkflowCodeCheckResult,
   type WorkflowRunResult,
   type WorkflowRuntimeStatus
 } from '../../shared/app-settings'
@@ -61,6 +62,7 @@ import {
   settingsPatchSchema,
   streamIdSchema,
   workflowRunNodePayloadSchema,
+  workflowCodeCheckPayloadSchema,
   uiPluginIdPayloadSchema,
   workspaceDirectoryCreatePayloadSchema,
   workspaceClipboardImageSavePayloadSchema,
@@ -89,6 +91,7 @@ import { probeModelProvider } from '../provider-connection'
 import type { ClawRuntime } from '../claw-runtime'
 import type { ScheduleRuntime } from '../schedule-runtime'
 import type { WorkflowRuntime } from '../workflow-runtime'
+import { checkWorkflowCode } from '../workflow-runtime'
 import { createAndSwitchGitBranch, getGitBranches, switchGitBranch } from '../services/git-service'
 import {
   abortMerge,
@@ -531,6 +534,11 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     const workflowRuntime = getWorkflowRuntime()
     if (!workflowRuntime) return { ok: false, message: 'Workflow runtime is not initialized.' }
     return workflowRuntime.runSingleNode(request.workflowId, request.nodeId)
+  })
+
+  ipcMain.handle('workflow:code:check', async (_, payload: unknown): Promise<WorkflowCodeCheckResult> => {
+    const request = parseIpcPayload('workflow:code:check', workflowCodeCheckPayloadSchema, payload)
+    return checkWorkflowCode(request.language, request.code)
   })
 
   ipcMain.handle(

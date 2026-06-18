@@ -739,7 +739,8 @@ const workflowGenerateImageConfigSchema = z
     prompt: z.string().max(MAX_CHANNEL_TEXT_LENGTH).optional(),
     providerId: z.string().max(MAX_ID_LENGTH).optional(),
     model: z.string().max(256).optional(),
-    size: z.string().max(32).optional()
+    size: z.string().max(32).optional(),
+    outputDir: z.string().max(1024).optional()
   })
   .strict()
 
@@ -972,6 +973,13 @@ export const workflowRunNodePayloadSchema = z
   .object({
     workflowId: trimmedString(MAX_ID_LENGTH),
     nodeId: trimmedString(MAX_ID_LENGTH)
+  })
+  .strict()
+
+export const workflowCodeCheckPayloadSchema = z
+  .object({
+    language: z.enum(['javascript', 'python', 'bash']),
+    code: z.string().max(MAX_BODY_BYTES)
   })
   .strict()
 

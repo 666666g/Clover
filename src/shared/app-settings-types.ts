@@ -641,6 +641,12 @@ export type WorkflowGenerateImageConfigV1 = {
   model: string
   /** Optional size override (e.g. "1024x1024"); empty uses the provider default. */
   size: string
+  /**
+   * Folder to save the image into. Empty = <workspace>/workflow-images.
+   * Relative paths resolve against the workspace; absolute paths are used as-is.
+   * Supports {{json.x}} / {{text}} interpolation.
+   */
+  outputDir: string
 }
 
 export type WorkflowConditionConfigV1 = {
@@ -878,6 +884,12 @@ export type WorkflowSettingsPatchV1 = Partial<Omit<WorkflowSettingsV1, 'workflow
 export type WorkflowRunResult =
   | { ok: true; runId: string; status: WorkflowRunStatus; message: string }
   | { ok: false; message: string }
+
+/** Result of an editor-time syntax check on a Code node's script. */
+export type WorkflowCodeCheckResult =
+  | { status: 'ok' }
+  | { status: 'error'; message: string }
+  | { status: 'unavailable'; message: string }
 
 export type WorkflowNodeStatusMap = Record<string, WorkflowNodeRunStatus>
 
