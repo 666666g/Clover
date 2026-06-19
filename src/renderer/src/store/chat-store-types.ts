@@ -234,8 +234,9 @@ export type ChatState = {
   createThread: (options?: {
     workspaceRoot?: string
     forceNew?: boolean
-    /** When true, acquire a worktree pool slot as the thread workspace. */
+    /** When true, checkout the selected branch into an isolated worktree. */
     useWorktreePool?: boolean
+    worktreeBranch?: string
   }) => Promise<void>
   selectThread: (id: string) => Promise<void>
   /**

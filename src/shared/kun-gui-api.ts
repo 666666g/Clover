@@ -11,7 +11,7 @@ import type {
   ScheduleTaskFromTextResult
 } from './app-settings'
 import type { EditorListResult, EditorOpenResult, OpenEditorPathOptions } from './editor'
-import type { GitBranchesResult } from './git-branches'
+import type { GitBranchesResult, GitBranchWorktreesResult, GitWorktreeCheckoutResult } from './git-branches'
 import type {
   MergeResult,
   SyncResult,
@@ -304,6 +304,13 @@ export type KunGuiApi = {
   getGitBranches: (workspaceRoot: string) => Promise<GitBranchesResult>
   switchGitBranch: (workspaceRoot: string, branch: string) => Promise<GitBranchesResult>
   createAndSwitchGitBranch: (workspaceRoot: string, branch: string) => Promise<GitBranchesResult>
+  checkoutGitBranchWorktree: (workspaceRoot: string, branch: string) => Promise<GitWorktreeCheckoutResult>
+  createGitBranchWorktree: (workspaceRoot: string, branch: string) => Promise<GitWorktreeCheckoutResult>
+  listGitBranchWorktrees: (params: {
+    projectPath: string
+    worktreeRoot?: string
+  }) => Promise<GitBranchWorktreesResult>
+  removeGitBranchWorktree: (params: { workspaceRoot: string; worktreePath: string }) => Promise<void>
   acquireWorktree: (params: {
     projectPath: string
     poolIndex: number

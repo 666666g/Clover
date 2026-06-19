@@ -4,8 +4,16 @@ import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { readdirSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { getGitBranches, switchGitBranch, createAndSwitchGitBranch } from './git-service'
+import { basename, join, relative, sep } from 'node:path'
+import {
+  checkoutGitBranchWorktree,
+  createGitBranchWorktree,
+  createAndSwitchGitBranch,
+  getGitBranches,
+  listGitBranchWorktrees,
+  removeGitBranchWorktree,
+  switchGitBranch
+} from './git-service'
 
 /**
  * Integration tests for git-service.ts that exercise the real `git` binary
@@ -147,5 +155,117 @@ describe('switchGitBranch / createAndSwitchGitBranch — integration with real g
     expect(result.repositoryRoot).toBe(repoRoot)
     expect(result.currentBranch).toBe('feature/y')
     expect(readdirSync(join(repoRoot, '.git', 'refs', 'heads'))).toContain('feature')
+  })
+})
+
+describe('worktree branch checkout — integration with real git', () => {
+  it('checks out an existing branch into a new worktree without switching the main repo', async () => {
+    execFileSync('git', ['-C', repoRoot, 'checkout', '-b', 'feature/worktree'], { stdio: 'pipe' })
+    await writeFile(join(repoRoot, 'worktree.txt'), 'worktree branch')
+    execFileSync('git', ['-C', repoRoot, 'add', 'worktree.txt'], { stdio: 'pipe' })
+    execFileSync('git', ['-C', repoRoot, 'commit', '-m', 'worktree branch'], { stdio: 'pipe' })
+    execFileSync('git', ['-C', repoRoot, 'checkout', 'main'], { stdio: 'pipe' })
+
+    const sub = join(repoRoot, 'src', 'components')
+    const worktreeRoot = join(sandbox, 'kun-worktrees')
+    await mkdir(sub, { recursive: true })
+
+    const result = await checkoutGitBranchWorktree(sub, 'feature/worktree', worktreeRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.sourceRepositoryRoot).toBe(repoRoot)
+    expect(result.repositoryRoot).toBe(result.worktreePath)
+    expect(result.worktreePath).not.toBe(repoRoot)
+    const worktreeRootReal = await realpath(worktreeRoot)
+    const relativeWorktreePath = relative(worktreeRootReal, result.worktreePath).split(sep)
+    expect(relativeWorktreePath).toHaveLength(2)
+    expect(relativeWorktreePath[0]).toMatch(/^[0-9a-f]{4}$/)
+    expect(relativeWorktreePath[1]).toBe(basename(repoRoot))
+    expect(result.worktreePath).not.toContain('feature-worktree')
+    expect(result.currentBranch).toMatch(/^kun\/worktree-[0-9a-f]{6}$/)
+
+    const mainBranch = execFileSync('git', ['-C', repoRoot, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    const worktreeBranch = execFileSync('git', ['-C', result.worktreePath, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    expect(mainBranch).toBe('main')
+    expect(worktreeBranch).toBe(result.currentBranch)
+    execFileSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', 'feature/worktree', worktreeBranch], {
+      stdio: 'pipe'
+    })
+  })
+
+  it('creates a derived worktree branch when the selected branch is checked out in the main repo', async () => {
+    const sub = join(repoRoot, 'src', 'components')
+    const worktreeRoot = join(sandbox, 'kun-worktrees')
+    await mkdir(sub, { recursive: true })
+
+    const result = await checkoutGitBranchWorktree(sub, 'main', worktreeRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.sourceRepositoryRoot).toBe(repoRoot)
+    expect(result.repositoryRoot).toBe(result.worktreePath)
+    expect(result.worktreePath).not.toBe(repoRoot)
+    expect(result.currentBranch).toMatch(/^kun\/worktree-[0-9a-f]{6}$/)
+
+    const mainBranch = execFileSync('git', ['-C', repoRoot, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    const worktreeBranch = execFileSync('git', ['-C', result.worktreePath, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    expect(mainBranch).toBe('main')
+    expect(worktreeBranch).toBe(result.currentBranch)
+    execFileSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', 'main', worktreeBranch], {
+      stdio: 'pipe'
+    })
+  })
+
+  it('creates a new branch in a new worktree without switching the main repo', async () => {
+    const sub = join(repoRoot, 'src', 'components')
+    const worktreeRoot = join(sandbox, 'kun-worktrees')
+    await mkdir(sub, { recursive: true })
+
+    const result = await createGitBranchWorktree(sub, 'feature/new-worktree', worktreeRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.sourceRepositoryRoot).toBe(repoRoot)
+    expect(result.repositoryRoot).toBe(result.worktreePath)
+    expect(result.worktreePath).not.toBe(repoRoot)
+    const worktreeRootReal = await realpath(worktreeRoot)
+    const relativeWorktreePath = relative(worktreeRootReal, result.worktreePath).split(sep)
+    expect(relativeWorktreePath).toHaveLength(2)
+    expect(relativeWorktreePath[0]).toMatch(/^[0-9a-f]{4}$/)
+    expect(relativeWorktreePath[1]).toBe(basename(repoRoot))
+    expect(result.worktreePath).not.toContain('feature-new-worktree')
+    expect(result.currentBranch).toBe('feature/new-worktree')
+
+    const mainBranch = execFileSync('git', ['-C', repoRoot, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    const worktreeBranch = execFileSync('git', ['-C', result.worktreePath, 'branch', '--show-current'], {
+      encoding: 'utf8'
+    }).trim()
+    expect(mainBranch).toBe('main')
+    expect(worktreeBranch).toBe('feature/new-worktree')
+
+    const listed = await listGitBranchWorktrees(repoRoot, worktreeRoot)
+    expect(listed.ok).toBe(true)
+    if (!listed.ok) throw new Error('unreachable')
+    expect(listed.worktrees.map((item) => item.path)).toContain(result.worktreePath)
+
+    await removeGitBranchWorktree({
+      workspaceRoot: repoRoot,
+      worktreePath: result.worktreePath
+    })
+    const afterRemove = await listGitBranchWorktrees(repoRoot, worktreeRoot)
+    expect(afterRemove.ok).toBe(true)
+    if (!afterRemove.ok) throw new Error('unreachable')
+    expect(afterRemove.worktrees.map((item) => item.path)).not.toContain(result.worktreePath)
   })
 })

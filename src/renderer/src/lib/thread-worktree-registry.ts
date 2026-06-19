@@ -12,7 +12,7 @@ import { browserStorage, type BrowserStorageLike } from './browser-storage'
 
 export type ThreadWorktreeRecord = {
   projectPath: string
-  poolIndex: number
+  poolIndex?: number
   worktreePath: string
   branch: string
   createdAt?: string
@@ -65,15 +65,15 @@ export function normalizeThreadWorktreeRegistry(raw: unknown): ThreadWorktreeReg
     const projectPath = normalizeThreadId(record.projectPath)
     const poolIndex = normalizeOptionalNumber(record.poolIndex)
     const worktreePath = normalizeThreadId(record.worktreePath)
-    if (!threadId || !projectPath || poolIndex === undefined || !worktreePath) continue
-    const branch = normalizeThreadId(record.branch) || `kun-pool-${poolIndex}`
+    if (!threadId || !projectPath || !worktreePath) continue
+    const branch = normalizeThreadId(record.branch) || (poolIndex === undefined ? 'worktree' : `kun-pool-${poolIndex}`)
     const createdAt = normalizeOptionalString(record.createdAt)
     delete worktrees[threadId]
     worktrees[threadId] = {
       projectPath,
-      poolIndex,
       worktreePath,
       branch,
+      ...(poolIndex === undefined ? {} : { poolIndex }),
       ...(createdAt ? { createdAt } : {})
     }
   }

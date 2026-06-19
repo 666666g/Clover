@@ -1,179 +1,101 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
-import { CheckCircle2, GitBranch, GitMerge, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react'
-import { MAX_WORKTREE_POOL_SIZE, parseWorktreeHasChangesError } from '@shared/worktree'
-import type { WorktreePoolStatus } from '@shared/worktree'
-import { useWorktreeStore } from '../stores/worktree-store'
+import { GitBranch, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import type { NormalizedThread } from '../agent/types'
+import type { GitBranchWorktreeRow, GitBranchWorktreesResult } from '@shared/git-branches'
+import { readThreadWorktreeRegistry } from '../lib/thread-worktree-registry'
 import { SettingsCard, SettingRow } from './settings-controls'
 
+type WorktreeDisplayRow = GitBranchWorktreeRow & {
+  threadTitle: string
+  createdAt: string
+}
+
 export function WorktreeSettingsSection({ ctx }: { ctx: Record<string, any> }): ReactElement {
-  const { t, compactHomePath, expandHomePath } = ctx
-  const { poolStatus, loading, error, lastMergeResult, lastSyncResult, setPoolStatus, setLoading, setError, setLastMergeResult, setLastSyncResult } =
-    useWorktreeStore()
-  const [busyPool, setBusyPool] = useState<number | null>(null)
-  const [projectPath, setProjectPath] = useState<string>('')
+  const { t } = ctx
+  const compactHomePath = typeof ctx.compactHomePath === 'function'
+    ? ctx.compactHomePath as (path: string) => string
+    : (path: string) => path
+  const expandHomePath = typeof ctx.expandHomePath === 'function'
+    ? ctx.expandHomePath as (path: string) => string
+    : (path: string) => path
+  const locale = String(ctx.locale || 'zh-CN')
+  const threads = useMemo(() => (ctx.threads ?? []) as NormalizedThread[], [ctx.threads])
+  const worktreeRoot = ctx.form?.worktreeRootPath
+    ? expandHomePath(String(ctx.form.worktreeRootPath))
+    : undefined
+  const projectPath = expandHomePath(String(ctx.form?.workspaceRoot || ctx.kun?.workspaceRoot || '')).trim()
+  const [result, setResult] = useState<GitBranchWorktreesResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [busyPath, setBusyPath] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
-  // Resolve current workspace root from the settings form.
-  const worktreeRoot: string | undefined = ctx.form?.worktreeRootPath || undefined
-
-  const refresh = useCallback(async () => {
-    const path = expandHomePath(ctx.form?.workspaceRoot || ctx.kun?.workspaceRoot || '')
-    if (!path) return
-    setProjectPath(path)
+  const refresh = useCallback(async (): Promise<void> => {
+    if (!projectPath) return
     setLoading(true)
     setError(null)
     try {
-      const status: WorktreePoolStatus = await window.kunGui.listWorktrees({
-        projectPath: path,
+      const next = await window.kunGui.listGitBranchWorktrees({
+        projectPath,
         worktreeRoot
       })
-      setPoolStatus(status)
+      setResult(next)
+      if (!next.ok) setError(next.message)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
-      setPoolStatus(null)
+      setResult(null)
     } finally {
       setLoading(false)
     }
-  }, [ctx.form, ctx.kun, worktreeRoot, setLoading, setError, setPoolStatus])
+  }, [projectPath, worktreeRoot])
 
   useEffect(() => {
     void refresh()
   }, [refresh])
 
-  const handleAcquire = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    setError(null)
-    try {
-      await window.kunGui.acquireWorktree({
-        projectPath,
-        poolIndex,
-        taskId: `manual-${Date.now()}`,
-        worktreeRoot
-      })
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleForceAcquire = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    setError(null)
-    try {
-      await window.kunGui.acquireWorktree({
-        projectPath,
-        poolIndex,
-        taskId: `manual-${Date.now()}`,
-        force: true,
-        worktreeRoot
-      })
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleRelease = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    try {
-      await window.kunGui.releaseWorktree({ projectPath, poolIndex })
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleRemove = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    try {
-      await window.kunGui.removeWorktree({ projectPath, poolIndex, worktreeRoot })
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleMerge = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    setLastMergeResult(null)
-    try {
-      const result = await window.kunGui.mergeWorktree({ projectPath, poolIndex, worktreeRoot })
-      setLastMergeResult(result)
-      if (result.success) await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleSync = async (poolIndex: number): Promise<void> => {
-    setBusyPool(poolIndex)
-    setLastSyncResult(null)
-    try {
-      const result = await window.kunGui.syncWorktreeFromMain({ projectPath, poolIndex, worktreeRoot })
-      setLastSyncResult(result)
-      if (result.success) await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleCleanup = async (): Promise<void> => {
-    setBusyPool(-1)
-    try {
-      await window.kunGui.cleanupWorktrees({ projectPath, worktreeRoot })
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyPool(null)
-    }
-  }
-
-  const handleAcquireClick = async (poolIndex: number): Promise<void> => {
-    setError(null)
-    // Try normal acquire first; if it fails with WORKTREE_HAS_CHANGES, the UI
-    // will show a confirm to force-reset.
-    setBusyPool(poolIndex)
-    try {
-      await window.kunGui.acquireWorktree({
-        projectPath,
-        poolIndex,
-        taskId: `manual-${Date.now()}`,
-        worktreeRoot
-      })
-      await refresh()
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      const parsed = parseWorktreeHasChangesError(msg)
-      if (parsed) {
-        const ok = window.confirm(
-          t('worktreeForceConfirm').replace('{{count}}', String(parsed.changesCount))
-        )
-        if (ok) {
-          await handleForceAcquire(poolIndex)
-        }
-      } else {
-        setError(msg)
+  const rows = useMemo<WorktreeDisplayRow[]>(() => {
+    if (!result?.ok) return []
+    const registry = readThreadWorktreeRegistry().worktrees
+    return result.worktrees.map((worktree) => {
+      const record = Object.entries(registry).find(([, item]) => item.worktreePath === worktree.path)
+      const thread = record ? threads.find((item) => item.id === record[0]) : null
+      return {
+        ...worktree,
+        threadTitle: thread?.title?.trim() || '',
+        createdAt: record?.[1]?.createdAt || ''
       }
-    } finally {
-      setBusyPool(null)
-    }
+    })
+  }, [result, threads])
+
+  const formatCreatedAt = (value: string): string => {
+    if (!value) return ''
+    const date = new Date(value)
+    if (!Number.isFinite(date.getTime())) return value
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(date)
   }
 
-  const pools = poolStatus?.worktrees ?? []
-  const poolByIndex = (i: number) => pools.find((w) => w.poolIndex === i)
+  const removeWorktree = async (path: string): Promise<void> => {
+    if (!projectPath || !path) return
+    setBusyPath(path)
+    setError(null)
+    try {
+      await window.kunGui.removeGitBranchWorktree({
+        workspaceRoot: projectPath,
+        worktreePath: path
+      })
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusyPath(null)
+    }
+  }
 
   return (
     <SettingsCard title={t('sectionWorktree')}>
@@ -183,229 +105,77 @@ export function WorktreeSettingsSection({ ctx }: { ctx: Record<string, any> }): 
         wideControl
         control={
           <div className="flex flex-col gap-3">
-            {/* Overview stats */}
-            <div className="grid grid-cols-4 gap-2 text-[12px]">
-              <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
-                <div className="text-ds-faint">{t('worktreeMainBranch')}</div>
-                <div className="mt-0.5 truncate font-mono text-[13px] font-semibold text-ds-ink">
-                  {poolStatus?.mainBranch ?? '—'}
-                </div>
-              </div>
-              <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
-                <div className="text-ds-faint">{t('worktreeInUse')}</div>
-                <div className="mt-0.5 font-mono text-[15px] font-semibold text-ds-ink">
-                  {poolStatus?.inUseCount ?? 0} / {MAX_WORKTREE_POOL_SIZE}
-                </div>
-              </div>
-              <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
-                <div className="text-ds-faint">{t('worktreePoolDir')}</div>
+            <div className="grid grid-cols-[1fr_auto] items-start gap-3">
+              <div className="min-w-0 rounded-lg border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                <div className="text-[12px] text-ds-faint">{t('worktreePoolDir')}</div>
                 <div
-                  className="mt-0.5 truncate font-mono text-[11px] text-ds-muted"
-                  title={poolStatus?.poolDir ? compactHomePath(poolStatus.poolDir) : undefined}
+                  className="mt-0.5 truncate font-mono text-[12px] text-ds-muted"
+                  title={result?.ok ? compactHomePath(result.worktreeRoot) : undefined}
                 >
-                  {poolStatus?.poolDir ? compactHomePath(poolStatus.poolDir) : '—'}
+                  {result?.ok ? compactHomePath(result.worktreeRoot) : '-'}
                 </div>
               </div>
-              <div className="flex items-end justify-end">
-                <button
-                  type="button"
-                  onClick={() => void refresh()}
-                  disabled={loading}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-ds-border-muted px-2.5 py-1.5 text-[12px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:opacity-45"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} strokeWidth={1.8} />
-                  {t('worktreeRefresh')}
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => void refresh()}
+                disabled={loading}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-ds-border-muted px-2.5 py-1.5 text-[12px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:opacity-45"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} strokeWidth={1.8} />
+                {t('worktreeRefresh')}
+              </button>
             </div>
 
-            {poolStatus?.isGitRepo === false ? (
-              <div className="rounded-xl border border-amber-200/80 bg-amber-50/80 px-3 py-2 text-[12px] text-amber-700 dark:border-amber-800/40 dark:bg-amber-500/10 dark:text-amber-300">
-                {t('worktreeNotGitRepo')}
-              </div>
-            ) : error ? (
-              <div className="rounded-xl border border-red-200/80 bg-red-50/80 px-3 py-2 text-[12px] text-red-700 dark:border-red-800/40 dark:bg-red-500/10 dark:text-red-300">
+            {error ? (
+              <div className="rounded-lg border border-red-200/80 bg-red-50/80 px-3 py-2 text-[12px] text-red-700 dark:border-red-800/40 dark:bg-red-500/10 dark:text-red-300">
                 {error}
               </div>
             ) : null}
 
-            {/* Pool cards */}
-            <div className="flex flex-col gap-2">
-              {Array.from({ length: MAX_WORKTREE_POOL_SIZE }, (_, i) => {
-                const wt = poolByIndex(i)
-                const isBusy = busyPool === i
+            <div className="overflow-hidden rounded-lg border border-ds-border-muted bg-ds-main/35">
+              {rows.length === 0 ? (
+                <div className="px-3 py-4 text-[13px] text-ds-faint">{t('worktreeEmptyList')}</div>
+              ) : rows.map((row) => {
+                const displayPath = compactHomePath(row.path)
                 return (
-                  <div
-                    key={i}
-                    className={`rounded-xl border px-3 py-2.5 transition ${
-                      wt?.inUse
-                        ? 'border-ds-ink/30 bg-ds-subtle/50'
-                        : 'border-ds-border-muted bg-ds-main/40'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <GitBranch className="h-4 w-4 shrink-0 text-ds-muted" strokeWidth={1.75} />
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2 text-[13px] font-semibold text-ds-ink">
+                  <div key={row.path} className="border-b border-ds-border-muted px-3 py-3 last:border-b-0">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-[13px] font-semibold text-ds-ink">
+                          <GitBranch className="h-3.5 w-3.5 shrink-0 text-ds-muted" strokeWidth={1.8} />
+                          <span className="truncate">{row.branch ?? 'DETACHED'}</span>
+                        </div>
+                        <div className="mt-1 truncate font-mono text-[12px] text-ds-muted" title={displayPath}>
+                          {displayPath}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-ds-faint">
+                          {row.createdAt ? (
                             <span>
-                              {t('worktreePool')} {i}
+                              {t('worktreeCreatedAt')}: {formatCreatedAt(row.createdAt)}
                             </span>
-                            {wt?.inUse ? (
-                              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
-                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                                {t('worktreeBusy')}
-                              </span>
-                            ) : wt ? (
-                              <span className="inline-flex items-center gap-1 rounded-full bg-ds-hover/60 px-2 py-0.5 text-[10px] font-medium text-ds-muted">
-                                {t('worktreeIdle')}
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1 rounded-full bg-ds-hover/30 px-2 py-0.5 text-[10px] font-medium text-ds-faint">
-                                {t('worktreeEmpty')}
-                              </span>
-                            )}
-                          </div>
-                          <div
-                            className="mt-0.5 truncate text-[11px] text-ds-faint"
-                            title={wt?.path ? compactHomePath(wt.path) : undefined}
-                          >
-                            {wt ? compactHomePath(wt.path) : t('worktreeNotCreated')}
-                            {wt && wt.changesCount > 0 ? (
-                              <span className="ml-2 text-amber-600 dark:text-amber-400">
-                                · {wt.changesCount} {t('worktreeUncommitted')}
-                              </span>
-                            ) : null}
-                          </div>
+                          ) : null}
+                          <span>
+                            {t('worktreeConversation')}: {row.threadTitle || t('worktreeNoConversation')}
+                          </span>
                         </div>
                       </div>
-                      <div className="flex shrink-0 items-center gap-1">
-                        {isBusy && <Loader2 className="h-3.5 w-3.5 animate-spin text-ds-muted" strokeWidth={1.8} />}
-                        {!wt && !isBusy && (
-                          <button
-                            type="button"
-                            onClick={() => void handleAcquireClick(i)}
-                            className="rounded-lg px-2 py-1 text-[12px] font-medium text-ds-ink transition hover:bg-ds-hover"
-                          >
-                            {t('worktreeCreate')}
-                          </button>
+                      <button
+                        type="button"
+                        onClick={() => void removeWorktree(row.path)}
+                        disabled={busyPath === row.path}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-red-600 transition hover:bg-red-500/10 disabled:opacity-45"
+                      >
+                        {busyPath === row.path ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.8} />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" strokeWidth={1.8} />
                         )}
-                        {wt && !wt.inUse && !isBusy && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => void handleMerge(i)}
-                              className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
-                              title={t('worktreeMergeTitle')}
-                            >
-                              <GitMerge className="h-3.5 w-3.5" strokeWidth={1.8} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => void handleSync(i)}
-                              className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[12px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
-                              title={t('worktreeSyncTitle')}
-                            >
-                              <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.8} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => void handleRemove(i)}
-                              className="rounded-lg p-1 text-ds-muted transition hover:bg-red-500/10 hover:text-red-600"
-                              title={t('worktreeRemove')}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.8} />
-                            </button>
-                          </>
-                        )}
-                        {wt?.inUse && !isBusy && (
-                          <button
-                            type="button"
-                            onClick={() => void handleRelease(i)}
-                            className="rounded-lg px-2 py-1 text-[12px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
-                          >
-                            {t('worktreeRelease')}
-                          </button>
-                        )}
-                      </div>
+                        {t('worktreeRemove')}
+                      </button>
                     </div>
                   </div>
                 )
               })}
-            </div>
-
-            {/* Merge / Sync result feedback */}
-            {lastMergeResult && (
-              <div
-                className={`flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px] ${
-                  lastMergeResult.success
-                    ? 'border-emerald-200/80 bg-emerald-50/80 text-emerald-700 dark:border-emerald-800/40 dark:bg-emerald-500/10 dark:text-emerald-300'
-                    : 'border-amber-200/80 bg-amber-50/80 text-amber-700 dark:border-amber-800/40 dark:bg-amber-500/10 dark:text-amber-300'
-                }`}
-              >
-                {lastMergeResult.success ? (
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-                ) : (
-                  <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-                )}
-                <div className="min-w-0">
-                  <div className="font-medium">{lastMergeResult.message}</div>
-                  {lastMergeResult.conflictedFiles.length > 0 && (
-                    <ul className="mt-1 list-inside list-disc text-[11px] opacity-80">
-                      {lastMergeResult.conflictedFiles.slice(0, 5).map((f) => (
-                        <li key={f} className="truncate font-mono">
-                          {f}
-                        </li>
-                      ))}
-                      {lastMergeResult.conflictedFiles.length > 5 && (
-                        <li>… +{lastMergeResult.conflictedFiles.length - 5}</li>
-                      )}
-                    </ul>
-                  )}
-                </div>
-              </div>
-            )}
-            {lastSyncResult && (
-              <div
-                className={`flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px] ${
-                  lastSyncResult.success
-                    ? 'border-emerald-200/80 bg-emerald-50/80 text-emerald-700 dark:border-emerald-800/40 dark:bg-emerald-500/10 dark:text-emerald-300'
-                    : 'border-amber-200/80 bg-amber-50/80 text-amber-700 dark:border-amber-800/40 dark:bg-amber-500/10 dark:text-amber-300'
-                }`}
-              >
-                {lastSyncResult.success ? (
-                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-                ) : (
-                  <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-                )}
-                <div className="min-w-0">
-                  <div className="font-medium">{lastSyncResult.message}</div>
-                  {lastSyncResult.conflictedFiles.length > 0 && (
-                    <ul className="mt-1 list-inside list-disc text-[11px] opacity-80">
-                      {lastSyncResult.conflictedFiles.slice(0, 5).map((f) => (
-                        <li key={f} className="truncate font-mono">
-                          {f}
-                        </li>
-                      ))}
-                      {lastSyncResult.conflictedFiles.length > 5 && (
-                        <li>… +{lastSyncResult.conflictedFiles.length - 5}</li>
-                      )}
-                    </ul>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* Cleanup button */}
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={() => void handleCleanup()}
-                disabled={busyPool === -1 || pools.length === 0}
-                className="rounded-lg px-2.5 py-1.5 text-[12px] font-medium text-red-600 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-45"
-              >
-                {t('worktreeCleanupAll')}
-              </button>
             </div>
           </div>
         }

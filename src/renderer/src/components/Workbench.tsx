@@ -441,6 +441,7 @@ export function Workbench(): ReactElement {
   const [input, setInput] = useState('')
   const [mode, setMode] = useState<'plan' | 'agent'>('agent')
   const [useWorktreePool, setUseWorktreePool] = useState(false)
+  const [worktreeBranch, setWorktreeBranch] = useState('')
   const [composerReasoningEffort, setComposerReasoningEffort] =
     useState<ComposerReasoningEffort>('max')
   const [runtimeInfo, setRuntimeInfo] = useState<CoreRuntimeInfoJson | null>(null)
@@ -700,7 +701,7 @@ export function Workbench(): ReactElement {
         return
       }
       if (commandId === 'new-chat') {
-        void createThread({ useWorktreePool })
+        void createThread({ useWorktreePool, worktreeBranch })
         if (useWorktreePool) setUseWorktreePool(false)
         return
       }
@@ -732,7 +733,8 @@ export function Workbench(): ReactElement {
     openSettings,
     setMode,
     toggleTerminal,
-    useWorktreePool
+    useWorktreePool,
+    worktreeBranch
   ])
   const showDevPreviewCard =
     route === 'chat' &&
@@ -2077,7 +2079,7 @@ export function Workbench(): ReactElement {
     if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     setConnectPhoneSidebarOpen(false)
     setRoute('chat')
-    void createThread({ useWorktreePool })
+    void createThread({ useWorktreePool, worktreeBranch })
     if (useWorktreePool) setUseWorktreePool(false)
   }
 
@@ -2085,7 +2087,7 @@ export function Workbench(): ReactElement {
     if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     setConnectPhoneSidebarOpen(false)
     setRoute('chat')
-    void createThread({ workspaceRoot, useWorktreePool })
+    void createThread({ workspaceRoot, useWorktreePool, worktreeBranch })
     if (useWorktreePool) setUseWorktreePool(false)
   }
 
@@ -2644,6 +2646,8 @@ export function Workbench(): ReactElement {
                 onInterrupt={(options) => void interrupt(options)}
                 onPlanCommand={() => void handleGuiPlanCommand()}
                 useWorktreePool={useWorktreePool}
+                worktreeBranch={worktreeBranch}
+                onWorktreeBranchChange={setWorktreeBranch}
                 onToggleWorktreeMode={() => setUseWorktreePool((v) => !v)}
                 onNewCommand={() => void createThread({ workspaceRoot: activeSkillWorkspace, forceNew: true })}
                 onReviewCommand={(target) => void reviewActiveThread(target)}

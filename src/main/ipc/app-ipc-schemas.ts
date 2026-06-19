@@ -800,6 +800,11 @@ export const worktreePathSchema = z.object({
   worktreePath: trimmedString(MAX_PATH_LENGTH)
 }).strict()
 
+export const gitWorktreeRemoveSchema = z.object({
+  workspaceRoot: workspaceRootSchema,
+  worktreePath: trimmedString(MAX_PATH_LENGTH)
+}).strict()
+
 export const worktreeProjectPathSchema = z.object({
   projectPath: trimmedString(MAX_PATH_LENGTH)
 }).strict()

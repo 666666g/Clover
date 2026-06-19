@@ -34,6 +34,7 @@ function releaseThreadWorktreeIfNeeded(threadId: string | null): void {
   if (typeof window.kunGui?.releaseWorktree !== 'function') return
   const record = readThreadWorktreeRegistry().worktrees[threadId]
   if (!record) return
+  if (record.poolIndex === undefined) return
   void window.kunGui
     .releaseWorktree({
       projectPath: record.projectPath,
@@ -618,7 +619,7 @@ export function createMaintenanceActions(
     // Release the worktree pool slot if this thread owned one. Best-effort:
     // a failure to release must not block thread deletion.
     const wtRecord = readThreadWorktreeRegistry().worktrees[targetId]
-    if (wtRecord) {
+    if (wtRecord?.poolIndex !== undefined) {
       try {
         await window.kunGui.releaseWorktree({
           projectPath: wtRecord.projectPath,

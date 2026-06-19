@@ -299,6 +299,7 @@ function releaseThreadWorktreeIfNeeded(threadId: string | null): void {
   if (typeof window.kunGui?.releaseWorktree !== 'function') return
   const record = readThreadWorktreeRegistry().worktrees[threadId]
   if (!record) return
+  if (record.poolIndex === undefined) return
   void window.kunGui
     .releaseWorktree({
       projectPath: record.projectPath,

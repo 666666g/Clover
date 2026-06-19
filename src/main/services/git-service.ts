@@ -1,6 +1,15 @@
 import { execFile } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { access, mkdir, realpath } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
-import type { GitBranchesResult } from '../../shared/git-branches'
+import type {
+  GitBranchesResult,
+  GitBranchWorktreeRow,
+  GitBranchWorktreesResult,
+  GitWorktreeCheckoutResult
+} from '../../shared/git-branches'
 import { findNearestGitRoot } from './git-discovery'
 
 const execFileAsync = promisify(execFile)
@@ -53,6 +62,107 @@ function gitFailure(error: unknown): GitBranchesResult {
     return { ok: false, reason: 'git_unavailable', message: 'Git executable was not found.' }
   }
   return { ok: false, reason: 'error', message }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function resolveBranchWorktreeRoot(worktreeRoot?: string): string {
+  return worktreeRoot?.trim() || join(homedir(), '.kun', 'worktrees')
+}
+
+async function allocateBranchWorktreePath(
+  sourceRepositoryRoot: string,
+  worktreeRoot?: string
+): Promise<string> {
+  const repoName = basename(sourceRepositoryRoot) || 'project'
+  const root = resolveBranchWorktreeRoot(worktreeRoot)
+  for (let i = 0; i < 100; i += 1) {
+    const id = randomBytes(2).toString('hex')
+    const candidate = join(root, id, repoName)
+    if (!(await pathExists(candidate))) return candidate
+  }
+  throw new Error(`Failed to allocate a free worktree path under ${root}`)
+}
+
+async function getPrimaryWorktreeRoot(cwd: string, fallback: string): Promise<string> {
+  try {
+    const { stdout } = await runGit(cwd, ['worktree', 'list', '--porcelain'])
+    const line = stdout.split('\n').find((item) => item.startsWith('worktree '))
+    const root = line?.slice('worktree '.length).trim()
+    return root || fallback
+  } catch {
+    return fallback
+  }
+}
+
+async function allocateDerivedWorktreeBranch(cwd: string): Promise<string> {
+  for (let i = 0; i < 100; i += 1) {
+    const branch = `kun/worktree-${randomBytes(3).toString('hex')}`
+    try {
+      await runGit(cwd, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
+    } catch {
+      return branch
+    }
+  }
+  throw new Error('Failed to allocate a free worktree branch name.')
+}
+
+function parseWorktreeListPorcelain(stdout: string): GitBranchWorktreeRow[] {
+  const rows: GitBranchWorktreeRow[] = []
+  let path = ''
+  let branch: string | null = null
+  let head = ''
+  const flush = (): void => {
+    if (path) rows.push({ path, branch, head })
+    path = ''
+    branch = null
+    head = ''
+  }
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) {
+      flush()
+      continue
+    }
+    if (line.startsWith('worktree ')) {
+      if (path) flush()
+      path = line.slice('worktree '.length).trim()
+    } else if (line.startsWith('HEAD ')) {
+      head = line.slice('HEAD '.length).trim()
+    } else if (line.startsWith('branch refs/heads/')) {
+      branch = line.slice('branch refs/heads/'.length).trim()
+    }
+  }
+  flush()
+  return rows
+}
+
+function gitWorktreeFailure(error: unknown): GitWorktreeCheckoutResult {
+  const result = gitFailure(error)
+  return result.ok
+    ? { ok: false, reason: 'error', message: 'Unexpected Git branch result.' }
+    : result
+}
+
+async function worktreeCheckoutResult(
+  worktreePath: string,
+  sourceRepositoryRoot: string
+): Promise<GitWorktreeCheckoutResult> {
+  const resolvedWorktreePath = await realpath(worktreePath).catch(() => worktreePath)
+  const result = await getGitBranches(resolvedWorktreePath)
+  if (!result.ok) return result
+  return {
+    ...result,
+    sourceRepositoryRoot,
+    worktreePath: result.repositoryRoot
+  }
 }
 
 export async function getGitBranches(workspaceRoot: string): Promise<GitBranchesResult> {
@@ -122,4 +232,83 @@ export async function createAndSwitchGitBranch(
   } catch (error) {
     return gitFailure(error)
   }
+}
+
+export async function checkoutGitBranchWorktree(
+  workspaceRoot: string,
+  branchName: string,
+  worktreeRoot?: string
+): Promise<GitWorktreeCheckoutResult> {
+  const cwd = await resolveGitCwd(workspaceRoot)
+  const branch = branchName.trim()
+  if (!cwd) return { ok: false, reason: 'no_workspace', message: 'No working directory selected.' }
+  if (!branch) return { ok: false, reason: 'error', message: 'Branch name is required.' }
+  try {
+    const currentRepositoryRoot = (await runGit(cwd, ['rev-parse', '--show-toplevel'])).stdout.trim()
+    const sourceRepositoryRoot = await getPrimaryWorktreeRoot(cwd, currentRepositoryRoot)
+    const wtPath = await allocateBranchWorktreePath(sourceRepositoryRoot, worktreeRoot)
+    const worktreeBranch = await allocateDerivedWorktreeBranch(cwd)
+    await mkdir(join(wtPath, '..'), { recursive: true })
+    await runGit(cwd, ['worktree', 'add', '-b', worktreeBranch, wtPath, branch], 30_000)
+    return worktreeCheckoutResult(wtPath, sourceRepositoryRoot)
+  } catch (error) {
+    return gitWorktreeFailure(error)
+  }
+}
+
+export async function createGitBranchWorktree(
+  workspaceRoot: string,
+  branchName: string,
+  worktreeRoot?: string
+): Promise<GitWorktreeCheckoutResult> {
+  const cwd = await resolveGitCwd(workspaceRoot)
+  const branch = branchName.trim()
+  if (!cwd) return { ok: false, reason: 'no_workspace', message: 'No working directory selected.' }
+  if (!branch) return { ok: false, reason: 'error', message: 'Branch name is required.' }
+  try {
+    await runGit(cwd, ['check-ref-format', '--branch', branch])
+    const currentRepositoryRoot = (await runGit(cwd, ['rev-parse', '--show-toplevel'])).stdout.trim()
+    const sourceRepositoryRoot = await getPrimaryWorktreeRoot(cwd, currentRepositoryRoot)
+    const wtPath = await allocateBranchWorktreePath(sourceRepositoryRoot, worktreeRoot)
+    await mkdir(join(wtPath, '..'), { recursive: true })
+    await runGit(cwd, ['worktree', 'add', '-b', branch, wtPath, 'HEAD'], 30_000)
+    return worktreeCheckoutResult(wtPath, sourceRepositoryRoot)
+  } catch (error) {
+    return gitWorktreeFailure(error)
+  }
+}
+
+export async function listGitBranchWorktrees(
+  workspaceRoot: string,
+  worktreeRoot?: string
+): Promise<GitBranchWorktreesResult> {
+  const cwd = await resolveGitCwd(workspaceRoot)
+  if (!cwd) return { ok: false, reason: 'no_workspace', message: 'No working directory selected.' }
+  try {
+    const currentRepositoryRoot = (await runGit(cwd, ['rev-parse', '--show-toplevel'])).stdout.trim()
+    const sourceRepositoryRoot = await getPrimaryWorktreeRoot(cwd, currentRepositoryRoot)
+    const root = await realpath(resolveBranchWorktreeRoot(worktreeRoot)).catch(() => resolveBranchWorktreeRoot(worktreeRoot))
+    const { stdout } = await runGit(cwd, ['worktree', 'list', '--porcelain'])
+    const worktrees = parseWorktreeListPorcelain(stdout)
+      .filter((row) => row.path !== sourceRepositoryRoot)
+      .filter((row) => row.path === root || row.path.startsWith(`${root}/`))
+    return {
+      ok: true,
+      repositoryRoot: sourceRepositoryRoot,
+      worktreeRoot: root,
+      worktrees
+    }
+  } catch (error) {
+    const result = gitFailure(error)
+    return result.ok ? { ok: false, reason: 'error', message: 'Unexpected Git branch result.' } : result
+  }
+}
+
+export async function removeGitBranchWorktree(params: {
+  workspaceRoot: string
+  worktreePath: string
+}): Promise<void> {
+  const cwd = await resolveGitCwd(params.workspaceRoot)
+  if (!cwd) throw new Error('No working directory selected.')
+  await runGit(cwd, ['worktree', 'remove', '--force', params.worktreePath], 30_000)
 }

@@ -134,6 +134,42 @@ describe('SidebarProjectsSection groups', () => {
     expect(groups[0]?.[1].map((item) => item.id)).toEqual(['default-short', 'default-absolute'])
   })
 
+  it('shows worktree threads under their source project instead of a separate worktree project', () => {
+    const projectPath = '/Users/zxy/code/Kook-VoiceShop-Bot'
+    const worktreePath = '/Users/zxy/.kun/worktrees/0ff7/Kook-VoiceShop-Bot'
+    const threadWorktrees = {
+      'thread-worktree': {
+        projectPath,
+        worktreePath
+      }
+    }
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [
+        thread({ id: 'thread-main', workspace: projectPath }),
+        thread({ id: 'thread-worktree', workspace: worktreePath })
+      ],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: projectPath,
+      workspaceRoots: [
+        projectPath,
+        worktreePath
+      ],
+      threadWorktrees
+    })
+
+    expect(groups.map(([workspace]) => workspace)).toEqual([projectPath])
+    expect(groups[0]?.[1].map((item) => item.id)).toEqual(['thread-main', 'thread-worktree'])
+
+    const workspaces = buildSidebarDraftWorkspacePaths({
+      threads: [thread({ id: 'thread-worktree', workspace: worktreePath })],
+      workspaceRoot: projectPath,
+      workspaceRoots: [projectPath, worktreePath],
+      threadWorktrees
+    })
+    expect(workspaces).toEqual([projectPath])
+  })
+
   it('loads requirement histories from all known project workspaces while searching', () => {
     const workspaces = buildSidebarDraftWorkspacePaths({
       threads: [

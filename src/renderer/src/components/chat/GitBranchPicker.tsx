@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } 
 import { AlertCircle, Check, ChevronDown, GitBranch, Loader2, Plus, Search } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { GitBranchesResult } from '@shared/git-branches'
+import { getProvider } from '../../agent/registry'
+import { markThreadWorktree, saveThreadWorktreeRegistry } from '../../lib/thread-worktree-registry'
+import { useChatStore } from '../../store/chat-store'
+import { rememberCodeWorkspaceRoots } from '../../store/chat-store-helpers'
 
 type Props = {
   workspaceRoot: string
@@ -70,25 +74,64 @@ export function GitBranchPicker({ workspaceRoot }: Props): ReactElement | null {
     return branches.filter((branch) => branch.name.toLowerCase().includes(q))
   }, [branches, query])
 
-  const exactBranchExists = branches.some((branch) => branch.name === query.trim())
-  const canCreate = query.trim().length > 0 && !exactBranchExists
+  const trimmedQuery = query.trim()
+  const exactBranchExists = branches.some((branch) => branch.name === trimmedQuery)
+  const selectedWorktreeBranch = trimmedQuery
+    ? exactBranchExists
+      ? trimmedQuery
+      : ''
+    : result?.ok
+      ? result.currentBranch ?? ''
+      : ''
+  const canCreate = trimmedQuery.length > 0 && !exactBranchExists
+  const canCheckoutWorktree = selectedWorktreeBranch.length > 0
+  const canRunFooterAction = canCreate || canCheckoutWorktree
   const currentBranch = result?.ok ? result.currentBranch : null
   const label = currentBranch || (result?.ok ? t('gitDetached') : t('gitBranchUnavailable'))
 
-  const switchBranch = async (branch: string): Promise<void> => {
-    if (!root || !branch || branch === currentBranch) {
-      setOpen(false)
-      return
+  const moveActiveThreadToWorktree = async (record: {
+    projectPath: string
+    worktreePath: string
+    branch: string
+  }): Promise<void> => {
+    const activeThreadId = useChatStore.getState().activeThreadId
+    if (!activeThreadId) return
+    const provider = getProvider()
+    if (typeof provider.updateThreadWorkspace === 'function') {
+      await provider.updateThreadWorkspace(activeThreadId, record.worktreePath)
     }
+    saveThreadWorktreeRegistry(
+      markThreadWorktree(activeThreadId, {
+        projectPath: record.projectPath,
+        worktreePath: record.worktreePath,
+        branch: record.branch,
+        createdAt: new Date().toISOString()
+      })
+    )
+    useChatStore.setState((state) => ({
+      codeWorkspaceRoots: rememberCodeWorkspaceRoots(state.codeWorkspaceRoots, [record.worktreePath]),
+      threads: state.threads.map((thread) =>
+        thread.id === activeThreadId ? { ...thread, workspace: record.worktreePath } : thread
+      )
+    }))
+  }
+
+  const checkoutBranchWorktree = async (branch: string): Promise<void> => {
+    if (!root || !branch) return
     setActingBranch(branch)
     setError(null)
     try {
-      const next = await window.kunGui.switchGitBranch(root, branch)
+      const next = await window.kunGui.checkoutGitBranchWorktree(root, branch)
       setResult(next)
       if (!next.ok) {
         setError(next.message)
         return
       }
+      await moveActiveThreadToWorktree({
+        projectPath: next.sourceRepositoryRoot,
+        worktreePath: next.worktreePath,
+        branch: next.currentBranch ?? branch
+      })
       setOpen(false)
       setQuery('')
     } catch (e) {
@@ -104,12 +147,17 @@ export function GitBranchPicker({ workspaceRoot }: Props): ReactElement | null {
     setActingBranch(branch)
     setError(null)
     try {
-      const next = await window.kunGui.createAndSwitchGitBranch(root, branch)
+      const next = await window.kunGui.createGitBranchWorktree(root, branch)
       setResult(next)
       if (!next.ok) {
         setError(next.message)
         return
       }
+      await moveActiveThreadToWorktree({
+        projectPath: next.sourceRepositoryRoot,
+        worktreePath: next.worktreePath,
+        branch: next.currentBranch ?? branch
+      })
       setOpen(false)
       setQuery('')
     } catch (e) {
@@ -151,9 +199,13 @@ export function GitBranchPicker({ workspaceRoot }: Props): ReactElement | null {
                   e.preventDefault()
                   setOpen(false)
                 }
-                if (e.key === 'Enter' && canCreate) {
+                if (e.key === 'Enter' && canRunFooterAction) {
                   e.preventDefault()
-                  void createBranch()
+                  if (canCreate) {
+                    void createBranch()
+                  } else {
+                    void checkoutBranchWorktree(selectedWorktreeBranch)
+                  }
                 }
               }}
               placeholder={t('gitSearchBranches')}
@@ -185,7 +237,7 @@ export function GitBranchPicker({ workspaceRoot }: Props): ReactElement | null {
                 key={branch.name}
                 type="button"
                 className="flex w-full items-start gap-3 rounded-lg px-1 py-2.5 text-left text-ds-ink transition hover:bg-ds-hover"
-                onClick={() => void switchBranch(branch.name)}
+                onClick={() => void checkoutBranchWorktree(branch.name)}
                 disabled={actingBranch != null}
               >
                 <GitBranch className="mt-0.5 h-4 w-4 shrink-0 text-ds-faint" strokeWidth={1.8} />
@@ -213,19 +265,27 @@ export function GitBranchPicker({ workspaceRoot }: Props): ReactElement | null {
           <div className="border-t border-ds-border-muted px-3 py-3">
             <button
               type="button"
-              disabled={!canCreate || actingBranch != null}
+              disabled={!canRunFooterAction || actingBranch != null}
               className="flex w-full items-center gap-3 rounded-lg px-1 py-2 text-left text-[14px] font-medium text-ds-ink transition hover:bg-ds-hover disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent"
-              onClick={() => void createBranch()}
+              onClick={() => {
+                if (canCreate) {
+                  void createBranch()
+                } else {
+                  void checkoutBranchWorktree(selectedWorktreeBranch)
+                }
+              }}
             >
-              {actingBranch === query.trim() ? (
+              {actingBranch === (canCreate ? trimmedQuery : selectedWorktreeBranch) ? (
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin text-ds-muted" strokeWidth={2} />
               ) : (
                 <Plus className="h-4 w-4 shrink-0 text-ds-muted" strokeWidth={1.9} />
               )}
               <span className="min-w-0 truncate">
-                {query.trim()
-                  ? t('gitCreateNamedBranch', { branch: query.trim() })
-                  : t('gitCreateBranch')}
+                {canCreate
+                  ? t('gitCreateNamedBranch', { branch: trimmedQuery })
+                  : selectedWorktreeBranch
+                    ? t('gitCheckoutNamedBranchWorktree', { branch: selectedWorktreeBranch })
+                    : t('gitCreateBranch')}
               </span>
             </button>
           </div>

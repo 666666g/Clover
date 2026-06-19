@@ -23,7 +23,6 @@ import {
   markThreadWorktree,
   saveThreadWorktreeRegistry
 } from '../lib/thread-worktree-registry'
-import { parseWorktreeHasChangesError } from '@shared/worktree'
 import { workspaceLabelFromPath } from '../lib/workspace-label'
 import { isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
 import {
@@ -230,50 +229,32 @@ export function createThreadActions(
         }
         return
       }
-      // Worktree pool mode: acquire an isolated worktree as the thread workspace
-      // so multiple agents can work on the same repo in parallel. Falls back to
-      // the normal workspace on any failure (pool full, not a git repo, etc.).
-      let acquiredWorktree: { projectPath: string; poolIndex: number; path: string; branch: string } | null = null
+      // Worktree mode: checkout the selected branch into an isolated worktree
+      // and bind the new thread to that workspace.
+      let acquiredWorktree: { projectPath: string; path: string; branch: string } | null = null
       if (options.useWorktreePool) {
         try {
-          const poolIndex = await window.kunGui.findAvailableWorktreePoolIndex({
-            projectPath: workspaceRoot
-          })
-          if (poolIndex === null) {
-            set({ error: i18n.t('common:worktreePoolFull') })
-          } else {
-            // Pool worktrees are ephemeral scratch spaces; if a leftover worktree
-            // has uncommitted changes from a previous run, force-reset it. This
-            // mirrors the Settings panel's force-acquire behavior.
-            const acquireWithForce = async (force: boolean) =>
-              window.kunGui.acquireWorktree({
-                projectPath: workspaceRoot,
-                poolIndex,
-                taskId: `pending-${Date.now()}`,
-                force
-              })
-            let wt: { path: string; branch: string }
-            try {
-              wt = await acquireWithForce(false)
-            } catch (acquireErr) {
-              const acquireMsg = acquireErr instanceof Error ? acquireErr.message : String(acquireErr)
-              if (parseWorktreeHasChangesError(acquireMsg)) {
-                wt = await acquireWithForce(true)
-              } else {
-                throw acquireErr
-              }
-            }
-            acquiredWorktree = {
-              projectPath: workspaceRoot,
-              poolIndex,
-              path: wt.path,
-              branch: wt.branch
-            }
-            workspaceRoot = wt.path
+          let branch = options.worktreeBranch?.trim() ?? ''
+          if (!branch) {
+            const branches = await window.kunGui.getGitBranches(workspaceRoot)
+            if (branches.ok) branch = branches.currentBranch ?? ''
           }
-        } catch {
-          set({ error: i18n.t('common:worktreeAcquireFailed') })
-          // proceed with the original workspaceRoot
+          if (!branch) {
+            throw new Error(i18n.t('common:worktreeBranchRequired'))
+          }
+          const wt = await window.kunGui.checkoutGitBranchWorktree(workspaceRoot, branch)
+          if (!wt.ok) {
+            throw new Error(wt.message)
+          }
+          acquiredWorktree = {
+            projectPath: wt.sourceRepositoryRoot,
+            path: wt.worktreePath,
+            branch: wt.currentBranch ?? branch
+          }
+          workspaceRoot = wt.worktreePath
+        } catch (err) {
+          set({ error: err instanceof Error ? err.message : i18n.t('common:worktreeAcquireFailed') })
+          return
         }
       }
       const t = await p.createThread({
@@ -294,7 +275,6 @@ export function createThreadActions(
         saveThreadWorktreeRegistry(
           markThreadWorktree(t.id, {
             projectPath: acquiredWorktree.projectPath,
-            poolIndex: acquiredWorktree.poolIndex,
             worktreePath: acquiredWorktree.path,
             branch: acquiredWorktree.branch,
             createdAt: new Date().toISOString()

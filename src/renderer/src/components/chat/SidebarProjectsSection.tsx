@@ -9,6 +9,7 @@ import {
   Folder,
   FolderPlus,
   FolderOpen,
+  GitBranch,
   Loader2,
   PencilLine,
   Plus,
@@ -36,6 +37,7 @@ import {
   SidebarSearchField,
   SidebarTreeRow
 } from '../sidebar/SidebarPrimitives'
+import { readThreadWorktreeRegistry, type ThreadWorktreeRecord } from '../../lib/thread-worktree-registry'
 
 type SidebarProjectsSectionProps = {
   threads: NormalizedThread[]
@@ -64,6 +66,8 @@ type SidebarProjectsSectionProps = {
 }
 
 export type SidebarWorkspaceGroup = [workspacePath: string, threads: NormalizedThread[]]
+type SidebarThreadWorktreeRecord = Pick<ThreadWorktreeRecord, 'projectPath' | 'worktreePath'> & Partial<Pick<ThreadWorktreeRecord, 'branch' | 'createdAt' | 'poolIndex'>>
+type SidebarThreadWorktrees = Record<string, SidebarThreadWorktreeRecord>
 
 type ThreadContextMenuState = {
   thread: NormalizedThread
@@ -102,12 +106,50 @@ function sortWorkspacePathsByActive(workspacePaths: string[], selectedWorkspace:
   return [...workspacePaths].sort((a, b) => compareWorkspacePathsByActive(a, b, selectedWorkspace))
 }
 
+function workspacePathForWorktreeRecord(record: Pick<ThreadWorktreeRecord, 'projectPath' | 'worktreePath'> | undefined): string {
+  const projectPath = normalizeWorkspaceRoot(record?.projectPath ?? '')
+  const worktreePath = normalizeWorkspaceRoot(record?.worktreePath ?? '')
+  return projectPath && worktreePath ? projectPath : ''
+}
+
+function sidebarWorkspacePathForThread(thread: NormalizedThread, worktrees: SidebarThreadWorktrees = {}): string {
+  const worktreeProjectPath = workspacePathForWorktreeRecord(worktrees[thread.id])
+  return worktreeProjectPath || normalizeWorkspaceRoot(thread.workspace)
+}
+
+function sidebarWorkspacePathForRememberedRoot(workspacePath: string, worktrees: SidebarThreadWorktrees = {}): string {
+  const normalized = normalizeWorkspaceRoot(workspacePath)
+  const key = workspaceRootIdentityKey(normalized)
+  if (!key) return ''
+  for (const record of Object.values(worktrees)) {
+    const worktreePath = normalizeWorkspaceRoot(record.worktreePath)
+    if (workspaceRootIdentityKey(worktreePath) === key) {
+      return workspacePathForWorktreeRecord(record) || normalized
+    }
+  }
+  return normalized
+}
+
+function worktreeRecordForSidebarThread(
+  thread: NormalizedThread,
+  worktrees: SidebarThreadWorktrees = {}
+): SidebarThreadWorktreeRecord | undefined {
+  const direct = worktrees[thread.id]
+  if (direct) return direct
+  const threadWorkspaceKey = workspaceRootIdentityKey(thread.workspace)
+  if (!threadWorkspaceKey) return undefined
+  return Object.values(worktrees).find((record) =>
+    workspaceRootIdentityKey(record.worktreePath) === threadWorkspaceKey
+  )
+}
+
 export function buildSidebarWorkspaceGroups(options: {
   threads: NormalizedThread[]
   searchQuery: string
   showArchived: boolean
   workspaceRoot: string
   workspaceRoots: string[]
+  threadWorktrees?: SidebarThreadWorktrees
 }): SidebarWorkspaceGroup[] {
   const map = new Map<string, { workspacePath: string, threads: NormalizedThread[] }>()
   const selectedWorkspace = normalizeWorkspaceRoot(options.workspaceRoot)
@@ -134,10 +176,10 @@ export function buildSidebarWorkspaceGroups(options: {
     if (isInternalDeepSeekGuiWorkspace(th.workspace)) continue
     if (isClawWorkspacePath(th.workspace)) continue
     if ((th.archived === true) !== options.showArchived) continue
-    const key = normalizeWorkspaceRoot(th.workspace)
+    const key = sidebarWorkspacePathForThread(th, options.threadWorktrees)
     if (!key) continue
     if (query) {
-      const haystack = [th.title, th.preview, key, workspaceLabelFromPath(key)]
+      const haystack = [th.title, th.preview, key, workspaceLabelFromPath(key), th.workspace]
         .filter(Boolean)
         .join('\n')
         .toLowerCase()
@@ -151,7 +193,7 @@ export function buildSidebarWorkspaceGroups(options: {
   }
   if (!query && !options.showArchived) {
     for (const workspacePath of options.workspaceRoots) {
-      const key = normalizeWorkspaceRoot(workspacePath)
+      const key = sidebarWorkspacePathForRememberedRoot(workspacePath, options.threadWorktrees)
       if (!key || map.has(workspaceRootIdentityKey(key))) continue
       if (isInternalTemporaryWorkspace(key)) continue
       if (isInternalDeepSeekGuiWorkspace(key)) continue
@@ -173,6 +215,7 @@ export function buildSidebarDraftWorkspacePaths(options: {
   threads: NormalizedThread[]
   workspaceRoot: string
   workspaceRoots: string[]
+  threadWorktrees?: SidebarThreadWorktrees
 }): string[] {
   const map = new Map<string, string>()
   const selectedWorkspace = normalizeWorkspaceRoot(options.workspaceRoot)
@@ -190,10 +233,10 @@ export function buildSidebarDraftWorkspacePaths(options: {
 
   upsertWorkspace(selectedWorkspace)
   for (const workspacePath of options.workspaceRoots) {
-    upsertWorkspace(workspacePath)
+    upsertWorkspace(sidebarWorkspacePathForRememberedRoot(workspacePath, options.threadWorktrees))
   }
   for (const thread of options.threads) {
-    upsertWorkspace(thread.workspace ?? '')
+    upsertWorkspace(sidebarWorkspacePathForThread(thread, options.threadWorktrees))
   }
 
   return sortWorkspacePathsByActive([...map.values()], selectedWorkspace)
@@ -320,7 +363,12 @@ export function SidebarProjectsSection({
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenuState | null>(null)
   const [renameThreadDialog, setRenameThreadDialog] = useState<RenameThreadDialogState | null>(null)
   const [draftHistoryByWorkspace, setDraftHistoryByWorkspace] = useState<Record<string, SddDraftHistoryItem[]>>({})
+  const [threadWorktrees, setThreadWorktrees] = useState<SidebarThreadWorktrees>(() => readThreadWorktreeRegistry().worktrees)
   const activeSddDraftId = useSddDraftStore((s) => s.activeDraft?.id ?? '')
+
+  useEffect(() => {
+    setThreadWorktrees(readThreadWorktreeRegistry().worktrees)
+  }, [activeThreadId, threads, workspaceRoots])
 
   const groups = useMemo(() => {
     return buildSidebarWorkspaceGroups({
@@ -328,17 +376,19 @@ export function SidebarProjectsSection({
       searchQuery,
       showArchived,
       workspaceRoot,
-      workspaceRoots
+      workspaceRoots,
+      threadWorktrees
     })
-  }, [searchQuery, showArchived, threads, workspaceRoot, workspaceRoots])
+  }, [searchQuery, showArchived, threadWorktrees, threads, workspaceRoot, workspaceRoots])
 
   const draftHistoryWorkspacePaths = useMemo(() => {
     return buildSidebarDraftWorkspacePaths({
       threads,
       workspaceRoot,
-      workspaceRoots
+      workspaceRoots,
+      threadWorktrees
     })
-  }, [threads, workspaceRoot, workspaceRoots])
+  }, [threadWorktrees, threads, workspaceRoot, workspaceRoots])
 
   const filteredDraftHistoryByWorkspace = useMemo(() => {
     return Object.fromEntries(
@@ -735,6 +785,7 @@ export function SidebarProjectsSection({
                       <ThreadRow
                         key={thread.id}
                         thread={thread}
+                        worktreeRecord={worktreeRecordForSidebarThread(thread, threadWorktrees)}
                         active={(activeView === 'chat' || activeView === 'write') && activeThreadId === thread.id}
                         deleting={deletingThreadIds[thread.id] === true}
                         locale={locale}
@@ -811,6 +862,7 @@ export function SidebarProjectsSection({
 
 type ThreadRowProps = {
   thread: NormalizedThread
+  worktreeRecord?: SidebarThreadWorktreeRecord
   active: boolean
   deleting: boolean
   locale: string
@@ -954,6 +1006,7 @@ export function SddDraftHistoryRows({
 
 function ThreadRow({
   thread,
+  worktreeRecord,
   active,
   deleting,
   locale,
@@ -969,12 +1022,16 @@ function ThreadRow({
   const { t } = useTranslation('common')
   const showUnreadDot = showUnread && !showRunning
   const archived = thread.archived === true
+  const worktreeLabel = worktreeRecord
+    ? t('sidebarThreadWorktree', { branch: worktreeRecord.branch || 'worktree' })
+    : ''
   const updatedLabel = formatRelativeTime(thread.updatedAt, locale)
   const ariaLabel = [
     thread.title,
     updatedLabel,
     showRunning ? t('sidebarThreadRunning') : '',
-    showUnreadDot ? t('sidebarThreadUnread') : ''
+    showUnreadDot ? t('sidebarThreadUnread') : '',
+    worktreeLabel
   ].filter(Boolean).join(' — ')
 
   return (
@@ -1016,7 +1073,7 @@ function ThreadRow({
       buttonClassName="items-center gap-2 px-2.5 py-1.5"
       disabled={deleting}
       ariaLabel={ariaLabel}
-      title={thread.title}
+      title={[thread.title, worktreeLabel].filter(Boolean).join('\n')}
       onClick={onSelect}
       onContextMenu={onContextMenu}
     >
@@ -1028,6 +1085,15 @@ function ThreadRow({
         >
           {thread.title}
         </span>
+        {worktreeRecord ? (
+          <span
+            className="inline-grid h-5 w-5 shrink-0 place-items-center rounded-full border border-ds-border-muted bg-ds-card/80 text-ds-muted"
+            title={worktreeLabel}
+            aria-label={worktreeLabel}
+          >
+            <GitBranch className="h-3 w-3" strokeWidth={1.8} />
+          </span>
+        ) : null}
         <span className={`ml-auto flex shrink-0 items-center gap-1.5 transition ${
           deleting ? 'opacity-0' : 'group-hover:opacity-0 group-focus-within:opacity-0'
         }`}>

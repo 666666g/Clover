@@ -178,6 +178,8 @@ type Props = {
   onNewCommand?: () => void
   /** Worktree parallel mode toggle (single-use per new conversation). */
   useWorktreePool?: boolean
+  worktreeBranch?: string
+  onWorktreeBranchChange?: (branch: string) => void
   onToggleWorktreeMode?: () => void
   onReviewCommand?: (target: ReviewTarget) => void
   onExecutionSettingsChange?: (patch: Partial<ComposerExecutionSettings>) => void
@@ -484,6 +486,8 @@ export function FloatingComposer({
   onPlanCommand,
   onNewCommand,
   useWorktreePool = false,
+  worktreeBranch = '',
+  onWorktreeBranchChange,
   onToggleWorktreeMode,
   onReviewCommand,
   onExecutionSettingsChange,
@@ -616,6 +620,7 @@ export function FloatingComposer({
   const [selectedFileMentionIndex, setSelectedFileMentionIndex] = useState(0)
   const [dismissedFileMentionKey, setDismissedFileMentionKey] = useState<string | null>(null)
   const [composerMenuOpen, setComposerMenuOpen] = useState(false)
+  const [worktreeBranches, setWorktreeBranches] = useState<string[]>([])
   const [goalPanelOpen, setGoalPanelOpen] = useState(false)
   const [contextCapacityOpen, setContextCapacityOpen] = useState(false)
   const [goalRuntimeNowMs, setGoalRuntimeNowMs] = useState(() => Date.now())
@@ -745,6 +750,25 @@ export function FloatingComposer({
           : useWorktreePool
             ? t('composerWorktreeModeHint')
             : t('composerSlashHint')
+
+  useEffect(() => {
+    if (!useWorktreePool || !effectiveWorkspaceRoot || typeof window.kunGui?.getGitBranches !== 'function') {
+      setWorktreeBranches([])
+      return
+    }
+    let cancelled = false
+    void window.kunGui.getGitBranches(effectiveWorkspaceRoot).then((result) => {
+      if (cancelled || !result.ok) return
+      const names = result.branches.map((branch) => branch.name)
+      setWorktreeBranches(names)
+      if (!worktreeBranch.trim() && result.currentBranch) {
+        onWorktreeBranchChange?.(result.currentBranch)
+      }
+    }).catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [effectiveWorkspaceRoot, onWorktreeBranchChange, useWorktreePool, worktreeBranch])
   const slashCommands = useMemo<SlashCommand[]>(() => {
     const threadActionDisabled = !runtimeReady || busy || !activeThreadId
     const goalActionDisabled = !canOpenGoalPanel
@@ -1670,7 +1694,9 @@ export function FloatingComposer({
                 className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
               >
                 <GitBranch className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
-                <span className="min-w-0 flex-1 truncate">{t('composerMenuWorktreeMode')}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  {useWorktreePool ? t('composerEnvironmentWorktree') : t('composerEnvironmentLocal')}
+                </span>
                 <span
                   role="switch"
                   aria-checked={useWorktreePool}
@@ -2284,6 +2310,23 @@ export function FloatingComposer({
               <WorkspaceProjectPicker currentWorkspaceRoot={effectiveWorkspaceRoot} />
             ) : null}
             <GitBranchPicker workspaceRoot={effectiveWorkspaceRoot} />
+            {useWorktreePool && worktreeBranches.length > 0 ? (
+              <label className="ds-no-drag inline-flex min-h-7 max-w-[220px] items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/72 px-2 py-0.5 text-[12.5px] font-medium text-ds-muted shadow-sm">
+                <GitBranch className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+                <select
+                  value={worktreeBranch || worktreeBranches[0]}
+                  onChange={(event) => onWorktreeBranchChange?.(event.target.value)}
+                  className="min-w-0 bg-transparent text-ds-muted outline-none"
+                  title={t('composerWorktreeBranch')}
+                >
+                  {worktreeBranches.map((branch) => (
+                    <option key={branch} value={branch}>
+                      {branch}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             {showThreadUsageFooter ? (
               <div
                 className="ds-composer-usage ds-no-drag inline-flex min-h-7 max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 overflow-visible rounded-lg border border-ds-border-muted bg-ds-card/72 px-2.5 py-0.5 text-[12.5px] font-medium leading-5 text-ds-muted shadow-sm"
