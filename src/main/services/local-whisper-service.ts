@@ -53,6 +53,8 @@ export async function getLocalWhisperModelStatus(
   modelId: unknown = LOCAL_WHISPER_DEFAULT_MODEL_ID
 ): Promise<LocalWhisperModelStatus> {
   const model = localWhisperModelById(modelId)
+  const diskStatus = await readLocalWhisperDiskStatus(model)
+  if (diskStatus) return diskStatus
   if (downloadPromise && lastProgress?.modelId === model.id) {
     return baseStatus(model.id, 'downloading', {
       downloadedBytes: lastProgress.downloadedBytes,
@@ -60,17 +62,21 @@ export async function getLocalWhisperModelStatus(
       speedBytesPerSecond: lastProgress.speedBytesPerSecond
     })
   }
+  return baseStatus(model.id, 'not_downloaded')
+}
+
+async function readLocalWhisperDiskStatus(model: LocalWhisperModel): Promise<LocalWhisperModelStatus | null> {
   const path = localWhisperModelPath(model.id)
   try {
     const info = await stat(path)
-    if (!info.isFile()) return baseStatus(model.id, 'not_downloaded')
+    if (!info.isFile()) return null
     return baseStatus(model.id, 'ready', {
       path,
       downloadedBytes: info.size,
       totalBytes: info.size
     })
   } catch {
-    return baseStatus(model.id, 'not_downloaded')
+    return null
   }
 }
 
@@ -476,5 +482,12 @@ export function localWhisperAvailableModels(): typeof LOCAL_WHISPER_MODELS {
 export const _internals = {
   fileSha256,
   checkLocalWhisperDownloadSource,
-  localWhisperDownloadUrl
+  localWhisperDownloadUrl,
+  localWhisperModelPath,
+  setLocalWhisperDownloadStateForTest(progress: LocalWhisperModelProgress | null): void {
+    lastProgress = progress
+    downloadPromise = progress
+      ? Promise.resolve({ ok: false, message: 'test' })
+      : null
+  }
 }

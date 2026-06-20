@@ -1,6 +1,6 @@
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('electron', () => ({
@@ -12,7 +12,7 @@ vi.mock('electron', () => ({
 
 import { app } from 'electron'
 import { LOCAL_WHISPER_MODELS, LOCAL_WHISPER_SMALL_MODEL_ID, localWhisperModelById } from '../../shared/local-whisper'
-import { _internals } from './local-whisper-service'
+import { _internals, getLocalWhisperModelStatus } from './local-whisper-service'
 
 describe('local-whisper-service helpers', () => {
   let rootDir = ''
@@ -20,6 +20,7 @@ describe('local-whisper-service helpers', () => {
   beforeEach(async () => {
     rootDir = await mkdtemp(join(tmpdir(), 'kun-local-whisper-'))
     vi.mocked(app.getPath).mockReturnValue(rootDir)
+    _internals.setLocalWhisperDownloadStateForTest(null)
   })
 
   it('keeps checksum metadata for every downloadable model', () => {
@@ -46,5 +47,23 @@ describe('local-whisper-service helpers', () => {
     await expect(_internals.fileSha256(path)).resolves.toBe(
       'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
     )
+  })
+
+  it('reports ready when the model file exists even if the last progress is complete', async () => {
+    const model = localWhisperModelById(LOCAL_WHISPER_SMALL_MODEL_ID)
+    const path = _internals.localWhisperModelPath(model.id)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, 'ready', 'utf8')
+    _internals.setLocalWhisperDownloadStateForTest({
+      modelId: model.id,
+      downloadedBytes: model.sizeBytes,
+      totalBytes: model.sizeBytes,
+      speedBytesPerSecond: 1024
+    })
+
+    const status = await getLocalWhisperModelStatus(model.id)
+
+    expect(status.state).toBe('ready')
+    expect(status.path).toBe(path)
   })
 })
