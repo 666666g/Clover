@@ -50,7 +50,8 @@ import { KEYBOARD_SHORTCUT_COMMANDS } from '../../shared/keyboard-shortcuts'
 import { WRITE_EXPORT_FORMATS } from '../../shared/write-export'
 import { WRITE_INFOGRAPHIC_MAX_TEXT_CHARS } from '../../shared/write-infographic'
 import { SPEECH_TRANSCRIPTION_MAX_BASE64_CHARS, SPEECH_TRANSCRIPTION_MAX_DURATION_MS } from '../../shared/speech-to-text'
-import { LOCAL_WHISPER_MODELS } from '../../shared/local-whisper'
+import { LOCAL_WHISPER_DOWNLOAD_SOURCES, LOCAL_WHISPER_MODELS } from '../../shared/local-whisper'
+import type { LocalWhisperDownloadSourceId } from '../../shared/local-whisper'
 import {
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS,
@@ -222,7 +223,13 @@ const modelEndpointFormatSchema = z.enum(MODEL_ENDPOINT_FORMATS)
 const imageGenerationProtocolSchema = z.enum(IMAGE_GENERATION_PROTOCOLS)
 const speechToTextProtocolSchema = z.enum(SPEECH_TO_TEXT_PROTOCOLS)
 const localWhisperModelIdSchema = z.enum(LOCAL_WHISPER_MODELS.map((model) => model.id) as [string, ...string[]])
-const localWhisperDownloadSourceSchema = z.enum(['huggingface', 'hf-mirror'])
+const localWhisperDownloadSourceIds = LOCAL_WHISPER_DOWNLOAD_SOURCES.map((source) => source.id) as [
+  LocalWhisperDownloadSourceId,
+  ...LocalWhisperDownloadSourceId[]
+]
+const localWhisperDownloadSourceSchema = z.enum(
+  localWhisperDownloadSourceIds
+)
 const textToSpeechProtocolSchema = z.enum(TEXT_TO_SPEECH_PROTOCOLS)
 const musicGenerationProtocolSchema = z.enum(MUSIC_GENERATION_PROTOCOLS)
 const videoGenerationProtocolSchema = z.enum(VIDEO_GENERATION_PROTOCOLS)

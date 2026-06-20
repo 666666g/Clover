@@ -12,6 +12,10 @@ export const LOCAL_WHISPER_DOWNLOAD_SOURCES = [
   {
     id: 'hf-mirror',
     label: 'HF-Mirror'
+  },
+  {
+    id: 'hf-sufy',
+    label: 'HF CDN'
   }
 ] as const
 export const LOCAL_WHISPER_DEFAULT_DOWNLOAD_SOURCE_ID = 'huggingface'
@@ -28,6 +32,11 @@ export const LOCAL_WHISPER_MODELS = [
         id: 'hf-mirror',
         label: 'HF-Mirror',
         downloadUrl: 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin'
+      },
+      {
+        id: 'hf-sufy',
+        label: 'HF CDN',
+        downloadUrl: 'https://hf-cdn.sufy.com/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin'
       }
     ],
     sha256: '422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898',
@@ -55,6 +64,11 @@ export const LOCAL_WHISPER_MODELS = [
         id: 'hf-mirror',
         label: 'HF-Mirror',
         downloadUrl: 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin'
+      },
+      {
+        id: 'hf-sufy',
+        label: 'HF CDN',
+        downloadUrl: 'https://hf-cdn.sufy.com/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin'
       }
     ],
     sha256: 'ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb',
@@ -82,6 +96,11 @@ export const LOCAL_WHISPER_MODELS = [
         id: 'hf-mirror',
         label: 'HF-Mirror',
         downloadUrl: 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin'
+      },
+      {
+        id: 'hf-sufy',
+        label: 'HF CDN',
+        downloadUrl: 'https://hf-cdn.sufy.com/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin'
       }
     ],
     sha256: '19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f',
