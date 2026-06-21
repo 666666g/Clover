@@ -36,6 +36,7 @@ import {
   MODEL_PROVIDER_MESSAGE_PARTS,
   MODEL_REASONING_EFFORTS,
   MODEL_REASONING_REQUEST_PROTOCOLS,
+  MIN_KUN_LOCAL_PORT,
   SCHEDULE_MODEL_IDS,
   SCHEDULE_REASONING_EFFORT_IDS,
   SPEECH_TO_TEXT_PROTOCOLS,
@@ -205,7 +206,8 @@ export const runtimeRequestPayloadSchema = z
 const localeSchema = z.enum(['en', 'zh'])
 const themeSchema = z.enum(['system', 'light', 'dark'])
 const uiFontScaleSchema = z.enum(['small', 'medium', 'large'])
-const approvalPolicySchema = z.enum(['on-request', 'untrusted', 'never', 'auto', 'suggest'])
+const hexColorSchema = z.string().trim().regex(/^#[0-9a-fA-F]{6}$/)
+const approvalPolicySchema = z.enum(['always', 'on-request', 'untrusted', 'never', 'auto', 'suggest'])
 const sandboxModeSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access', 'external-sandbox'])
 const mcpSearchModeSchema = z.enum(['direct', 'search', 'auto'])
 const kunStorageBackendSchema = z.enum(['hybrid', 'file'])
@@ -317,7 +319,7 @@ const modelProviderPatchSchema = z.object({
 
 const kunRuntimePatchSchema = z.object({
   binaryPath: defaultPathSchema,
-  port: z.number().int().min(1).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   autoStart: z.boolean().optional(),
   apiKey: z.string().max(MAX_BODY_BYTES).optional(),
   baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
@@ -545,7 +547,7 @@ const clawSkillPatchSchema = z.object({
 const clawImPatchSchema = z.object({
   enabled: z.boolean().optional(),
   provider: clawImProviderSchema.optional(),
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   path: trimmedString(MAX_PATH_LENGTH).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional(),
   weixinBridgeUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
@@ -673,7 +675,7 @@ const scheduleSkillPatchSchema = z.object({
 }).strict()
 
 const scheduleInternalPatchSchema = z.object({
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional()
 }).strict()
 
@@ -1162,7 +1164,7 @@ const workflowSettingsPatchSchema = z
     model: optionalTrimmedString(128),
     mode: clawRunModeSchema.optional(),
     keepAwake: z.boolean().optional(),
-    webhookPort: z.number().int().min(1024).max(65_535).optional(),
+    webhookPort: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
     webhookSecret: z.string().max(MAX_BODY_BYTES).optional(),
     workflows: z.array(workflowPatchSchema).max(200).optional(),
     presets: z.array(workflowNodePresetSchema).max(100).optional(),
@@ -1242,6 +1244,7 @@ const settingsPatchObjectSchema = z.object({
   theme: themeSchema.optional(),
   uiFontScale: uiFontScaleSchema.optional(),
   cursorSpotlight: z.boolean().optional(),
+  cursorSpotlightColor: hexColorSchema.optional(),
   provider: modelProviderPatchSchema.optional(),
   agents: z.object({
     kun: kunRuntimePatchSchema.optional()

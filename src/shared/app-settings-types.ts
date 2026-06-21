@@ -21,6 +21,8 @@ export {
   type ApprovalPolicy,
   type SandboxMode
 } from '../../kun/src/contracts/policy.js'
+export const KUN_TOOL_PERMISSION_MODES = ['always-ask', 'read-only', 'sensitive-ask', 'workspace-write', 'bypass'] as const
+export type KunToolPermissionMode = (typeof KUN_TOOL_PERMISSION_MODES)[number]
 export type UiFontScale = 'small' | 'medium' | 'large'
 export type ScheduleRunMode = 'agent' | 'plan'
 export type ScheduleKind = 'manual' | 'interval' | 'daily' | 'at'
@@ -60,7 +62,8 @@ export const DEFAULT_SCHEDULE_MODEL = 'deepseek-v4-flash'
 export const SCHEDULE_MODEL_IDS = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const
 export const DEFAULT_SCHEDULE_REASONING_EFFORT = 'medium'
 export const SCHEDULE_REASONING_EFFORT_IDS = ['auto', 'off', 'low', 'medium', 'high', 'max'] as const
-export const DEFAULT_SCHEDULE_INTERNAL_PORT = 8788
+export const MIN_KUN_LOCAL_PORT = 10_000
+export const DEFAULT_SCHEDULE_INTERNAL_PORT = 18788
 // 这些默认目录与 legacy-data-migration.ts 的 HOME_DATA_MIGRATION_MAPPINGS
 // 一一对应:老安装的 ~/.deepseekgui/* 在启动期被搬到这里。
 export const DEFAULT_WRITE_WORKSPACE_ROOT = '~/.kun/write_workspace'
@@ -75,8 +78,9 @@ export const DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS = 96
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_DEBOUNCE_MS = 2_800
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_MIN_ACCEPT_SCORE = 0.36
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS = 256
-export const DEFAULT_KUN_PORT = 8899
+export const DEFAULT_KUN_PORT = 18899
 export const DEFAULT_LOG_RETENTION_DAYS = 3
+export const DEFAULT_CURSOR_SPOTLIGHT_COLOR = '#85c1f1'
 export const DEFAULT_WEIXIN_BRIDGE_RPC_URL = 'http://127.0.0.1:18790/api/v1/admin/rpc'
 export const DEFAULT_MODEL_PROVIDER_ID = 'deepseek'
 export const NETWORK_PROXY_PROTOCOLS = ['http', 'https', 'socks', 'socks4', 'socks4a', 'socks5', 'socks5h'] as const
@@ -233,6 +237,38 @@ export type KunRuntimeSettingsV1 = {
   computerUse: KunComputerUseSettingsV1
   /** First-party design-quality linter applied to frontend output. */
   quality: KunDesignQualitySettingsV1
+}
+
+export function kunToolPermissionModeSettings(
+  mode: KunToolPermissionMode
+): Pick<KunRuntimeSettingsV1, 'approvalPolicy' | 'sandboxMode'> {
+  switch (mode) {
+    case 'always-ask':
+      return { approvalPolicy: 'always', sandboxMode: 'danger-full-access' }
+    case 'read-only':
+      return { approvalPolicy: 'on-request', sandboxMode: 'danger-full-access' }
+    case 'sensitive-ask':
+      return { approvalPolicy: 'untrusted', sandboxMode: 'danger-full-access' }
+    case 'workspace-write':
+      return { approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }
+    case 'bypass':
+      return { approvalPolicy: 'auto', sandboxMode: 'danger-full-access' }
+  }
+}
+
+export function kunToolPermissionModeFromSettings(
+  settings: Pick<KunRuntimeSettingsV1, 'approvalPolicy' | 'sandboxMode'>
+): KunToolPermissionMode {
+  if (settings.approvalPolicy === 'always') return 'always-ask'
+  if (settings.approvalPolicy === 'untrusted') return 'sensitive-ask'
+  if (
+    settings.approvalPolicy === 'auto' &&
+    settings.sandboxMode === 'danger-full-access'
+  ) {
+    return 'bypass'
+  }
+  if (settings.sandboxMode === 'workspace-write') return 'workspace-write'
+  return 'read-only'
 }
 
 /** Detection aggressiveness for the design-quality linter. */
@@ -1561,6 +1597,7 @@ export type AppSettingsV1 = {
   theme: 'system' | 'light' | 'dark'
   uiFontScale: UiFontScale
   cursorSpotlight?: boolean
+  cursorSpotlightColor?: string
   provider: ModelProviderSettingsV1
   agents: KunSettingsEnvelopeV1
   workspaceRoot: string

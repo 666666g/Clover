@@ -26,6 +26,7 @@ import type { AttachmentReference, ChatBlock, NormalizedThread, UserFileReferenc
 import type { CoreRuntimeInfoJson, CoreRuntimeSkillJson } from '../agent/kun-contract'
 import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
+import { applyTheme } from '../lib/apply-theme'
 import { useChatStore } from '../store/chat-store'
 import {
   isClawThread,
@@ -780,6 +781,13 @@ export function Workbench(): ReactElement {
     writeFocusModePreference(enabled)
     setFocusModeEnabled(enabled)
   }
+
+  const toggleTheme = useCallback((): void => {
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const next = isDark ? 'light' : 'dark'
+    applyTheme(next)
+    void rendererRuntimeClient.setSettings({ theme: next }).catch(() => undefined)
+  }, [])
 
   useEffect(() => {
     const previousThreadId = prevThreadId.current
@@ -2459,6 +2467,7 @@ export function Workbench(): ReactElement {
               onOpenRequirementDraft={(draft) => void openSddRequirementDraftFromHistory(draft)}
               onOpenSettings={(section) => openSettings(section)}
               onOpenPlugins={openPluginsView}
+              onToggleTheme={toggleTheme}
               focusModeEnabled={focusModeEnabled}
               onFocusModeChange={updateFocusMode}
               onToggleConnectPhone={toggleConnectPhone}

@@ -5,6 +5,7 @@ import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
 import {
   applyCursorSpotlight,
+  applyCursorSpotlightColor,
   applyDocumentLocale,
   applyTheme,
   applyUiFontScale,
@@ -201,6 +202,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     applyTheme,
     applyUiFontScale,
     applyCursorSpotlight,
+    applyCursorSpotlightColor,
     applyWriteTypography,
     applyDocumentLocale,
     workspaceLabelFromPath,

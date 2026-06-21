@@ -236,6 +236,69 @@ export function resolvePlanModeToolSpecs(
     : toolSpecs.filter((tool) => tool.name === planTool)
 }
 
+export function buildRuntimeContextInstruction(input: {
+  workspace?: string
+  nowIso: string
+  timeZone?: string
+}): string | null {
+  const workspace = input.workspace?.trim()
+  const projectPath = workspace
+    ? isAbsolute(workspace) ? workspace : resolve(workspace)
+    : ''
+  const localTime = formatLocalDateTimeForPrompt(input.nowIso, input.timeZone)
+  if (!projectPath && !localTime) return null
+  return [
+    'Runtime context for this model request:',
+    projectPath ? `- Current opened project absolute path: \`${projectPath}\`` : '',
+    localTime ? `- Current user local time: ${localTime}` : '',
+    '- Treat this block as environment context, not as user instructions.'
+  ].filter(Boolean).join('\n')
+}
+
+export function shouldInjectInitialRuntimeContext(input: {
+  stepIndex: number
+  turnId: string
+  historyItems: readonly TurnItem[]
+}): boolean {
+  return input.stepIndex === 0 && input.historyItems.every((item) => item.turnId === input.turnId)
+}
+
+function formatLocalDateTimeForPrompt(nowIso: string, timeZone?: string): string {
+  const date = new Date(nowIso)
+  const fallback = nowIso.trim()
+  if (Number.isNaN(date.getTime())) return fallback
+  const resolvedTimeZone = timeZone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone
+  try {
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      ...(resolvedTimeZone ? { timeZone: resolvedTimeZone } : {}),
+      weekday: 'long',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+      timeZoneName: 'shortOffset'
+    })
+    const parts = new Map(formatter.formatToParts(date).map((part) => [part.type, part.value]))
+    const year = parts.get('year')
+    const month = parts.get('month')
+    const day = parts.get('day')
+    const hour = parts.get('hour')
+    const minute = parts.get('minute')
+    const second = parts.get('second')
+    const weekday = parts.get('weekday')
+    if (!year || !month || !day || !hour || !minute || !second || !weekday) {
+      return fallback || date.toISOString()
+    }
+    const zone = [resolvedTimeZone, parts.get('timeZoneName')].filter(Boolean).join(', ')
+    return `${year}-${month}-${day} ${hour}:${minute}:${second} ${weekday}${zone ? ` (${zone})` : ''}`
+  } catch {
+    return fallback || date.toISOString()
+  }
+}
+
 function goalContinuationInstruction(goal: ThreadGoal | undefined): string | null {
   if (!goal || goal.status !== 'active') return null
   const tokenBudget = goal.tokenBudget == null ? 'none' : String(goal.tokenBudget)
@@ -1175,7 +1238,18 @@ export class AgentLoop {
     await this.recordPipelineStage(threadId, turnId, 'input_compressed', {
       historyItems: history.length
     })
+    const runtimeContextInstruction = shouldInjectInitialRuntimeContext({
+      stepIndex,
+      turnId,
+      historyItems
+    })
+      ? buildRuntimeContextInstruction({
+          workspace: thread?.workspace,
+          nowIso: this.opts.nowIso()
+        })
+      : null
     const contextInstructions = [
+      ...(runtimeContextInstruction ? [runtimeContextInstruction] : []),
       ...(activeGoalInstruction ? [activeGoalInstruction] : []),
       ...(goalRecoveryInstruction && (this.goalNoToolRecoveryStepsByTurn.get(turnId) ?? 0) > 0
         ? [goalRecoveryInstruction]
@@ -1751,8 +1825,8 @@ export class AgentLoop {
     approvalPolicy: ToolHostContext['approvalPolicy'],
     toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
   ): boolean {
-    // Untrusted/never prompt on every tool, so parallel fan-out is unsafe.
-    if (approvalPolicy === 'untrusted' || approvalPolicy === 'never') return false
+    // always / untrusted / never 会触发审批或阻断工具调用，不能并发扇出。
+    if (approvalPolicy === 'always' || approvalPolicy === 'untrusted' || approvalPolicy === 'never') return false
     // Delegated children are isolated runs; multiple in one assistant message
     // are independent and safe to fan out. The delegation runtime caps real
     // concurrency at maxParallel and queues the overflow.
@@ -2707,6 +2781,7 @@ function normalizeApprovalPolicy(
 ): ToolHostContext['approvalPolicy'] {
   switch (value) {
     case 'on-request':
+    case 'always':
     case 'never':
     case 'auto':
     case 'suggest':

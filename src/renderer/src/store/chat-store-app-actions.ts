@@ -26,6 +26,7 @@ type CreateAppActionsOptions = {
   applyTheme: (theme: AppSettingsV1['theme']) => void
   applyUiFontScale: (scale: AppSettingsV1['uiFontScale']) => void
   applyCursorSpotlight: (enabled: boolean) => void
+  applyCursorSpotlightColor: (color: AppSettingsV1['cursorSpotlightColor']) => void
   applyWriteTypography: (typography: AppSettingsV1['write']['typography']) => void
   applyDocumentLocale: (locale: AppSettingsV1['locale']) => void
   workspaceLabelFromPath: (workspaceRoot: string) => string
@@ -63,6 +64,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     applyTheme,
     applyUiFontScale,
     applyCursorSpotlight,
+    applyCursorSpotlightColor,
     applyWriteTypography,
     applyDocumentLocale,
     workspaceLabelFromPath,
@@ -212,6 +214,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
       applyTheme(settings.theme)
       applyUiFontScale(settings.uiFontScale)
       applyCursorSpotlight(settings.cursorSpotlight !== false)
+      applyCursorSpotlightColor(settings.cursorSpotlightColor)
       if (settings.write?.typography) applyWriteTypography(settings.write.typography)
       set({
         workspaceRoot,

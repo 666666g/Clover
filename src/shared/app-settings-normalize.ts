@@ -1,5 +1,6 @@
 import {
   DEFAULT_GUI_UPDATE_CHANNEL,
+  DEFAULT_CURSOR_SPOTLIGHT_COLOR,
   DEFAULT_LOG_RETENTION_DAYS,
   normalizeGuiUpdateChannel,
   type AppBehaviorConfigV1,
@@ -74,6 +75,7 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
         ? maybeSettings.uiFontScale
         : 'small',
     cursorSpotlight: maybeSettings.cursorSpotlight !== false,
+    cursorSpotlightColor: normalizeCursorSpotlightColor(maybeSettings.cursorSpotlightColor),
     provider: providerSettings,
     agents: kunSettingsEnvelope(mergeKunRuntimeSettings(defaultKunRuntimeSettings(), {
       ...runtime,
@@ -104,6 +106,12 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
     codePromptPrefix: typeof maybeSettings.codePromptPrefix === 'string' ? maybeSettings.codePromptPrefix : '',
     disabledSkillIds: normalizeDisabledSkillIds(maybeSettings.disabledSkillIds)
   }
+}
+
+export function normalizeCursorSpotlightColor(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_CURSOR_SPOTLIGHT_COLOR
+  const color = value.trim()
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color.toLowerCase() : DEFAULT_CURSOR_SPOTLIGHT_COLOR
 }
 
 function normalizeDisabledSkillIds(value: unknown): string[] {
