@@ -2,13 +2,18 @@ import type i18next from 'i18next'
 import type { AppSettingsV1 } from '@shared/app-settings'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import type { ChatState, ChatStoreGet, ChatStoreSet, InitialSetupMode, PluginHostRoute, SettingsRouteSection } from './chat-store-types'
+import type { ComposerPlanMode } from './chat-store-helpers'
 import {
   canSwitchComposerModel,
   composerModelSelectable,
+  composerModeForThread,
+  persistComposerMode,
   persistComposerProviderId,
   providerIdForComposerModel,
   providerIdMatchesComposerModel,
+  readThreadComposerMode,
   readThreadComposerSelection,
+  rememberThreadComposerMode,
   rememberThreadComposerSelection,
   readStoredComposerProviderId
 } from './chat-store-helpers'
@@ -18,6 +23,8 @@ type CreateAppActionsOptions = {
   get: ChatStoreGet
   i18n: typeof i18next
   persistComposerModel: (model: string) => void
+  persistComposerMode: (mode: ComposerPlanMode) => void
+  rememberThreadComposerMode: (threadId: string, mode: ComposerPlanMode) => void
   readStoredComposerModel: (allowedIds: readonly string[]) => string
   mergeComposerPickList: (upstreamOk: boolean, upstreamIds: string[]) => string[]
   fallbackComposerModel: (pickList: readonly string[], runtimeDefault: string) => string
@@ -36,6 +43,7 @@ type CreateAppActionsOptions = {
 export function createAppActions(options: CreateAppActionsOptions): Pick<
   ChatState,
   | 'setError'
+  | 'setComposerMode'
   | 'setComposerModel'
   | 'loadComposerModels'
   | 'setRoute'
@@ -56,6 +64,8 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     get,
     i18n,
     persistComposerModel,
+    persistComposerMode,
+    rememberThreadComposerMode,
     readStoredComposerModel,
     mergeComposerPickList,
     fallbackComposerModel,
@@ -73,6 +83,16 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
 
   return {
     setError: (message) => set({ error: message }),
+
+    setComposerMode: (mode) => {
+      const activeThreadId = get().activeThreadId
+      if (activeThreadId) {
+        rememberThreadComposerMode(activeThreadId, mode)
+      } else {
+        persistComposerMode(mode)
+      }
+      set({ composerMode: mode })
+    },
 
     setComposerModel: (modelId, providerId) => {
       const nextProviderId = providerId?.trim() || providerIdForComposerModel(get().composerModelGroups, modelId)
