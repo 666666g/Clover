@@ -36,7 +36,7 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
-        ...defaultKunRuntimeSettings(8899),
+        ...defaultKunRuntimeSettings(18899),
         binaryPath,
         autoStart: true
       }
@@ -112,7 +112,7 @@ describe('startKunChild', () => {
       'ready-child.js',
       [
         "setTimeout(() => {",
-        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 8899 }) + '\\n')",
+        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 18899 }) + '\\n')",
         "}, 50)",
         "setInterval(() => {}, 1_000)"
       ].join('\n')
@@ -123,7 +123,7 @@ describe('startKunChild', () => {
     await module.stopKunChildAndWait()
     const logText = await readKunLog()
     expect(logText).toContain('KUN_READY')
-    expect(logText).toContain('ready marker received on port 8899')
+    expect(logText).toContain('ready marker received on port 18899')
   })
 
   it('shares the startup promise while Kun is spawned but not ready', async () => {
@@ -138,7 +138,7 @@ describe('startKunChild', () => {
         'setInterval(() => {',
         '  if (sentReady || !existsSync(readySignalPath)) return',
         '  sentReady = true',
-        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 8899 }) + '\\n')",
+        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 18899 }) + '\\n')",
         '}, 10)',
         'setInterval(() => {}, 1_000)'
       ].join('\n')
@@ -170,18 +170,18 @@ describe('startKunChild', () => {
     const script = writeScript(
       'exit-child.js',
       [
-        "process.stderr.write('bind failed on port 8899\\n')",
+        "process.stderr.write('bind failed on port 18899\\n')",
         'setTimeout(() => process.exit(23), 20)'
       ].join('\n')
     )
     const module = await import('./kun-process')
     await expect(module.startKunChild(createSettings(script))).rejects.toThrow(
-      /Kun exited during startup with code 23[\s\S]*bind failed on port 8899/
+      /Kun exited during startup with code 23[\s\S]*bind failed on port 18899/
     )
     expect(module.isKunChildRunning()).toBe(false)
     await module.stopKunChildAndWait()
     const logText = await readKunLog()
-    expect(logText).toContain('bind failed on port 8899')
+    expect(logText).toContain('bind failed on port 18899')
     expect(logText).toContain('exited with code 23')
   })
 })
@@ -266,29 +266,31 @@ describe('resolveKunDataDir', () => {
 describe('parseListeningPidsFromNetstat', () => {
   it('extracts the listening TCP PIDs for the port across IPv4/IPv6, ignoring everything else', async () => {
     const { parseListeningPidsFromNetstat } = await import('./kun-process')
+    const targetPort = 18899
+    const otherPort = targetPort + 1
     const output = [
       '',
       'Active Connections',
       '',
       '  Proto  Local Address          Foreign Address        State           PID',
       '  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1010',
-      '  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       6789',
-      '  TCP    [::1]:8899             [::]:0                 LISTENING       6789',
-      '  TCP    127.0.0.1:8899         127.0.0.1:51000        ESTABLISHED     7000',
-      '  TCP    127.0.0.1:18899        0.0.0.0:0              LISTENING       8000',
-      '  UDP    0.0.0.0:8899           *:*                                    9000',
-      `  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       ${process.pid}`,
+      `  TCP    127.0.0.1:${targetPort}         0.0.0.0:0              LISTENING       6789`,
+      `  TCP    [::1]:${targetPort}             [::]:0                 LISTENING       6789`,
+      `  TCP    127.0.0.1:${targetPort}         127.0.0.1:51000        ESTABLISHED     7000`,
+      `  TCP    127.0.0.1:${otherPort}         0.0.0.0:0              LISTENING       8000`,
+      `  UDP    0.0.0.0:${targetPort}           *:*                                    9000`,
+      `  TCP    127.0.0.1:${targetPort}         0.0.0.0:0              LISTENING       ${process.pid}`,
       ''
     ].join('\r\n')
 
     // Dedups IPv4+IPv6 rows for the same PID; excludes the :135 listener, the
-    // ESTABLISHED row, the :18899 suffix collision, the UDP row, and our own PID.
-    expect(parseListeningPidsFromNetstat(output, 8899)).toEqual([6789])
+    // ESTABLISHED row, the different TCP port, the UDP row, and our own PID.
+    expect(parseListeningPidsFromNetstat(output, targetPort)).toEqual([6789])
   })
 
   it('returns no PIDs when nothing listens on the port', async () => {
     const { parseListeningPidsFromNetstat } = await import('./kun-process')
-    const output = '  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       6789'
+    const output = '  TCP    127.0.0.1:18899         0.0.0.0:0              LISTENING       6789'
 
     expect(parseListeningPidsFromNetstat(output, 9999)).toEqual([])
   })
@@ -546,7 +548,7 @@ describe('syncGuiManagedKunConfig', () => {
     const configPath = join(tempRoot, 'config.json')
     const module = await import('./kun-process')
     const settings = createSettings('/tmp/fake-kun-child.js')
-    settings.schedule.internal.port = 9788
+    settings.schedule.internal.port = 19788
     settings.schedule.internal.secret = 'top-secret'
 
     await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
@@ -570,11 +572,11 @@ describe('syncGuiManagedKunConfig', () => {
         '/tmp/deepseek-gui-test-app/out/main/claw-schedule-mcp-node-entry.js',
         '--gui-schedule-mcp-server',
         '--base-url',
-        'http://127.0.0.1:9788',
+        'http://127.0.0.1:19788',
         '--secret',
         'top-secret',
         '--workflow-base-url',
-        'http://127.0.0.1:8799'
+        'http://127.0.0.1:18799'
       ],
       env: {
         ELECTRON_RUN_AS_NODE: '1'
@@ -918,9 +920,9 @@ describe('syncGuiManagedKunConfig', () => {
         '/tmp/deepseek-gui-test-app/out/main/claw-schedule-mcp-node-entry.js',
         '--gui-schedule-mcp-server',
         '--base-url',
-        'http://127.0.0.1:8788',
+        'http://127.0.0.1:18788',
         '--workflow-base-url',
-        'http://127.0.0.1:8799'
+        'http://127.0.0.1:18799'
       ],
       env: {
         ELECTRON_RUN_AS_NODE: '1'

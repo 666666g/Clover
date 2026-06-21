@@ -12,6 +12,7 @@ import {
   DEFAULT_WRITE_INLINE_COMPLETION_MODEL,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
   DEFAULT_KUN_DATA_DIR,
+  MIN_KUN_LOCAL_PORT,
   WRITE_INLINE_COMPLETION_MODEL_IDS,
   defaultModelProviderSettings,
   isKunRuntimeInsecure
@@ -499,7 +500,7 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                       <div>
                         <input
                           type="number"
-                          min={1}
+                          min={MIN_KUN_LOCAL_PORT}
                           max={65535}
                           className={`w-28 rounded-xl border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:outline-none focus:ring-1 ${
                             portError

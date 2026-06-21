@@ -36,6 +36,7 @@ import {
   MODEL_PROVIDER_MESSAGE_PARTS,
   MODEL_REASONING_EFFORTS,
   MODEL_REASONING_REQUEST_PROTOCOLS,
+  MIN_KUN_LOCAL_PORT,
   SCHEDULE_MODEL_IDS,
   SCHEDULE_REASONING_EFFORT_IDS,
   SPEECH_TO_TEXT_PROTOCOLS,
@@ -317,7 +318,7 @@ const modelProviderPatchSchema = z.object({
 
 const kunRuntimePatchSchema = z.object({
   binaryPath: defaultPathSchema,
-  port: z.number().int().min(1).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   autoStart: z.boolean().optional(),
   apiKey: z.string().max(MAX_BODY_BYTES).optional(),
   baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
@@ -545,7 +546,7 @@ const clawSkillPatchSchema = z.object({
 const clawImPatchSchema = z.object({
   enabled: z.boolean().optional(),
   provider: clawImProviderSchema.optional(),
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   path: trimmedString(MAX_PATH_LENGTH).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional(),
   weixinBridgeUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
@@ -673,7 +674,7 @@ const scheduleSkillPatchSchema = z.object({
 }).strict()
 
 const scheduleInternalPatchSchema = z.object({
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional()
 }).strict()
 
@@ -1162,7 +1163,7 @@ const workflowSettingsPatchSchema = z
     model: optionalTrimmedString(128),
     mode: clawRunModeSchema.optional(),
     keepAwake: z.boolean().optional(),
-    webhookPort: z.number().int().min(1024).max(65_535).optional(),
+    webhookPort: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
     webhookSecret: z.string().max(MAX_BODY_BYTES).optional(),
     workflows: z.array(workflowPatchSchema).max(200).optional(),
     presets: z.array(workflowNodePresetSchema).max(100).optional(),

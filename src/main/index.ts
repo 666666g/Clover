@@ -27,6 +27,7 @@ import {
   mergeModelProviderSettings,
   mergeScheduleSettings,
   mergeWriteSettings,
+  MIN_KUN_LOCAL_PORT,
   normalizeAppSettings,
   normalizeAppBehaviorSettings,
   normalizeKeyboardShortcuts,
@@ -1192,8 +1193,8 @@ function runtimeStartupConfigChanged(prev: AppSettingsV1, next: AppSettingsV1): 
  */
 function validateRuntimeSettingsForApply(next: AppSettingsV1): string | null {
   const runtime = resolveKunRuntimeSettings(next)
-  if (!Number.isInteger(runtime.port) || runtime.port < 1 || runtime.port > 65_535) {
-    return `Kun port must be an integer between 1 and 65535 (got ${String(runtime.port)})`
+  if (!Number.isInteger(runtime.port) || runtime.port < MIN_KUN_LOCAL_PORT || runtime.port > 65_535) {
+    return `Kun port must be an integer between ${MIN_KUN_LOCAL_PORT} and 65535 (got ${String(runtime.port)})`
   }
   const baseUrl = (runtime.baseUrl ?? '').trim()
   if (baseUrl) {

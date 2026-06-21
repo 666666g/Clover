@@ -692,7 +692,7 @@
   "kunToolArgumentRepairDesc": "Single string arguments longer than this byte count are truncated before tool execution, avoiding unusually large arguments.",
   "port": "Local service port",
   "portDesc": "Port used by the local AI assistant service. Most users do not need to change it.",
-  "portInvalid": "Port must be between 1 and 65535.",
+  "portInvalid": "Port must be between 10000 and 65535.",
   "runtimeToken": "Local access token (optional)",
   "runtimeTokenDesc": "Protects the assistant service running on this computer. Fill this only if another local program needs to connect to it.",
   "configFilePath": "External tool config path",

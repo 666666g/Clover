@@ -318,12 +318,12 @@ describe('claw settings', () => {
         ...defaults,
         im: {
           ...defaults.im,
-          weixinBridgeUrl: '  http://127.0.0.1:8787/rpc  '
+          weixinBridgeUrl: '  http://127.0.0.1:18787/rpc  '
         }
       }
     })
 
-    expect(normalized.claw.im.weixinBridgeUrl).toBe('http://127.0.0.1:8787/rpc')
+    expect(normalized.claw.im.weixinBridgeUrl).toBe('http://127.0.0.1:18787/rpc')
   })
 
   it('migrates the legacy OpenClaw Gateway URL into the WeChat bridge URL', () => {
@@ -335,12 +335,12 @@ describe('claw settings', () => {
         im: {
           ...defaults.im,
           weixinBridgeUrl: '',
-          openClawGatewayUrl: '  http://127.0.0.1:8787/rpc  '
+          openClawGatewayUrl: '  http://127.0.0.1:18787/rpc  '
         } as typeof defaults.im & { openClawGatewayUrl: string }
       }
     })
 
-    expect(normalized.claw.im.weixinBridgeUrl).toBe('http://127.0.0.1:8787/rpc')
+    expect(normalized.claw.im.weixinBridgeUrl).toBe('http://127.0.0.1:18787/rpc')
   })
 
   it('normalizes phone agent default names without touching custom names', () => {
@@ -438,11 +438,11 @@ describe('mergeKunRuntimeSettings', () => {
     const current = defaultKunRuntimeSettings()
     const next = mergeKunRuntimeSettings(current, {
       model: 'deepseek-reasoner',
-      port: 9000,
+      port: 19000,
       tokenEconomyMode: true
     })
     expect(next.model).toBe('deepseek-reasoner')
-    expect(next.port).toBe(9000)
+    expect(next.port).toBe(19000)
     expect(next.tokenEconomyMode).toBe(true)
     expect(next.tokenEconomy.enabled).toBe(true)
     expect(next.baseUrl).toBe(current.baseUrl)
@@ -725,7 +725,7 @@ describe('legacy Kun defaults migration', () => {
       agentProvider: 'deepseek-runtime',
       deepseek: {
         binaryPath: '/usr/local/bin/deepseek',
-        port: 8787,
+        port: 18787,
         autoStart: false,
         apiKey: 'sk-old',
         baseUrl: 'https://api.deepseek.com',
@@ -743,7 +743,7 @@ describe('legacy Kun defaults migration', () => {
 
     expect(normalized.agents.kun).toEqual(expect.objectContaining({
       binaryPath: '',
-      port: 8787,
+      port: 18787,
       autoStart: false,
       runtimeToken: 'old-token',
       approvalPolicy: 'on-request',
@@ -762,11 +762,36 @@ describe('legacy Kun defaults migration', () => {
       version: 1,
       agentProvider: 'deepseek-runtime',
       deepseek: {
+        // 这里必须保留旧版真实写入值, 用于升级到当前 Kun 默认端口。
         port: 7878
       }
     } as unknown as Parameters<typeof migrateLegacyAppSettings>[0])
 
-    expect(migrated.agents?.kun?.port).toBe(8899)
+    expect(migrated.agents?.kun?.port).toBe(18899)
+  })
+
+  it('moves previous Kun local default ports out of the low range', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      agents: { kun: { ...defaultKunRuntimeSettings(), port: 8899 } },
+      claw: {
+        ...defaultClawSettings(),
+        im: { ...defaultClawSettings().im, port: 8787 }
+      },
+      schedule: {
+        ...defaultScheduleSettings(),
+        internal: { ...defaultScheduleSettings().internal, port: 8788 }
+      },
+      workflow: {
+        ...defaultWorkflowSettings(),
+        webhookPort: 8799
+      }
+    })
+
+    expect(normalized.agents.kun.port).toBe(18899)
+    expect(normalized.claw.im.port).toBe(18787)
+    expect(normalized.schedule.internal.port).toBe(18788)
+    expect(normalized.workflow.webhookPort).toBe(18799)
   })
 
   it('fills image generation defaults for settings stored before the feature existed', () => {
@@ -938,7 +963,7 @@ describe('schedule settings', () => {
 
     expect(merged.enabled).toBe(true)
     expect(merged.defaultWorkspaceRoot).toBe('/tmp/schedule')
-    expect(merged.internal.port).toBe(1024)
+    expect(merged.internal.port).toBe(10000)
     expect(merged.internal.secret).toBe('secret')
     expect(merged.tasks[0].schedule.everyMinutes).toBe(1)
     expect(merged.tasks[0].schedule.timeOfDay).toBe('09:00')

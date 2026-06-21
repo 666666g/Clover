@@ -137,7 +137,7 @@ describe('app-ipc-schemas', () => {
       theme: 'dark',
       agents: {
         kun: {
-          port: 9000,
+          port: 19000,
           model: 'deepseek-chat',
           modelProfiles: {
             'custom-vision-model': {
@@ -174,7 +174,7 @@ describe('app-ipc-schemas', () => {
       disabledSkillIds: ['test-skill-08']
     })
 
-    expect(payload.agents?.kun?.port).toBe(9000)
+    expect(payload.agents?.kun?.port).toBe(19000)
     expect(payload.agents?.kun?.modelProfiles?.['custom-vision-model']?.inputModalities).toEqual(['text', 'image'])
     expect(payload.agents?.kun?.tokenEconomy?.enabled).toBe(true)
     expect(payload.agents?.kun?.tokenEconomy?.historyHygiene?.maxToolResultTokens).toBe(4000)
@@ -182,6 +182,21 @@ describe('app-ipc-schemas', () => {
     expect(payload.write?.selectionAssist?.infographicPrompt).toBe('手绘风格信息图。')
     expect(payload.write?.selectionAssist?.quickActions).toHaveLength(2)
     expect(payload.disabledSkillIds).toEqual(['test-skill-08'])
+  })
+
+  it('rejects low local service ports', () => {
+    expect(() => settingsPatchSchema.parse({
+      agents: { kun: { port: 9999 } }
+    })).toThrow()
+    expect(() => settingsPatchSchema.parse({
+      claw: { im: { port: 9999 } }
+    })).toThrow()
+    expect(() => settingsPatchSchema.parse({
+      schedule: { internal: { port: 9999 } }
+    })).toThrow()
+    expect(() => settingsPatchSchema.parse({
+      workflow: { webhookPort: 9999 }
+    })).toThrow()
   })
 
   it('accepts the cursor spotlight preference', () => {
@@ -269,7 +284,7 @@ describe('app-ipc-schemas', () => {
           extraDirs: ['/tmp/skills']
         },
         internal: {
-          port: 9788,
+          port: 19788,
           secret: 'secret'
         },
         tasks: [{
@@ -294,7 +309,7 @@ describe('app-ipc-schemas', () => {
       }
     })
 
-    expect(payload.schedule?.internal?.port).toBe(9788)
+    expect(payload.schedule?.internal?.port).toBe(19788)
     expect(payload.schedule?.providerId).toBe('minimax-token-plan')
     expect(payload.schedule?.tasks?.[0]?.schedule?.kind).toBe('daily')
     expect(payload.schedule?.tasks?.[0]?.reasoningEffort).toBe('high')
@@ -328,7 +343,7 @@ describe('app-ipc-schemas', () => {
       },
       agents: {
         kun: {
-          port: 9001,
+          port: 19001,
           imageRecognition: { enabled: true }
         },
         reasonix: {
@@ -342,7 +357,7 @@ describe('app-ipc-schemas', () => {
 
     expect(payload.locale).toBe('zh')
     expect(payload.provider?.providers?.[0]?.imageRecognition).toEqual({ enabled: true })
-    expect(payload.agents?.kun?.port).toBe(9001)
+    expect(payload.agents?.kun?.port).toBe(19001)
     expect(payload.agents?.kun?.imageRecognition).toEqual({ enabled: true })
     expect(payload.disabledSkillIds).toEqual(['legacy-skill'])
     expect('reasonix' in payload).toBe(false)

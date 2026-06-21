@@ -692,7 +692,7 @@
   "kunToolArgumentRepairDesc": "模型传给工具的单个字符串参数超过此字节数时会被截断，避免异常长参数拖慢或撑爆上下文。",
   "port": "本地服务端口",
   "portDesc": "AI 助手后台服务使用的本机端口。一般不需要修改。",
-  "portInvalid": "端口必须在 1 到 65535 之间。",
+  "portInvalid": "端口必须在 10000 到 65535 之间。",
   "runtimeToken": "本地访问令牌（可选）",
   "runtimeTokenDesc": "用于保护本机上的助手服务。只在你需要让其他本地程序连接它时填写。",
   "configFilePath": "外部工具配置路径",
