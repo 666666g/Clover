@@ -34,7 +34,7 @@ interface LspSession {
   workspaceRoot: string
   serverKey: string
   serverDisplayName: string
-  pythonPath: string | null
+  pythonPath: string
   refCount: number
   cleanupTimer: NodeJS.Timeout | null
   /** Sequential buffer for stdout framing. */
@@ -657,8 +657,7 @@ export async function lspGetDiagnostics(
   try {
     const result = await sendRequest(session, 'textDocument/diagnostic', {
       textDocument: { uri: filePathToUri(filePath) },
-      ...(session.diagnosticIdentifier ? { identifier: session.diagnosticIdentifier } : {}),
-      previousResultId: null
+      ...(session.diagnosticIdentifier ? { identifier: session.diagnosticIdentifier } : {})
     })
     const pulled = normalizeDiagnosticReport(result) ?? []
     if (pulled.length > 0) {
@@ -687,9 +686,12 @@ export async function lspGetDiagnostics(
     // Workspace diagnostics are optional and not supported by all servers.
   }
 
+  // Push diagnostics may have arrived while the pull requests were in flight,
+  // so re-read the cache here rather than relying on the function-entry snapshot.
+  const finalCached = session.diagnostics.get(filePathToUri(filePath)) ?? []
   return {
-    diagnostics: session.diagnostics.get(filePathToUri(filePath)) ?? [],
-    source: cached.length > 0 ? 'publishDiagnostics-cache' : 'none'
+    diagnostics: finalCached,
+    source: finalCached.length > 0 ? 'publishDiagnostics-cache' : 'none'
   }
 }
 
