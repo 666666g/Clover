@@ -48,6 +48,17 @@ type Props = {
   onOpenSideChat?: () => void
 }
 
+const TOPBAR_ICON_CLASS = 'h-[17px] w-[17px]'
+const TOPBAR_BUTTON_BASE =
+  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border p-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]'
+const TOPBAR_BUTTON_ACTIVE = 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
+const TOPBAR_BUTTON_IDLE =
+  'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
+
+function topbarIconButtonClass(active: boolean): string {
+  return `${TOPBAR_BUTTON_BASE} ${active ? TOPBAR_BUTTON_ACTIVE : TOPBAR_BUTTON_IDLE}`
+}
+
 export function WorkbenchTopBar({
   rightPanelMode,
   onToggleRightPanelMode,
@@ -250,18 +261,18 @@ export function WorkbenchTopBar({
 
   const renderGuiUpdateIcon = (): ReactElement => {
     if (guiUpdateState.status === 'downloading' || guiUpdateState.status === 'installing' || applyingGuiUpdate) {
-      return <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+      return <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
     }
     if (guiUpdateAction?.downloaded || guiUpdateState.status === 'downloaded') {
-      return <RefreshCw className="h-3.5 w-3.5" strokeWidth={1.85} />
+      return <RefreshCw className="h-4 w-4" strokeWidth={1.85} />
     }
     if (guiUpdateAction?.manualOnly) {
-      return <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.85} />
+      return <ExternalLink className="h-4 w-4" strokeWidth={1.85} />
     }
     if (guiUpdateAction) {
-      return <ArrowUpCircle className="h-3.5 w-3.5" strokeWidth={1.85} />
+      return <ArrowUpCircle className="h-4 w-4" strokeWidth={1.85} />
     }
-    return <Download className="h-3.5 w-3.5" strokeWidth={1.85} />
+    return <Download className="h-4 w-4" strokeWidth={1.85} />
   }
 
   return (
@@ -284,7 +295,7 @@ export function WorkbenchTopBar({
         <button
           type="button"
           onClick={() => setEditorMenuOpen((value) => !value)}
-          className="inline-flex items-center gap-1 rounded-full border border-transparent bg-white/38 px-2.5 py-1.5 text-ds-faint opacity-90 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] dark:hover:bg-white/8"
+          className="inline-flex h-7 items-center gap-1 rounded-full border border-transparent bg-white/38 px-2.5 text-ds-faint opacity-90 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] dark:hover:bg-white/8"
           aria-label={t('editorPickerTitle')}
           aria-expanded={editorMenuOpen}
           title={
@@ -293,8 +304,8 @@ export function WorkbenchTopBar({
               : t('editorPickerTitle')
           }
         >
-          {renderEditorIcon(selectedEditor, 'h-4 w-4')}
-          <ChevronDown className="h-3 w-3 opacity-60" strokeWidth={1.9} />
+          {renderEditorIcon(selectedEditor, TOPBAR_ICON_CLASS)}
+          <ChevronDown className="h-3.5 w-3.5 opacity-60" strokeWidth={1.9} />
         </button>
 
         {editorMenuOpen ? (
@@ -335,16 +346,12 @@ export function WorkbenchTopBar({
           type="button"
           onClick={onOpenSideChat}
           disabled={!sideChatEnabled}
-          className={`relative rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition disabled:cursor-not-allowed disabled:opacity-45 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
-            sideChatOpen
-              ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-              : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-          }`}
+          className={`relative ${topbarIconButtonClass(sideChatOpen)} disabled:cursor-not-allowed disabled:opacity-45`}
           aria-label={t('sidePanelOpen')}
           aria-pressed={sideChatOpen}
           title={t('sidePanelOpen')}
         >
-          <MessageCircleMore className="h-4 w-4" strokeWidth={1.75} />
+          <MessageCircleMore className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
           {sideChatCount > 0 ? (
             <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-semibold leading-none text-white">
               {Math.min(sideChatCount, 9)}
@@ -365,31 +372,23 @@ export function WorkbenchTopBar({
             <button
               type="button"
               onClick={() => onToggleRightPanelMode(item.mode)}
-              className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
-                active
-                  ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-                  : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-              }`}
+              className={topbarIconButtonClass(active)}
               aria-label={item.label}
               aria-pressed={active}
               title={item.label}
             >
-              <Icon className="h-4 w-4" strokeWidth={1.75} />
+              <Icon className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
             </button>
             {isChanges && onToggleTerminal ? (
               <button
                 type="button"
                 onClick={onToggleTerminal}
-                className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
-                  terminalOpen
-                    ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-                    : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-                }`}
+                className={topbarIconButtonClass(terminalOpen)}
                 aria-label={t('rightPanelTerminal')}
                 aria-pressed={terminalOpen}
                 title={t('rightPanelTerminal')}
               >
-                <Terminal className="h-4 w-4" strokeWidth={1.75} />
+                <Terminal className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
               </button>
             ) : null}
           </Fragment>
@@ -401,16 +400,12 @@ export function WorkbenchTopBar({
           type="button"
           onClick={onToggleFileTree}
           disabled={!fileTreeEnabled}
-          className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition disabled:cursor-not-allowed disabled:opacity-45 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
-            fileTreeOpen
-              ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-              : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-          }`}
+          className={`${topbarIconButtonClass(fileTreeOpen)} disabled:cursor-not-allowed disabled:opacity-45`}
           aria-label={t('rightPanelFiles')}
           aria-pressed={fileTreeOpen}
           title={t('rightPanelFiles')}
         >
-          <Folders className="h-4 w-4" strokeWidth={1.75} />
+          <Folders className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
         </button>
       ) : null}
     </div>

@@ -1,6 +1,7 @@
 :root {
   --ds-window-controls-safe-block: 0px;
   --ds-window-controls-safe-inset: 0px;
+  --ds-collapsed-sidebar-titlebar-extra-inset: 0px;
   --ds-write-titlebar-extra-inset: 0px;
   --ds-ui-scale: 1;
   /* Kun 吉祥物配色:鲸蓝 #6ca2dd / 小鸟浅蓝 #85c1f1 / 奶油 #fff2db / 珊瑚 #f47464 / 藏青描边 #0e2f66 / 淡紫天光 #f9f8ff */
@@ -103,6 +104,7 @@
 :root[data-platform='darwin'] {
   --ds-window-controls-safe-block: 42px;
   --ds-window-controls-safe-inset: 56px;
+  --ds-collapsed-sidebar-titlebar-extra-inset: 3.5rem;
   --ds-write-titlebar-extra-inset: 20px;
 }
 
@@ -2900,9 +2902,9 @@ pre {
 }
 
 .chat-topbar {
-  margin-top: 0.35rem;
-  min-height: 40px;
-  border-radius: 18px;
+  margin-top: 1rem;
+  min-height: 46px;
+  border-radius: 22px;
 }
 
 .ds-message-timeline-content {
@@ -2913,14 +2915,14 @@ pre {
 
 .chat-topbar-grid {
   grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
+  align-items: center;
   gap: 0.5rem;
-  padding-block: 0.35rem;
+  padding-block: 0.45rem;
 }
 
 .chat-topbar-session {
   min-width: 0;
-  align-self: start;
+  align-self: center;
 }
 
 .chat-topbar-actions {
@@ -2928,9 +2930,14 @@ pre {
   flex-wrap: nowrap;
   overflow-x: visible;
   overflow-y: visible;
-  align-self: start;
+  align-self: center;
   justify-self: end;
   scrollbar-width: none;
+  transform: translateY(-3px);
+}
+
+.chat-topbar .ds-titlebar-sidebar-toggle {
+  transform: translateY(-3px);
 }
 
 .chat-topbar-actions::-webkit-scrollbar {
@@ -2958,12 +2965,12 @@ pre {
 
 @container (max-width: 760px) {
   .chat-topbar {
-    margin-top: 0.2rem;
-    min-height: 36px;
+    margin-top: 0.875rem;
+    min-height: 42px;
   }
 
   .chat-topbar-grid {
-    padding-block: 0.25rem;
+    padding-block: 0.35rem;
   }
 
   .session-meta-usage,
@@ -2993,12 +3000,12 @@ pre {
   }
 
   .chat-topbar {
-    margin-top: 0.2rem;
-    min-height: 36px;
+    margin-top: 0.875rem;
+    min-height: 42px;
   }
 
   .chat-topbar-grid {
-    padding-block: 0.25rem;
+    padding-block: 0.35rem;
   }
 
   .ds-chat-stage .ds-floating-composer {

@@ -34,12 +34,18 @@ import {
   type McpMarketplaceOverlay,
   type McpMarketplaceOverlayStatus
 } from './plugin-marketplace-runtime'
+import { SidebarTitlebarToggleButton } from './sidebar/SidebarPrimitives'
 
 type PluginKind = 'mcp' | 'skill'
 type PluginFilter = 'all' | 'recommended' | 'installed'
 type NoticeTone = 'success' | 'error' | 'info'
 
 type Notice = MarketplaceNotice
+
+type Props = {
+  leftSidebarCollapsed: boolean
+  onToggleLeftSidebar: () => void
+}
 
 type MarketplaceItem = {
   id: string
@@ -730,7 +736,7 @@ export function recommendedMarketplaceItemIds(): string[] {
   return RECOMMENDED_ITEMS.map((item) => item.id)
 }
 
-export function PluginMarketplaceView(): ReactElement {
+export function PluginMarketplaceView({ leftSidebarCollapsed, onToggleLeftSidebar }: Props): ReactElement {
   const { t } = useTranslation('common')
   const workspaceRoot = normalizeWorkspaceRoot(useChatStore((s) => s.workspaceRoot))
   const [activeKind, setActiveKind] = useState<PluginKind>('mcp')
@@ -1220,8 +1226,28 @@ export function PluginMarketplaceView(): ReactElement {
   }
 
   return (
-    <div className="ds-no-drag h-full min-h-0 overflow-y-auto px-6 py-7 md:px-10 lg:px-14">
-      <div className="mx-auto max-w-6xl">
+    <div className="ds-drag flex h-full min-h-0 flex-col bg-ds-main">
+      <div className="ds-stage-inset shrink-0">
+        <header className="ds-topbar-surface relative z-10 mt-3 flex min-h-[46px] w-full items-stretch overflow-visible rounded-[24px]">
+          <div className="grid w-full min-w-0 items-center gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
+            <div
+              className={`flex min-w-0 items-center gap-2.5 ${
+                leftSidebarCollapsed ? 'ds-window-controls-collapsed-titlebar-inset' : ''
+              }`}
+            >
+              <SidebarTitlebarToggleButton
+                onClick={onToggleLeftSidebar}
+                title={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
+                ariaLabel={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
+              />
+              <h1 className="sr-only">{t('plugins')}</h1>
+            </div>
+          </div>
+        </header>
+      </div>
+
+      <main className="ds-no-drag min-h-0 flex-1 overflow-y-auto px-6 pb-8 pt-7 md:px-10 lg:px-14">
+        <div className="mx-auto max-w-6xl">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="inline-flex rounded-xl bg-ds-subtle p-1">
             <TabButton active={activeKind === 'mcp'} onClick={() => setActiveKind('mcp')}>
@@ -1453,7 +1479,8 @@ export function PluginMarketplaceView(): ReactElement {
             <span>{t('pluginMcpRestartHint')}</span>
           </div>
         ) : null}
-      </div>
+        </div>
+      </main>
     </div>
   )
 }

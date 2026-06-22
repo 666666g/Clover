@@ -96,7 +96,7 @@ export function WriteWorkspaceToolbar({
           <div className="write-pdf-topbar-grid grid w-full min-w-0 items-center gap-2 px-3 py-2 sm:px-4 md:pl-5 md:pr-3">
             <div
               className={`flex min-w-0 items-center gap-2.5 ${
-                leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : ''
+                leftSidebarCollapsed ? 'ds-window-controls-collapsed-titlebar-inset' : ''
               }`}
             >
               <SidebarTitlebarToggleButton
@@ -147,7 +147,7 @@ export function WriteWorkspaceToolbar({
         <div className="write-workspace-toolbar-grid grid w-full min-w-0 items-center gap-2 px-3 py-2 sm:px-4 md:pl-5 md:pr-2 lg:gap-4">
           <div
             className={`flex min-w-0 items-center gap-2.5 ${
-              leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : ''
+              leftSidebarCollapsed ? 'ds-window-controls-collapsed-titlebar-inset' : ''
             }`}
           >
             <SidebarTitlebarToggleButton

@@ -2496,18 +2496,12 @@ export function Workbench(): ReactElement {
         }`}
       >
         {route === 'plugins' ? (
-          <>
-            <div className="ds-no-drag shrink-0 px-4 pt-4">
-              <SidebarTitlebarToggleButton
-                onClick={toggleLeftSidebar}
-                title={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
-                ariaLabel={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
-              />
-            </div>
-            <Suspense fallback={<div className="h-full bg-ds-main" />}>
-              <PluginMarketplaceView />
-            </Suspense>
-          </>
+          <Suspense fallback={<div className="h-full bg-ds-main" />}>
+            <PluginMarketplaceView
+              leftSidebarCollapsed={leftSidebarCollapsed}
+              onToggleLeftSidebar={toggleLeftSidebar}
+            />
+          </Suspense>
         ) : route === 'schedule' ? (
           <Suspense fallback={<div className="h-full bg-ds-main" />}>
             <ScheduleTasksView
@@ -2562,11 +2556,11 @@ export function Workbench(): ReactElement {
           ) : (
             <section className="ds-chat-stage ds-drag flex min-h-0 min-w-0 flex-1 flex-col">
             <div className={`${stageInsetClass} flex min-h-0 min-w-0 flex-1 flex-col`}>
-            <header className="chat-topbar ds-topbar-surface relative z-10 mt-3 flex min-h-[46px] w-full shrink-0 items-stretch overflow-visible rounded-[24px]">
-              <div className="chat-topbar-grid grid w-full min-w-0 items-start gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
+            <header className="chat-topbar ds-topbar-surface relative z-10 flex w-full shrink-0 items-stretch overflow-visible">
+              <div className="chat-topbar-grid grid w-full min-w-0 items-center gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
                 <div
                   className={`chat-topbar-session flex min-w-0 items-center gap-2.5 ${
-                    leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : ''
+                    leftSidebarCollapsed ? 'ds-window-controls-collapsed-titlebar-inset' : ''
                   }`}
                 >
                   <SidebarTitlebarToggleButton
@@ -2576,7 +2570,7 @@ export function Workbench(): ReactElement {
                   />
                   <SessionHeader compact className="min-w-0 flex-1" />
                 </div>
-                <div className="chat-topbar-actions flex min-w-0 flex-wrap items-center justify-end gap-2 self-start">
+                <div className="chat-topbar-actions flex min-w-0 flex-wrap items-center justify-end gap-2 self-center">
                   {busy ? (
                     <span className="inline-flex shrink-0 rounded-full bg-amber-500/16 px-2.5 py-1 text-[11.5px] font-semibold text-amber-950 dark:text-amber-100">
                       {t('running')}
