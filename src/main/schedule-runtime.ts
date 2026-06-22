@@ -65,6 +65,18 @@ export class ScheduleRuntime {
   private runningTaskIds = new Set<string>()
   private queuedTaskIds = new Set<string>()
   private queuedTaskModes = new Map<string, boolean>()
+  /**
+   * Per-task completion deferreds. An IPC caller that invokes runTask() wants
+   * the eventual ScheduleRunResult (or the queue acknowledgement), even when
+   * the task is forced through the queue+drain path to serialize the
+   * concurrency-cap check. The deferred is stored only for the duration of
+   * the queued+running window; drainQueue resolves it once runTaskInternal
+   * returns (or once the task is dropped from the queue for any reason).
+   */
+  private taskCompletions = new Map<string, {
+    resolve: (value: ScheduleRunResult) => void
+    reject: (reason: unknown) => void
+  }>()
   private worktreeLeases = new Map<string, { projectPath: string; poolIndex: number }>()
   private drainingQueue = false
   private powerSaveBlockerId: number | null = null
@@ -127,12 +139,57 @@ export class ScheduleRuntime {
     if (hasTaskDependencyCycle(task.id, settings.schedule.tasks)) {
       return { ok: false, message: 'Task dependencies contain a cycle.' }
     }
+    // Always go through the queue+drain path. The earlier two-step check —
+    // `size < MAX` followed by an awaited store.load() — let two concurrent
+    // IPC callers both pass the cap check before either of them had
+    // incremented runningTaskIds, briefly running 4+ tasks at once. drainQueue
+    // owns the cap synchronously (it is serialized via drainingQueue), so
+    // routing every immediate-run through it eliminates the race.
     const dependenciesReady = dependencies.every((dependency) => dependency?.lastStatus === 'success')
-    if (dependenciesReady && this.runningTaskIds.size < MAX_CONCURRENT_BACKGROUND_TASKS) {
-      return this.runTaskInternal(task, false)
-    }
+    const completion = this.createTaskCompletion(task.id)
     await this.enqueueTask(task, false)
-    return { ok: true, threadId: '', queued: true, message: 'Task queued.' }
+    if (!dependenciesReady) {
+      // Dependency tasks have not all finished yet — the queue will pick this
+      // task up later when they complete. Return the queued ack now; the
+      // completion deferred stays parked.
+      return { ok: true, threadId: '', queued: true, message: 'Task queued.' }
+    }
+    return completion
+  }
+
+  private createTaskCompletion(taskId: string): Promise<ScheduleRunResult> {
+    // If a completion is already parked for this task (e.g. someone else is
+    // about to run it), return that one. Otherwise create a fresh deferred.
+    const existing = this.taskCompletions.get(taskId)
+    if (existing) {
+      return new Promise<ScheduleRunResult>((resolve, reject) => {
+        const prevResolve = existing.resolve
+        const prevReject = existing.reject
+        existing.resolve = (value) => {
+          prevResolve(value)
+          resolve(value)
+        }
+        existing.reject = (reason) => {
+          prevReject(reason)
+          reject(reason)
+        }
+      })
+    }
+    let resolveFn: (value: ScheduleRunResult) => void = () => undefined
+    let rejectFn: (reason: unknown) => void = () => undefined
+    const promise = new Promise<ScheduleRunResult>((resolve, reject) => {
+      resolveFn = resolve
+      rejectFn = reject
+    })
+    this.taskCompletions.set(taskId, { resolve: resolveFn, reject: rejectFn })
+    return promise
+  }
+
+  private resolveTaskCompletion(taskId: string, value: ScheduleRunResult): void {
+    const deferred = this.taskCompletions.get(taskId)
+    if (!deferred) return
+    this.taskCompletions.delete(taskId)
+    deferred.resolve(value)
   }
 
   async createScheduledTaskFromText(
@@ -424,6 +481,7 @@ export class ScheduleRuntime {
               lastMessage: 'Paused',
               updatedAt: new Date().toISOString()
             }))
+            this.resolveTaskCompletion(task.id, { ok: false, message: 'Task is paused.' })
             continue
           }
           if (!task.prompt.trim()) {
@@ -435,6 +493,7 @@ export class ScheduleRuntime {
               lastMessage: 'Task prompt is empty.',
               updatedAt: new Date().toISOString()
             }))
+            this.resolveTaskCompletion(task.id, { ok: false, message: 'Task prompt is empty.' })
             continue
           }
           const dependencies = (task.dependsOn ?? [])
@@ -443,16 +502,18 @@ export class ScheduleRuntime {
             hasTaskDependencyCycle(task.id, settings.schedule.tasks) ||
             dependencies.some((dependency) => !dependency || dependency.lastStatus === 'error')
           ) {
+            const cycleMessage = hasTaskDependencyCycle(task.id, settings.schedule.tasks)
+              ? 'Task dependencies contain a cycle.'
+              : 'A required task is missing or failed.'
             this.queuedTaskIds.delete(task.id)
             this.queuedTaskModes.delete(task.id)
             await this.updateTask(task.id, (current) => ({
               ...current,
               lastStatus: 'error',
-              lastMessage: hasTaskDependencyCycle(task.id, settings.schedule.tasks)
-                ? 'Task dependencies contain a cycle.'
-                : 'A required task is missing or failed.',
+              lastMessage: cycleMessage,
               updatedAt: new Date().toISOString()
             }))
+            this.resolveTaskCompletion(task.id, { ok: false, message: cycleMessage })
             continue
           }
           if (dependencies.every((dependency) => dependency?.lastStatus === 'success')) {
@@ -462,29 +523,51 @@ export class ScheduleRuntime {
         }
         if (!next) break
         const scheduled = this.queuedTaskModes.get(next.id) ?? false
-        this.queuedTaskIds.delete(next.id)
-        this.queuedTaskModes.delete(next.id)
-        void this.runTaskInternal(next, scheduled).finally(() => {
-          void this.drainQueue()
-        })
+        const dequeued = next
+        this.queuedTaskIds.delete(dequeued.id)
+        this.queuedTaskModes.delete(dequeued.id)
+        // Synchronously reserve the running slot BEFORE awaiting anything so
+        // the next iteration of this drain loop (and a re-entrant drainQueue
+        // call) sees the updated size. runTaskInternal also defends against
+        // double-running, but reserving here is what makes the size check at
+        // the top of the loop correct under back-to-back drains.
+        this.runningTaskIds.add(dequeued.id)
+        void this.runTaskInternal(dequeued, scheduled, { slotReserved: true })
+          .then((result) => {
+            this.resolveTaskCompletion(dequeued.id, result)
+          })
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error)
+            this.resolveTaskCompletion(dequeued.id, { ok: false, message })
+          })
+          .finally(() => {
+            void this.drainQueue()
+          })
       }
     } finally {
       this.drainingQueue = false
     }
   }
 
-  private async runTaskInternal(task: ScheduledTaskV1, scheduled: boolean): Promise<ScheduleRunResult> {
-    if (this.runningTaskIds.has(task.id)) {
+  private async runTaskInternal(
+    task: ScheduledTaskV1,
+    scheduled: boolean,
+    options: { slotReserved?: boolean } = {}
+  ): Promise<ScheduleRunResult> {
+    const { slotReserved = false } = options
+    if (!slotReserved && this.runningTaskIds.has(task.id)) {
       return { ok: false, message: 'Task is already running.' }
     }
     if (scheduled && (!task.enabled || task.schedule.kind === 'manual')) {
+      if (slotReserved) this.runningTaskIds.delete(task.id)
       return { ok: false, message: 'Task is not scheduled.' }
     }
     if (!task.prompt.trim()) {
+      if (slotReserved) this.runningTaskIds.delete(task.id)
       return { ok: false, message: 'Task prompt is empty.' }
     }
 
-    this.runningTaskIds.add(task.id)
+    if (!slotReserved) this.runningTaskIds.add(task.id)
     await this.updateTask(task.id, (current) => ({
       ...current,
       lastStatus: 'running',
@@ -500,7 +583,35 @@ export class ScheduleRuntime {
       if (task.useWorktree) {
         const projectPath = workspaceRoot
         const poolIndex = await findAvailablePoolIndex({ projectPath })
-        if (poolIndex === null) throw new Error('No worktree pool slot is available.')
+        if (poolIndex === null) {
+          // No slot is currently available. If other worktree tasks are
+          // running, one of them will release a slot soon — re-enqueue this
+          // task so drainQueue picks it up once a slot frees. If nothing else
+          // is running, every slot is permanently in a state findAvailable...
+          // can't recover from (e.g. dirty from a non-scheduled lease); fall
+          // through to the existing error path so the user sees a clear
+          // failure instead of an unbounded re-queue loop.
+          const hasOtherWorktreeTasks = [...this.runningTaskIds].some((id) => {
+            if (id === task.id) return false
+            return this.worktreeLeases.has(id)
+          })
+          if (hasOtherWorktreeTasks) {
+            this.runningTaskIds.delete(task.id)
+            await this.updateTask(task.id, (current) => ({
+              ...current,
+              lastStatus: 'queued',
+              lastMessage: 'Waiting for a free worktree slot.',
+              updatedAt: new Date().toISOString()
+            }))
+            this.queuedTaskIds.add(task.id)
+            this.queuedTaskModes.set(task.id, scheduled)
+            // Defer the drain so the currently-running worktree task gets a
+            // chance to release before this one is re-picked.
+            setTimeout(() => { void this.drainQueue() }, 250).unref?.()
+            return { ok: true, threadId: '', queued: true, message: 'Task re-queued: no worktree slot available.' }
+          }
+          throw new Error('No worktree pool slot is available.')
+        }
         const worktree = await acquireWorktree({ projectPath, poolIndex, taskId: task.id })
         workspaceRoot = worktree.path
         this.worktreeLeases.set(task.id, { projectPath, poolIndex })
