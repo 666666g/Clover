@@ -8,7 +8,8 @@ import {
   DEFAULT_VIDEO_GENERATION_PROTOCOL,
   MUSIC_GENERATION_PROTOCOLS,
   TEXT_TO_SPEECH_PROTOCOLS,
-  VIDEO_GENERATION_PROTOCOLS
+  VIDEO_GENERATION_PROTOCOLS,
+  type VideoGenerationProtocol
 } from '@shared/app-settings'
 import { ModelSelect, SecretInput, SettingsCard, SettingRow, Toggle } from './settings-controls'
 import { ImageGenerationSettingsSection } from './settings-section-image-generation'
@@ -346,9 +347,15 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                       value={videoGeneration.protocol}
                       onChange={(e) => updateVideoGeneration({ protocol: e.target.value })}
                     >
-                      {VIDEO_GENERATION_PROTOCOLS.map((protocol) => (
-                        <option key={protocol} value={protocol}>{t('videoGenerationProtocolMiniMax')}</option>
-                      ))}
+                      {VIDEO_GENERATION_PROTOCOLS.map((protocol) => {
+                        const labelKey: Record<VideoGenerationProtocol, string> = {
+                          'minimax-video': 'videoGenerationProtocolMiniMax',
+                          'agnes-video': 'videoGenerationProtocolAgnes'
+                        }
+                        return (
+                          <option key={protocol} value={protocol}>{t(labelKey[protocol])}</option>
+                        )
+                      })}
                     </select>
                   }
                 />

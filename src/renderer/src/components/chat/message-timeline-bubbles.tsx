@@ -469,7 +469,7 @@ function mergeMediaReferences(
 
 type MediaPreviewRequest =
   | { key: string; id: string; mode: 'attachment' }
-  | { key: string; path: string; mode: 'workspace-image' }
+  | { key: string; path: string; mode: 'workspace-media' }
 
 function isMediaPreviewRequest(entry: MediaPreviewRequest | null): entry is MediaPreviewRequest {
   return entry !== null
@@ -489,8 +489,8 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
           if (item.id && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
             return { key, id: item.id, mode: 'attachment' } satisfies MediaPreviewRequest
           }
-          const path = mediaIsImage(item) ? mediaPath(item) : undefined
-          if (path) return { key, path, mode: 'workspace-image' } satisfies MediaPreviewRequest
+          const path = mediaIsImage(item) || mediaIsVideo(item) ? mediaPath(item) : undefined
+          if (path) return { key, path, mode: 'workspace-media' } satisfies MediaPreviewRequest
           return null
         })
         .filter(isMediaPreviewRequest),
@@ -500,7 +500,7 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
     .map((request) =>
       request.mode === 'attachment'
         ? `attachment:${request.id}`
-        : `workspace-image:${request.path}`
+        : `workspace-media:${request.path}`
     )
     .join('\n')
 
@@ -521,8 +521,8 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
               previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`
             }
           }
-          if (request.mode === 'workspace-image' && request.path && typeof window.kunGui?.readWorkspaceImage === 'function') {
-            const result = await window.kunGui.readWorkspaceImage({
+          if (request.mode === 'workspace-media' && request.path && typeof window.kunGui?.readWorkspaceMedia === 'function') {
+            const result = await window.kunGui.readWorkspaceMedia({
               path: request.path,
               ...(workspaceRoot ? { workspaceRoot } : {})
             })

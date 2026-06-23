@@ -33,6 +33,7 @@ import type {
   WorkspaceFileWritePayload,
   WorkspaceFileWriteResult,
   WorkspaceImageReadResult,
+  WorkspaceMediaReadResult,
   WorkspacePdfReadResult
 } from '../../shared/workspace-file'
 import {
@@ -51,6 +52,7 @@ import {
 
 const MAX_FILE_PREVIEW_BYTES = 1_500_000
 const MAX_IMAGE_PREVIEW_BYTES = 12 * 1024 * 1024
+const MAX_VIDEO_PREVIEW_BYTES = 64 * 1024 * 1024
 const MAX_PDF_PREVIEW_BYTES = 64 * 1024 * 1024
 const WORKSPACE_IMAGE_DIR = 'img'
 const CLIPBOARD_TEMP_DIR = join(tmpdir(), 'kun')
@@ -64,6 +66,15 @@ const WORKSPACE_IMAGE_MIME_BY_EXT = new Map([
   ['.bmp', 'image/bmp'],
   ['.avif', 'image/avif'],
   ['.ico', 'image/x-icon']
+])
+
+const WORKSPACE_VIDEO_MIME_BY_EXT = new Map([
+  ['.mp4', 'video/mp4'],
+  ['.webm', 'video/webm'],
+  ['.mov', 'video/quicktime'],
+  ['.m4v', 'video/mp4'],
+  ['.ogg', 'video/ogg'],
+  ['.ogv', 'video/ogg']
 ])
 
 export async function listWorkspaceDirectory(
@@ -146,6 +157,43 @@ export async function readWorkspaceImage(
     const mimeType = WORKSPACE_IMAGE_MIME_BY_EXT.get(ext)
     if (!mimeType) {
       return { ok: false, message: 'This image type is not supported in Write mode.' }
+    }
+
+    const bytes = await readFile(targetPath)
+    return {
+      ok: true,
+      path: targetPath,
+      dataUrl: `data:${mimeType};base64,${bytes.toString('base64')}`,
+      mimeType,
+      size: fileInfo.size
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : String(error)
+    }
+  }
+}
+
+export async function readWorkspaceMedia(
+  payload: WorkspaceFileTarget
+): Promise<WorkspaceMediaReadResult> {
+  try {
+    const targetPath = await resolveOpenTargetPath(payload.path, payload.workspaceRoot)
+    const fileInfo = await stat(targetPath)
+    if (fileInfo.isDirectory()) {
+      return { ok: false, message: 'Cannot preview a directory.' }
+    }
+
+    const ext = extensionFromName(targetPath).toLowerCase()
+    const mimeType = WORKSPACE_IMAGE_MIME_BY_EXT.get(ext) ?? WORKSPACE_VIDEO_MIME_BY_EXT.get(ext)
+    if (!mimeType) {
+      return { ok: false, message: 'This media type is not supported for preview.' }
+    }
+
+    const maxBytes = mimeType.startsWith('video/') ? MAX_VIDEO_PREVIEW_BYTES : MAX_IMAGE_PREVIEW_BYTES
+    if (fileInfo.size > maxBytes) {
+      return { ok: false, message: 'This media file is too large to preview.' }
     }
 
     const bytes = await readFile(targetPath)

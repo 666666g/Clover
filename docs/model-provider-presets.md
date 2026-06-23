@@ -75,6 +75,20 @@ MiniMax:
 - image base URL: `https://api.minimaxi.com`
 - image models: `image-01`
 
+Agnes:
+
+- id: `agnes`
+- base URL: `https://apihub.agnes-ai.com/v1`
+- endpoint format: OpenAI Chat Completions
+- initial models: `agnes-2.0-flash`
+- image protocol: Agnes `/v1/images/generations`
+- image base URL: `https://apihub.agnes-ai.com`
+- image models: `agnes-image-2.1-flash`
+- video protocol: Agnes `/v1/videos`
+- video base URL: `https://apihub.agnes-ai.com`
+- video models: `agnes-video-v2.0`
+- role: optional multi-modal provider added from Settings > Providers only
+
 Zhipu Coding Plan:
 
 - id: `zhipu-coding-plan`

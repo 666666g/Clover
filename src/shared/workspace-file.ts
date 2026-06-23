@@ -110,8 +110,17 @@ export type WorkspaceImageReadResult =
     }
   | { ok: false; message: string }
 
-export type WorkspacePdfReadResult =
+export type WorkspaceMediaReadResult =
   | {
+      ok: true
+      path: string
+      dataUrl: string
+      mimeType: string
+      size: number
+    }
+  | { ok: false; message: string }
+
+export type WorkspacePdfReadResult = {
       ok: true
       path: string
       dataBase64: string

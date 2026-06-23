@@ -3,7 +3,8 @@ import {
   CUSTOM_IMAGE_GENERATION_PROVIDER_ID,
   DEFAULT_IMAGE_GENERATION_PROTOCOL,
   IMAGE_GENERATION_PROTOCOLS,
-  resolveKunImageGenerationSettings
+  resolveKunImageGenerationSettings,
+  type ImageGenerationProtocol
 } from '@shared/app-settings'
 import { InlineNoticeView, ModelSelect, SecretInput, SettingsCard, SettingRow, Toggle } from './settings-controls'
 
@@ -122,11 +123,18 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                     value={imageGeneration.protocol}
                     onChange={(e) => updateImageGeneration({ protocol: e.target.value })}
                   >
-                    {IMAGE_GENERATION_PROTOCOLS.map((protocol) => (
-                      <option key={protocol} value={protocol}>
-                        {t(protocol === 'minimax-image' ? 'imageGenProtocolMiniMax' : 'imageGenProtocolOpenAi')}
-                      </option>
-                    ))}
+                    {IMAGE_GENERATION_PROTOCOLS.map((protocol) => {
+                      const labelKey: Record<ImageGenerationProtocol, string> = {
+                        'openai-images': 'imageGenProtocolOpenAi',
+                        'minimax-image': 'imageGenProtocolMiniMax',
+                        'agnes-image': 'imageGenProtocolAgnes'
+                      }
+                      return (
+                        <option key={protocol} value={protocol}>
+                          {t(labelKey[protocol])}
+                        </option>
+                      )
+                    })}
                   </select>
                 }
               />

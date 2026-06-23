@@ -1117,7 +1117,8 @@ function normalizeModelProviderImageCapability(
 }
 
 export function normalizeImageGenerationProtocol(value: unknown): ImageGenerationProtocol {
-  return value === 'minimax-image' ? 'minimax-image' : DEFAULT_IMAGE_GENERATION_PROTOCOL
+  if (value === 'minimax-image' || value === 'agnes-image') return value
+  return DEFAULT_IMAGE_GENERATION_PROTOCOL
 }
 
 function normalizeModelProviderSpeechCapability(
@@ -1200,7 +1201,8 @@ function normalizeModelProviderVideoCapability(
 }
 
 export function normalizeVideoGenerationProtocol(value: unknown): VideoGenerationProtocol {
-  return value === 'minimax-video' ? 'minimax-video' : DEFAULT_VIDEO_GENERATION_PROTOCOL
+  if (value === 'minimax-video' || value === 'agnes-video') return value
+  return DEFAULT_VIDEO_GENERATION_PROTOCOL
 }
 
 function normalizeModelProviderBaseUrl(value: unknown, fallback = DEFAULT_DEEPSEEK_BASE_URL): string {

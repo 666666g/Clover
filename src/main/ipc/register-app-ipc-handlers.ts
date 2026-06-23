@@ -148,6 +148,7 @@ import {
   readClipboardImage,
   readWorkspaceImage,
   readWorkspaceFile,
+  readWorkspaceMedia,
   readWorkspacePdf,
   renameWorkspaceEntry,
   resolveOpenTargetPath,
@@ -1080,6 +1081,11 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
   ipcMain.handle('file:read-workspace-image', async (_, payload: unknown) =>
     readWorkspaceImage(
       parseIpcPayload('file:read-workspace-image', workspaceFileTargetPayloadSchema, payload)
+    )
+  )
+  ipcMain.handle('file:read-workspace-media', async (_, payload: unknown) =>
+    readWorkspaceMedia(
+      parseIpcPayload('file:read-workspace-media', workspaceFileTargetPayloadSchema, payload)
     )
   )
   ipcMain.handle('file:read-workspace-pdf', async (_, payload: unknown) =>

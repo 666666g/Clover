@@ -27,6 +27,7 @@ export type ModelProviderPresetId =
   | 'moonshot-global'
   | 'xiaomi'
   | 'minimax'
+  | 'agnes'
   | 'aliyun'
   | 'tencentcloud'
   | 'vercel-ai-gateway'
@@ -530,6 +531,28 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     },
     docsUrl: 'https://platform.minimax.io/docs/api-reference/text-anthropic-api',
     apiKeyUrl: 'https://platform.minimaxi.com/user-center/basic-information/interface-key'
+  },
+  {
+    id: 'agnes',
+    name: 'Agnes',
+    baseUrl: 'https://apihub.agnes-ai.com/v1',
+    endpointFormat: 'chat_completions',
+    models: ['agnes-2.0-flash'],
+    modelProfiles: {
+      'agnes-2.0-flash': visionChatProfile(128_000)
+    },
+    image: {
+      protocol: 'agnes-image',
+      baseUrl: 'https://apihub.agnes-ai.com',
+      models: ['agnes-image-2.1-flash']
+    },
+    video: {
+      protocol: 'agnes-video',
+      baseUrl: 'https://apihub.agnes-ai.com',
+      models: ['agnes-video-v2.0']
+    },
+    docsUrl: 'https://docs.agnes-ai.com',
+    apiKeyUrl: 'https://apihub.agnes-ai.com'
   },
   {
     id: 'aliyun',

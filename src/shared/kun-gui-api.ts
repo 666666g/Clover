@@ -41,6 +41,7 @@ import type {
   WorkspaceFileSaveAsPayload,
   WorkspaceFileSaveAsResult,
   WorkspaceImageReadResult,
+  WorkspaceMediaReadResult,
   WorkspacePdfReadResult,
   WorkspaceDirectoryCreatePayload,
   WorkspaceDirectoryCreateResult,
@@ -399,6 +400,7 @@ export type KunGuiApi = {
   resolveWorkspaceFile: (options: WorkspaceFileTarget) => Promise<WorkspaceFileResolveResult>
   readWorkspaceFile: (options: WorkspaceFileTarget) => Promise<WorkspaceFileReadResult>
   readWorkspaceImage: (options: WorkspaceFileTarget) => Promise<WorkspaceImageReadResult>
+  readWorkspaceMedia: (options: WorkspaceFileTarget) => Promise<WorkspaceMediaReadResult>
   readWorkspacePdf: (options: WorkspaceFileTarget) => Promise<WorkspacePdfReadResult>
   saveWorkspaceFileAs: (payload: WorkspaceFileSaveAsPayload) => Promise<WorkspaceFileSaveAsResult>
   writeWorkspaceFile: (payload: WorkspaceFileWritePayload) => Promise<WorkspaceFileWriteResult>

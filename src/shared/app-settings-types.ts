@@ -37,7 +37,7 @@ export type ClawModel = 'auto' | ScheduleModel
 
 export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 export const CUSTOM_IMAGE_GENERATION_PROVIDER_ID = 'custom'
-export const IMAGE_GENERATION_PROTOCOLS = ['openai-images', 'minimax-image'] as const
+export const IMAGE_GENERATION_PROTOCOLS = ['openai-images', 'minimax-image', 'agnes-image'] as const
 export type ImageGenerationProtocol = (typeof IMAGE_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_IMAGE_GENERATION_PROTOCOL: ImageGenerationProtocol = 'openai-images'
 export const CUSTOM_SPEECH_TO_TEXT_PROVIDER_ID = 'custom'
@@ -53,7 +53,7 @@ export const MUSIC_GENERATION_PROTOCOLS = ['minimax-music'] as const
 export type MusicGenerationProtocol = (typeof MUSIC_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_MUSIC_GENERATION_PROTOCOL: MusicGenerationProtocol = 'minimax-music'
 export const CUSTOM_VIDEO_GENERATION_PROVIDER_ID = 'custom'
-export const VIDEO_GENERATION_PROTOCOLS = ['minimax-video'] as const
+export const VIDEO_GENERATION_PROTOCOLS = ['minimax-video', 'agnes-video'] as const
 export type VideoGenerationProtocol = (typeof VIDEO_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_VIDEO_GENERATION_PROTOCOL: VideoGenerationProtocol = 'minimax-video'
 export const DEFAULT_CLAW_MODEL = 'auto'

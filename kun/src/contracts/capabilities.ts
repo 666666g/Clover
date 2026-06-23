@@ -257,7 +257,7 @@ export const MemoryCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type MemoryCapabilityConfig = z.infer<typeof MemoryCapabilityConfig>
 
-export const ImageGenerationProtocol = z.enum(['openai-images', 'minimax-image'])
+export const ImageGenerationProtocol = z.enum(['openai-images', 'minimax-image', 'agnes-image'])
 export type ImageGenerationProtocol = z.infer<typeof ImageGenerationProtocol>
 
 export const ImageGenCapabilityConfig = CapabilityToggleConfig.extend({
@@ -298,7 +298,7 @@ export const MusicGenCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type MusicGenCapabilityConfig = z.infer<typeof MusicGenCapabilityConfig>
 
-export const VideoGenerationProtocol = z.enum(['minimax-video'])
+export const VideoGenerationProtocol = z.enum(['minimax-video', 'agnes-video'])
 export type VideoGenerationProtocol = z.infer<typeof VideoGenerationProtocol>
 
 export const VideoGenCapabilityConfig = CapabilityToggleConfig.extend({

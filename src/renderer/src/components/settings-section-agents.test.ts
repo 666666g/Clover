@@ -59,6 +59,7 @@ const labels: Record<string, string> = {
   imageGenProtocol: 'Image protocol',
   imageGenProtocolOpenAi: 'OpenAI Images',
   imageGenProtocolMiniMax: 'MiniMax image_generation',
+  imageGenProtocolAgnes: 'Agnes Images',
   imageGenBaseUrl: 'Image base URL',
   imageGenModel: 'Image model',
   imageGenBaseUrlPlaceholder: 'https://api.example.com/v1',

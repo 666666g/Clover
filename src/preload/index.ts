@@ -132,6 +132,8 @@ const api = {
     ipcRenderer.invoke('file:read-workspace', options),
   readWorkspaceImage: (options) =>
     ipcRenderer.invoke('file:read-workspace-image', options),
+  readWorkspaceMedia: (options) =>
+    ipcRenderer.invoke('file:read-workspace-media', options),
   readWorkspacePdf: (options) =>
     ipcRenderer.invoke('file:read-workspace-pdf', options),
   saveWorkspaceFileAs: (payload) =>

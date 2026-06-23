@@ -407,6 +407,9 @@ export function createVideoGenClient(config: {
   baseUrl?: string
   apiKey?: string
 }): VideoGenClient {
+  if (config.protocol === 'agnes-video') {
+    return new AgnesVideoClient(config.baseUrl!, config.apiKey!)
+  }
   return new MiniMaxVideoClient(config.baseUrl!, config.apiKey!)
 }
 
@@ -675,6 +678,162 @@ export class MiniMaxVideoClient implements VideoGenClient {
       'Content-Type': 'application/json'
     }
   }
+}
+
+export class AgnesVideoClient implements VideoGenClient {
+  readonly id = 'agnes-video'
+  private readonly rootUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string
+  ) {
+    this.rootUrl = agnesRootUrl(baseUrl)
+  }
+
+  async generate(request: VideoGenRequest): Promise<GeneratedMedia> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    const { width, height } = agnesVideoDimensions(request.resolution)
+    const numFrames = agnesVideoFrameCount(request.duration)
+    const body: Record<string, unknown> = {
+      model: request.model,
+      prompt: request.prompt,
+      height,
+      width,
+      num_frames: numFrames,
+      frame_rate: AGNES_VIDEO_FRAME_RATE
+    }
+    if (request.lastFrameImage) {
+      // 同时提供首帧/尾帧时按关键帧动画处理；
+      // 只有尾帧时按多图视频生成处理。
+      body.extra_body = {
+        image: [
+          ...(request.firstFrameImage
+            ? [dataUri(request.firstFrameImage.mimeType, request.firstFrameImage.data)]
+            : []),
+          dataUri(request.lastFrameImage.mimeType, request.lastFrameImage.data)
+        ],
+        ...(request.firstFrameImage ? { mode: 'keyframes' } : {})
+      }
+    } else if (request.firstFrameImage) {
+      body.image = dataUri(request.firstFrameImage.mimeType, request.firstFrameImage.data)
+    }
+    const createPayload = await requestJson<AgnesVideoCreatePayload>(`${this.rootUrl}/v1/videos`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(body),
+      signal
+    }, request)
+    const videoId = createPayload.video_id ?? createPayload.task_id
+    if (!videoId) throw new Error('Agnes video provider returned no video_id or task_id')
+    await request.onUpdate?.({
+      output: { status: createPayload.status ?? 'submitted', taskId: videoId, provider: this.id }
+    })
+
+    const deadline = Date.now() + request.timeoutMs
+    let lastStatus = createPayload.status ?? 'submitted'
+    while (Date.now() < deadline) {
+      await delay(request.pollIntervalMs, signal)
+      const queryUrl = new URL(`${this.rootUrl}/agnesapi`)
+      queryUrl.searchParams.set('video_id', videoId)
+      const queryPayload = await requestJson<AgnesVideoQueryPayload>(queryUrl.toString(), {
+        method: 'GET',
+        headers: this.headers(),
+        signal
+      }, request)
+      lastStatus = queryPayload.status || lastStatus
+      await request.onUpdate?.({
+        output: { status: lastStatus, taskId: videoId, provider: this.id }
+      })
+      if (isFailureStatus(lastStatus)) {
+        const errorDetail = queryPayload.error ? ` (${JSON.stringify(queryPayload.error)})` : ''
+        throw new Error(`Agnes video generation failed with status ${lastStatus}${errorDetail}`)
+      }
+      if (!isSuccessStatus(lastStatus)) continue
+      const downloadUrl = extractAgnesVideoUrl(queryPayload)
+      if (!downloadUrl) throw new Error('Agnes video provider finished without download url')
+      const response = await requestResponse(downloadUrl, { method: 'GET', signal }, request)
+      if (!response.ok) throw new ImageGenHttpError(response.status, await response.text())
+      const mimeType = response.headers.get('content-type')?.split(';')[0] || 'video/mp4'
+      return {
+        data: Buffer.from(await response.arrayBuffer()),
+        mimeType,
+        extension: videoExtension(mimeType)
+      }
+    }
+    throw new Error(`Agnes video generation timed out after ${request.timeoutMs}ms (last status: ${lastStatus})`)
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json'
+    }
+  }
+}
+
+function agnesRootUrl(baseUrl: string): string {
+  const normalized = trimTrailingSlashes(baseUrl.trim())
+  if (!normalized) return ''
+  for (const suffix of ['/v1/videos', '/videos', '/agnesapi']) {
+    if (normalized.toLowerCase().endsWith(suffix)) {
+      return trimTrailingSlashes(normalized.slice(0, -suffix.length))
+    }
+  }
+  if (normalized.toLowerCase().endsWith('/v1')) return trimTrailingSlashes(normalized.slice(0, -3))
+  return normalized
+}
+
+const AGNES_VIDEO_FRAME_RATE = 24
+
+function agnesVideoDimensions(resolution: string): { width: number; height: number } {
+  switch (resolution.trim().toLowerCase()) {
+    case '1080p':
+      return { width: 1920, height: 1080 }
+    case '720p':
+      return { width: 1280, height: 720 }
+    case '768p':
+    default:
+      return { width: 1280, height: 768 }
+  }
+}
+
+function agnesVideoFrameCount(durationSeconds: number): number {
+  // Agnes 要求 num_frames ≤ 441 且满足 8n + 1。
+  const raw = Math.min(441, Math.max(1, Math.round(durationSeconds * AGNES_VIDEO_FRAME_RATE)))
+  return Math.max(1, Math.floor((raw - 1) / 8) * 8 + 1)
+}
+
+type AgnesVideoCreatePayload = {
+  id?: string
+  task_id?: string
+  video_id?: string
+  status?: string
+  progress?: number
+  seconds?: string
+  size?: string
+}
+
+type AgnesVideoQueryPayload = {
+  status?: string
+  progress?: number
+  remixed_from_video_id?: string
+  url?: string
+  video_url?: string
+  seconds?: string
+  size?: string
+  error?: unknown
+}
+
+function extractAgnesVideoUrl(payload: AgnesVideoQueryPayload): string | undefined {
+  // 官方文档把最终视频 URL 放在 remixed_from_video_id 字段；
+  // 同时保留几个常见字段名作为防御性回退。
+  return (
+    payload.remixed_from_video_id ||
+    payload.video_url ||
+    payload.url ||
+    undefined
+  )
 }
 
 type MiniMaxAudioPayload = {

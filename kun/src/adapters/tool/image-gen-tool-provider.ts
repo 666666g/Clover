@@ -357,6 +357,9 @@ export function createImageGenClient(config: {
   if (config.protocol === 'minimax-image') {
     return new MiniMaxImageClient(config.baseUrl!, config.apiKey!)
   }
+  if (config.protocol === 'agnes-image') {
+    return new AgnesImageClient(config.baseUrl!, config.apiKey!)
+  }
   return new OpenAiCompatImageClient(config.baseUrl!, config.apiKey!)
 }
 
@@ -576,6 +579,100 @@ export class MiniMaxImageClient implements ImageGenClient {
   }
 }
 
+export class AgnesImageClient implements ImageGenClient {
+  readonly id = 'agnes-image'
+  private readonly endpointUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string
+  ) {
+    const normalized = trimTrailingSlashes(baseUrl.trim())
+    this.endpointUrl = normalized ? `${normalized}/v1/images/generations` : '/v1/images/generations'
+  }
+
+  async generate(request: ImageGenRequest): Promise<GeneratedImage> {
+    return this.requestImage(
+      {
+        model: request.model,
+        prompt: request.prompt,
+        ...(request.size ? { size: request.size } : {}),
+        return_base64: true
+      },
+      request
+    )
+  }
+
+  async edit(request: ImageGenEditRequest): Promise<GeneratedImage> {
+    return this.requestImage(
+      {
+        model: request.model,
+        prompt: request.prompt,
+        ...(request.size ? { size: request.size } : {}),
+        extra_body: {
+          image: request.images.map((image) => dataUri(image.mimeType, image.data)),
+          response_format: 'b64_json'
+        }
+      },
+      request
+    )
+  }
+
+  private async requestImage(
+    body: Record<string, unknown>,
+    request: { timeoutMs: number; signal: AbortSignal }
+  ): Promise<GeneratedImage> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    let response: Response
+    try {
+      response = await fetch(this.endpointUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body),
+        signal
+      })
+    } catch (error) {
+      throw imageFetchFailure(this.endpointUrl, error, request)
+    }
+    const text = await response.text()
+    if (!response.ok) throw new ImageGenHttpError(response.status, text)
+    let payload: AgnesImagePayload
+    try {
+      payload = JSON.parse(text) as AgnesImagePayload
+    } catch {
+      throw new Error('Agnes image provider returned invalid JSON')
+    }
+    const entry = payload.data?.[0]
+    if (entry?.b64_json) {
+      return { data: Buffer.from(entry.b64_json, 'base64'), mimeType: 'image/png' }
+    }
+    if (entry?.url) {
+      let download: Response
+      try {
+        download = await fetch(entry.url, { signal })
+      } catch (error) {
+        throw imageFetchFailure(entry.url, error, request)
+      }
+      if (!download.ok) throw new ImageGenHttpError(download.status, await download.text())
+      const mimeType = download.headers.get('content-type')?.split(';')[0] || 'image/png'
+      return { data: Buffer.from(await download.arrayBuffer()), mimeType }
+    }
+    throw new Error('Agnes image provider returned no image data')
+  }
+}
+
+type AgnesImagePayload = {
+  created?: number
+  data?: Array<{
+    url?: string | null
+    b64_json?: string | null
+    revised_prompt?: string | null
+  }>
+}
+
 function minimaxImageGenerationUrl(baseUrl: string): string {
   const normalized = trimTrailingSlashes(baseUrl.trim())
   const lower = normalized.toLowerCase()
@@ -583,6 +680,10 @@ function minimaxImageGenerationUrl(baseUrl: string): string {
   if (lower.endsWith('/v1/image_generation') || lower.endsWith('/image_generation')) return normalized
   if (lower.endsWith('/v1')) return `${normalized}/image_generation`
   return `${normalized}/v1/image_generation`
+}
+
+function dataUri(mimeType: string, data: Buffer): string {
+  return `data:${mimeType};base64,${data.toString('base64')}`
 }
 
 function trimTrailingSlashes(value: string): string {
