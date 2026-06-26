@@ -35,6 +35,7 @@ import {
   isClawWorkspacePath,
   isInternalDeepSeekGuiWorkspace,
   isInternalTemporaryWorkspace,
+  isConversationWorkspacePath,
   normalizeWorkspaceRoot,
   workspaceRootIdentityKey
 } from '../../lib/workspace-path'
@@ -59,6 +60,8 @@ type SidebarProjectsSectionProps = {
   showArchived: boolean
   workspaceRoot: string
   workspaceRoots: string[]
+  /** 对话工作目录根,用于在项目区块中过滤掉对话会话。 */
+  conversationRoot: string
   busy: boolean
   watchTurnCompletion: Record<string, boolean>
   unreadThreadIds: Record<string, boolean>
@@ -259,6 +262,7 @@ export function buildSidebarWorkspaceGroups(options: {
   showArchived: boolean
   workspaceRoot: string
   workspaceRoots: string[]
+  conversationRoot: string
   threadWorktrees?: SidebarThreadWorktrees
 }): SidebarWorkspaceGroup[] {
   const map = new Map<string, { workspacePath: string, threads: NormalizedThread[] }>()
@@ -266,6 +270,7 @@ export function buildSidebarWorkspaceGroups(options: {
   const selectedWorkspaceKey = workspaceRootIdentityKey(selectedWorkspace)
   const query = options.searchQuery.trim().toLowerCase()
   const candidateProjectPaths = sidebarWorkspaceResolutionCandidates(options)
+  const conversationRoot = options.conversationRoot
 
   const upsertWorkspace = (workspacePath: string, threads: NormalizedThread[] = []): void => {
     const normalized = normalizeWorkspaceRoot(workspacePath)
@@ -286,6 +291,7 @@ export function buildSidebarWorkspaceGroups(options: {
     if (isInternalTemporaryWorkspace(th.workspace)) continue
     if (isInternalDeepSeekGuiWorkspace(th.workspace)) continue
     if (isClawWorkspacePath(th.workspace)) continue
+    if (isConversationWorkspacePath(th.workspace, conversationRoot)) continue
     if ((th.archived === true) !== options.showArchived) continue
     const key = sidebarWorkspacePathForThread(th, options.threadWorktrees, candidateProjectPaths)
     if (!key) continue
@@ -313,6 +319,7 @@ export function buildSidebarWorkspaceGroups(options: {
       if (isInternalTemporaryWorkspace(key)) continue
       if (isInternalDeepSeekGuiWorkspace(key)) continue
       if (isClawWorkspacePath(key)) continue
+      if (isConversationWorkspacePath(key, conversationRoot)) continue
       upsertWorkspace(key)
     }
   }
@@ -467,6 +474,7 @@ export function SidebarProjectsSection({
   showArchived,
   workspaceRoot,
   workspaceRoots,
+  conversationRoot,
   busy,
   watchTurnCompletion,
   unreadThreadIds,
@@ -511,9 +519,10 @@ export function SidebarProjectsSection({
       showArchived,
       workspaceRoot,
       workspaceRoots,
+      conversationRoot,
       threadWorktrees
     })
-  }, [searchQuery, showArchived, threadWorktrees, threads, workspaceRoot, workspaceRoots])
+  }, [searchQuery, showArchived, threadWorktrees, threads, workspaceRoot, workspaceRoots, conversationRoot])
 
   const draftHistoryWorkspacePaths = useMemo(() => {
     return buildSidebarDraftWorkspacePaths({

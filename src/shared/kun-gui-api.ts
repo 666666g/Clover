@@ -121,6 +121,7 @@ export type KunRuntimeStatusPayload = {
 
 export type RuntimeRequestResult = { ok: boolean; status: number; body: string }
 export type WorkspacePickResult = { canceled: boolean; path: string | null }
+export type ConversationWorkspaceCreateResult = { ok: boolean; path: string; error?: string }
 export type PathOpenResult = { ok: boolean; message?: string }
 export const DESKTOP_COMMANDS = [
   'undo',
@@ -339,6 +340,8 @@ export type KunGuiApi = {
     allowedChatIds?: string
   ) => Promise<ClawImTelegramConnectResult>
   pickWorkspaceDirectory: (defaultPath?: string) => Promise<WorkspacePickResult>
+  /** 在对话工作目录根下创建一个时间戳子目录作为新对话的工作目录。 */
+  createConversationWorkspace: (root?: string) => Promise<ConversationWorkspaceCreateResult>
   confirmDialog: (options: ConfirmDialogOptions) => Promise<boolean>
   /** Detect importable conversations from a previous DeepSeek GUI install. */
   detectLegacySessions: () => Promise<LegacySessionDetectResult>

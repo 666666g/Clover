@@ -2,6 +2,7 @@ import {
   mergeComposerPickList,
   readStoredComposerMode
 } from './chat-store-helpers'
+import { defaultConversationWorkspaceRoot } from '../lib/workspace-path'
 
 export function createInitialChatStoreState(workingDirectoryLabel: string) {
   return {
@@ -12,6 +13,7 @@ export function createInitialChatStoreState(workingDirectoryLabel: string) {
     initialSetupOpen: false,
     initialSetupMode: 'required' as const,
     workspaceRoot: '',
+    conversationWorkspaceRoot: defaultConversationWorkspaceRoot(),
     workspaceLabel: workingDirectoryLabel,
     runtimeConnection: 'idle' as const,
     runtimeStatus: null,

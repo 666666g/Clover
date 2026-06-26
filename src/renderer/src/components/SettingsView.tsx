@@ -33,7 +33,7 @@ import {
 } from '../lib/apply-theme'
 import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
 import type { SkillRootListItem } from '@shared/kun-gui-api'
-import { normalizeWorkspaceRoot } from '../lib/workspace-path'
+import { defaultConversationWorkspaceRoot, normalizeWorkspaceRoot } from '../lib/workspace-path'
 import {
   compactHomePathForSettingsDisplay,
   compactHomePathListForSettingsDisplay,
@@ -107,6 +107,7 @@ export function SettingsView(): ReactElement {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [workspacePickerError, setWorkspacePickerError] = useState<string | null>(null)
   const [writeWorkspacePickerError, setWriteWorkspacePickerError] = useState<string | null>(null)
+  const [conversationWorkspacePickerError, setConversationWorkspacePickerError] = useState<string | null>(null)
   const [clawWorkspacePickerError, setClawWorkspacePickerError] = useState<string | null>(null)
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle')
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -834,6 +835,28 @@ export function SettingsView(): ReactElement {
     update({ workspaceRoot: expandHomePath(DEFAULT_WORKSPACE_ROOT) })
   }
 
+  const pickConversationWorkspace = async (): Promise<void> => {
+    try {
+      setConversationWorkspacePickerError(null)
+      if (typeof window.kunGui?.pickWorkspaceDirectory !== 'function') {
+        throw new Error('workspace:pick-directory unavailable')
+      }
+      const picked = await window.kunGui.pickWorkspaceDirectory(
+        expandHomePath(form.conversationWorkspaceRoot || defaultConversationWorkspaceRoot())
+      )
+      if (!picked.canceled && picked.path) {
+        update({ conversationWorkspaceRoot: picked.path })
+      }
+    } catch (e) {
+      setConversationWorkspacePickerError(formatWorkspacePickerError(e))
+    }
+  }
+
+  const resetConversationWorkspaceToDefault = (): void => {
+    setConversationWorkspacePickerError(null)
+    update({ conversationWorkspaceRoot: expandHomePath(defaultConversationWorkspaceRoot()) })
+  }
+
   const pickWriteWorkspace = async (): Promise<void> => {
     try {
       setWriteWorkspacePickerError(null)
@@ -937,6 +960,9 @@ export function SettingsView(): ReactElement {
     pickWorkspace,
     resetWorkspaceToDefault,
     workspacePickerError,
+    pickConversationWorkspace,
+    resetConversationWorkspaceToDefault,
+    conversationWorkspacePickerError,
     guiUpdateInfo,
     checkingGuiUpdate,
     downloadingGuiUpdate,

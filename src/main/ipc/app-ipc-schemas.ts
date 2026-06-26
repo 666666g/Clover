@@ -1354,6 +1354,7 @@ const settingsPatchObjectSchema = z.object({
     kun: kunRuntimePatchSchema.optional()
   }).strict().optional(),
   workspaceRoot: defaultPathSchema,
+  conversationWorkspaceRoot: defaultPathSchema,
   log: logPatchSchema.optional(),
   checkpointCleanup: checkpointCleanupPatchSchema.optional(),
   notifications: notificationsPatchSchema.optional(),

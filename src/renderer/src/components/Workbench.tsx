@@ -378,6 +378,7 @@ export function Workbench(): ReactElement {
     activeThreadParentId,
     selectThread,
     createThread,
+    createConversation,
     blocks,
     liveReasoning,
     liveAssistant,
@@ -442,6 +443,7 @@ export function Workbench(): ReactElement {
       activeThreadParentId: s.activeThreadParentId,
       selectThread: s.selectThread,
       createThread: s.createThread,
+      createConversation: s.createConversation,
       blocks: s.blocks,
       liveReasoning: s.liveReasoning,
       liveAssistant: s.liveAssistant,
@@ -2216,6 +2218,13 @@ export function Workbench(): ReactElement {
     if (useWorktreePool) setUseWorktreePool(false)
   }
 
+  const startNewConversation = (): void => {
+    if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
+    setConnectPhoneSidebarOpen(false)
+    setRoute('chat')
+    void createConversation()
+  }
+
   const openCodeMode = (): void => {
     setConnectPhoneSidebarOpen(false)
     void openCode()
@@ -2579,6 +2588,7 @@ export function Workbench(): ReactElement {
               onWriteOpen={openWriteMode}
               onScheduleOpen={openScheduleView}
               onWorkflowOpen={openWorkflowView}
+              onNewConversation={startNewConversation}
             />
             )}
           </div>

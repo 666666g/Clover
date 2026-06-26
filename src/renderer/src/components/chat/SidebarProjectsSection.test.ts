@@ -62,6 +62,7 @@ describe('SidebarProjectsSection groups', () => {
       searchQuery: '',
       showArchived: false,
       workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
       workspaceRoots: [
         '/Users/zxy/project-a',
         '/Users/zxy/project-b',
@@ -82,6 +83,7 @@ describe('SidebarProjectsSection groups', () => {
     const base = {
       threads: [thread({ id: 'reasonix-current', workspace: '/Users/zxy/project-a' })],
       workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
       workspaceRoots: ['/Users/zxy/project-b']
     }
 
@@ -112,6 +114,7 @@ describe('SidebarProjectsSection groups', () => {
       searchQuery: '',
       showArchived: false,
       workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
       workspaceRoots: [
         '/Users/zxy/project-a',
         '/Users/zxy/.deepseekgui/default_workspace',
@@ -135,6 +138,7 @@ describe('SidebarProjectsSection groups', () => {
       searchQuery: '',
       showArchived: false,
       workspaceRoot: 'C:\\Users\\zxy\\.deepseekgui\\default_workspace',
+      conversationRoot: '',
       workspaceRoots: [
         '~/.deepseekgui/default_workspace',
         'C:\\Users\\zxy\\.deepseekgui\\default_workspace'
@@ -154,6 +158,7 @@ describe('SidebarProjectsSection groups', () => {
       searchQuery: '',
       showArchived: false,
       workspaceRoot: projectPath,
+      conversationRoot: '',
       workspaceRoots: [projectPath, worktreePath]
     })
 
@@ -178,6 +183,7 @@ describe('SidebarProjectsSection groups', () => {
       searchQuery: '',
       showArchived: false,
       workspaceRoot: projectPath,
+      conversationRoot: '',
       workspaceRoots: [
         projectPath,
         worktreePath
@@ -217,12 +223,31 @@ describe('SidebarProjectsSection groups', () => {
     ])
   })
 
+  it('excludes conversation workspaces from project groups', () => {
+    // 工作目录落在对话工作目录根下的会话不进「项目」分组。
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [
+        thread({ id: 'project-thread', workspace: '/Users/zxy/project-a' }),
+        thread({ id: 'conversation-thread', workspace: '/Users/zxy/Documents/Kun/20260626-153012' })
+      ],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '/Users/zxy/Documents/Kun',
+      workspaceRoots: ['/Users/zxy/project-a']
+    })
+
+    expect(groups.map(([workspace]) => workspace)).toEqual(['/Users/zxy/project-a'])
+    expect(groups[0]?.[1].map((item) => item.id)).toEqual(['project-thread'])
+  })
+
   it('merges requirement-only search matches into displayed groups', () => {
     const groups = buildSidebarWorkspaceGroups({
       threads: [thread({ id: 'reasonix-current', workspace: '/Users/zxy/project-a' })],
       searchQuery: 'checkout',
       showArchived: false,
       workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
       workspaceRoots: ['/Users/zxy/project-a', '/Users/zxy/project-b']
     })
     const filteredDraftHistory = {

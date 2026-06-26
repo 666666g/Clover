@@ -67,6 +67,7 @@ function settings(): AppSettingsV1 {
       }
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
     checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },

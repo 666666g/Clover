@@ -115,7 +115,7 @@ const checkpointGitUnavailableWorkspaces = new Set<string>()
 
 export function createThreadActions(
   { set, get, sseAbortRef }: StoreActionContext
-): Pick<ChatState, 'createThread' | 'recoverActiveTurn' | 'selectThread' | 'subscribeThreadEventsLive' | 'drainQueuedMessages' | 'removeQueuedMessage' | 'sendMessage' | 'reviewActiveThread'> {
+): Pick<ChatState, 'createThread' | 'createConversation' | 'recoverActiveTurn' | 'selectThread' | 'subscribeThreadEventsLive' | 'drainQueuedMessages' | 'removeQueuedMessage' | 'sendMessage' | 'reviewActiveThread'> {
   return {
   createThread: async (options = {}) => {
     if (get().runtimeConnection !== 'ready') {
@@ -128,6 +128,49 @@ export function createThreadActions(
       const activeThread = get().activeThreadId
         ? get().threads.find((thread) => thread.id === get().activeThreadId)
         : null
+
+      // 对话会话:不绑定项目文件夹,在 conversationWorkspaceRoot 下自动创建
+      // 一个时间戳子目录作为工作目录(主进程负责实际建目录)。
+      if (options.conversation) {
+        if (typeof window.kunGui === 'undefined' || typeof window.kunGui.createConversationWorkspace !== 'function') {
+          set({ error: i18n.t('common:workspacePickerUnavailable') })
+          return
+        }
+        const created = await window.kunGui.createConversationWorkspace(
+          settings.conversationWorkspaceRoot || undefined
+        )
+        if (!created.ok || !created.path) {
+          set({ error: created.error || i18n.t('common:worktreeAcquireFailed') })
+          return
+        }
+        const pickedAgentId = options.agentId?.trim() || get().composerAgentId?.trim() || ''
+        const personaProfile = pickedAgentId
+          ? settings.agents?.kun?.subagents?.profiles?.find(
+            (profile) => profile.id === pickedAgentId &&
+              profile.enabled &&
+              (profile.mode === 'primary' || profile.mode === 'all')
+          )
+          : undefined
+        const t = await p.createThread({
+          workspace: created.path,
+          title: getDefaultThreadTitle(),
+          mode: 'agent',
+          ...(personaProfile ? {
+            agentId: personaProfile.id,
+            ...(personaProfile.providerId ? { providerId: personaProfile.providerId } : {}),
+            ...(personaProfile.model ? { model: personaProfile.model } : {}),
+            ...(personaProfile.systemPrompt ? { systemPrompt: personaProfile.systemPrompt } : {})
+          } : {})
+        })
+        set((s) => ({
+          activeThreadId: t.id,
+          threads: s.threads.some((thread) => thread.id === t.id) ? s.threads : [t, ...s.threads]
+        }))
+        await get().selectThread(t.id)
+        await get().refreshThreads()
+        return
+      }
+
       let workspaceRoot =
         normalizeWorkspaceRoot(options.workspaceRoot) ||
         (activeThread && !isInternalTemporaryWorkspace(activeThread.workspace)
@@ -239,6 +282,10 @@ export function createThreadActions(
           : {})
       })
     }
+  },
+
+  createConversation: async () => {
+    await get().createThread({ conversation: true })
   },
 
   recoverActiveTurn: async () => {
