@@ -1,6 +1,6 @@
 /**
  * Fetch the Claude models available to a subscription, via the Agent SDK's
- * `startup()` → `WarmQuery.supportedModels()`. The SDK lives in kun's
+ * `query().supportedModels()`. The SDK lives in kun's
  * node_modules (not the app's), so we run a short ESM eval in a Node subprocess
  * with cwd = the kun dir, scoping the OAuth token into its env. Defensive: any
  * failure (no SDK, timeout, not-logged-in) resolves to `[]` so the caller keeps
@@ -41,9 +41,12 @@ export function fetchSdkModels(options: {
   const timeoutMs = options.timeoutMs ?? 30_000
   const nodePath = options.nodePath ?? process.execPath
   const script = [
-    `import { startup } from ${JSON.stringify(SDK_PKG)};`,
+    `import { query } from ${JSON.stringify(SDK_PKG)};`,
     `let out = [];`,
-    `try { const wq = await startup({ options: {} }); try { await wq.initializationResult?.(); out = (await wq.supportedModels()) || []; } finally { try { await wq[Symbol.asyncDispose]?.(); } catch {} } } catch {}`,
+    // supportedModels() lives on the Query (from query()), NOT the WarmQuery from
+    // startup(). It's a control request — we call it and interrupt() WITHOUT
+    // iterating the prompt, so no turn runs and the subscription isn't charged.
+    `try { const q = query({ prompt: 'list-models', options: {} }); try { out = (await q.supportedModels()) || []; } finally { try { await q.interrupt?.(); } catch {} } } catch {}`,
     `process.stdout.write(${JSON.stringify(MARK)} + JSON.stringify(out) + ${JSON.stringify(MARK)});`,
     `process.exit(0);`
   ].join('\n')
