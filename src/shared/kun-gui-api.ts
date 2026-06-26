@@ -294,6 +294,13 @@ export type ClaudeSubscriptionLoginResult =
   | { ok: true; token: string }
   | { ok: false; message: string }
 
+export type SdkDownloadState = {
+  status: 'downloading' | 'done' | 'error'
+  receivedBytes: number
+  totalBytes: number
+  message?: string
+}
+
 export type KunGuiApi = {
   platform: string
   homeDir: string
@@ -304,12 +311,16 @@ export type KunGuiApi = {
   claudeSubscriptionLogin: () => Promise<ClaudeSubscriptionLoginResult>
   /** List Claude models available to the subscription (via the SDK's supportedModels). */
   claudeSubscriptionModels: (token?: string) => Promise<string[]>
-  /** Whether the on-demand Claude Code binary is present (download not needed). */
-  claudeSubscriptionSdkStatus: () => Promise<{ installed: boolean; path?: string }>
-  /** Download + install the Claude Code binary into the user-data dir. */
-  claudeSubscriptionSdkInstall: () => Promise<
-    { ok: true; path: string } | { ok: false; message: string }
-  >
+  /** Whether the on-demand Claude Code binary is present + any in-flight download. */
+  claudeSubscriptionSdkStatus: () => Promise<{
+    installed: boolean
+    path?: string
+    download?: SdkDownloadState | null
+  }>
+  /** Start (or resume) the background download; returns the live state immediately. */
+  claudeSubscriptionSdkInstall: () => Promise<SdkDownloadState>
+  /** Subscribe to background-download progress; returns an unsubscribe fn. */
+  onClaudeSubscriptionSdkProgress: (handler: (state: SdkDownloadState) => void) => () => void
   setSettings: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   saveSettingsSilent: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   runtimeRequest: (path: string, method?: string, body?: string) => Promise<RuntimeRequestResult>

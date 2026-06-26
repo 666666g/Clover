@@ -10,7 +10,7 @@
  */
 import { spawn } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, rmSync, chmodSync, statSync } from 'node:fs'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -92,6 +92,7 @@ export async function installClaudeBinary(options: {
   userDataDir: string
   proxyUrl?: string
   version?: string
+  onProgress?: (receivedBytes: number, totalBytes: number) => void
 }): Promise<AgentSdkInstallResult> {
   const pkg = platformBinaryPackage()
   if (!pkg) return { ok: false, message: `unsupported platform: ${process.platform}/${process.arch}` }
@@ -108,11 +109,24 @@ export async function installClaudeBinary(options: {
     const tarball = meta.dist?.tarball
     if (!tarball) throw new Error(`no tarball for ${pkg}@${version}`)
 
-    // 2. stream the (~222MB) tarball to a temp file
+    // 2. stream the (~222MB) tarball to a temp file, reporting progress
     const res = await fetchWithOptionalProxy(tarball, {}, proxyUrl)
     if (!res.ok || !res.body) throw new Error(`download ${tarball}: ${res.status}`)
+    const totalBytes = Number(res.headers.get('content-length')) || 0
+    let receivedBytes = 0
+    const counter = new Transform({
+      transform(chunk, _enc, cb) {
+        receivedBytes += chunk.length
+        options.onProgress?.(receivedBytes, totalBytes)
+        cb(null, chunk)
+      }
+    })
     mkdirSync(destDir, { recursive: true })
-    await pipeline(Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(tgz))
+    await pipeline(
+      Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]),
+      counter,
+      createWriteStream(tgz)
+    )
 
     // 3. extract just the binary (tarball root is `package/`)
     await runTar(['-xzf', tgz, '-C', destDir, '--strip-components=1', `package/${claudeBinaryName()}`])
@@ -126,4 +140,55 @@ export async function installClaudeBinary(options: {
   } finally {
     rmSync(tgz, { force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Background download — a process-wide singleton so it keeps running even if the
+// user navigates away from the settings page; the UI re-reads its state on mount.
+// ---------------------------------------------------------------------------
+
+export type SdkDownloadState = {
+  status: 'downloading' | 'done' | 'error'
+  receivedBytes: number
+  totalBytes: number
+  message?: string
+}
+
+let activeState: SdkDownloadState | null = null
+let activePromise: Promise<AgentSdkInstallResult> | null = null
+
+/** Current background-download state, or null if none has run. */
+export function agentSdkDownloadState(): SdkDownloadState | null {
+  return activeState
+}
+
+/**
+ * Start (or resume) the background download. Idempotent while one is in flight —
+ * a second call returns the current state instead of starting another. Returns
+ * immediately with the live state; `onState` is called on every update.
+ */
+export function startAgentSdkInstall(
+  options: { userDataDir: string; proxyUrl?: string; version?: string },
+  onState?: (state: SdkDownloadState) => void
+): SdkDownloadState {
+  if (activeState?.status === 'downloading') return activeState
+  const emit = (state: SdkDownloadState): void => {
+    activeState = state
+    onState?.(state)
+  }
+  emit({ status: 'downloading', receivedBytes: 0, totalBytes: 0 })
+  activePromise = installClaudeBinary({
+    ...options,
+    onProgress: (receivedBytes, totalBytes) => emit({ status: 'downloading', receivedBytes, totalBytes })
+  }).then((result) => {
+    const received = activeState?.receivedBytes ?? 0
+    const total = activeState?.totalBytes ?? 0
+    emit(
+      result.ok
+        ? { status: 'done', receivedBytes: received, totalBytes: total }
+        : { status: 'error', receivedBytes: received, totalBytes: total, message: result.message }
+    )
+    return result
+  })
+  return activeState as SdkDownloadState
 }

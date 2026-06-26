@@ -105,7 +105,12 @@ import {
 import { detectLegacySessions, importLegacySessions } from '../services/legacy-session-import-service'
 import { claudeSubscriptionStatus, runClaudeSetupToken } from '../claude-subscription-auth'
 import { fetchSdkModels } from '../claude-subscription-models'
-import { agentSdkStatus, installClaudeBinary, resolveClaudeBinary } from '../agent-sdk-installer'
+import {
+  agentSdkDownloadState,
+  agentSdkStatus,
+  resolveClaudeBinary,
+  startAgentSdkInstall
+} from '../agent-sdk-installer'
 import type { JsonSettingsStore } from '../settings-store'
 import { probeModelProvider } from '../provider-connection'
 import type { ClawRuntime } from '../claw-runtime'
@@ -516,14 +521,15 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     ].map((root) => join(root, 'kun'))
   const claudeSubBinary = (): string | undefined =>
     resolveClaudeBinary(app.getPath('userData'), claudeSubKunDirs())
-  ipcMain.handle('claude-subscription:sdk-status', async () =>
-    agentSdkStatus(app.getPath('userData'), claudeSubKunDirs())
-  )
+  ipcMain.handle('claude-subscription:sdk-status', async () => ({
+    ...agentSdkStatus(app.getPath('userData'), claudeSubKunDirs()),
+    download: agentSdkDownloadState()
+  }))
   ipcMain.handle('claude-subscription:sdk-install', async () =>
-    installClaudeBinary({
-      userDataDir: app.getPath('userData'),
-      proxyUrl: resolveModelProviderProxyUrl(await store.load())
-    })
+    startAgentSdkInstall(
+      { userDataDir: app.getPath('userData'), proxyUrl: resolveModelProviderProxyUrl(await store.load()) },
+      (state) => getMainWindow()?.webContents.send('claude-subscription:sdk-progress', state)
+    )
   )
   ipcMain.handle('claude-subscription:login', async () =>
     runClaudeSetupToken({ binaryPath: claudeSubBinary() })

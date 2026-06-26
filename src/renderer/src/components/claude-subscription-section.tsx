@@ -7,6 +7,8 @@ type Translate = (key: string) => string
 
 const SETUP_TOKEN_COMMAND = 'claude setup-token'
 
+const formatMb = (bytes: number): string => (bytes / (1024 * 1024)).toFixed(1)
+
 function loginErrorText(message: string, t: Translate): string {
   if (message === 'claude-cli-not-found') return t('claudeSubLoginFailedCli')
   if (message === 'timeout') return t('claudeSubLoginFailedTimeout')
@@ -38,35 +40,59 @@ export function ClaudeSubscriptionSection({
   const [copied, setCopied] = useState(false)
   const [modelsBusy, setModelsBusy] = useState(false)
   const [modelsNote, setModelsNote] = useState<string | null>(null)
-  const [sdk, setSdk] = useState<'checking' | 'ready' | 'missing'>('checking')
-  const [sdkBusy, setSdkBusy] = useState(false)
+  const [sdk, setSdk] = useState<'checking' | 'ready' | 'missing' | 'downloading'>('checking')
+  const [progress, setProgress] = useState<{ received: number; total: number } | null>(null)
   const [sdkNote, setSdkNote] = useState<string | null>(null)
+
+  // Apply a background-download state (from status or a live progress event).
+  // Returns true if it represented an active/known download.
+  const applyDownload = (
+    d: { status: string; receivedBytes: number; totalBytes: number; message?: string } | null | undefined
+  ): boolean => {
+    if (!d) return false
+    if (d.status === 'downloading') {
+      setSdk('downloading')
+      setProgress({ received: d.receivedBytes, total: d.totalBytes })
+      return true
+    }
+    if (d.status === 'done') {
+      setSdk('ready')
+      setProgress(null)
+      return true
+    }
+    if (d.status === 'error') {
+      setSdk('missing')
+      setProgress(null)
+      setSdkNote(d.message ? `${t('claudeSubSdkFailed')}: ${d.message}` : t('claudeSubSdkFailed'))
+      return true
+    }
+    return false
+  }
 
   const checkSdk = async (): Promise<void> => {
     try {
       const s = await window.kunGui.claudeSubscriptionSdkStatus()
-      setSdk(s.installed ? 'ready' : 'missing')
+      if (s.installed) {
+        setSdk('ready')
+        return
+      }
+      if (!applyDownload(s.download)) setSdk('missing')
     } catch {
       setSdk('missing')
     }
   }
 
-  // Download the ~222MB Claude Code binary on demand (it isn't bundled).
+  // Start the ~222MB download in the background (main keeps it running even if the
+  // user navigates away); progress + completion arrive via the subscription below.
   const installSdk = async (): Promise<void> => {
-    setSdkBusy(true)
     setSdkNote(null)
+    setSdk('downloading')
+    setProgress({ received: 0, total: 0 })
     try {
-      const result = await window.kunGui.claudeSubscriptionSdkInstall()
-      if (result.ok) {
-        setSdk('ready')
-        setSdkNote(t('claudeSubSdkReady'))
-      } else {
-        setSdkNote(`${t('claudeSubSdkFailed')}: ${result.message}`)
-      }
+      applyDownload(await window.kunGui.claudeSubscriptionSdkInstall())
     } catch (err) {
+      setSdk('missing')
       setSdkNote(`${t('claudeSubSdkFailed')}: ${err instanceof Error ? err.message : ''}`)
-    } finally {
-      setSdkBusy(false)
     }
   }
 
@@ -103,6 +129,8 @@ export function ClaudeSubscriptionSection({
     void refreshStatus()
     void checkSdk()
   }, [])
+  // The download runs in main; subscribe so progress shows even after remounting.
+  useEffect(() => window.kunGui.onClaudeSubscriptionSdkProgress((state) => applyDownload(state)), [])
 
   const runLogin = async (): Promise<void> => {
     setBusy(true)
@@ -136,6 +164,10 @@ export function ClaudeSubscriptionSection({
   }
 
   const hasToken = provider.apiKey.trim().length > 0
+  const downloadPct =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.received / progress.total) * 100))
+      : 0
 
   return (
     <div className="flex flex-col gap-3">
@@ -146,30 +178,47 @@ export function ClaudeSubscriptionSection({
       {sdk !== 'ready' ? (
         <div className="flex flex-col gap-2 rounded-lg border border-amber-300/50 bg-amber-50/40 px-3 py-2.5 dark:bg-amber-900/10">
           <div className="flex items-center gap-2 text-[13px]">
-            {sdk === 'checking' ? (
+            {sdk === 'checking' || sdk === 'downloading' ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin text-ds-muted" strokeWidth={1.9} />
             ) : (
               <AlertCircle className="h-3.5 w-3.5 text-amber-500" strokeWidth={1.9} />
             )}
             <span className="text-ds-ink">
-              {sdk === 'checking' ? t('claudeSubSdkChecking') : t('claudeSubSdkMissing')}
+              {sdk === 'checking'
+                ? t('claudeSubSdkChecking')
+                : sdk === 'downloading'
+                  ? t('claudeSubSdkDownloading')
+                  : t('claudeSubSdkMissing')}
             </span>
           </div>
+
+          {sdk === 'downloading' ? (
+            <div className="flex flex-col gap-1">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-ds-border">
+                <div
+                  className="h-full rounded-full bg-accent transition-[width] duration-200"
+                  style={{ width: `${downloadPct}%` }}
+                />
+              </div>
+              <span className="text-[11px] text-ds-muted">
+                {progress && progress.total > 0
+                  ? `${formatMb(progress.received)} / ${formatMb(progress.total)} MB · ${downloadPct}%`
+                  : `${formatMb(progress?.received ?? 0)} MB`}
+              </span>
+            </div>
+          ) : null}
+
           {sdk === 'missing' ? (
             <button
               type="button"
-              disabled={sdkBusy}
               onClick={() => void installSdk()}
-              className="inline-flex h-9 items-center justify-center gap-2 self-start rounded-lg border border-accent/50 bg-ds-main/45 px-3 text-[13px] font-medium text-ds-ink transition hover:bg-ds-main/70 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex h-9 items-center justify-center gap-2 self-start rounded-lg border border-accent/50 bg-ds-main/45 px-3 text-[13px] font-medium text-ds-ink transition hover:bg-ds-main/70"
             >
-              {sdkBusy ? (
-                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
-              ) : (
-                <Download className="h-4 w-4" strokeWidth={1.9} />
-              )}
-              {sdkBusy ? t('claudeSubSdkDownloading') : t('claudeSubSdkDownload')}
+              <Download className="h-4 w-4" strokeWidth={1.9} />
+              {t('claudeSubSdkDownload')}
             </button>
           ) : null}
+
           {sdkNote ? <span className="text-[12px] text-ds-muted">{sdkNote}</span> : null}
         </div>
       ) : null}

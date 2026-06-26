@@ -17,6 +17,14 @@ const api = {
   claudeSubscriptionModels: (token) => ipcRenderer.invoke('claude-subscription:models', token),
   claudeSubscriptionSdkStatus: () => ipcRenderer.invoke('claude-subscription:sdk-status'),
   claudeSubscriptionSdkInstall: () => ipcRenderer.invoke('claude-subscription:sdk-install'),
+  onClaudeSubscriptionSdkProgress: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('claude-subscription:sdk-progress', wrapped)
+    return () => ipcRenderer.removeListener('claude-subscription:sdk-progress', wrapped)
+  },
   setSettings: (partial) =>
     ipcRenderer.invoke('settings:set', partial),
   saveSettingsSilent: (partial) =>
