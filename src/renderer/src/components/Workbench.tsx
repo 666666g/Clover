@@ -1129,6 +1129,10 @@ export function Workbench(): ReactElement {
     setFileTreeSidePanelOpen((open) => !open)
   }
 
+  const openFileTreeSidePanel = (): void => {
+    setFileTreeSidePanelOpen(true)
+  }
+
   useEffect(() => {
     if (rightPanelMode !== 'file' || !filePreviewTarget) return
     setOpenFilePreviewTargets((current) => {
@@ -2788,6 +2792,7 @@ export function Workbench(): ReactElement {
                 onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
                 onRemoveAttachment={removeComposerAttachment}
                 onAddFileReference={addComposerFileReference}
+                onOpenFileReferencePicker={openFileTreeSidePanel}
                 onRemoveFileReference={removeComposerFileReference}
                 queuedMessages={queuedMessages}
                 onRemoveQueuedMessage={removeQueuedMessage}

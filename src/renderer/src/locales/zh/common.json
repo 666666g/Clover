@@ -1011,6 +1011,7 @@
   "composerOfflineHint": "运行时恢复连接后，才可以继续发送消息。",
   "composerWorkspaceHint": "先选择一个工作目录，然后再开始或继续会话。",
   "composerAddImage": "添加图片",
+  "composerAddFilesAndFolders": "文件和文件夹",
   "composerVoiceStart": "语音输入",
   "composerVoiceStop": "停止录音",
   "composerVoiceSend": "停止并发送",

@@ -24,6 +24,7 @@ import {
   MessageCircleMore,
   Mic,
   Minimize2,
+  Paperclip,
   PauseCircle,
   Pencil,
   Plus,
@@ -180,6 +181,7 @@ type Props = {
   onPasteClipboardImage?: (options?: { silentNoImage?: boolean }) => void | Promise<void>
   onRemoveAttachment?: (id: string) => void
   onAddFileReference?: (reference: ComposerFileReference) => void
+  onOpenFileReferencePicker?: () => void
   onRemoveFileReference?: (relativePath: string) => void
   onSend: () => void
   onInterrupt: (options?: { discard?: boolean }) => void
@@ -493,6 +495,7 @@ export function FloatingComposer({
   onPasteClipboardImage,
   onRemoveAttachment,
   onAddFileReference,
+  onOpenFileReferencePicker,
   onRemoveFileReference,
   onSend,
   onInterrupt,
@@ -614,6 +617,7 @@ export function FloatingComposer({
     (fileReferenceEnabled && fileReferences.length > 0)
   )
   const canPickAttachment = canCompose && attachmentUploadEnabled && !attachmentUploadBusy
+  const canPickFileReference = canCompose && fileReferenceEnabled && Boolean(effectiveWorkspaceRoot) && Boolean(onOpenFileReferencePicker)
   const showIntentToolbar = !compact && route === 'chat'
   const showComposerMenuButton = showIntentToolbar
   const canTogglePlanMode = canCompose && Boolean(onPlanCommand)
@@ -622,7 +626,7 @@ export function FloatingComposer({
   const canRunReview = canCompose && route !== 'claw' && Boolean(onReviewCommand)
   const canToggleWorktreeMode = canCompose && route !== 'claw' && Boolean(onToggleWorktreeMode)
   const canOpenComposerMenu = showComposerMenuButton
-    && (canTogglePlanMode || canCreateNewThread || canOpenGoalPanel || canRunReview || canToggleWorktreeMode)
+    && (canPickFileReference || canTogglePlanMode || canCreateNewThread || canOpenGoalPanel || canRunReview || canToggleWorktreeMode)
   const showToolbarStartControls = showComposerMenuButton
   const showExecutionSettingsPicker = showIntentToolbar
     && Boolean(executionSettings)
@@ -1270,6 +1274,13 @@ export function FloatingComposer({
     draft.focusComposer()
   }
 
+  const handleFileReferenceMenuClick = (): void => {
+    if (!canPickFileReference) return
+    setComposerMenuOpen(false)
+    onOpenFileReferencePicker?.()
+    draft.focusComposer()
+  }
+
   const handlePlanToolbarClick = (): void => {
     if (!canTogglePlanMode) return
     setComposerMenuOpen(false)
@@ -1677,8 +1688,20 @@ export function FloatingComposer({
             ref={composerMenuPanelRef}
             className="absolute bottom-12 left-1 z-40 w-48 overflow-hidden rounded-[18px] border border-ds-border bg-white py-1.5 text-[13px] text-ds-muted shadow-[0_18px_48px_rgba(20,47,95,0.16)] dark:bg-ds-card"
           >
+            {fileReferenceEnabled ? (
+              <button
+                type="button"
+                disabled={!canPickFileReference}
+                onClick={handleFileReferenceMenuClick}
+                className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
+              >
+                <Paperclip className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+                <span className="min-w-0 flex-1 truncate">{t('composerAddFilesAndFolders')}</span>
+              </button>
+            ) : null}
             {attachmentUploadEnabled ? (
               <>
+                {fileReferenceEnabled ? <div className="my-1 h-px bg-ds-border-muted/70" /> : null}
                 <button
                   type="button"
                   disabled={!canPickAttachment || !onPickAttachments}
