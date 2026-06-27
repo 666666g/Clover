@@ -1118,6 +1118,7 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
     baseUrl: hasProviderSettings
       ? parsed.provider?.baseUrl
       : nonEmptyStringOrFallback(explicitKun.baseUrl, legacySeed.baseUrl),
+    proxy: parsed.provider?.proxy,
     providers: parsed.provider?.providers
   })
   const kun = {

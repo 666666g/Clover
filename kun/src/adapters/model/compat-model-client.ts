@@ -407,7 +407,10 @@ export class CompatModelClient implements ModelClient {
       return { kind: 'response', response }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      return { kind: 'error', message: `model request failed: ${message}` }
+      const proxyHint = this.config.modelProxyUrl?.trim()
+        ? '. Check the configured model-request proxy in Settings > Providers.'
+        : ''
+      return { kind: 'error', message: `model request failed: ${message}${proxyHint}` }
     }
   }
 

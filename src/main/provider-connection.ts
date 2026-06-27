@@ -12,6 +12,8 @@ import { fetchWithOptionalProxy } from './proxy-fetch'
 const PROBE_TIMEOUT_MS = 10_000
 const ANTHROPIC_VERSION = '2023-06-01'
 
+type ProviderProbeFetch = typeof fetchWithOptionalProxy
+
 export function providerProbeHeaders(
   endpointFormat: ModelEndpointFormat,
   apiKey: string
@@ -33,7 +35,8 @@ export function providerProbeHeaders(
  */
 export async function probeModelProvider(
   request: ModelProviderProbeRequest,
-  settings?: AppSettingsV1
+  settings?: AppSettingsV1,
+  fetcher: ProviderProbeFetch = fetchWithOptionalProxy
 ): Promise<ModelProviderProbeResult> {
   const baseUrl = request.baseUrl.trim()
   if (!/^https?:\/\//i.test(baseUrl)) {
@@ -48,19 +51,24 @@ export async function probeModelProvider(
   }
   const url = upstreamOpenAiModelsUrl(baseUrl)
   const startedAt = Date.now()
+  const proxyUrl = settings ? resolveModelProviderProxyUrl(settings) : ''
   let res: Response
   let text: string
   try {
-    res = await fetchWithOptionalProxy(url, {
+    res = await fetcher(url, {
       method: 'GET',
       headers: providerProbeHeaders(endpointFormat, request.apiKey),
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-    }, settings ? resolveModelProviderProxyUrl(settings) : '')
+    }, proxyUrl)
     text = await res.text()
   } catch (e) {
-    const message = e instanceof Error && e.name === 'TimeoutError'
-      ? `Request to ${url} timed out after ${PROBE_TIMEOUT_MS / 1_000}s.`
-      : e instanceof Error ? e.message : String(e)
+    const message = providerProbeFailureMessage(e, url)
+    if (proxyUrl && await directProviderReachable(url, endpointFormat, request.apiKey, fetcher)) {
+      return {
+        ok: false,
+        message: `${message} The configured model-request proxy failed, but a direct connection reached the provider. Disable or update the proxy in Settings > Providers.`
+      }
+    }
     return { ok: false, message }
   }
   const latencyMs = Date.now() - startedAt
@@ -68,6 +76,32 @@ export async function probeModelProvider(
     return { ok: false, message: `${url} responded ${res.status}: ${text.slice(0, 300)}` }
   }
   return { ok: true, latencyMs, modelIds: parseModelIds(text) }
+}
+
+function providerProbeFailureMessage(error: unknown, url: string): string {
+  if (error instanceof Error && error.name === 'TimeoutError') {
+    return `Request to ${url} timed out after ${PROBE_TIMEOUT_MS / 1_000}s.`
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function directProviderReachable(
+  url: string,
+  endpointFormat: ModelEndpointFormat,
+  apiKey: string,
+  fetcher: ProviderProbeFetch
+): Promise<boolean> {
+  try {
+    const response = await fetcher(url, {
+      method: 'GET',
+      headers: providerProbeHeaders(endpointFormat, apiKey),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    }, '')
+    await response.body?.cancel().catch(() => undefined)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function parseModelIds(body: string): string[] {
