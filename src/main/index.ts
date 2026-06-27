@@ -1185,8 +1185,16 @@ function canonicalSettingsValue(value: unknown): unknown {
   return out
 }
 
+function modelProviderSettingsChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
+  return !stableSettingsValueEqual(prev.provider, next.provider)
+}
+
 function runtimeStartupConfigChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
-  return kunRuntimeConfigChanged(prev, next) || clawScheduleMcpSettingsChanged(prev, next)
+  return (
+    kunRuntimeConfigChanged(prev, next) ||
+    modelProviderSettingsChanged(prev, next) ||
+    clawScheduleMcpSettingsChanged(prev, next)
+  )
 }
 
 /**

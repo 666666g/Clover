@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -57,6 +57,27 @@ export function workspaceRoot(workspace: string): string {
   return isAbsolute(workspace) ? resolve(workspace) : resolve(process.cwd(), workspace)
 }
 
+function resolveRealPath(absolutePath: string): string {
+  try {
+    return realpathSync(absolutePath)
+  } catch {
+    // 路径不存在时（如写入新文件），向上找到最近存在的祖先目录解析真实路径，再拼接后缀。
+    let prefix = absolutePath
+    const suffixes: string[] = []
+    while (prefix !== dirname(prefix)) {
+      suffixes.unshift(basename(prefix))
+      prefix = dirname(prefix)
+      try {
+        const realPrefix = realpathSync(prefix)
+        return resolve(realPrefix, ...suffixes)
+      } catch {
+        // continue walking up
+      }
+    }
+    return absolutePath
+  }
+}
+
 export function resolveWorkspacePath(inputPath: string, context: ToolHostContext): {
   workspaceRoot: string
   absolutePath: string
@@ -64,13 +85,14 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
 } {
   const root = workspaceRoot(context.workspace)
   const absolutePath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath)
-  const relativePath = relative(root, absolutePath)
+  const realAbsolutePath = resolveRealPath(absolutePath)
+  const relativePath = relative(root, realAbsolutePath)
   if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
     throw new Error(`path escapes the workspace root: ${inputPath}`)
   }
   return {
     workspaceRoot: root,
-    absolutePath,
+    absolutePath: realAbsolutePath,
     relativePath: relativePath || '.'
   }
 }

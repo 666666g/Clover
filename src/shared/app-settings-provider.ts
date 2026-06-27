@@ -928,8 +928,7 @@ function deepseekTextModelProfile(): ModelProviderModelProfileV1 {
 /**
  * Stored provider settings may predate the capability metadata in the presets
  * (older saves carry empty modelProfiles). For known preset providers the
- * preset is the source of truth, so its profiles override stale stored ones;
- * stored profiles for models the preset does not know are kept.
+ * preset fills in missing profiles, but explicit user edits are preserved.
  */
 function withPresetModelProfiles(
   providerId: string,
@@ -947,6 +946,8 @@ function withPresetModelProfiles(
       const aliases = normalizeProviderModels(presetProfile.aliases)
       if (!aliases.some((alias) => knownModelKeys.has(normalizeModelKey(alias)))) continue
     }
+    // 仅在用户没有显式配置该模型时才使用预设能力；用户自定义的上下文窗口、推理等选项优先保留。
+    if (merged[modelId]) continue
     merged[modelId] = normalizeModelProviderModelProfile(presetProfile)
   }
   return merged

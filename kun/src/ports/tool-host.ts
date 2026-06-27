@@ -80,8 +80,14 @@ export type ToolHostContext = {
   }
   /** Optional provider allow-list. When set, other providers are not advertised or executed. */
   allowedProviderIds?: readonly string[]
+  /** Optional provider block-list. Takes precedence over the allow-list. */
+  blockedProviderIds?: readonly string[]
   /** Optional tool-name allow-list. When set, other tools are not advertised or executed. */
   allowedToolNames?: readonly string[]
+  /** Optional tool-name block-list. Takes precedence over the allow-list. */
+  blockedToolNames?: readonly string[]
+  /** Optional skill id block-list. Tools from blocked skills are not advertised or executed. */
+  blockedSkillIds?: readonly string[]
   approvalPolicy: ApprovalPolicy
   /** Filesystem/command sandbox selected for this turn. Defaults at execution time for old callers. */
   sandboxMode?: SandboxMode
