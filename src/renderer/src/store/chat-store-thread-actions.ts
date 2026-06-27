@@ -51,6 +51,7 @@ import {
   findLatestUserBlockId,
   findReusableEmptyThreadId,
   reconcileOptimisticUserBlock,
+  settlePendingRuntimeWorkAfterInterrupt,
   threadHasPendingRuntimeWork,
   threadSnapshotLooksRunning,
   threadBelongsToWorkspace
@@ -308,8 +309,13 @@ export function createThreadActions(
         goal,
         todos
       } = await p.getThreadDetail(activeThreadId)
-      const blocks = hydrateBlockModelLabels(activeThreadId, rawBlocks)
-      const busy = threadSnapshotLooksRunning(blocks, threadStatus)
+      const loaded = hydrateBlockModelLabels(activeThreadId, rawBlocks)
+      const busy = threadSnapshotLooksRunning(loaded, threadStatus)
+      // The server has settled but a tool/approval/user_input block may still be
+      // open (e.g. a delegate_task interrupted by a runtime restart). Settle it,
+      // otherwise threadHasPendingRuntimeWork stays true and the queued message
+      // we are recovering re-queues forever instead of draining (KunAgent/Kun#621).
+      const blocks = busy ? loaded : settlePendingRuntimeWorkAfterInterrupt(loaded)
       const currentTurnUserId = busy
         ? state.currentTurnUserId ?? latestUserMessageId ?? findLatestUserBlockId(blocks)
         : null
@@ -405,8 +411,11 @@ export function createThreadActions(
                 : block
             )
           : rawBlocks
-      const blocks = hydrateBlockModelLabels(id, labeledBlocks)
-      const busy = threadSnapshotLooksRunning(blocks, threadStatus)
+      const loaded = hydrateBlockModelLabels(id, labeledBlocks)
+      const busy = threadSnapshotLooksRunning(loaded, threadStatus)
+      // Settle blocks left open by an interrupted turn when the server has
+      // already settled, so selecting the thread doesn't keep it wedged (#621).
+      const blocks = busy ? loaded : settlePendingRuntimeWorkAfterInterrupt(loaded)
       const currentTurnUserId = busy
         ? latestUserMessageId ?? findLatestUserBlockId(blocks)
         : null
@@ -523,8 +532,11 @@ export function createThreadActions(
         todos
       } = await p.getThreadDetail(targetThreadId)
       if (ac.signal.aborted) return
-      const blocks = hydrateBlockModelLabels(targetThreadId, rawBlocks)
-      const busy = threadSnapshotLooksRunning(blocks, threadStatus)
+      const loaded = hydrateBlockModelLabels(targetThreadId, rawBlocks)
+      const busy = threadSnapshotLooksRunning(loaded, threadStatus)
+      // Settle blocks left open by an interrupted turn when the server has
+      // already settled, so the thread doesn't stay wedged on load (#621).
+      const blocks = busy ? loaded : settlePendingRuntimeWorkAfterInterrupt(loaded)
       const currentTurnUserId = busy
         ? latestUserMessageId ?? findLatestUserBlockId(blocks)
         : null

@@ -681,6 +681,18 @@ export async function startKunServe(
     .catch((error) => {
       console.warn('[kun] orphaned turn reconciliation failed:', error)
     })
+  // Settle subagent (child-run) records left 'queued'/'running' by the previous
+  // process, so a restart doesn't leave them stuck in-flight forever (#621).
+  void runtime.delegationRuntime
+    ?.reconcileOrphanedChildRuns()
+    .then((count) => {
+      if (count > 0) {
+        console.warn(`[kun] marked ${count} orphaned subagent run(s) as failed after restart`)
+      }
+    })
+    .catch((error) => {
+      console.warn('[kun] orphaned child-run reconciliation failed:', error)
+    })
   return {
     ...server,
     runtime,

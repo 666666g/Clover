@@ -378,6 +378,69 @@ describe('chat-store-thread-actions subscribeThreadEventsLive', () => {
   })
 })
 
+describe('chat-store-thread-actions recoverActiveTurn settles interrupted work', () => {
+  beforeEach(() => {
+    rendererRuntimeClient.invalidateSettings()
+    registryMock.getProvider.mockReset()
+    registryMock.getProvider.mockReturnValue({})
+  })
+
+  afterEach(() => {
+    rendererRuntimeClient.invalidateSettings()
+    vi.unstubAllGlobals()
+  })
+
+  function providerWith(threadStatus: string) {
+    return {
+      getThreadDetail: vi.fn(async () => ({
+        blocks: [
+          { id: 'u1', kind: 'user', text: 'do the big thing' },
+          { id: 'tool1', kind: 'tool', name: 'delegate_task', status: 'running' }
+        ],
+        latestSeq: 3,
+        threadStatus,
+        latestTurnId: 'turn_1',
+        latestUserMessageId: 'u1'
+      })),
+      subscribeThreadEvents: vi.fn(async () => ({ streamId: 'stream_recover' }))
+    }
+  }
+
+  it('settles a stuck running tool block when the server has already settled (#621)', async () => {
+    const provider = providerWith('idle')
+    registryMock.getProvider.mockReturnValue(provider)
+
+    const { actions, state } = buildHarness()
+    state.activeThreadId = 'thr_existing'
+    state.busy = true
+
+    const busy = await actions.recoverActiveTurn()
+
+    expect(busy).toBe(false)
+    expect(state.busy).toBe(false)
+    // The interrupted delegate_task block is settled, so hasPendingRuntimeWork
+    // is no longer true and queued/new messages can actually send.
+    const tool = state.blocks.find((block) => block.kind === 'tool')
+    expect(tool?.status).toBe('error')
+  })
+
+  it('keeps a running tool block when the server reports the thread still running', async () => {
+    const provider = providerWith('running')
+    registryMock.getProvider.mockReturnValue(provider)
+
+    const { actions, state } = buildHarness()
+    state.activeThreadId = 'thr_existing'
+    state.busy = true
+
+    const busy = await actions.recoverActiveTurn()
+
+    expect(busy).toBe(true)
+    // A genuinely live turn must keep its running block so the GUI reconnects.
+    const tool = state.blocks.find((block) => block.kind === 'tool')
+    expect(tool?.status).toBe('running')
+  })
+})
+
 describe('chat-store-thread-actions createThread conversation mode', () => {
   beforeEach(() => {
     rendererRuntimeClient.invalidateSettings()
