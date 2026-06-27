@@ -87,8 +87,13 @@ describe('buildClaudeSystemPrompt', () => {
 
 describe('buildCanUseTool', () => {
   test('allow passes through, with optional updatedInput', async () => {
+    // updatedInput must always be present (SDK runtime schema requires it);
+    // when kun doesn't rewrite, it echoes the original input through.
     const allow = buildCanUseTool(() => ({ allow: true }))
-    expect(await allow('Bash', { command: 'ls' })).toEqual({ behavior: 'allow' })
+    expect(await allow('Bash', { command: 'ls' })).toEqual({
+      behavior: 'allow',
+      updatedInput: { command: 'ls' }
+    })
 
     const rewrite = buildCanUseTool(() => ({ allow: true, updatedInput: { command: 'ls -la' } }))
     expect(await rewrite('Bash', { command: 'ls' })).toEqual({
@@ -100,6 +105,13 @@ describe('buildCanUseTool', () => {
   test('deny carries the message', async () => {
     const deny = buildCanUseTool(() => ({ allow: false, message: 'blocked by user' }))
     expect(await deny('Bash', {})).toEqual({ behavior: 'deny', message: 'blocked by user' })
+  })
+
+  test('deny without a message gets a default (SDK requires a non-empty message)', async () => {
+    const deny = buildCanUseTool(() => ({ allow: false }))
+    const result = await deny('Bash', {})
+    expect(result.behavior).toBe('deny')
+    expect((result as { message: string }).message).toBeTruthy()
   })
 
   test('a throwing decider denies closed', async () => {

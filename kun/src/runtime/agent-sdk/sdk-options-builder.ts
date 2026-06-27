@@ -139,16 +139,20 @@ export type ToolApprovalDecider = (
  */
 export function buildCanUseTool(decide: ToolApprovalDecider): SdkCanUseTool {
   return async (toolName, input): Promise<SdkPermissionResult> => {
+    const safeInput = input ?? {}
     try {
-      const decision = await decide(toolName, input ?? {})
+      const decision = await decide(toolName, safeInput)
       if (decision.allow) {
-        return decision.updatedInput
-          ? { behavior: 'allow', updatedInput: decision.updatedInput }
-          : { behavior: 'allow' }
+        // The SDK's runtime schema requires `updatedInput` to be a record on an
+        // allow result — its TS type marks it optional, but validation rejects a
+        // missing value (seen as a ZodError when the model calls AskUserQuestion).
+        // Echo the original input through when kun doesn't rewrite it.
+        return { behavior: 'allow', updatedInput: decision.updatedInput ?? safeInput }
       }
+      // The deny variant requires a non-empty `message`.
       return {
         behavior: 'deny',
-        ...(decision.message ? { message: decision.message } : {}),
+        message: decision.message ?? 'Denied by kun permission policy',
         ...(decision.interrupt ? { interrupt: true } : {})
       }
     } catch (err) {
