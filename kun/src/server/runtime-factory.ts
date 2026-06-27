@@ -460,6 +460,8 @@ export async function createKunServeRuntime(
           defaultIsAgentSdk,
           defaultToken: options.apiKey,
           skillRuntime,
+          userInputGate,
+          nowIso,
           ...(attachmentStore ? { attachmentStore } : {}),
           ...(memoryStore ? { memoryStore } : {}),
           ...(process.env.KUN_CLAUDE_BINARY

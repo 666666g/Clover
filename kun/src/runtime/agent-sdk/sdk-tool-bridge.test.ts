@@ -21,14 +21,23 @@ describe('selectBridgeableTools', () => {
       tool('read'),
       tool('bash'),
       tool('edit'),
+      tool('echo'),
       tool('user_input'),
       tool('generate_image'),
       tool('memory_create'),
       tool('delegate_task'),
       tool('web_search')
     ]
+    // overlap (read/bash/edit) and excluded (echo) are dropped; user_input is
+    // now bridged so kun's GUI input panel handles interactive questions.
     const kept = selectBridgeableTools(tools).map((t) => t.name)
-    expect(kept).toEqual(['generate_image', 'memory_create', 'delegate_task', 'web_search'])
+    expect(kept).toEqual([
+      'user_input',
+      'generate_image',
+      'memory_create',
+      'delegate_task',
+      'web_search'
+    ])
   })
 
   test('de-dupes by name and ignores blanks', () => {

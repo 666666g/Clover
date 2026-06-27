@@ -37,6 +37,13 @@ export const DEFAULT_SDK_BUILTIN_TOOLS: readonly string[] = [
 ]
 
 /**
+ * Claude Code built-in tools we suppress on the kun-driven SDK path.
+ * AskUserQuestion has no UI in this embedding (the model would ask and get no
+ * answer); kun's own bridged `user_input` panel handles interactive questions.
+ */
+export const DEFAULT_SDK_DISALLOWED_TOOLS: readonly string[] = ['AskUserQuestion']
+
+/**
  * Env vars that, if present in the spawned Claude Code process, would override
  * the subscription OAuth token (auth precedence: ANTHROPIC_API_KEY >
  * ANTHROPIC_AUTH_TOKEN > apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN). They MUST be
@@ -192,6 +199,7 @@ export function assembleSdkOptions(params: AssembleSdkOptionsParams): SdkQueryOp
     cwd: params.cwd,
     systemPrompt: buildClaudeSystemPrompt(params.kunSystemPrompt, params.threadPersona),
     allowedTools,
+    disallowedTools: [...DEFAULT_SDK_DISALLOWED_TOOLS],
     permissionMode: mapApprovalPolicyToPermissionMode(params.approvalPolicy, params.planMode),
     includePartialMessages: true,
     env: buildScopedEnv(params.baseEnv, params.oauthToken),

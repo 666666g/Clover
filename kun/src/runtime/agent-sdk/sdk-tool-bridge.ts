@@ -57,14 +57,12 @@ export const DEFAULT_OVERLAP_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 /**
  * kun tools better handled by the SDK's own surfaces or meaningless here.
- * user_input/request_user_input are excluded so the SDK's native
- * AskUserQuestion + canUseTool flow owns interactive input (avoids two UIs).
+ * NOTE: user_input/request_user_input are intentionally NOT excluded — they are
+ * bridged so the model uses kun's own GUI input panel (wired via the tool
+ * context's awaitUserInput). The SDK's native AskUserQuestion is suppressed
+ * (disallowedTools) because it has no UI in this embedding.
  */
-export const DEFAULT_EXCLUDED_TOOL_NAMES: ReadonlySet<string> = new Set([
-  'echo',
-  'user_input',
-  'request_user_input'
-])
+export const DEFAULT_EXCLUDED_TOOL_NAMES: ReadonlySet<string> = new Set(['echo'])
 
 export interface SelectBridgeableOptions {
   overlap?: ReadonlySet<string>

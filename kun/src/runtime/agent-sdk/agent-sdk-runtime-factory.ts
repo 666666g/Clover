@@ -27,6 +27,13 @@ import {
 } from '../../loop/agent-loop.js'
 import type { GuiPlanContext } from '../../ports/tool-host.js'
 import type { ThreadRecord } from '../../contracts/threads.js'
+import type {
+  UserInputGate,
+  UserInputRequest,
+  UserInputResolution
+} from '../../ports/user-input-gate.js'
+import type { TurnItem } from '../../contracts/items.js'
+import { makeUserInputItem } from '../../domain/item.js'
 import {
   buildHistoryTranscript,
   DEFAULT_SDK_HISTORY_TRANSCRIPT_MAX_BYTES
@@ -57,6 +64,10 @@ export interface AgentSdkRuntimeFactoryDeps {
   skillRuntime?: SkillRuntime
   /** Long-term memory store — injects relevant memories per turn. */
   memoryStore?: MemoryStore
+  /** Interactive-input gate — lets the bridged `user_input` tool surface kun's GUI panel. */
+  userInputGate?: UserInputGate
+  /** Clock for stamping item timestamps (falls back to Date when absent). */
+  nowIso?: () => string
   /** Cap for the replayed history transcript (bytes); defaults to the assembler's. */
   historyTranscriptMaxBytes?: number
   pathToClaudeCodeExecutable?: string
@@ -93,6 +104,39 @@ export function resolveTurnPlanContext(
   return { planMode, ...(guiPlan ? { guiPlan } : {}) }
 }
 
+/**
+ * Await a user-input gate resolution, cancelling the pending request if the turn
+ * aborts first. Mirrors the native loop's waitForUserInput abort handling.
+ */
+export function waitForGate(
+  gate: UserInputGate,
+  request: UserInputRequest,
+  signal: AbortSignal
+): Promise<UserInputResolution> {
+  const pending = gate.request(request)
+  if (signal.aborted) {
+    gate.resolve(request.id, { status: 'cancelled' })
+    return Promise.resolve({ status: 'cancelled' })
+  }
+  return new Promise<UserInputResolution>((resolve, reject) => {
+    const onAbort = (): void => {
+      gate.resolve(request.id, { status: 'cancelled' })
+      signal.removeEventListener('abort', onAbort)
+      reject(new Error('cancelled while awaiting user input'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    pending
+      .then((resolution) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(resolution)
+      })
+      .catch((error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      })
+  })
+}
+
 export function createAgentSdkRuntime(deps: AgentSdkRuntimeFactoryDeps): AgentSdkRuntime {
   // Last SDK session id per thread, recorded for diagnostics only. We do NOT
   // resume from it: kun owns the canonical history and replays it as a transcript
@@ -100,11 +144,78 @@ export function createAgentSdkRuntime(deps: AgentSdkRuntimeFactoryDeps): AgentSd
   // survives a provider switch mid-thread and a runtime restart.
   const sessionIds = new Map<string, string>()
 
+  const nowIso = (): string => (deps.nowIso ? deps.nowIso() : new Date().toISOString())
+
+  /**
+   * Bridge kun's `user_input` tool to its GUI panel: persist the request item +
+   * publish the events the renderer renders the panel from, wait on the gate,
+   * then mark it resolved. Returns undefined when no gate is wired (the tool then
+   * stays unadvertised — its shouldAdvertise checks for awaitUserInput).
+   */
+  const makeAwaitUserInput = (
+    threadId: string,
+    turnId: string,
+    signal: AbortSignal
+  ): ToolHostContext['awaitUserInput'] => {
+    const gate = deps.userInputGate
+    if (!gate) return undefined
+    return async (input): Promise<UserInputResolution> => {
+      const item = makeUserInputItem({
+        id: input.itemId,
+        threadId,
+        turnId,
+        inputId: input.id,
+        prompt: input.prompt,
+        questions: input.questions
+      })
+      await deps.turns.applyItem(threadId, item)
+      await deps.events.record({
+        kind: 'user_input_requested',
+        threadId,
+        turnId,
+        itemId: item.id,
+        inputId: input.id,
+        status: 'pending',
+        prompt: input.prompt,
+        questions: input.questions
+      })
+      let resolution: UserInputResolution
+      try {
+        resolution = await waitForGate(
+          gate,
+          { id: input.id, threadId, turnId, itemId: input.itemId, prompt: input.prompt, questions: input.questions },
+          signal
+        )
+      } catch {
+        resolution = { status: 'cancelled' }
+      }
+      await deps.turns.updateItem(threadId, item.id, {
+        status: resolution.status,
+        finishedAt: nowIso()
+      } as Partial<TurnItem>)
+      await deps.events.record({
+        kind: 'user_input_resolved',
+        threadId,
+        turnId,
+        itemId: item.id,
+        inputId: input.id,
+        status: resolution.status,
+        prompt: input.prompt,
+        questions: input.questions
+      })
+      return resolution
+    }
+  }
+
   const toolContext = (
     threadId: string,
     turnId: string,
     workspace: string,
-    plan?: { planMode?: boolean; guiPlan?: GuiPlanContext }
+    opts?: {
+      planMode?: boolean
+      guiPlan?: GuiPlanContext
+      awaitUserInput?: ToolHostContext['awaitUserInput']
+    }
   ): ToolHostContext => ({
     threadId,
     turnId,
@@ -113,8 +224,10 @@ export function createAgentSdkRuntime(deps: AgentSdkRuntimeFactoryDeps): AgentSd
     abortSignal: new AbortController().signal,
     // Expose plan state so `create_plan` is advertised (listTools) and executable
     // (executeKunTool) on plan turns — both are gated on it.
-    ...(plan?.planMode ? { threadMode: 'plan' as const } : {}),
-    ...(plan?.guiPlan ? { guiPlan: plan.guiPlan } : {}),
+    ...(opts?.planMode ? { threadMode: 'plan' as const } : {}),
+    ...(opts?.guiPlan ? { guiPlan: opts.guiPlan } : {}),
+    // Wire interactive input to kun's GUI panel (advertises `user_input`).
+    ...(opts?.awaitUserInput ? { awaitUserInput: opts.awaitUserInput } : {}),
     // The SDK gates every call via canUseTool, so the bridged execution path
     // itself does not re-prompt; this stub keeps the context type satisfied.
     awaitApproval: async () => 'allow'
@@ -167,8 +280,13 @@ export function createAgentSdkRuntime(deps: AgentSdkRuntimeFactoryDeps): AgentSd
       const token = providerCfg?.apiKey?.trim() || deps.defaultToken?.trim()
       // Plan turns expose create_plan (and narrow kun tools to the plan-allowed
       // set); resolve before listing tools so the bridge sees create_plan.
+      // awaitUserInput presence is what advertises `user_input` (the signal here
+      // is only for advertisement; the real per-call signal is set on execution).
       const plan = resolveTurnPlanContext(thread, turnId)
-      const ctx = toolContext(threadId, turnId, thread.workspace, plan)
+      const ctx = toolContext(threadId, turnId, thread.workspace, {
+        ...plan,
+        awaitUserInput: makeAwaitUserInput(threadId, turnId, new AbortController().signal)
+      })
       const bridgeableTools: BridgeableTool[] = deps.registry.listTools(ctx).map((spec) => ({
         name: spec.name,
         description: spec.description,
@@ -234,11 +352,15 @@ export function createAgentSdkRuntime(deps: AgentSdkRuntimeFactoryDeps): AgentSd
       }
     },
 
-    async executeKunTool(threadId, turnId, toolName, args): Promise<KunToolResult> {
+    async executeKunTool(threadId, turnId, toolName, args, signal): Promise<KunToolResult> {
       const thread = await deps.threadStore.get(threadId)
       // Re-resolve plan context so create_plan can write to its reserved path.
       const plan = thread ? resolveTurnPlanContext(thread, turnId) : undefined
-      const ctx = toolContext(threadId, turnId, thread?.workspace ?? process.cwd(), plan)
+      // Real per-call signal so an interactive user_input cancels on turn abort.
+      const ctx = toolContext(threadId, turnId, thread?.workspace ?? process.cwd(), {
+        ...(plan ?? {}),
+        awaitUserInput: makeAwaitUserInput(threadId, turnId, signal ?? new AbortController().signal)
+      })
       try {
         const record = deps.registry.resolveTool(toolName, ctx)
         const result = await record.tool.execute(args, ctx)

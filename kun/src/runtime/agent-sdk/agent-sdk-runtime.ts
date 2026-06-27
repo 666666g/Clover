@@ -92,12 +92,14 @@ export interface SdkRuntimeDeps {
   handlesProvider(providerId: string | undefined): boolean
   /** Resolve the turn's inputs; null aborts the turn early (e.g. no user text). */
   loadTurnContext(threadId: string, turnId: string): Promise<SdkTurnContext | null>
-  /** Execute a kun tool in-process (raw — permission/hooks handled by the SDK seam). */
+  /** Execute a kun tool in-process (raw — permission/hooks handled by the SDK seam).
+   *  `signal` aborts in-flight interactive work (e.g. a pending user_input). */
   executeKunTool(
     threadId: string,
     turnId: string,
     toolName: string,
-    args: Record<string, unknown>
+    args: Record<string, unknown>,
+    signal?: AbortSignal
   ): Promise<KunToolResult>
   /** kun's per-call permission decision (routes to the GUI approval panel). */
   decideToolApproval(
@@ -160,7 +162,7 @@ export class AgentSdkRuntime {
 
       // Bridge kun-exclusive tools into an in-process MCP server.
       const bridged = buildBridgedToolSpecs(selectBridgeableTools(ctx.bridgeableTools), (name, args) =>
-        this.deps.executeKunTool(threadId, turnId, name, args)
+        this.deps.executeKunTool(threadId, turnId, name, args, abort.signal)
       )
       const mcpServers = bridged.length ? { kun: toSdkMcpServer(sdk, bridged) } : undefined
 
