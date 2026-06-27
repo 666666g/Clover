@@ -143,6 +143,9 @@ const WorkflowView = lazy(() =>
 const WorkflowRunPanel = lazy(() =>
   import('./workflow/WorkflowRunPanel').then((module) => ({ default: module.WorkflowRunPanel }))
 )
+const ImageEditView = lazy(() =>
+  import('./image-edit/ImageEditView').then((module) => ({ default: module.ImageEditView }))
+)
 
 type PendingSddPlanTarget = {
   planId: string
@@ -360,6 +363,7 @@ export function Workbench(): ReactElement {
     openClaw,
     openSchedule,
     openWorkflow,
+    openImageEdit,
     chooseWorkspace,
     clawChannels,
     activeClawChannelId,
@@ -421,6 +425,7 @@ export function Workbench(): ReactElement {
       openClaw: s.openClaw,
       openSchedule: s.openSchedule,
       openWorkflow: s.openWorkflow,
+      openImageEdit: s.openImageEdit,
       chooseWorkspace: s.chooseWorkspace,
       clawChannels: s.clawChannels,
       activeClawChannelId: s.activeClawChannelId,
@@ -2146,19 +2151,26 @@ export function Workbench(): ReactElement {
     openWorkflow()
   }
 
+  const openImageEditView = (): void => {
+    setConnectPhoneSidebarOpen(false)
+    openImageEdit()
+  }
+
   const toggleConnectPhone = (): void => {
     if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     openClaw()
     setConnectPhoneSidebarOpen((open) => !open)
   }
 
-  const sidebarView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' =
+  const sidebarView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'image-edit' =
     route === 'claw' || (route === 'plugins' && pluginHostRoute === 'claw')
       ? 'claw'
       : route === 'schedule'
         ? 'schedule'
       : route === 'workflow'
         ? 'workflow'
+      : route === 'image-edit'
+        ? 'image-edit'
       : route === 'write'
         ? 'write'
         : 'chat'
@@ -2478,6 +2490,7 @@ export function Workbench(): ReactElement {
               onWriteOpen={openWriteMode}
               onScheduleOpen={openScheduleView}
               onWorkflowOpen={openWorkflowView}
+              onImageEditOpen={openImageEditView}
             />
             )}
           </div>
@@ -2516,6 +2529,13 @@ export function Workbench(): ReactElement {
               leftSidebarCollapsed={leftSidebarCollapsed}
               onToggleLeftSidebar={toggleLeftSidebar}
               onOpenThread={openThread}
+            />
+          </Suspense>
+        ) : route === 'image-edit' ? (
+          <Suspense fallback={<div className="h-full bg-ds-main" />}>
+            <ImageEditView
+              leftSidebarCollapsed={leftSidebarCollapsed}
+              onToggleLeftSidebar={toggleLeftSidebar}
             />
           </Suspense>
         ) : route === 'write' ? (

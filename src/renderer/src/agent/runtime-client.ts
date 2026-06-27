@@ -1,6 +1,7 @@
 import type { AppSettingsPatch, AppSettingsV1 } from '@shared/app-settings'
 import type {
   RuntimeRequestResult,
+  RuntimeUploadAttachmentPayload,
   SseEndPayload,
   SseErrorPayload,
   SseEventPayload
@@ -44,6 +45,10 @@ class RendererRuntimeClient {
       return window.kunGui.runtimeRequest(path, method)
     }
     return window.kunGui.runtimeRequest(path, method, body)
+  }
+
+  uploadRuntimeAttachment(payload: RuntimeUploadAttachmentPayload): Promise<RuntimeRequestResult> {
+    return window.kunGui.uploadRuntimeAttachment(payload)
   }
 
   restartRuntime(): Promise<void> {

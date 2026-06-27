@@ -43,12 +43,12 @@ describe('initialSetupSelection', () => {
     expect(initialSetupSelection(current)).toEqual({ presetId: 'minimax', mode: 'token-plan' })
   })
 
-  it('falls back to deepseek for unknown or empty active providers', () => {
-    expect(initialSetupSelection(settings())).toEqual({ presetId: 'deepseek', mode: 'api' })
+  it('falls back to agnes for unknown or empty active providers', () => {
+    expect(initialSetupSelection(settings())).toEqual({ presetId: 'agnes', mode: 'api' })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'custom-provider-2' } } })))
-      .toEqual({ presetId: 'deepseek', mode: 'api' })
+      .toEqual({ presetId: 'agnes', mode: 'api' })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'litellm' } } })))
-      .toEqual({ presetId: 'deepseek', mode: 'api' })
+      .toEqual({ presetId: 'agnes', mode: 'api' })
   })
 })
 
@@ -79,11 +79,11 @@ describe('initialSetupDrafts', () => {
     ]
     const drafts = initialSetupDrafts(settings())
 
-    expect(INITIAL_SETUP_PROVIDER_PRESETS.map((preset) => preset.id)).toEqual(['xiaomi', 'minimax'])
+    expect(INITIAL_SETUP_PROVIDER_PRESETS.map((preset) => preset.id)).toEqual(['xiaomi', 'minimax', 'agnes'])
     for (const id of excludedIds) {
       expect(drafts[id]).toBeUndefined()
       expect(initialSetupSelection(settings({ agents: { kun: { providerId: id } } })))
-        .toEqual({ presetId: 'deepseek', mode: 'api' })
+        .toEqual({ presetId: 'agnes', mode: 'api' })
     }
   })
 })

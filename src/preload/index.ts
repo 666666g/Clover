@@ -18,6 +18,8 @@ const api = {
     ipcRenderer.invoke('settings:save-silent', partial),
   runtimeRequest: (path, method, body) =>
     ipcRenderer.invoke('runtime:request', { path, method, body }),
+  uploadRuntimeAttachment: (payload) =>
+    ipcRenderer.invoke('runtime:upload-attachment', payload),
   restartRuntime: () => ipcRenderer.invoke('runtime:restart'),
   fetchUpstreamModels: () => ipcRenderer.invoke('upstream:models'),
   probeModelProvider: (payload) => ipcRenderer.invoke('provider:probe', payload),
@@ -176,6 +178,7 @@ const api = {
     ipcRenderer.invoke('write:retrieve-context', payload),
   generateWriteInfographic: (payload) =>
     ipcRenderer.invoke('write:generate-infographic', payload),
+  editImage: (payload) => ipcRenderer.invoke('image-edit:generate', payload),
   authorizeWritePrototype: (payload) =>
     ipcRenderer.invoke('write:authorize-prototype', payload),
   openWritePrototype: (payload) =>

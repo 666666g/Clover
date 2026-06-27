@@ -60,6 +60,7 @@ import {
   worktreeOptionalRootSchema,
   worktreePathSchema,
   runtimeRequestPayloadSchema,
+  runtimeUploadAttachmentPayloadSchema,
   scheduleTaskFromTextPayloadSchema,
   shellOpenExternalUrlSchema,
   skillGithubImportPayloadSchema,
@@ -89,6 +90,7 @@ import {
   writeExportPayloadSchema,
   writeRichClipboardPayloadSchema,
   writeInfographicPayloadSchema,
+  imageEditPayloadSchema,
   writeInlineCompletionPayloadSchema,
   writePrototypeFilePayloadSchema,
   writeRetrievalPayloadSchema,
@@ -96,6 +98,7 @@ import {
   legacySessionImportPayloadSchema
 } from './app-ipc-schemas'
 import { DEFAULT_KUN_DATA_DIR, resolveKunRuntimeSettings } from '../../shared/app-settings'
+import { KUN_ATTACHMENTS_PATH } from '../../shared/kun-endpoints'
 import { detectLegacySessions, importLegacySessions } from '../services/legacy-session-import-service'
 import type { JsonSettingsStore } from '../settings-store'
 import { probeModelProvider } from '../provider-connection'
@@ -163,6 +166,7 @@ import {
 } from '../services/write-inline-completion-service'
 import { retrieveWriteContext } from '../services/write-retrieval-service'
 import { requestWriteInfographic } from '../services/write-infographic-service'
+import { requestImageEdit } from '../services/image-edit-service'
 import { authorizePrototypePath } from '../services/prototype-embed-registry'
 import { requestSpeechTranscription } from '../services/speech-to-text-service'
 import {
@@ -499,6 +503,14 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
   ipcMain.handle('runtime:request', async (_, payload: unknown) => {
     const request = parseIpcPayload('runtime:request', runtimeRequestPayloadSchema, payload)
     return runtimeRequest(request.path, request.method, request.body)
+  })
+  ipcMain.handle('runtime:upload-attachment', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'runtime:upload-attachment',
+      runtimeUploadAttachmentPayloadSchema,
+      payload
+    )
+    return runtimeRequest(KUN_ATTACHMENTS_PATH, 'POST', JSON.stringify(request))
   })
 
   ipcMain.handle('runtime:restart', async () => restartRuntime())
@@ -1218,6 +1230,12 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     requestWriteInfographic(
       await store.load(),
       parseIpcPayload('write:generate-infographic', writeInfographicPayloadSchema, payload)
+    )
+  )
+  ipcMain.handle('image-edit:generate', async (_, payload: unknown) =>
+    requestImageEdit(
+      await store.load(),
+      parseIpcPayload('image-edit:generate', imageEditPayloadSchema, payload)
     )
   )
   ipcMain.handle('write:authorize-prototype', async (_, payload: unknown) => {

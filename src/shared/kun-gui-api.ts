@@ -119,6 +119,36 @@ export type KunRuntimeStatusPayload = {
 }
 
 export type RuntimeRequestResult = { ok: boolean; status: number; body: string }
+
+export type RuntimeUploadAttachmentTextFallback = {
+  dataBase64: string
+  mimeType: string
+  byteSize: number
+  width?: number
+  height?: number
+  wasCompressed?: boolean
+}
+
+export type RuntimeUploadAttachmentPayload = {
+  name: string
+  mimeType?: string
+  dataBase64: string
+  localFilePath?: string
+  textFallback?: RuntimeUploadAttachmentTextFallback
+  threadId?: string
+  workspace?: string
+}
+
+export type ImageEditRequestPayload = {
+  originalImage: string
+  maskImage: string
+  prompt: string
+}
+
+export type ImageEditResult =
+  | { ok: true; imageDataUrl: string }
+  | { ok: false; error: string }
+
 export type WorkspacePickResult = { canceled: boolean; path: string | null }
 export type PathOpenResult = { ok: boolean; message?: string }
 export const DESKTOP_COMMANDS = [
@@ -291,6 +321,7 @@ export type KunGuiApi = {
   setSettings: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   saveSettingsSilent: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   runtimeRequest: (path: string, method?: string, body?: string) => Promise<RuntimeRequestResult>
+  uploadRuntimeAttachment: (payload: RuntimeUploadAttachmentPayload) => Promise<RuntimeRequestResult>
   restartRuntime: () => Promise<void>
   fetchUpstreamModels: () => Promise<UpstreamModelsResult>
   probeModelProvider: (payload: ModelProviderProbeRequest) => Promise<ModelProviderProbeResult>
@@ -431,6 +462,7 @@ export type KunGuiApi = {
   generateWriteInfographic: (
     payload: WriteInfographicRequest
   ) => Promise<WriteInfographicResult>
+  editImage: (payload: ImageEditRequestPayload) => Promise<ImageEditResult>
   authorizeWritePrototype: (payload: {
     path: string
     workspaceRoot: string

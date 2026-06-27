@@ -53,6 +53,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
   | 'openClaw'
   | 'openSchedule'
   | 'openWorkflow'
+  | 'openImageEdit'
   | 'openInitialSetup'
   | 'closeInitialSetup'
   | 'selectInspectorItem'
@@ -213,6 +214,10 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
 
     openWorkflow: () => {
       set({ route: 'workflow' })
+    },
+
+    openImageEdit: () => {
+      set({ route: 'image-edit' })
     },
 
     openInitialSetup: (mode: InitialSetupMode = 'required') =>

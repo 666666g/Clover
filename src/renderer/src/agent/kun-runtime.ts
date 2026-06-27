@@ -11,7 +11,6 @@ import type {
 import { getKunRuntimeSettings } from '@shared/app-settings'
 import {
   KUN_ATTACHMENT_DIAGNOSTICS_PATH,
-  KUN_ATTACHMENTS_PATH,
   KUN_MEMORY_DIAGNOSTICS_PATH,
   KUN_MEMORY_PATH,
   KUN_RUNTIME_INFO_PATH,
@@ -620,11 +619,7 @@ export class KunRuntimeProvider implements AgentProvider {
     threadId?: string
     workspace?: string
   }): Promise<CoreAttachmentMetadataJson> {
-    const response = await rendererRuntimeClient.runtimeRequest(
-      KUN_ATTACHMENTS_PATH,
-      'POST',
-      JSON.stringify(input)
-    )
+    const response = await rendererRuntimeClient.uploadRuntimeAttachment(input)
     if (!response.ok) {
       throw runtimeErrorToError(readRuntimeError(response.body, 'attachment upload failed'))
     }

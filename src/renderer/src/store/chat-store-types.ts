@@ -96,7 +96,7 @@ export type SettingsRouteSection =
   | 'claw'
   | 'updates'
   | 'terminal'
-export type AppRoute = 'chat' | 'write' | 'settings' | 'plugins' | 'claw' | 'schedule' | 'workflow'
+export type AppRoute = 'chat' | 'write' | 'settings' | 'plugins' | 'claw' | 'schedule' | 'workflow' | 'image-edit'
 export type PluginHostRoute = 'chat' | 'claw'
 
 /**
@@ -205,6 +205,7 @@ export type ChatState = {
   openClaw: () => void
   openSchedule: () => void
   openWorkflow: () => void
+  openImageEdit: () => void
   refreshClawChannels: () => Promise<void>
   addClawChannel: (
     provider: ClawImProvider,

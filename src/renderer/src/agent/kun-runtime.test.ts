@@ -46,6 +46,7 @@ function installDsGui(overrides: Partial<Window['kunGui']>): void {
     kunGui: {
       getSettings: vi.fn(async () => settings()),
       runtimeRequest: vi.fn(async () => ({ ok: true, status: 200, body: '{}' })),
+      uploadRuntimeAttachment: vi.fn(async () => ({ ok: true, status: 200, body: '{}' })),
       startSse: vi.fn(async (_threadId: string, _sinceSeq: number, streamId?: string) => ({
         streamId: streamId ?? 'stream-1'
       })),
@@ -430,6 +431,22 @@ describe('KunRuntimeProvider', () => {
   })
 
   it('loads runtime diagnostics and uploads image attachments through Kun endpoints', async () => {
+    const uploadRuntimeAttachment = vi.fn(async () => ({
+      ok: true,
+      status: 201,
+      body: JSON.stringify({
+        attachment: {
+          id: 'att_1',
+          name: 'shot.png',
+          mimeType: 'image/png',
+          byteSize: 3,
+          hash: 'hash',
+          localFilePath: '/tmp/picked/shot.png',
+          createdAt: 't0',
+          updatedAt: 't0'
+        }
+      })
+    }))
     const runtimeRequest = vi.fn(async (path: string) => {
       if (path === '/v1/runtime/info') {
         return {
@@ -497,24 +514,6 @@ describe('KunRuntimeProvider', () => {
           })
         }
       }
-      if (path === '/v1/attachments') {
-        return {
-          ok: true,
-          status: 201,
-          body: JSON.stringify({
-            attachment: {
-              id: 'att_1',
-              name: 'shot.png',
-              mimeType: 'image/png',
-              byteSize: 3,
-              hash: 'hash',
-              localFilePath: '/tmp/picked/shot.png',
-              createdAt: 't0',
-              updatedAt: 't0'
-            }
-          })
-        }
-      }
       if (path === '/v1/attachments/att_1/content?thread_id=thr_1') {
         return {
           ok: true,
@@ -536,7 +535,7 @@ describe('KunRuntimeProvider', () => {
       }
       return { ok: true, status: 200, body: '{}' }
     })
-    installDsGui({ runtimeRequest })
+    installDsGui({ runtimeRequest, uploadRuntimeAttachment })
     const provider = new KunRuntimeProvider()
 
     await expect(provider.getRuntimeInfo()).resolves.toMatchObject({
@@ -571,25 +570,21 @@ describe('KunRuntimeProvider', () => {
       attachment: { id: 'att_1', mimeType: 'image/png' },
       dataBase64: 'abc'
     })
-    expect(runtimeRequest).toHaveBeenCalledWith(
-      '/v1/attachments',
-      'POST',
-      JSON.stringify({
-        name: 'shot.png',
-        mimeType: 'image/png',
-        dataBase64: 'abc',
-        localFilePath: '/tmp/picked/shot.png',
-        textFallback: {
-          dataBase64: 'xyz',
-          mimeType: 'image/webp',
-          byteSize: 2,
-          width: 1,
-          height: 1,
-          wasCompressed: true
-        },
-        threadId: 'thr_1'
-      })
-    )
+    expect(uploadRuntimeAttachment).toHaveBeenCalledWith({
+      name: 'shot.png',
+      mimeType: 'image/png',
+      dataBase64: 'abc',
+      localFilePath: '/tmp/picked/shot.png',
+      textFallback: {
+        dataBase64: 'xyz',
+        mimeType: 'image/webp',
+        byteSize: 2,
+        width: 1,
+        height: 1,
+        wasCompressed: true
+      },
+      threadId: 'thr_1'
+    })
   })
 
   it('lists, disables, and deletes memory records through Kun endpoints', async () => {

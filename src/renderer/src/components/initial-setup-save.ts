@@ -29,11 +29,13 @@ export type InitialSetupSelection = {
   mode: InitialSetupAccessMode
 }
 
-const INITIAL_SETUP_PROVIDER_PRESET_IDS = new Set(['xiaomi', 'minimax'])
+const INITIAL_SETUP_PROVIDER_PRESET_IDS = new Set(['agnes', 'xiaomi', 'minimax'])
 
 export const INITIAL_SETUP_PROVIDER_PRESETS = MODEL_PROVIDER_PRESETS.filter(
   (preset) => INITIAL_SETUP_PROVIDER_PRESET_IDS.has(preset.id)
 )
+
+export const INITIAL_SETUP_DEFAULT_PROVIDER_ID = 'agnes'
 
 export function initialSetupProfileId(selection: InitialSetupSelection): string {
   if (selection.presetId === DEFAULT_MODEL_PROVIDER_ID) return DEFAULT_MODEL_PROVIDER_ID
@@ -64,7 +66,7 @@ export function initialSetupDrafts(settings: AppSettingsV1): InitialSetupDrafts 
   return drafts
 }
 
-/** Card and mode to preselect: the active provider when it is one of ours, DeepSeek otherwise. */
+/** Card and mode to preselect: the active provider when it is one of ours, Agnes otherwise. */
 export function initialSetupSelection(settings: AppSettingsV1): InitialSetupSelection {
   const activeId = getKunRuntimeSettings(settings).providerId.trim()
   for (const preset of INITIAL_SETUP_PROVIDER_PRESETS) {
@@ -73,7 +75,9 @@ export function initialSetupSelection(settings: AppSettingsV1): InitialSetupSele
       return { presetId: preset.id, mode: 'token-plan' }
     }
   }
-  return { presetId: DEFAULT_MODEL_PROVIDER_ID, mode: 'api' }
+  // On first run the active provider is still the app-wide default (DeepSeek);
+  // default the onboarding selection to Agnes so users see it first.
+  return { presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID, mode: 'api' }
 }
 
 export type InitialSetupAutoWirePlan = {

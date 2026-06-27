@@ -27,6 +27,7 @@ export type ImageGenRequest = {
 
 export type ImageGenEditRequest = ImageGenRequest & {
   images: { name: string; mimeType: string; data: Buffer }[]
+  mask?: { name: string; mimeType: string; data: Buffer }
 }
 
 export class ImageGenHttpError extends Error {
@@ -431,6 +432,13 @@ export class OpenAiCompatImageClient implements ImageGenClient {
       const field = request.images.length > 1 ? 'image[]' : 'image'
       for (const image of request.images) {
         form.append(field, new Blob([new Uint8Array(image.data)], { type: image.mimeType }), image.name)
+      }
+      if (request.mask) {
+        form.append(
+          'mask',
+          new Blob([new Uint8Array(request.mask.data)], { type: request.mask.mimeType }),
+          request.mask.name
+        )
       }
       return form
     }

@@ -5,6 +5,7 @@ import {
   Clock3,
   FileQuestion,
   Focus,
+  Image as ImageIcon,
   LayoutGrid,
   Moon,
   Plus,
@@ -37,7 +38,7 @@ import {
 type Props = {
   threads: NormalizedThread[]
   activeThreadId: string | null
-  activeView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow'
+  activeView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'image-edit'
   connectPhoneSidebarOpen: boolean
   pluginsActive: boolean
   runtimeReady: boolean
@@ -63,6 +64,7 @@ type Props = {
   onWriteOpen: () => void
   onScheduleOpen: () => void
   onWorkflowOpen: () => void
+  onImageEditOpen: () => void
 }
 
 export function Sidebar({
@@ -93,7 +95,8 @@ export function Sidebar({
   onCodeOpen,
   onWriteOpen,
   onScheduleOpen,
-  onWorkflowOpen
+  onWorkflowOpen,
+  onImageEditOpen
 }: Props): ReactElement {
   const { t, i18n } = useTranslation('common')
   const [isDarkMode, setIsDarkMode] = useState(
@@ -187,26 +190,22 @@ export function Sidebar({
           onWriteOpen={onWriteOpen}
         />
 
-        {activeView !== 'claw' && activeView !== 'schedule' && activeView !== 'workflow' ? (
-          <>
-            <SidebarCommandRow
-              icon={<Plus className="h-4 w-4" strokeWidth={2} />}
-              label={t('newAgent')}
-              onClick={runtimeReady ? onNewChat : undefined}
-              disabled={!runtimeReady}
-              disabledHint={t('runtimeActionNeedsConnection')}
-              variant="accent"
-            />
-            <SidebarCommandRow
-              icon={<FileQuestion className="h-4 w-4" strokeWidth={1.9} />}
-              label={t('sddNewRequirement')}
-              onClick={runtimeReady ? onNewRequirement : undefined}
-              disabled={!runtimeReady}
-              disabledHint={t('runtimeActionNeedsConnection')}
-              variant="accent"
-            />
-          </>
-        ) : null}
+        <SidebarCommandRow
+          icon={<Plus className="h-4 w-4" strokeWidth={2} />}
+          label={t('newAgent')}
+          onClick={runtimeReady ? onNewChat : undefined}
+          disabled={!runtimeReady}
+          disabledHint={t('runtimeActionNeedsConnection')}
+          variant="accent"
+        />
+        <SidebarCommandRow
+          icon={<FileQuestion className="h-4 w-4" strokeWidth={1.9} />}
+          label={t('sddNewRequirement')}
+          onClick={runtimeReady ? onNewRequirement : undefined}
+          disabled={!runtimeReady}
+          disabledHint={t('runtimeActionNeedsConnection')}
+          variant="accent"
+        />
         <SidebarCommandRow
           icon={<LayoutGrid className="h-4 w-4" strokeWidth={1.75} />}
           label={t('plugins')}
@@ -224,6 +223,12 @@ export function Sidebar({
           label={t('workflow')}
           onClick={onWorkflowOpen}
           active={activeView === 'workflow'}
+        />
+        <SidebarCommandRow
+          icon={<ImageIcon className="h-4 w-4" strokeWidth={1.75} />}
+          label={t('imageEdit')}
+          onClick={onImageEditOpen}
+          active={activeView === 'image-edit'}
         />
       </div>
 
@@ -255,6 +260,11 @@ export function Sidebar({
         <div className="ds-no-drag flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
           <Workflow className="h-7 w-7 text-ds-faint" strokeWidth={1.5} />
           <p className="text-[12.5px] leading-5 text-ds-faint">{t('workflowSidebarHint')}</p>
+        </div>
+      ) : activeView === 'image-edit' ? (
+        <div className="ds-no-drag flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+          <ImageIcon className="h-7 w-7 text-ds-faint" strokeWidth={1.5} />
+          <p className="text-[12.5px] leading-5 text-ds-faint">{t('imageEditSidebarHint')}</p>
         </div>
       ) : activeView === 'schedule' ? (
         <SidebarProjectsSection

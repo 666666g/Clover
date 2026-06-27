@@ -205,6 +205,29 @@ export const runtimeRequestPayloadSchema = z
   })
   .strict()
 
+const runtimeUploadAttachmentTextFallbackSchema = z
+  .object({
+    dataBase64: z.string().min(1).max(MAX_BODY_BYTES),
+    mimeType: z.string().min(1).max(128),
+    byteSize: z.number().int().nonnegative(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    wasCompressed: z.boolean().optional()
+  })
+  .strict()
+
+export const runtimeUploadAttachmentPayloadSchema = z
+  .object({
+    name: z.string().min(1).max(256),
+    mimeType: z.string().max(128).optional(),
+    dataBase64: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    localFilePath: z.string().max(MAX_PATH_LENGTH).optional(),
+    textFallback: runtimeUploadAttachmentTextFallbackSchema.optional(),
+    threadId: z.string().max(64).optional(),
+    workspace: z.string().max(MAX_PATH_LENGTH).optional()
+  })
+  .strict()
+
 const localeSchema = z.enum(['en', 'zh'])
 const themeSchema = z.enum(['system', 'light', 'dark'])
 const uiFontScaleSchema = z.enum(['small', 'medium', 'large'])
@@ -1630,6 +1653,14 @@ export const writeInfographicPayloadSchema = z
     imageDir: optionalTrimmedString(MAX_PATH_LENGTH),
     kind: z.enum(['infographic', 'design']).optional(),
     referenceImagePath: optionalTrimmedString(MAX_PATH_LENGTH)
+  })
+  .strict()
+
+export const imageEditPayloadSchema = z
+  .object({
+    originalImage: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    maskImage: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    prompt: z.string().trim().min(1).max(4_000)
   })
   .strict()
 

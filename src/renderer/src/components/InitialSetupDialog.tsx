@@ -9,6 +9,7 @@ import {
 } from '@shared/app-settings'
 import {
   buildInitialSetupSettings,
+  INITIAL_SETUP_DEFAULT_PROVIDER_ID,
   INITIAL_SETUP_PROVIDER_PRESETS,
   initialSetupAutoWirePlan,
   initialSetupDrafts,
@@ -59,27 +60,64 @@ type SetupProviderCard = {
   preset: ModelProviderPreset | null
 }
 
-const PROVIDER_CARDS: SetupProviderCard[] = [
-  {
-    presetId: DEFAULT_MODEL_PROVIDER_ID,
-    name: 'DeepSeek',
-    descKey: 'firstRunProviderDeepseekDesc',
-    capability: null,
-    preset: null
-  },
-  ...INITIAL_SETUP_PROVIDER_PRESETS.map((preset) => ({
+const DEFAULT_PROVIDER_CARD: SetupProviderCard = {
+  presetId: DEFAULT_MODEL_PROVIDER_ID,
+  name: 'DeepSeek',
+  descKey: 'firstRunProviderDeepseekDesc',
+  capability: null,
+  preset: null
+}
+
+const PRESET_PROVIDER_CARDS: SetupProviderCard[] = INITIAL_SETUP_PROVIDER_PRESETS.map((preset) => {
+  let descKey: string
+  switch (preset.id) {
+    case 'xiaomi':
+      descKey = 'firstRunProviderXiaomiDesc'
+      break
+    case 'minimax':
+      descKey = 'firstRunProviderMinimaxDesc'
+      break
+    case 'agnes':
+      descKey = 'firstRunProviderAgnesDesc'
+      break
+    default:
+      descKey = 'firstRunProviderDefaultDesc'
+  }
+  return {
     presetId: preset.id,
     name: preset.name,
-    descKey: preset.id === 'xiaomi' ? 'firstRunProviderXiaomiDesc' : 'firstRunProviderMinimaxDesc',
+    descKey,
     capability: preset.speech ? ('speech' as const) : preset.image ? ('image' as const) : null,
     preset
-  }))
+  }
+})
+
+const defaultPresetCard = PRESET_PROVIDER_CARDS.find(
+  (card) => card.presetId === INITIAL_SETUP_DEFAULT_PROVIDER_ID
+)
+const otherPresetCards = PRESET_PROVIDER_CARDS.filter(
+  (card) => card.presetId !== INITIAL_SETUP_DEFAULT_PROVIDER_ID
+)
+
+const PROVIDER_CARDS: SetupProviderCard[] = [
+  defaultPresetCard ?? DEFAULT_PROVIDER_CARD,
+  DEFAULT_PROVIDER_CARD,
+  ...otherPresetCards
 ]
 
 function keyHintKey(card: SetupProviderCard, mode: InitialSetupSelection['mode']): string {
   if (card.presetId === DEFAULT_MODEL_PROVIDER_ID) return 'firstRunBuyApiHint'
   const suffix = mode === 'token-plan' ? 'TokenPlan' : 'Api'
-  return card.presetId === 'xiaomi' ? `firstRunKeyHintXiaomi${suffix}` : `firstRunKeyHintMinimax${suffix}`
+  switch (card.presetId) {
+    case 'xiaomi':
+      return `firstRunKeyHintXiaomi${suffix}`
+    case 'minimax':
+      return `firstRunKeyHintMinimax${suffix}`
+    case 'agnes':
+      return `firstRunKeyHintAgnes${suffix}`
+    default:
+      return 'firstRunBuyApiHint'
+  }
 }
 
 function keyPageUrl(card: SetupProviderCard, mode: InitialSetupSelection['mode']): string {
@@ -93,7 +131,8 @@ function keyPlaceholder(card: SetupProviderCard, mode: InitialSetupSelection['mo
     const prefix = card.preset?.tokenPlan?.keyPrefix
     return prefix ? `${prefix}...` : 'API Key'
   }
-  return card.presetId === 'minimax' ? 'API Key' : 'sk-...'
+  if (card.presetId === 'minimax' || card.presetId === 'agnes') return 'API Key'
+  return 'sk-...'
 }
 
 export function canCloseInitialSetup(mode: InitialSetupMode): boolean {
@@ -140,7 +179,7 @@ export function InitialSetupDialog(): ReactElement {
   const [form, setForm] = useState<AppSettingsV1 | null>(null)
   const [drafts, setDrafts] = useState<InitialSetupDrafts | null>(null)
   const [selection, setSelection] = useState<InitialSetupSelection>({
-    presetId: DEFAULT_MODEL_PROVIDER_ID,
+    presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID,
     mode: 'api'
   })
   const [showApiKey, setShowApiKey] = useState(false)
