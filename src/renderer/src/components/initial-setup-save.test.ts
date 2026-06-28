@@ -48,11 +48,11 @@ describe('initialSetupSelection', () => {
   })
 
   it('falls back to agnes for unknown or empty active providers', () => {
-    expect(initialSetupSelection(settings())).toEqual({ presetId: 'agnes', mode: 'api' })
+    expect(initialSetupSelection(settings())).toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'custom-provider-2' } } })))
-      .toEqual({ presetId: 'agnes', mode: 'api' })
+      .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'litellm' } } })))
-      .toEqual({ presetId: 'agnes', mode: 'api' })
+      .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
   })
 })
 
@@ -87,7 +87,7 @@ describe('initialSetupDrafts', () => {
     for (const id of excludedIds) {
       expect(drafts[id]).toBeUndefined()
       expect(initialSetupSelection(settings({ agents: { kun: { providerId: id } } })))
-        .toEqual({ presetId: 'agnes', mode: 'api' })
+        .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
     }
   })
 })
