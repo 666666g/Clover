@@ -147,6 +147,25 @@ const WorkflowRunPanel = lazy(() =>
 const ImageEditView = lazy(() =>
   import('./image-edit/ImageEditView').then((module) => ({ default: module.ImageEditView }))
 )
+const WriteWorkspaceView = lazy(() =>
+  import('./write/WriteWorkspaceView').then((module) => ({ default: module.WriteWorkspaceView }))
+)
+const WriteAssistantPanel = lazy(() =>
+  import('./write/WriteAssistantPanel').then((module) => ({ default: module.WriteAssistantPanel }))
+)
+const WriteSidebar = lazy(() =>
+  import('./write/WriteSidebar').then((module) => ({ default: module.WriteSidebar }))
+)
+const SddAssistantPanel = lazy(() =>
+  import('./sdd/SddAssistantPanel').then((module) => ({ default: module.SddAssistantPanel }))
+)
+const SddDraftEditorView = lazy(() =>
+  import('./sdd/SddDraftEditorView').then((module) => ({ default: module.SddDraftEditorView }))
+)
+
+function WorkbenchPaneFallback(): ReactElement {
+  return <div className="h-full min-h-0 w-full bg-ds-main" aria-hidden />
+}
 
 type PendingSddPlanTarget = {
   planId: string

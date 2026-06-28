@@ -109,7 +109,7 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
   workspaceRoot: string
   absolutePath: string
   relativePath: string
-}> {
+} {
   const root = workspaceRoot(context.workspace)
   const absolutePath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath)
   // danger-full-access 模式下允许访问工作区外路径，不再进行逃逸检查。
@@ -125,78 +125,11 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
   if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
     throw new Error(`path escapes the workspace root: ${inputPath}`)
   }
-  // Return LEXICAL paths to callers. The realpath-resolved pair is only used
-  // for the escape check above; downstream code (subprocess cwd, display
-  // paths, language-server init) expects the user-facing workspace path,
-  // which on symlinked roots (e.g. macOS `/tmp` -> `/private/tmp`) would
-  // otherwise diverge from what the user typed and break display layers.
   return {
     workspaceRoot: root,
     absolutePath: realAbsolutePath,
     relativePath: relativePath || '.'
   }
-}
-
-async function safeRealpath(target: string): Promise<string | null> {
-  try {
-    return await realpath(target)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return null
-    if (code === 'EACCES' || code === 'ELOOP' || code === 'ENOTDIR') return null
-    throw error
-  }
-}
-
-// Whether `target` is itself a symbolic link, without following it. Returns
-// false when the entry is absent or cannot be stat-ed (treated as "not a link"
-// — the escape check still anchors against the nearest existing ancestor).
-async function isSymlink(target: string): Promise<boolean> {
-  try {
-    return (await lstat(target)).isSymbolicLink()
-  } catch {
-    return false
-  }
-}
-
-async function resolveSymlinkSafe(lexicalPath: string, depth = 0): Promise<string> {
-  // Guard against symlink loops (dangling link A -> B -> A never resolves).
-  if (depth > 40) {
-    throw new Error(`too many symbolic links resolving: ${lexicalPath}`)
-  }
-  const direct = await safeRealpath(lexicalPath)
-  if (direct !== null) return direct
-  // Target doesn't fully resolve — either a genuinely missing path (write/create
-  // case) or a *dangling* symlink whose target is absent. `realpath` reports
-  // both as ENOENT, so we must walk the components ourselves: anchor on the
-  // nearest existing ancestor, but if a non-resolving component is actually a
-  // symlink, follow it explicitly so the redirection is reflected in the escape
-  // check. Re-anchoring a dangling symlink lexically (the old behavior) let a
-  // planted link like `<ws>/evil -> /etc/passwd` (target absent) pass as an
-  // in-workspace path and escape on the subsequent write.
-  const segments: string[] = []
-  let current = lexicalPath
-  // Guard against pathological component counts.
-  for (let i = 0; i < 128 && current !== dirname(current); i += 1) {
-    const resolved = await safeRealpath(current)
-    if (resolved !== null) {
-      return segments.length > 0 ? resolve(resolved, ...segments) : resolved
-    }
-    if (await isSymlink(current)) {
-      // Dangling (or otherwise non-resolving) symlink: follow its target so the
-      // redirection is reflected, then re-resolve the target plus the suffix
-      // collected below this component.
-      const linkTarget = await readlink(current)
-      const resolvedParent = (await safeRealpath(dirname(current))) ?? dirname(current)
-      const followed = isAbsolute(linkTarget) ? resolve(linkTarget) : resolve(resolvedParent, linkTarget)
-      const rejoined = segments.length > 0 ? resolve(followed, ...segments) : followed
-      return resolveSymlinkSafe(rejoined, depth + 1)
-    }
-    segments.unshift(basename(current))
-    current = dirname(current)
-  }
-  // Nothing on the path exists; treat as escape.
-  throw new Error(`path escapes the workspace root: ${lexicalPath}`)
 }
 
 export function isBinaryBuffer(buffer: Buffer): boolean {

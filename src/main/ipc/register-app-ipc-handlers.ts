@@ -11,6 +11,7 @@ import {
   type ClawRunResult,
   type ClawTaskFromTextResult,
   type ClawRuntimeStatus,
+  resolveModelProviderProxyUrl,
   type ScheduleRunResult,
   type ScheduleRuntimeStatus,
   type ScheduleTaskFromTextResult,

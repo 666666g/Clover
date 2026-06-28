@@ -332,7 +332,7 @@ export function Sidebar({
         activeThreadId={activeThreadId}
         runtimeReady={runtimeReady}
         conversationRoot={conversationWorkspaceRoot}
-        onNewConversation={onNewConversation}
+        onNewConversation={onNewChat}
         onSelectThread={onSelectThread}
         onRenameThread={onRenameThread}
         onPinThread={onPinThread}

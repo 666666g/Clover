@@ -240,7 +240,8 @@ export function InitialSetupDialog(): ReactElement {
   const [drafts, setDrafts] = useState<InitialSetupDrafts | null>(null)
   const [selection, setSelection] = useState<InitialSetupSelection>({
     presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID,
-    mode: 'api'
+    mode: 'api',
+    permissionMode: 'read-only'
   })
   const [showApiKey, setShowApiKey] = useState(false)
   const [saving, setSaving] = useState(false)

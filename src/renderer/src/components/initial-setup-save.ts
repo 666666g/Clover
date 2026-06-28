@@ -42,7 +42,9 @@ export const INITIAL_SETUP_PROVIDER_PRESETS = MODEL_PROVIDER_PRESETS.filter(
 
 export const INITIAL_SETUP_DEFAULT_PROVIDER_ID = 'agnes'
 
-export function initialSetupProfileId(selection: InitialSetupSelection): string {
+export function initialSetupProfileId(
+  selection: Pick<InitialSetupSelection, 'presetId' | 'mode'>
+): string {
   if (selection.presetId === DEFAULT_MODEL_PROVIDER_ID) return DEFAULT_MODEL_PROVIDER_ID
   return selection.mode === 'token-plan' ? tokenPlanProviderId(selection.presetId) : selection.presetId
 }
@@ -84,7 +86,7 @@ export function initialSetupSelection(settings: AppSettingsV1): InitialSetupSele
   }
   // On first run the active provider is still the app-wide default (DeepSeek);
   // default the onboarding selection to Agnes so users see it first.
-  return { presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID, mode: 'api' }
+  return { presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID, mode: 'api', permissionMode }
 }
 
 export type InitialSetupAutoWirePlan = {
