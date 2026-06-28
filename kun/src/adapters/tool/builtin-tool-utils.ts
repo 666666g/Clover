@@ -1,8 +1,9 @@
 import { existsSync, lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
 import type { ToolHostContext } from '../../ports/tool-host.js'
+import { effectiveSandboxMode } from './sandbox-policy.js'
 import type {
   EditInstruction,
   FsStats,
@@ -108,7 +109,7 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
   workspaceRoot: string
   absolutePath: string
   relativePath: string
-} {
+}> {
   const root = workspaceRoot(context.workspace)
   const absolutePath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath)
   // danger-full-access 模式下允许访问工作区外路径，不再进行逃逸检查。
@@ -124,11 +125,78 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
   if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
     throw new Error(`path escapes the workspace root: ${inputPath}`)
   }
+  // Return LEXICAL paths to callers. The realpath-resolved pair is only used
+  // for the escape check above; downstream code (subprocess cwd, display
+  // paths, language-server init) expects the user-facing workspace path,
+  // which on symlinked roots (e.g. macOS `/tmp` -> `/private/tmp`) would
+  // otherwise diverge from what the user typed and break display layers.
   return {
     workspaceRoot: root,
     absolutePath: realAbsolutePath,
     relativePath: relativePath || '.'
   }
+}
+
+async function safeRealpath(target: string): Promise<string | null> {
+  try {
+    return await realpath(target)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return null
+    if (code === 'EACCES' || code === 'ELOOP' || code === 'ENOTDIR') return null
+    throw error
+  }
+}
+
+// Whether `target` is itself a symbolic link, without following it. Returns
+// false when the entry is absent or cannot be stat-ed (treated as "not a link"
+// — the escape check still anchors against the nearest existing ancestor).
+async function isSymlink(target: string): Promise<boolean> {
+  try {
+    return (await lstat(target)).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
+async function resolveSymlinkSafe(lexicalPath: string, depth = 0): Promise<string> {
+  // Guard against symlink loops (dangling link A -> B -> A never resolves).
+  if (depth > 40) {
+    throw new Error(`too many symbolic links resolving: ${lexicalPath}`)
+  }
+  const direct = await safeRealpath(lexicalPath)
+  if (direct !== null) return direct
+  // Target doesn't fully resolve — either a genuinely missing path (write/create
+  // case) or a *dangling* symlink whose target is absent. `realpath` reports
+  // both as ENOENT, so we must walk the components ourselves: anchor on the
+  // nearest existing ancestor, but if a non-resolving component is actually a
+  // symlink, follow it explicitly so the redirection is reflected in the escape
+  // check. Re-anchoring a dangling symlink lexically (the old behavior) let a
+  // planted link like `<ws>/evil -> /etc/passwd` (target absent) pass as an
+  // in-workspace path and escape on the subsequent write.
+  const segments: string[] = []
+  let current = lexicalPath
+  // Guard against pathological component counts.
+  for (let i = 0; i < 128 && current !== dirname(current); i += 1) {
+    const resolved = await safeRealpath(current)
+    if (resolved !== null) {
+      return segments.length > 0 ? resolve(resolved, ...segments) : resolved
+    }
+    if (await isSymlink(current)) {
+      // Dangling (or otherwise non-resolving) symlink: follow its target so the
+      // redirection is reflected, then re-resolve the target plus the suffix
+      // collected below this component.
+      const linkTarget = await readlink(current)
+      const resolvedParent = (await safeRealpath(dirname(current))) ?? dirname(current)
+      const followed = isAbsolute(linkTarget) ? resolve(linkTarget) : resolve(resolvedParent, linkTarget)
+      const rejoined = segments.length > 0 ? resolve(followed, ...segments) : followed
+      return resolveSymlinkSafe(rejoined, depth + 1)
+    }
+    segments.unshift(basename(current))
+    current = dirname(current)
+  }
+  // Nothing on the path exists; treat as escape.
+  throw new Error(`path escapes the workspace root: ${lexicalPath}`)
 }
 
 export function isBinaryBuffer(buffer: Buffer): boolean {
@@ -244,34 +312,84 @@ export function describeKind(mode: TruncateMode): string {
   return mode === 'head' ? 'first' : 'last'
 }
 
+const WINDOWS_POWERSHELL_ARGS = ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+
+// `%SystemRoot%` (a.k.a. `%windir%`) — the Windows install directory. Always
+// present in a sane environment; the literal fallback covers the rare case
+// where even that has been stripped from the spawned process's env.
+function windowsSystemRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return env.SystemRoot || env.windir || env.SYSTEMROOT || 'C:\\Windows'
+}
+
+// Absolute path to cmd.exe. `%ComSpec%` is the canonical pointer the OS itself
+// uses; fall back to System32\cmd.exe so we never depend on PATH resolution.
+function windowsComSpec(env: NodeJS.ProcessEnv = process.env): string {
+  return env.ComSpec || env.COMSPEC || win32.join(windowsSystemRoot(env), 'System32', 'cmd.exe')
+}
+
 export function shellConfig(
   platform: NodeJS.Platform = process.platform,
   lookup: SpawnSyncLike = spawnSync,
-  fileExists: (path: string) => boolean = existsSync
+  fileExists: (path: string) => boolean = existsSync,
+  env: NodeJS.ProcessEnv = process.env
 ): ShellConfig {
   if (platform === 'win32') {
     const pwsh = firstLookupResult(lookup, 'where', ['pwsh.exe'])
-    if (pwsh) {
-      return {
-        shell: pwsh,
-        args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
-      }
-    }
+    if (pwsh) return { shell: pwsh, args: WINDOWS_POWERSHELL_ARGS }
     const powershell = firstLookupResult(lookup, 'where', ['powershell.exe'])
-    if (powershell) {
-      return {
-        shell: powershell,
-        args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
-      }
-    }
+    if (powershell) return { shell: powershell, args: WINDOWS_POWERSHELL_ARGS }
     const bash = firstLookupResult(lookup, 'where', ['bash.exe'])
     if (bash) return { shell: bash, args: ['-lc'] }
-    return { shell: 'cmd.exe', args: ['/d', '/s', '/c'] }
+    // Every branch above resolves the shell through PATH (`where` itself lives
+    // in System32). A GUI-launched Windows app frequently inherits a PATH that
+    // has lost System32, so `where.exe`, `powershell.exe` and even a bare
+    // `cmd.exe` all fail to spawn with "ENOENT". Resolve a shell by absolute
+    // path from well-known environment variables so the shell always starts.
+    const winPowerShell = win32.join(
+      windowsSystemRoot(env),
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe'
+    )
+    if (fileExists(winPowerShell)) return { shell: winPowerShell, args: WINDOWS_POWERSHELL_ARGS }
+    return { shell: windowsComSpec(env), args: ['/d', '/s', '/c'] }
   }
   if (fileExists('/bin/bash')) return { shell: '/bin/bash', args: ['-lc'] }
   const candidate = firstLookupResult(lookup, 'which', ['bash'])
   if (candidate) return { shell: candidate, args: ['-lc'] }
   return { shell: 'sh', args: ['-lc'] }
+}
+
+// Environment for spawned shells/commands. On Windows, guarantees the core
+// system directories are on PATH so built-in utilities (`where`, `findstr`,
+// `tasklist`, …) and PATH-resolved tools (`node`, `npm`, `python`) remain
+// reachable from inside the shell even when the app inherited a PATH without
+// System32 — the same breakage that makes the bare `cmd.exe` spawn fail. The
+// directories are appended (never prepended), so the user's own PATH entries
+// keep their precedence. A no-op on non-Windows platforms.
+export function shellSpawnEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): NodeJS.ProcessEnv {
+  if (platform !== 'win32') return env
+  const systemRoot = windowsSystemRoot(env)
+  const required = [
+    win32.join(systemRoot, 'System32'),
+    systemRoot,
+    win32.join(systemRoot, 'System32', 'Wbem'),
+    win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0')
+  ]
+  // PATH casing varies on Windows (PATH vs Path); update the key as it exists.
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'Path'
+  const existing = (env[pathKey] ?? '').split(win32.delimiter).filter(Boolean)
+  const seen = new Set(existing.map((entry) => entry.toLowerCase().replace(/[\\/]+$/, '')))
+  const missing = required.filter((dir) => !seen.has(dir.toLowerCase()))
+  if (missing.length === 0) return env
+  return {
+    ...env,
+    [pathKey]: [...existing, ...missing].join(win32.delimiter)
+  }
 }
 
 export type ShellRuntimeInfo = ShellConfig & {
@@ -455,7 +573,7 @@ export async function spawnCapture(
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const child = spawn(file, args, {
     cwd: options.cwd,
-    env: process.env,
+    env: shellSpawnEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   })

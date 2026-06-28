@@ -22,6 +22,7 @@ export type ModelContextProfile = ModelContextThresholds & {
   canonicalModel: string
   modelIds: readonly string[]
   contextWindowTokens: number
+  maxOutputTokens?: number
   inputModalities: readonly ModelInputModality[]
   outputModalities: readonly ModelInputModality[]
   supportsToolCalling: boolean
@@ -33,6 +34,7 @@ export type ModelContextProfile = ModelContextThresholds & {
 export type ModelContextProfileConfig = {
   aliases?: readonly string[]
   contextWindowTokens?: number
+  maxOutputTokens?: number
   contextCompaction?: ModelContextCompactionProfileConfig
   /** @deprecated Use contextCompaction.softRatio. */
   softRatio?: number
@@ -61,6 +63,10 @@ export type ContextCompactionConfig = {
   summaryTimeoutMs?: number
   summaryMaxTokens?: number
   summaryInputMaxBytes?: number
+  /** Optional model override for compaction summary (empty = follow main model). */
+  summaryModel?: string
+  /** Provider id paired with summaryModel. */
+  summaryProviderId?: string
   /**
    * @deprecated Model-specific context windows and compaction thresholds belong
    * in top-level models.profiles. This field is still read for compatibility.
@@ -152,6 +158,7 @@ export function modelCapabilitiesForModel(
     outputModalities: [...(profile?.outputModalities ?? DEFAULT_MODEL_OUTPUT_MODALITIES)],
     supportsToolCalling: profile?.supportsToolCalling ?? true,
     contextWindowTokens: profile?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+    ...(profile?.maxOutputTokens ? { maxOutputTokens: profile.maxOutputTokens } : {}),
     messageParts: [...(profile?.messageParts ?? DEFAULT_MODEL_MESSAGE_PARTS)],
     ...(profile?.reasoning ? { reasoning: copyReasoningCapability(profile.reasoning) } : {}),
     ...(profile?.endpointFormat ? { endpointFormat: profile.endpointFormat } : {})
@@ -239,10 +246,12 @@ function mergeModelContextProfile(
   ])
   const reasoning = input.reasoning ?? current?.reasoning
   const endpointFormat = input.endpointFormat ?? current?.endpointFormat
+  const maxOutputTokens = input.maxOutputTokens ?? current?.maxOutputTokens
   return {
     canonicalModel,
     modelIds,
     contextWindowTokens,
+    ...(maxOutputTokens ? { maxOutputTokens } : {}),
     softThreshold,
     hardThreshold,
     inputModalities: uniqueModelCapabilityValues(input.inputModalities ?? current?.inputModalities ?? DEFAULT_MODEL_INPUT_MODALITIES),

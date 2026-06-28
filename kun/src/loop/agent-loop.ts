@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from 'node:path'
 import type { ModelClient, ModelRequest, ModelToolSpec } from '../ports/model-client.js'
+import type { AgentSdkRuntime } from '../runtime/agent-sdk/agent-sdk-runtime.js'
 import type {
   ToolHost,
   ToolCallLike,
@@ -28,7 +29,9 @@ import {
   insertCompactionIntoVisibleHistory,
   placeCompactionsAtTurnEnd
 } from './compaction-history.js'
-import { summarizeCompactionWithModel } from './compaction-summary.js'
+import { resolveCompactionModel, summarizeCompactionWithModel } from './compaction-summary.js'
+import { generateThreadTitle, resolveRoleModel } from './title-generator.js'
+import type { RolesConfig } from '../config/kun-config.js'
 import { InflightTracker } from './inflight-tracker.js'
 import { SteeringQueue } from './steering-queue.js'
 import {
@@ -86,6 +89,7 @@ import { guiPlanWorkspaceMatches } from '../shared/gui-plan.js'
 import { GET_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME } from '../adapters/tool/goal-tools.js'
 import { TODO_LIST_TOOL_NAME, TODO_WRITE_TOOL_NAME } from '../adapters/tool/todo-tools.js'
 import { shellRuntimeInstruction } from '../adapters/tool/builtin-tool-utils.js'
+import { VERIFY_CHANGES_TOOL_NAME } from '../adapters/tool/builtin-verify-tool.js'
 import {
   GoalResumeCoordinator,
   DEFAULT_MAX_GOAL_RESUME_NO_PROGRESS_ATTEMPTS,
@@ -121,7 +125,7 @@ const GOAL_NON_PROGRESS_TOOL_NAMES = new Set<string>([
  */
 const GOAL_RESUME_PROMPT = [
   'Continue working toward the active goal.',
-  'The previous attempt was interrupted before the goal was complete (it failed or the runtime restarted).',
+  'The previous attempt stopped before the goal was complete (it was interrupted, truncated, or the runtime restarted, or it simply stopped early).',
   'Review the current state, pick up where the work left off, and keep going until the goal is genuinely achieved or blocked.'
 ].join(' ')
 
@@ -132,6 +136,37 @@ const GOAL_RESUME_PROMPT = [
  */
 function goalResumeKey(threadId: string, goal: ThreadGoal): string {
   return `${threadId}::${goal.createdAt}::${goal.objective}`
+}
+
+/**
+ * Placeholder titles the GUI assigns to a fresh thread. When a thread still
+ * carries one of these (or an empty title), the title is considered
+ * auto-generatable; a user-set title never matches and is preserved. Mirrors
+ * the renderer's `shouldAutoTitleThread` placeholder set so backend title
+ * generation only fills in genuinely-default titles.
+ */
+const PLACEHOLDER_THREAD_TITLES = new Set(['New Thread', '新会话', 'Untitled', '未命名'])
+const CODEX_PLACEHOLDER_TITLE = /^__codex_[a-z0-9_]+__$/i
+
+function isAutoTitleableThreadTitle(title: string | null | undefined): boolean {
+  const raw = title?.trim() ?? ''
+  if (!raw) return true
+  if (PLACEHOLDER_THREAD_TITLES.has(raw)) return true
+  if (CODEX_PLACEHOLDER_TITLE.test(raw)) return true
+  return false
+}
+
+/**
+ * Whether the backend LLM titler may (re)generate a thread's title.
+ *
+ * - `titleAuto === false` → user renamed it manually; never overwrite.
+ * - `titleAuto === true`  → client set a provisional first-message title; upgrade it.
+ * - absent (legacy)       → only upgrade placeholder titles, never a real one.
+ */
+export function canUpgradeThreadTitle(thread: { title?: string | null; titleAuto?: boolean }): boolean {
+  if (thread.titleAuto === false) return false
+  if (thread.titleAuto === true) return true
+  return isAutoTitleableThreadTitle(thread.title)
 }
 const MAX_TOOL_CATALOG_SNAPSHOTS = 256
 
@@ -190,7 +225,7 @@ export const PLAN_MODE_INSTRUCTION = [
   'You are in Plan mode.',
   'Investigate the task first using read-only tools: prefer `read`, `grep`, `find`, and `ls` to gather the facts you need.',
   'Do NOT modify project files, apply edits, run shell commands, or run mutating commands in this mode.',
-  'If the request is ambiguous or hinges on a decision only the user can make, ask one concise round of clarifying questions and stop: end your turn with the question(s) and wait for the answer. Do NOT call `create_plan` yet — a set of options the user still has to choose between is not a plan.',
+  'If the request is ambiguous or hinges on a decision only the user can make, ask before planning: prefer the `user_input` tool to ask one concise round of clarifying questions (offer concrete options when there are any), then use the answer to write the plan in the same turn. If that tool is not available, end your turn with the question(s) in prose and wait for the answer. Either way, do NOT call `create_plan` until the ambiguity is resolved — a set of options the user still has to choose between is not a plan.',
   'When you understand the task well enough, call the `create_plan` tool to save a complete implementation plan as Markdown.',
   'Use `operation: "draft"` for the first plan, and `operation: "refine"` when revising an existing plan; you may call `create_plan` multiple times as the plan evolves.',
   'Write concrete, actionable steps rather than vague intentions, and structure the saved Markdown with `##` section headings (e.g. Summary, Steps, Tests, Risks).',
@@ -212,13 +247,21 @@ const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   'web_fetch'
 ])
 
+/** Interactive tools allowed during the investigation phase (step 0) of a
+ * Plan-mode turn so the model can ask the user a structured clarifying
+ * question (with options) and continue to `create_plan` in the same turn
+ * instead of stopping with a prose question. Only effective on GUI turns:
+ * these tools advertise off `awaitUserInput`, so IM/headless plan turns never
+ * surface them and the prose-and-stop fallback applies there. */
+const PLAN_INTERACTIVE_TOOL_NAMES = new Set(['user_input', 'request_user_input'])
+
 /**
  * Resolve the tool list for a Plan-mode turn step. Extracted as a pure
  * function so the behaviour can be unit-tested without spinning up the
  * full agent loop.
  *
  * - Not plan-active or plan already satisfied → pass through unchanged.
- * - Step 0 (investigation): read-only tools + create_plan.
+ * - Step 0 (investigation): read-only + interactive (user_input) tools + create_plan.
  * - Step > 0 (must produce plan): only create_plan.
  */
 export function resolvePlanModeToolSpecs(
@@ -228,15 +271,78 @@ export function resolvePlanModeToolSpecs(
     createPlanSatisfied: boolean
     stepIndex: number
     readOnlyToolNames?: ReadonlySet<string>
+    interactiveToolNames?: ReadonlySet<string>
     planToolName?: string
   }
 ): ModelToolSpec[] {
   if (!options.planTurnActive || options.createPlanSatisfied) return toolSpecs
   const readOnly = options.readOnlyToolNames ?? PLAN_READ_ONLY_TOOL_NAMES
+  const interactive = options.interactiveToolNames ?? PLAN_INTERACTIVE_TOOL_NAMES
   const planTool = options.planToolName ?? CREATE_PLAN_TOOL_NAME
   return options.stepIndex === 0
-    ? toolSpecs.filter((tool) => tool.name === planTool || readOnly.has(tool.name))
+    ? toolSpecs.filter(
+        (tool) => tool.name === planTool || readOnly.has(tool.name) || interactive.has(tool.name)
+      )
     : toolSpecs.filter((tool) => tool.name === planTool)
+}
+
+// Source files a `verify_changes` run can meaningfully validate (Vitest/tsc).
+// Documents and HTML written in write / design / SDD modes never match, so
+// those modes are never nudged to run code verification.
+const VERIFIABLE_SOURCE_PATH = /\.[cm]?[jt]sx?$/i
+
+function fileChangeResultPath(item: TurnItem): string | null {
+  if (item.kind !== 'tool_result') return null
+  const output = item.output
+  if (!output || typeof output !== 'object') return null
+  const record = output as Record<string, unknown>
+  const path = record.relative_path ?? record.path
+  return typeof path === 'string' ? path : null
+}
+
+/**
+ * Whether this turn changed real source files (.ts/.js family) that a later
+ * `verify_changes` run has not yet covered. Only successful, non-plan
+ * file-change results with a source-code path count — so writing docs or HTML
+ * (write / design / SDD modes) never asks for code verification, and a denied
+ * or failed edit never does either. Used only to surface an optional nudge;
+ * verification is never forced.
+ */
+export function turnHasUnverifiedSourceChanges(
+  items: readonly TurnItem[],
+  turnId: string
+): boolean {
+  let lastSourceChangeIndex = -1
+  let lastVerificationIndex = -1
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+    if (!item || item.turnId !== turnId || item.kind !== 'tool_result') continue
+    if (item.toolName === VERIFY_CHANGES_TOOL_NAME) {
+      lastVerificationIndex = index
+      continue
+    }
+    if (
+      item.toolKind === 'file_change' &&
+      item.toolName !== CREATE_PLAN_TOOL_NAME &&
+      item.isError !== true
+    ) {
+      const path = fileChangeResultPath(item)
+      if (path && VERIFIABLE_SOURCE_PATH.test(path)) lastSourceChangeIndex = index
+    }
+  }
+  return lastSourceChangeIndex >= 0 && lastSourceChangeIndex > lastVerificationIndex
+}
+
+/**
+ * A soft, optional nudge to run acceptance checks after source edits. The loop
+ * never forces `verify_changes` — the model decides whether validation applies.
+ */
+function verificationSuggestionInstruction(): string {
+  return [
+    'You changed source files in this turn.',
+    `If these are code changes, consider running \`${VERIFY_CHANGES_TOOL_NAME}\` to run the project's adjacent tests and typecheck before finishing.`,
+    'This is optional — skip it when verification does not apply.'
+  ].join(' ')
 }
 
 /**
@@ -350,7 +456,7 @@ function formatLocalDateTimeForPrompt(nowIso: string, timeZone?: string): string
   }
 }
 
-function goalContinuationInstruction(goal: ThreadGoal | undefined): string | null {
+export function goalContinuationInstruction(goal: ThreadGoal | undefined): string | null {
   if (!goal || goal.status !== 'active') return null
   const tokenBudget = goal.tokenBudget == null ? 'none' : String(goal.tokenBudget)
   const remainingTokens = goal.tokenBudget == null
@@ -455,7 +561,7 @@ function charBigramCounts(text: string): Map<string, number> {
   return counts
 }
 
-function todoContinuationInstruction(todos: ThreadTodoList | undefined): string | null {
+export function todoContinuationInstruction(todos: ThreadTodoList | undefined): string | null {
   const items = todos?.items ?? []
   if (items.length === 0) return null
   const rows = items.slice(0, 50).map((item, index) => {
@@ -568,6 +674,8 @@ export type AgentLoopOptions = {
   memoryStore?: MemoryStore
   tokenEconomy?: TokenEconomyConfig
   contextCompaction?: ContextCompactionConfig
+  /** Internal-LLM role model routing (smallModel slot + title/summary/codeReview overrides). */
+  roles?: RolesConfig
   toolStorm?: ToolStormBreakerOptions & { enabled?: boolean }
   toolArgumentRepair?: {
     maxStringBytes?: number
@@ -587,6 +695,23 @@ export type AgentLoopOptions = {
    * tools — enforced at both the schema (listTools) and execute layers.
    */
   forcedAllowedToolNames?: readonly string[]
+  /**
+   * Provider ids hard-blocked for this loop (e.g. a subagent profile's blocked
+   * MCP servers, as `mcp:<serverId>`). Deny-list layered on top of inherit and
+   * enforced at both the schema and execute layers.
+   */
+  blockedProviderIds?: readonly string[]
+  /**
+   * Tool names hard-blocked for this loop (e.g. a subagent profile's blocked
+   * built-in tools). Deny-list layered on top of inherit; enforced at both layers.
+   */
+  blockedToolNames?: readonly string[]
+  /**
+   * Skill ids hard-blocked for this loop's turns (e.g. a subagent profile's
+   * blockedSkills). Hidden from the catalog + auto-activation and rejected by
+   * `load_skill`, without mutating the shared skill runtime.
+   */
+  blockedSkillIds?: readonly string[]
   /**
    * Lifecycle hooks (UserPromptSubmit, TurnStart, TurnEnd, PreCompact).
    * Tool phases are handled by the tool host; the loop ignores them.
@@ -611,6 +736,13 @@ export type AgentLoopOptions = {
     relativePath: string
     markdown: string
   }) => Promise<void>
+  /**
+   * Subscription engine. When set and it owns the active thread's provider
+   * (kind: 'agent-sdk'), the entire turn is delegated to the embedded Claude
+   * Agent SDK instead of kun's own model loop, billing the user's Claude
+   * subscription. kun's tools/persona/permissions are injected into the SDK.
+   */
+  sdkRuntime?: AgentSdkRuntime
 }
 
 /**
@@ -639,6 +771,13 @@ export class AgentLoop {
   private readonly turnFailures = new Map<string, TurnFailure>()
   /** Turns that executed at least one real (non-goal-status) tool call. */
   private readonly turnMadeProgress = new Set<string>()
+  /**
+   * Turns whose stop was a deliberate cap rather than an unfinished-goal
+   * interruption (cost-budget exhaustion, or a repetition stall that made no
+   * real progress). These must not drive goal auto-resume even though the goal
+   * is still `active`.
+   */
+  private readonly goalResumeSuppressedByTurn = new Set<string>()
   private readonly goalResume: GoalResumeCoordinator
 
   constructor(opts: AgentLoopOptions) {
@@ -689,6 +828,17 @@ export class AgentLoop {
       await this.opts.turns.finishTurn({ threadId, turnId, status: 'aborted' })
       return 'aborted'
     }
+    // Subscription engine dispatch: if a Claude Agent SDK runtime owns this
+    // thread's provider, delegate the whole turn to it (the SDK runs the loop on
+    // the user's subscription; kun's brain is injected). All other providers
+    // fall through to kun's native loop below.
+    const sdkRuntime = this.opts.sdkRuntime
+    if (sdkRuntime) {
+      const providerId = (await this.opts.threadStore.get(threadId))?.providerId
+      if (sdkRuntime.handlesProvider(providerId)) {
+        return sdkRuntime.runTurn(threadId, turnId, signal)
+      }
+    }
     let goalTimer: GoalElapsedTimer | null = null
     let finalStatus: 'completed' | 'failed' | 'aborted' | undefined
     let finalError: string | undefined
@@ -737,6 +887,11 @@ export class AgentLoop {
       })
       finalStatus = status
       finalError = failure?.error
+      if (status === 'completed') {
+        // Fire-and-forget: generate an LLM title after the FIRST assistant
+        // reply completes, only when the thread still has a default title.
+        void this.maybeGenerateThreadTitle(threadId, turnId, signal).catch(() => {})
+      }
       return status
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error)
@@ -773,6 +928,7 @@ export class AgentLoop {
       this.lastNoToolTextByTurn.delete(turnId)
       this.goalNoToolRecoveryStepsByTurn.delete(turnId)
       this.turnMadeProgress.delete(turnId)
+      this.goalResumeSuppressedByTurn.delete(turnId)
       this.emptyPostToolRecoveryStepsByTurn.delete(turnId)
       this.turnFailures.delete(turnId)
       await this.runTurnEndHooks(threadId, turnId, finalStatus ?? 'failed', finalError)
@@ -867,6 +1023,68 @@ export class AgentLoop {
     await this.opts.turns.finishTurn({ threadId, turnId, status: 'failed', error: message })
   }
 
+  /**
+   * After the FIRST assistant reply completes, generate a concise LLM title for
+   * the thread — but only when the thread still carries a default/placeholder
+   * title (so a user-set or already-generated title is never overwritten) and
+   * only on the first completed turn. Model precedence: titleModel -> smallModel
+   * -> main conversation model. Persists the title to the thread store and emits
+   * a `thread_updated` event so the renderer's list refreshes. Best-effort: any
+   * failure is swallowed by the fire-and-forget caller.
+   */
+  private async maybeGenerateThreadTitle(threadId: string, turnId: string, signal?: AbortSignal): Promise<void> {
+    const thread = await this.opts.threadStore.get(threadId)
+    if (!thread) return
+    // Only on the first completed turn so we don't re-title on every reply.
+    const completedTurns = thread.turns.filter((t) => t.status === 'completed').length
+    if (completedTurns > 1) return
+    if (!canUpgradeThreadTitle(thread)) return
+
+    const items = await this.opts.sessionStore.loadItems(threadId)
+    const userText = items.find((item) => item.kind === 'user_message')?.text ?? ''
+    if (!userText.trim()) return
+    const assistantText = items.find((item) => item.kind === 'assistant_text')?.text
+
+    const resolved = resolveRoleModel({
+      roleModel: this.opts.roles?.titleModel,
+      roleProviderId: this.opts.roles?.titleProviderId,
+      roles: this.opts.roles,
+      mainModel: thread.model || this.opts.model.model,
+      mainProviderId: thread.providerId
+    })
+    if (!resolved) return
+
+    const title = await generateThreadTitle({
+      threadId,
+      turnId,
+      modelClient: this.opts.model,
+      model: resolved.model,
+      ...(resolved.providerId ? { providerId: resolved.providerId } : {}),
+      userText,
+      ...(assistantText ? { assistantText } : {}),
+      ...(this.opts.roles?.titleReasoningEffort
+        ? { reasoningEffort: this.opts.roles.titleReasoningEffort }
+        : {}),
+      ...(signal ? { abortSignal: signal } : {})
+    })
+    if (!title) return
+
+    // Re-check the title is still upgradeable (no user rename raced us).
+    const latest = await this.opts.threadStore.get(threadId)
+    if (!latest || !canUpgradeThreadTitle(latest)) return
+    // Keep titleAuto:true — the LLM title is still auto-generated, so a later
+    // user rename can still lock it, but we won't re-title (gated by turn count).
+    const updated = touchThread({ ...latest, title, titleAuto: true }, this.opts.nowIso())
+    await this.opts.threadStore.upsert(updated)
+    await this.opts.events.record({
+      kind: 'thread_updated',
+      threadId,
+      title: updated.title,
+      titleAuto: true,
+      status: updated.status
+    })
+  }
+
   private rememberTurnFailure(turnId: string, failure: TurnFailure): void {
     if (!failure.error.trim()) return
     this.turnFailures.set(turnId, failure)
@@ -942,12 +1160,22 @@ export class AgentLoop {
   /**
    * Decide whether to auto-resume the goal after a turn settles (path B).
    *
-   * Only failed, non-plan turns on a still-`active` goal are resumed: a model
-   * step-budget stop or a model/network/tool error left the goal "in
-   * progress" with nothing running (KunAgent/Kun#370). Deliberate stops
-   * (`completed`: the goal-repetition guard or a cost-budget block) and user
-   * interrupts / shutdown (`aborted`) are never relaunched. When the
-   * consecutive no-progress budget is exhausted the goal is moved to
+   * A goal still `active` once the turn ends means the model never marked it
+   * complete or blocked, so the objective is unfinished and nothing is running
+   * (KunAgent/Kun#370). Mirroring codex's idle-relaunch-while-active policy, we
+   * drive a fresh continuation turn — routed through the backoff coordinator —
+   * not only after a `failed` turn (error / step-budget) but also after a
+   * `completed` turn that left the goal active (e.g. the model stopped early or
+   * its output was truncated). Without this, such a clean stop stranded the
+   * goal with the banner still showing "in progress" until the user nudged it.
+   *
+   * Deliberate stops are never relaunched: a plan turn, a user interrupt or
+   * shutdown (`aborted`), and the caps that set `goalResumeSuppressedByTurn`
+   * (cost-budget exhaustion, or a repetition stall that made no real progress
+   * — relaunching those would just re-hit the budget or reproduce the filler).
+   * A repetition stall that *did* make progress first (e.g. edited files, then
+   * trailed off) is not suppressed: it resumes like any other unfinished turn.
+   * When the consecutive no-progress budget is exhausted the goal is moved to
    * `blocked` so the banner reflects reality.
    */
   private async evaluateGoalResume(
@@ -963,11 +1191,12 @@ export class AgentLoop {
     }
     const turn = thread.turns.find((t) => t.id === turnId)
     const wasPlanTurn = turn?.mode === 'plan' || Boolean(turn?.guiPlan)
-    if (finalStatus !== 'failed' || wasPlanTurn) {
+    const deliberateStop = this.goalResumeSuppressedByTurn.has(turnId)
+    if (finalStatus === 'aborted' || wasPlanTurn || deliberateStop) {
       this.goalResume.clear(threadId)
       return
     }
-    const outcome = this.goalResume.noteGoalTurnFailed({
+    const outcome = this.goalResume.noteGoalTurnSettled({
       threadId,
       goalKey: goalResumeKey(threadId, goal),
       madeProgress: this.turnMadeProgress.has(turnId)
@@ -1120,7 +1349,13 @@ export class AgentLoop {
     const planContextStale = isStalePlanContext(candidatePlanContext, thread?.workspace ?? '')
     const activePlanContext = planContextStale ? undefined : candidatePlanContext
     const budgetGate = await this.checkBudgetGate(thread, threadId, turnId)
-    if (budgetGate === 'blocked') return 'stop'
+    if (budgetGate === 'blocked') {
+      // A cost-budget stop is a deliberate cap, not an interrupted goal turn:
+      // suppress goal auto-resume so it isn't relaunched straight back into
+      // the same exhausted budget.
+      this.goalResumeSuppressedByTurn.add(turnId)
+      return 'stop'
+    }
     const loadedItems = await this.opts.sessionStore.loadItems(threadId)
     // Heal (and possibly rewrite) on-disk history once per turn: within a
     // turn the loop only appends well-formed items, and healing's deep
@@ -1180,9 +1415,10 @@ export class AgentLoop {
       workspace: thread?.workspace ?? '',
       modelCapabilities
     })
-    const skillResolution = this.opts.skillRuntime?.resolveTurn({
+    const skillResolution = await this.opts.skillRuntime?.resolveTurn({
       prompt: turn?.prompt ?? '',
-      workspace: thread?.workspace ?? ''
+      workspace: thread?.workspace ?? '',
+      ...(this.opts.blockedSkillIds ? { blockedSkillIds: this.opts.blockedSkillIds } : {})
     }) ?? {
       activeSkillIds: [],
       activations: [],
@@ -1225,6 +1461,9 @@ export class AgentLoop {
       memoryPolicy: { enabled: Boolean(this.opts.memoryStore) },
       delegationPolicy: { enabled: false },
       ...(allowedToolNames ? { allowedToolNames } : {}),
+      ...(this.opts.blockedProviderIds ? { blockedProviderIds: this.opts.blockedProviderIds } : {}),
+      ...(this.opts.blockedToolNames ? { blockedToolNames: this.opts.blockedToolNames } : {}),
+      ...(this.opts.blockedSkillIds ? { blockedSkillIds: this.opts.blockedSkillIds } : {}),
       approvalPolicy,
       sandboxMode,
       abortSignal: signal,
@@ -1286,6 +1525,10 @@ export class AgentLoop {
       toolSpecs.some((tool) => tool.name === CREATE_PLAN_TOOL_NAME)
         ? CREATE_PLAN_TOOL_NAME
         : undefined
+    const suggestVerification =
+      !planTurnActive &&
+      toolSpecs.some((tool) => tool.name === VERIFY_CHANGES_TOOL_NAME) &&
+      turnHasUnverifiedSourceChanges(historyItems, turnId)
     const effectiveToolSpecs = resolvePlanModeToolSpecs(toolSpecs, {
       planTurnActive,
       createPlanSatisfied,
@@ -1328,9 +1571,11 @@ export class AgentLoop {
         tools: effectiveToolSpecs
       }),
       ...memoryInstructions(memories),
+      ...(skillResolution.catalogInstruction ? [skillResolution.catalogInstruction] : []),
       ...skillResolution.instructions,
       ...(userInputDisabled ? [userInputUnavailableInstruction()] : []),
       ...(effectiveToolSpecs.some((tool) => tool.name === 'bash') ? [shellRuntimeInstruction()] : []),
+      ...(suggestVerification ? [verificationSuggestionInstruction()] : []),
       ...(toolCatalogDriftMessage ? [toolCatalogDriftMessage] : [])
     ]
     await this.recordPipelineStage(threadId, turnId, 'input_remembered', {
@@ -1343,7 +1588,15 @@ export class AgentLoop {
       turnId,
       model,
       ...(thread?.providerId?.trim() ? { providerId: thread.providerId.trim() } : {}),
-      systemPrompt: this.opts.prefix.systemPrompt,
+      // Thread-level systemPrompt (primary-agent persona snapshot) is
+      // appended to the runtime base — same augment strategy as child agents
+      // (child-agent-executor) — so the agent keeps kun's tool/safety
+      // conventions and skill catalog instead of losing them to the persona.
+      // Empty/whitespace falls back to the immutable prefix verbatim so
+      // unbound threads keep the prompt-cache fingerprint.
+      systemPrompt: thread?.systemPrompt?.trim()
+        ? `${this.opts.prefix.systemPrompt}\n\n${thread.systemPrompt.trim()}`
+        : this.opts.prefix.systemPrompt,
       ...(planTurnActive ? { modeInstruction: PLAN_MODE_INSTRUCTION } : {}),
       ...(contextInstructions.length ? { contextInstructions } : {}),
       prefix: this.opts.prefix.fewShots,
@@ -1748,11 +2001,48 @@ export class AgentLoop {
           })
           this.lastNoToolTextByTurn.delete(turnId)
           this.goalNoToolRecoveryStepsByTurn.delete(turnId)
+          // A repetition stall on a turn that never made real progress would
+          // just be reproduced by a fresh resume turn, so suppress auto-resume.
+          // But a turn that edited files (etc.) and only then trailed off into
+          // "I'm done" filler IS advancing the goal — the common "stops right
+          // after editing files" case — so let the normal resume path carry it
+          // forward instead of stranding it.
+          if (!this.turnMadeProgress.has(turnId)) {
+            this.goalResumeSuppressedByTurn.add(turnId)
+          }
           return 'stop'
         }
         this.goalNoToolRecoveryStepsByTurn.delete(turnId)
         this.lastNoToolTextByTurn.set(turnId, textAccumulator.value)
         return 'continue'
+      }
+      if (stopReason === 'length') {
+        // The model hit its output-token ceiling and was cut off without a tool
+        // call. Don't report this as a clean completion — surface a warning so
+        // the truncation is visible instead of looking like the model "gave up".
+        const message =
+          'The model reached its maximum output length and the response was truncated. ' +
+          'Raise the model’s max output tokens, or ask it to continue or split the work into smaller steps.'
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message,
+          code: 'output_truncated',
+          severity: 'warning'
+        })
+        await this.opts.turns.applyItem(
+          threadId,
+          makeErrorItem({
+            id: this.opts.ids.next('item_error'),
+            turnId,
+            threadId,
+            message,
+            code: 'output_truncated',
+            severity: 'warning'
+          })
+        )
+        return 'stop'
       }
       return 'stop'
     }
@@ -1949,6 +2239,9 @@ export class AgentLoop {
       memoryPolicy: { enabled: Boolean(this.opts.memoryStore) },
       delegationPolicy: { enabled: false },
       ...(input.allowedToolNames ? { allowedToolNames: input.allowedToolNames } : {}),
+      ...(this.opts.blockedProviderIds ? { blockedProviderIds: this.opts.blockedProviderIds } : {}),
+      ...(this.opts.blockedToolNames ? { blockedToolNames: this.opts.blockedToolNames } : {}),
+      ...(this.opts.blockedSkillIds ? { blockedSkillIds: this.opts.blockedSkillIds } : {}),
       approvalPolicy: input.approvalPolicy,
       sandboxMode: input.sandboxMode,
       abortSignal: input.signal,
@@ -2330,10 +2623,15 @@ export class AgentLoop {
       keepRecent: plan.keepRecent
     })
     if (result.replacedTokens > 0 && this.opts.contextCompaction?.summaryMode === 'model') {
+      const compactionModel = resolveCompactionModel({
+        contextCompaction: this.opts.contextCompaction,
+        fallbackModel: model
+      })
       const modelSummary = await summarizeCompactionWithModel({
         threadId,
         turnId,
-        model,
+        model: compactionModel.model,
+        ...(compactionModel.providerId ? { providerId: compactionModel.providerId } : {}),
         modelClient: this.opts.model,
         prefix: this.opts.prefix,
         contextCompaction: this.opts.contextCompaction,
@@ -2346,7 +2644,7 @@ export class AgentLoop {
             kind: 'usage',
             threadId,
             turnId,
-            model,
+            model: compactionModel.model,
             usage
           })
         },
@@ -2953,7 +3251,7 @@ function autoModelRouteKey(threadId: string, turnId: string): string {
   return `${threadId}:${turnId}`
 }
 
-function memoryInstructions(memories: Array<{ id: string; content: string; scope: string }>): string[] {
+export function memoryInstructions(memories: Array<{ id: string; content: string; scope: string }>): string[] {
   if (memories.length === 0) return []
   return [
     [

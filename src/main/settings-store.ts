@@ -6,6 +6,8 @@ import {
   applyKunRuntimePatch,
   kunSettingsEnvelope,
   DEFAULT_GUI_UPDATE_CHANNEL,
+  DEFAULT_CHECKPOINT_CLEANUP_ENABLED,
+  DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS,
   DEFAULT_CURSOR_SPOTLIGHT_COLOR,
   DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_WRITE_WORKSPACE_ROOT,
@@ -25,7 +27,9 @@ import {
   mergeWriteSettings,
   defaultTerminalSettings,
   mergeTerminalSettings,
+  DEFAULT_UI_FONT_SCALE,
   normalizeAppBehaviorSettings,
+  normalizeCheckpointCleanupSettings,
   normalizeKeyboardShortcuts,
   migrateLegacyAppSettings,
   normalizeAppSettings,
@@ -41,6 +45,12 @@ export type { AppSettingsV1 }
 // legacy-data-migration.ts 在启动期搬迁并留兼容链接;settings 里存的旧
 // 绝对路径也在那里按迁移结果重写,这里只负责“新值”。
 const DEFAULT_WORKSPACE_ROOT = join(homedir(), '.kun', 'default_workspace')
+// 对话会话不绑定项目文件夹,每个新会话在此目录下自动创建时间戳子目录作为工作目录。
+// macOS/Windows 用系统 Documents 文件夹;Linux 没有 Documents 约定,改用 XDG 风格目录。
+const DEFAULT_CONVERSATION_WORKSPACE_ROOT_ABSOLUTE =
+  process.platform === 'linux'
+    ? join(homedir(), '.local', 'share', 'Kun', 'conversations')
+    : join(homedir(), 'Documents', 'Kun')
 const DEFAULT_CLAW_CHANNELS_ROOT = join(homedir(), '.kun', 'claw')
 const DEFAULT_WRITE_WORKSPACE_ROOT_ABSOLUTE = expandHomePath(DEFAULT_WRITE_WORKSPACE_ROOT)
 const SETTINGS_FILE_NAME = 'kun-settings.json'
@@ -77,6 +87,10 @@ function normalizeWorkspaceRoot(raw: string | null | undefined): string {
 
 function normalizeWriteWorkspaceRoot(raw: string | null | undefined): string {
   return expandHomePath(raw) || DEFAULT_WRITE_WORKSPACE_ROOT_ABSOLUTE
+}
+
+function normalizeConversationWorkspaceRoot(raw: string | null | undefined): string {
+  return expandHomePath(raw) || DEFAULT_CONVERSATION_WORKSPACE_ROOT_ABSOLUTE
 }
 
 function sanitizePathSegment(raw: string | null | undefined, fallback: string): string {
@@ -140,6 +154,7 @@ function normalizeStoredSettings(settings: AppSettingsV1): AppSettingsV1 {
   return {
     ...normalized,
     workspaceRoot: normalizeWorkspaceRoot(normalized.workspaceRoot),
+    conversationWorkspaceRoot: normalizeConversationWorkspaceRoot(normalized.conversationWorkspaceRoot),
     write: {
       ...normalized.write,
       defaultWorkspaceRoot: writeDefaultRoot,
@@ -184,6 +199,12 @@ async function ensureWriteWorkspaceRootsExist(settings: AppSettingsV1): Promise<
   }
 }
 
+async function ensureConversationWorkspaceRootExists(settings: AppSettingsV1): Promise<void> {
+  const root = normalizeConversationWorkspaceRoot(settings.conversationWorkspaceRoot)
+  if (!root) return
+  await mkdir(root, { recursive: true })
+}
+
 async function ensureClawChannelWorkspaceRootsExist(settings: AppSettingsV1): Promise<void> {
   for (const channel of settings.claw.channels) {
     const workspaceRoot = normalizeClawChannelWorkspaceRoot(channel)
@@ -201,7 +222,7 @@ const defaultSettings = (): AppSettingsV1 => ({
   version: 1,
   locale: 'en',
   theme: 'system',
-  uiFontScale: 'small',
+  uiFontScale: DEFAULT_UI_FONT_SCALE,
   cursorSpotlight: true,
   cursorSpotlightColor: DEFAULT_CURSOR_SPOTLIGHT_COLOR,
   provider: defaultModelProviderSettings(),
@@ -209,9 +230,14 @@ const defaultSettings = (): AppSettingsV1 => ({
     kun: defaultKunRuntimeSettings()
   },
   workspaceRoot: DEFAULT_WORKSPACE_ROOT,
+  conversationWorkspaceRoot: DEFAULT_CONVERSATION_WORKSPACE_ROOT_ABSOLUTE,
   log: {
     enabled: true,
     retentionDays: DEFAULT_LOG_RETENTION_DAYS
+  },
+  checkpointCleanup: {
+    enabled: DEFAULT_CHECKPOINT_CLEANUP_ENABLED,
+    intervalDays: DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS
   },
   notifications: {
     turnComplete: true
@@ -241,6 +267,10 @@ function buildMergedSettings(parsed: Partial<AppSettingsV1>): AppSettingsV1 {
       mergeKunRuntimeSettings(getKunRuntimeSettings(defaults), migrated.agents?.kun)
     ),
     log: { ...defaults.log, ...migrated.log },
+    checkpointCleanup: normalizeCheckpointCleanupSettings({
+      ...defaults.checkpointCleanup,
+      ...migrated.checkpointCleanup
+    }),
     notifications: { ...defaults.notifications, ...migrated.notifications },
     appBehavior: mergeAppBehaviorSettings(defaults.appBehavior, migrated.appBehavior),
     keyboardShortcuts: normalizeKeyboardShortcuts(migrated.keyboardShortcuts),
@@ -275,6 +305,7 @@ async function loadDefaultSettings(): Promise<AppSettingsV1> {
   const defaults = normalizeStoredSettings(defaultSettings())
   await ensureWorkspaceRootExists(defaults.workspaceRoot)
   await ensureWriteWorkspaceRootsExist(defaults)
+  await ensureConversationWorkspaceRootExists(defaults)
   await ensureClawChannelWorkspaceRootsExist(defaults)
   return defaults
 }
@@ -400,6 +431,7 @@ export class JsonSettingsStore {
     const normalized = normalizeStoredSettings(buildMergedSettings(parsed as Partial<AppSettingsV1>))
     await ensureWorkspaceRootExists(normalized.workspaceRoot)
     await ensureWriteWorkspaceRootsExist(normalized)
+    await ensureConversationWorkspaceRootExists(normalized)
     await ensureClawChannelWorkspaceRootsExist(normalized)
     this.cache = normalized
     if (sourcePath !== this.path) {
@@ -412,6 +444,7 @@ export class JsonSettingsStore {
     const normalized = normalizeStoredSettings(data)
     await ensureWorkspaceRootExists(normalized.workspaceRoot)
     await ensureWriteWorkspaceRootsExist(normalized)
+    await ensureConversationWorkspaceRootExists(normalized)
     await ensureClawChannelWorkspaceRootsExist(normalized)
     this.cache = normalized
     await mkdir(dirname(this.path), { recursive: true })
@@ -426,6 +459,10 @@ export class JsonSettingsStore {
       ...restPatch,
       provider: mergeModelProviderSettings(cur.provider, providerPatch),
       log: { ...cur.log, ...(partial.log ?? {}) },
+      checkpointCleanup: normalizeCheckpointCleanupSettings({
+        ...cur.checkpointCleanup,
+        ...(partial.checkpointCleanup ?? {})
+      }),
       notifications: { ...cur.notifications, ...(partial.notifications ?? {}) },
       appBehavior: mergeAppBehaviorSettings(cur.appBehavior, partial.appBehavior),
       keyboardShortcuts: normalizeKeyboardShortcuts({

@@ -198,6 +198,30 @@ describe('worktree branch checkout — integration with real git', () => {
     })
   })
 
+  it('creates multiple derived worktrees from the same source branch', async () => {
+    const sub = join(repoRoot, 'src', 'components')
+    const worktreeRoot = join(sandbox, 'kun-worktrees')
+    await mkdir(sub, { recursive: true })
+
+    const first = await checkoutGitBranchWorktree(sub, 'main', worktreeRoot)
+    const second = await checkoutGitBranchWorktree(sub, 'main', worktreeRoot)
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (!first.ok || !second.ok) throw new Error('unreachable')
+    expect(first.worktreePath).not.toBe(second.worktreePath)
+    expect(first.currentBranch).toMatch(/^kun\/worktree-[0-9a-f]{6}$/)
+    expect(second.currentBranch).toMatch(/^kun\/worktree-[0-9a-f]{6}$/)
+    expect(first.currentBranch).not.toBe(second.currentBranch)
+
+    const listed = await listGitBranchWorktrees(repoRoot, worktreeRoot)
+    expect(listed.ok).toBe(true)
+    if (!listed.ok) throw new Error('unreachable')
+    expect(listed.worktrees.map((item) => item.path)).toEqual(
+      expect.arrayContaining([first.worktreePath, second.worktreePath])
+    )
+  })
+
   it('creates a derived worktree branch when the selected branch is checked out in the main repo', async () => {
     const sub = join(repoRoot, 'src', 'components')
     const worktreeRoot = join(sandbox, 'kun-worktrees')
@@ -267,5 +291,39 @@ describe('worktree branch checkout — integration with real git', () => {
     expect(afterRemove.ok).toBe(true)
     if (!afterRemove.ok) throw new Error('unreachable')
     expect(afterRemove.worktrees.map((item) => item.path)).not.toContain(result.worktreePath)
+  })
+})
+
+describe('getGitBranches — worktree annotations', () => {
+  it('flags a branch checked out in another worktree and points back to the primary checkout', async () => {
+    // Park `main` in a linked worktree so the main repo and the worktree share
+    // a repository but hold different branches — the scenario that produced the
+    // "'develop' is already used by worktree" error.
+    execFileSync('git', ['-C', repoRoot, 'checkout', '-b', 'feature/parked'], { stdio: 'pipe' })
+    const worktreePath = join(sandbox, 'linked', basename(repoRoot))
+    await mkdir(join(worktreePath, '..'), { recursive: true })
+    execFileSync('git', ['-C', repoRoot, 'worktree', 'add', worktreePath, 'main'], { stdio: 'pipe' })
+    const worktreeReal = await realpath(worktreePath)
+
+    // From the main repo: `main` lives in the linked (non-primary) worktree.
+    const fromMain = await getGitBranches(repoRoot)
+    expect(fromMain.ok).toBe(true)
+    if (!fromMain.ok) throw new Error('unreachable')
+    expect(fromMain.primaryRepositoryRoot).toBe(repoRoot)
+    const mainRow = fromMain.branches.find((b) => b.name === 'main')
+    expect(mainRow?.worktreePath).toBe(worktreeReal)
+    expect(mainRow?.worktreePrimary).toBe(false)
+    // The current branch is never flagged as living elsewhere.
+    expect(fromMain.branches.find((b) => b.name === 'feature/parked')?.worktreePath).toBeUndefined()
+
+    // From the linked worktree: `feature/parked` lives in the primary checkout.
+    const fromWorktree = await getGitBranches(worktreeReal)
+    expect(fromWorktree.ok).toBe(true)
+    if (!fromWorktree.ok) throw new Error('unreachable')
+    expect(fromWorktree.primaryRepositoryRoot).toBe(repoRoot)
+    const parkedRow = fromWorktree.branches.find((b) => b.name === 'feature/parked')
+    expect(parkedRow?.worktreePath).toBe(repoRoot)
+    expect(parkedRow?.worktreePrimary).toBe(true)
+    expect(fromWorktree.branches.find((b) => b.name === 'main')?.worktreePath).toBeUndefined()
   })
 })

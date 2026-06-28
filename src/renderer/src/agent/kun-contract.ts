@@ -16,12 +16,20 @@ export type CoreItemStatus =
 export type CoreThreadSummaryJson = {
   id: string
   title: string
+  /** Whether the title is auto/provisional (see ThreadSchema.titleAuto on the core). */
+  titleAuto?: boolean
+  /** Optional whole-conversation summary produced by the summarize route. */
+  summary?: string
   workspace?: string
   model: string
   mode: string
   status: CoreThreadStatus
   approvalPolicy?: string
   sandboxMode?: string
+  pinned?: boolean
+  providerId?: string
+  agentId?: string
+  systemPrompt?: string
   relation?: 'primary' | 'fork' | 'side'
   parentThreadId?: string
   forkedFromThreadId?: string
@@ -38,6 +46,8 @@ export type CoreThreadSummaryJson = {
 export type CoreThreadJson = CoreThreadSummaryJson & {
   turns?: CoreTurnJson[]
   latestSeq?: number
+  /** Request ids the runtime is still actively awaiting (live ask-user gate). */
+  pendingUserInputIds?: string[]
 }
 
 export type CoreAttachmentMetadataJson = {
@@ -535,6 +545,10 @@ export type CoreRuntimeEventJson = {
 	  changeKind?: 'additive' | 'breaking'
 	  toolNames?: string[]
   status?: string
+  /** thread_created / thread_updated: the thread's (possibly upgraded) title. */
+  title?: string
+  /** thread_created / thread_updated: whether that title is auto/provisional. */
+  titleAuto?: boolean
   stage?:
     | 'setup'
     | 'pre_start'

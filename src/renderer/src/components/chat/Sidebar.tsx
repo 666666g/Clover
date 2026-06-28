@@ -28,6 +28,7 @@ import { ClawAddImDialog } from './SidebarClawDialog'
 import { SidebarMascot } from './AnimatedWorkLogo'
 import { ConnectPhoneSidebarPanel } from './ConnectPhoneView'
 import { SidebarProjectsSection } from './SidebarProjectsSection'
+import { SidebarConversationsSection } from './SidebarConversationsSection'
 import { WorkspaceModeTabs } from './WorkspaceModeTabs'
 import {
   SidebarCommandRow,
@@ -47,6 +48,7 @@ type Props = {
   onThreadSearchChange: (query: string) => void
   onSelectThread: (id: string) => void
   onRenameThread: (id: string, title: string) => Promise<void>
+  onPinThread: (id: string, pinned: boolean) => Promise<void>
   onArchiveThread: (id: string) => Promise<void>
   onDeleteThread: (id: string) => Promise<void>
   onRestoreThread: (id: string) => Promise<void>
@@ -79,6 +81,7 @@ export function Sidebar({
   onThreadSearchChange,
   onSelectThread,
   onRenameThread,
+  onPinThread,
   onArchiveThread,
   onDeleteThread,
   onRestoreThread,
@@ -112,6 +115,7 @@ export function Sidebar({
   }, [])
 
   const workspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const conversationWorkspaceRoot = useChatStore((s) => s.conversationWorkspaceRoot)
   const codeWorkspaceRoots = useChatStore((s) => s.codeWorkspaceRoots)
   const chooseWorkspace = useChatStore((s) => s.chooseWorkspace)
   const deleteWorkspace = useChatStore((s) => s.deleteWorkspace)
@@ -276,6 +280,7 @@ export function Sidebar({
           showArchived={showArchivedThreads}
           workspaceRoot={workspaceRoot}
           workspaceRoots={codeWorkspaceRoots}
+          conversationRoot={conversationWorkspaceRoot}
           busy={busy}
           watchTurnCompletion={watchTurnCompletion}
           unreadThreadIds={unreadThreadIds}
@@ -286,6 +291,7 @@ export function Sidebar({
           onOpenRequirementDraft={onOpenRequirementDraft}
           onSelectThread={onSelectThread}
           onRenameThread={onRenameThread}
+          onPinThread={onPinThread}
           onArchiveThread={onArchiveThread}
           onDeleteThread={onDeleteThread}
           onRestoreThread={onRestoreThread}
@@ -293,6 +299,7 @@ export function Sidebar({
           t={t}
         />
       ) : (
+      <>
       <SidebarProjectsSection
         threads={threads}
         activeView={activeView === 'write' ? 'write' : 'chat'}
@@ -302,6 +309,7 @@ export function Sidebar({
         showArchived={showArchivedThreads}
         workspaceRoot={workspaceRoot}
         workspaceRoots={codeWorkspaceRoots}
+        conversationRoot={conversationWorkspaceRoot}
         busy={busy}
         watchTurnCompletion={watchTurnCompletion}
         unreadThreadIds={unreadThreadIds}
@@ -312,12 +320,28 @@ export function Sidebar({
         onOpenRequirementDraft={onOpenRequirementDraft}
         onSelectThread={onSelectThread}
         onRenameThread={onRenameThread}
+        onPinThread={onPinThread}
         onArchiveThread={onArchiveThread}
         onDeleteThread={onDeleteThread}
         onRestoreThread={onRestoreThread}
         onSearchQueryChange={onThreadSearchChange}
         t={t}
       />
+      <SidebarConversationsSection
+        threads={threads}
+        activeThreadId={activeThreadId}
+        runtimeReady={runtimeReady}
+        conversationRoot={conversationWorkspaceRoot}
+        onNewConversation={onNewConversation}
+        onSelectThread={onSelectThread}
+        onRenameThread={onRenameThread}
+        onPinThread={onPinThread}
+        onArchiveThread={onArchiveThread}
+        onDeleteThread={onDeleteThread}
+        onRestoreThread={onRestoreThread}
+        t={t}
+      />
+      </>
       )}
 
     </SidebarFrame>

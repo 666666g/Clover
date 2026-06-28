@@ -46,7 +46,7 @@ import {
 } from '../../shared/app-settings'
 import { DESKTOP_COMMANDS } from '../../shared/kun-gui-api'
 import { GUI_UPDATE_CHANNELS } from '../../shared/gui-update'
-import { WINDOW_CLOSE_ACTIONS } from '../../shared/app-settings'
+import { WINDOW_CLOSE_ACTIONS, UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX } from '../../shared/app-settings'
 import { KEYBOARD_SHORTCUT_COMMANDS } from '../../shared/keyboard-shortcuts'
 import { WRITE_EXPORT_FORMATS } from '../../shared/write-export'
 import { WRITE_INFOGRAPHIC_MAX_TEXT_CHARS } from '../../shared/write-infographic'
@@ -230,7 +230,10 @@ export const runtimeUploadAttachmentPayloadSchema = z
 
 const localeSchema = z.enum(['en', 'zh'])
 const themeSchema = z.enum(['system', 'light', 'dark'])
-const uiFontScaleSchema = z.enum(['small', 'medium', 'large'])
+const uiFontScaleSchema = z.union([
+  z.number().min(UI_FONT_SCALE_MIN).max(UI_FONT_SCALE_MAX),
+  z.enum(['small', 'medium', 'large'])
+])
 const hexColorSchema = z.string().trim().regex(/^#[0-9a-fA-F]{6}$/)
 const approvalPolicySchema = z.enum(['always', 'on-request', 'untrusted', 'never', 'auto', 'suggest'])
 const sandboxModeSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access', 'external-sandbox'])
@@ -280,6 +283,7 @@ const modelReasoningRequestProtocolSchema = z.enum(MODEL_REASONING_REQUEST_PROTO
 const modelProfilePatchSchema = z.object({
   aliases: z.array(modelIdSchema).max(50).optional(),
   contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
+  maxOutputTokens: z.number().int().positive().max(1_000_000).optional(),
   inputModalities: z.array(modelProviderInputModalitySchema).max(8).optional(),
   outputModalities: z.array(modelProviderInputModalitySchema).max(8).optional(),
   supportsToolCalling: z.boolean().optional(),
@@ -305,6 +309,7 @@ const modelProviderPatchSchema = z.object({
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     endpointFormat: modelEndpointFormatSchema.optional(),
+    kind: z.enum(['http', 'agent-sdk']).optional(),
     // Some third-party aggregators (litellm, oneapi, …) advertise 500+ chat
     // models in a single /v1/models response. The previous 200/50 caps caused
     // settings:set to silently fail with no toast (#397). Raised to leave
@@ -343,6 +348,42 @@ const modelProviderPatchSchema = z.object({
     }).strict().nullable().optional()
   }).strict()).max(50).optional()
 }).strict()
+
+// Subagent profile patch. `.passthrough()` so a field the GUI adds later is
+// preserved through the strict parent instead of being dropped (which would
+// silently lose a configured model/reasoning on round-trip).
+const subagentProfilePatchSchema = z
+  .object({
+    id: z.string().min(1).max(128),
+    enabled: z.boolean(),
+    name: z.string().max(200),
+    description: z.string().max(2000).optional(),
+    color: z.string().max(32).optional(),
+    mode: z.enum(['subagent', 'primary', 'all']),
+    model: z.string().max(256).optional(),
+    providerId: z.string().trim().max(64).optional(),
+    systemPrompt: z.string().max(MAX_BODY_BYTES).optional(),
+    promptPreamble: z.string().max(MAX_BODY_BYTES).optional(),
+    toolPolicy: z.enum(['readOnly', 'inherit']),
+    allowedTools: z.array(z.string().max(128)).max(200).optional(),
+    blockedTools: z.array(z.string().max(128)).max(200).optional(),
+    blockedMcpServers: z.array(z.string().max(128)).max(200).optional(),
+    blockedSkills: z.array(z.string().max(128)).max(200).optional(),
+    reasoningEffort: modelReasoningEffortSchema.optional(),
+    builtin: z.boolean().optional()
+  })
+  .passthrough()
+
+const subagentsPatchSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    maxParallel: z.number().int().nonnegative().max(64).optional(),
+    maxChildRuns: z.number().int().nonnegative().max(10_000).optional(),
+    defaultToolPolicy: z.enum(['readOnly', 'inherit']).optional(),
+    defaultProfile: z.string().max(128).optional(),
+    profiles: z.array(subagentProfilePatchSchema).max(200).optional()
+  })
+  .passthrough()
 
 const kunRuntimePatchSchema = z.object({
   binaryPath: defaultPathSchema,
@@ -391,7 +432,9 @@ const kunRuntimePatchSchema = z.object({
     summaryMode: kunCompactionSummaryModeSchema.optional(),
     summaryTimeoutMs: z.number().int().positive().max(120_000).optional(),
     summaryMaxTokens: z.number().int().positive().max(16_000).optional(),
-    summaryInputMaxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional()
+    summaryInputMaxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional(),
+    summaryModel: optionalModelIdSchema,
+    summaryProviderId: z.string().trim().max(64).optional()
   }).strict().optional(),
   runtimeTuning: z.object({
     streamIdleTimeoutMs: z.number().int().min(0).max(3_600_000).optional(),
@@ -477,12 +520,38 @@ const kunRuntimePatchSchema = z.object({
     modelIdSchema,
     modelProfilePatchSchema.nullable()
   ).optional(),
-  memoryEnabled: z.boolean().optional()
+  memoryEnabled: z.boolean().optional(),
+  // Global small-model slot + per-role internal-LLM model overrides (agents.kun.*).
+  // Title & Summary default to smallModel, then the main conversation model.
+  smallModel: optionalModelIdSchema,
+  smallModelProviderId: z.string().trim().max(64).optional(),
+  titleModel: optionalModelIdSchema,
+  titleProviderId: z.string().trim().max(64).optional(),
+  summaryModel: optionalModelIdSchema,
+  summaryProviderId: z.string().trim().max(64).optional(),
+  codeReviewModel: optionalModelIdSchema,
+  codeReviewProviderId: z.string().trim().max(64).optional(),
+  // Per-role reasoning depth. Default 'off' is omitted by the normalizer.
+  titleReasoningEffort: modelReasoningEffortSchema.optional(),
+  summaryReasoningEffort: modelReasoningEffortSchema.optional(),
+  codeReviewReasoningEffort: modelReasoningEffortSchema.optional(),
+  subagents: subagentsPatchSchema.optional()
 }).strict()
 
 const logPatchSchema = z.object({
   enabled: z.boolean().optional(),
   retentionDays: z.number().int().min(1).max(365).optional()
+}).strict()
+
+const checkpointCleanupPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalDays: z.union([
+    z.literal(1),
+    z.literal(2),
+    z.literal(3),
+    z.literal(5),
+    z.literal(10)
+  ]).optional()
 }).strict()
 
 const notificationsPatchSchema = z.object({
@@ -565,7 +634,7 @@ const writeSettingsPatchSchema = z.object({
 }).strict()
 
 const terminalColorPatchSchema = z.object({
-  colorMode: z.enum(['none', 'custom']).optional(),
+  colorMode: z.enum(['native', 'none', 'custom']).optional(),
   foreground: z.string().max(64).optional(),
   background: z.string().max(64).optional(),
   cursor: z.string().max(64).optional(),
@@ -1308,7 +1377,9 @@ const settingsPatchObjectSchema = z.object({
     kun: kunRuntimePatchSchema.optional()
   }).strict().optional(),
   workspaceRoot: defaultPathSchema,
+  conversationWorkspaceRoot: defaultPathSchema,
   log: logPatchSchema.optional(),
+  checkpointCleanup: checkpointCleanupPatchSchema.optional(),
   notifications: notificationsPatchSchema.optional(),
   appBehavior: appBehaviorPatchSchema.optional(),
   keyboardShortcuts: keyboardShortcutsPatchSchema.optional(),
@@ -1361,6 +1432,11 @@ export const skillListPayloadSchema = z
   .strict()
 
 export const rootPathSchema = trimmedString(MAX_PATH_LENGTH)
+export const localPdfTextTargetPayloadSchema = z
+  .object({
+    path: rootPathSchema
+  })
+  .strict()
 export const deepseekConfigContentSchema = z.string().max(MAX_CONFIG_FILE_BYTES)
 
 export const workspaceRootSchema = trimmedString(MAX_PATH_LENGTH)

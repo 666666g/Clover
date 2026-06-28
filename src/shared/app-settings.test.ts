@@ -51,13 +51,15 @@ function settings(): AppSettingsV1 {
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -811,7 +813,7 @@ describe('legacy Kun defaults migration', () => {
       version: 1,
       locale: 'zh',
       theme: 'dark',
-      uiFontScale: 'small',
+      uiFontScale: 0.82,
       agentProvider: 'deepseek-runtime',
       deepseek: {
         binaryPath: '/usr/local/bin/deepseek',
@@ -852,7 +854,7 @@ describe('legacy Kun defaults migration', () => {
       version: 1,
       locale: 'zh',
       theme: 'dark',
-      uiFontScale: 'small',
+      uiFontScale: 0.82,
       agentProvider: 'deepseek-runtime',
       deepseek: {
         binaryPath: '/usr/local/bin/deepseek',
@@ -985,6 +987,10 @@ describe('legacy Kun defaults migration', () => {
       provider: {
         apiKey: 'sk-default',
         baseUrl: 'https://api.deepseek.com',
+        proxy: {
+          enabled: true,
+          url: 'http://127.0.0.1:7890'
+        },
         providers: [
           ...defaultModelProviderSettings().providers,
           {
@@ -1019,6 +1025,10 @@ describe('legacy Kun defaults migration', () => {
       ])
     )
     expect(migrated.agents.kun.providerId).toBe('custom-provider-2')
+    expect(migrated.provider.proxy).toEqual({
+      enabled: true,
+      url: 'http://127.0.0.1:7890'
+    })
     expect(resolveKunRuntimeSettings(migrated)).toEqual(
       expect.objectContaining({
         apiKey: 'sk-custom',

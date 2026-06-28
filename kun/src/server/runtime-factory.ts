@@ -12,6 +12,7 @@ import { HybridSessionStore, HybridThreadStore } from '../adapters/hybrid/index.
 import { CompatModelClient } from '../adapters/model/compat-model-client.js'
 import { MultiProviderModelClient } from '../adapters/model/multi-provider-model-client.js'
 import { CapabilityRegistry } from '../adapters/tool/capability-registry.js'
+import { createAgentSdkRuntime } from '../runtime/agent-sdk/agent-sdk-runtime-factory.js'
 import { buildGoalLocalTools } from '../adapters/tool/goal-tools.js'
 import { buildTodoLocalTools } from '../adapters/tool/todo-tools.js'
 import { LocalToolHost, buildDefaultLocalTools } from '../adapters/tool/local-tool-host.js'
@@ -28,7 +29,7 @@ import {
   buildVideoGenToolProviders
 } from '../adapters/tool/media-gen-tool-provider.js'
 import { LocalWorkspaceInspector } from '../adapters/workspace/local-workspace-inspector.js'
-import { createImmutablePrefix, setSystemPrompt } from '../cache/immutable-prefix.js'
+import { createImmutablePrefix } from '../cache/immutable-prefix.js'
 import {
   buildRuntimeCapabilityManifest,
   type KunCapabilitiesConfig
@@ -48,6 +49,7 @@ import {
   DEFAULT_STORAGE_CONFIG,
   expandHomePath,
   type QualityConfig,
+  type RolesConfig,
   type RuntimeTuningConfig,
   type ServeProviderConfig,
   type StorageConfig
@@ -105,6 +107,8 @@ export type KunServeRuntimeOptions = {
   models?: ModelConfig
   contextCompaction?: ContextCompactionConfig
   runtime?: RuntimeTuningConfig
+  /** Internal-LLM role model routing (small-model slot + title/summary/codeReview overrides). */
+  roles?: RolesConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
   /** Command hooks from config.json; resolved and wired into tool hosts and the loop. */
@@ -184,13 +188,20 @@ export async function createKunServeRuntime(
   // back to the default client when the id is absent or unknown, so behavior
   // is unchanged for single-provider deployments.
   const providerClients = new Map<string, CompatModelClient>()
+  // Providers whose kind is 'agent-sdk' don't get an HTTP client — their turns
+  // are delegated to the embedded Claude Agent SDK (subscription) instead.
+  const agentSdkProviderIds = new Set<string>()
   for (const [providerId, provider] of Object.entries(options.providers ?? {})) {
     const trimmedId = providerId.trim()
     if (!trimmedId) continue
+    if ((provider.kind ?? 'http') === 'agent-sdk') {
+      agentSdkProviderIds.add(trimmedId)
+      continue
+    }
     providerClients.set(
       trimmedId,
       new CompatModelClient({
-        baseUrl: provider.baseUrl,
+        baseUrl: provider.baseUrl ?? options.baseUrl ?? '',
         apiKey: provider.apiKey,
         modelProxyUrl: provider.modelProxyUrl ?? options.modelProxyUrl,
         endpointFormat: provider.endpointFormat ?? options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
@@ -211,13 +222,6 @@ export async function createKunServeRuntime(
     SkillRuntime.create(options.capabilities?.skills),
     seedUsageCarryover({ threadStore, sessionStore, usageService })
   ])
-  // Fold the available-skills catalog into the stable prefix once per session so
-  // the model knows which skills exist (and where to read them) even when no
-  // trigger fires. Stays byte-stable across turns, preserving prompt-cache reuse.
-  const skillCatalog = skillRuntime.catalogInstruction()
-  if (skillCatalog) {
-    prefix = setSystemPrompt(prefix, `${KUN_SYSTEM_PROMPT}\n\n${skillCatalog}`)
-  }
   const turnService = new TurnService({
     threadStore,
     sessionStore,
@@ -243,7 +247,10 @@ export async function createKunServeRuntime(
     ...(options.models ? { models: options.models } : {}),
     ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
     ...(tokenEconomy ? { tokenEconomy } : {}),
-    ...(options.runtime ? { runtime: options.runtime } : {})
+    ...(options.runtime ? { runtime: options.runtime } : {}),
+    ...(options.roles?.codeReviewReasoningEffort
+      ? { reasoningEffort: options.roles.codeReviewReasoningEffort }
+      : {})
   })
   const webProviders = buildWebToolProviders(options.capabilities?.web)
   const attachmentStore = options.capabilities?.attachments.enabled
@@ -319,6 +326,11 @@ export async function createKunServeRuntime(
           modelCapabilities,
           skillRuntime,
           tokenEconomy,
+          // Persist the child as a hidden `side` thread on the shared stores +
+          // event bus so its session is loadable and streams live in the GUI.
+          sessionStore,
+          threadStore,
+          events,
           ...(options.runtime ? { runtime: options.runtime } : {}),
           ...(memoryStore ? { memoryStore } : {}),
           nowIso
@@ -425,6 +437,38 @@ export async function createKunServeRuntime(
       // ignore duplicate/colliding registration
     }
   })
+  // Subscription engine: only constructed when at least one provider is the
+  // 'agent-sdk' kind. Owns the delegated turn for those providers' threads.
+  // The runtime's own default provider can itself be agent-sdk (the Claude
+  // subscription set as the main model). kun-process signals that via env so we
+  // route default-provider turns to the SDK too, not just per-provider ones.
+  const defaultIsAgentSdk = process.env.KUN_RUNTIME_PROVIDER_KIND === 'agent-sdk'
+  const sdkRuntime =
+    agentSdkProviderIds.size > 0 || defaultIsAgentSdk
+      ? createAgentSdkRuntime({
+          registry,
+          turns: turnService,
+          sessionStore,
+          threadStore,
+          events,
+          ids,
+          prefix,
+          providerConfigs: options.providers ?? {},
+          agentSdkProviderIds,
+          defaultApprovalPolicy: options.approvalPolicy,
+          defaultModel: options.model,
+          defaultIsAgentSdk,
+          defaultToken: options.apiKey,
+          skillRuntime,
+          userInputGate,
+          nowIso,
+          ...(attachmentStore ? { attachmentStore } : {}),
+          ...(memoryStore ? { memoryStore } : {}),
+          ...(process.env.KUN_CLAUDE_BINARY
+            ? { pathToClaudeCodeExecutable: process.env.KUN_CLAUDE_BINARY }
+            : {})
+        })
+      : undefined
   const loop = new AgentLoop({
     threadStore,
     sessionStore,
@@ -432,6 +476,7 @@ export async function createKunServeRuntime(
     userInputGate,
     model: modelClient,
     toolHost,
+    ...(sdkRuntime ? { sdkRuntime } : {}),
     usage: usageService,
     events,
     turns: turnService,
@@ -445,6 +490,7 @@ export async function createKunServeRuntime(
     skillRuntime,
     tokenEconomy,
     contextCompaction: options.contextCompaction,
+    ...(options.roles ? { roles: options.roles } : {}),
     ...(options.runtime?.toolStorm ? { toolStorm: options.runtime.toolStorm } : {}),
     ...(options.runtime?.toolArgumentRepair ? { toolArgumentRepair: options.runtime.toolArgumentRepair } : {}),
     ...(resolvedHooks.length ? { hooks: resolvedHooks } : {}),
@@ -475,6 +521,11 @@ export async function createKunServeRuntime(
     toolHost,
     ...(attachmentStore ? { attachmentStore } : {}),
     ...(memoryStore ? { memoryStore } : {}),
+    ...(delegationRuntime ? { delegationRuntime } : {}),
+    modelClient,
+    defaultModel: options.model,
+    ...(options.roles ? { roles: options.roles } : {}),
+    immutablePrefix: prefix,
     runTurn(threadId, turnId) {
       return loop.runTurn(threadId, turnId)
     },
@@ -629,6 +680,18 @@ export async function startKunServe(
     })
     .catch((error) => {
       console.warn('[kun] orphaned turn reconciliation failed:', error)
+    })
+  // Settle subagent (child-run) records left 'queued'/'running' by the previous
+  // process, so a restart doesn't leave them stuck in-flight forever (#621).
+  void runtime.delegationRuntime
+    ?.reconcileOrphanedChildRuns()
+    .then((count) => {
+      if (count > 0) {
+        console.warn(`[kun] marked ${count} orphaned subagent run(s) as failed after restart`)
+      }
+    })
+    .catch((error) => {
+      console.warn('[kun] orphaned child-run reconciliation failed:', error)
     })
   return {
     ...server,

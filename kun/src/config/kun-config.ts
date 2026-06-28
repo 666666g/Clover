@@ -13,7 +13,8 @@ import {
   KunCapabilitiesConfig,
   ModelInputModality,
   ModelMessagePartSupport,
-  ModelReasoningCapabilityMetadata
+  ModelReasoningCapabilityMetadata,
+  ModelReasoningEffort
 } from '../contracts/capabilities.js'
 import {
   DEFAULT_MODEL_ENDPOINT_FORMAT,
@@ -53,6 +54,7 @@ export const ModelContextProfileConfigSchema = z
   .object({
     aliases: z.array(z.string().min(1)).optional(),
     contextWindowTokens: PositiveInt.optional(),
+    maxOutputTokens: PositiveInt.optional(),
     contextCompaction: ModelContextCompactionProfileConfigSchema.optional(),
     softRatio: PositiveRatio.optional(),
     hardRatio: PositiveRatio.optional(),
@@ -64,7 +66,7 @@ export const ModelContextProfileConfigSchema = z
     messageParts: z.array(ModelMessagePartSupport).optional(),
     reasoning: ModelReasoningCapabilityMetadata.optional(),
     // Per-model wire-format override. Omitted means "inherit the
-    // provider/runtime endpointFormat" — no default coercion here, otherwise
+    // provider/runtime endpointFormat"; no default coercion here, otherwise
     // every model would be pinned to chat_completions.
     endpointFormat: z
       .preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS))
@@ -107,6 +109,8 @@ export const ContextCompactionConfigSchema = z
     summaryTimeoutMs: PositiveInt.optional(),
     summaryMaxTokens: PositiveInt.optional(),
     summaryInputMaxBytes: PositiveInt.optional(),
+    summaryModel: z.string().min(1).optional(),
+    summaryProviderId: z.string().min(1).optional(),
     modelProfiles: z.record(z.string().min(1), ModelContextProfileConfigSchema).optional()
   })
   .strict()
@@ -207,8 +211,16 @@ export const DEFAULT_STORAGE_CONFIG: StorageConfig = {
  */
 export const ServeProviderConfigSchema = z
   .object({
+    /**
+     * Transport kind. `http` (default) routes turns through a CompatModelClient
+     * over `baseUrl`. `agent-sdk` delegates whole turns to the embedded Claude
+     * Agent SDK (Claude Pro/Max subscription billing): `baseUrl` is unused and
+     * `apiKey` carries the CLAUDE_CODE_OAUTH_TOKEN (empty => rely on the host's
+     * existing Claude Code login).
+     */
+    kind: z.enum(['http', 'agent-sdk']).default('http').optional(),
     apiKey: z.string().default(''),
-    baseUrl: z.string().min(1),
+    baseUrl: z.string().min(1).optional(),
     endpointFormat: z
       .preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS))
       .default(DEFAULT_MODEL_ENDPOINT_FORMAT)
@@ -216,6 +228,15 @@ export const ServeProviderConfigSchema = z
     modelProxyUrl: z.string().optional()
   })
   .strict()
+  .superRefine((cfg, ctx) => {
+    if ((cfg.kind ?? 'http') !== 'agent-sdk' && !cfg.baseUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['baseUrl'],
+        message: 'baseUrl is required for http providers'
+      })
+    }
+  })
 export type ServeProviderConfig = z.infer<typeof ServeProviderConfigSchema>
 
 export const KunServeConfigSchema = z
@@ -248,12 +269,39 @@ export const KunServeConfigSchema = z
   })
   .strict()
 
+/**
+ * Internal-LLM role model routing. The global `smallModel` slot is the default
+ * for cheap internal one-shot calls (thread title, whole-session summary). Each
+ * role can override with its own model/provider. Empty/absent => fall back to
+ * smallModel, then the main conversation model. Compaction is intentionally NOT
+ * here: it reuses the main conversation model for prompt-cache reasons and only
+ * exposes its heuristic/model toggle via contextCompaction.summaryMode.
+ */
+export const RolesConfigSchema = z
+  .object({
+    smallModel: z.string().min(1).optional(),
+    smallModelProviderId: z.string().min(1).optional(),
+    titleModel: z.string().min(1).optional(),
+    titleProviderId: z.string().min(1).optional(),
+    summaryModel: z.string().min(1).optional(),
+    summaryProviderId: z.string().min(1).optional(),
+    codeReviewModel: z.string().min(1).optional(),
+    codeReviewProviderId: z.string().min(1).optional(),
+    // Per-role reasoning depth. Default 'off' (the GUI omits it entirely).
+    titleReasoningEffort: ModelReasoningEffort.optional(),
+    summaryReasoningEffort: ModelReasoningEffort.optional(),
+    codeReviewReasoningEffort: ModelReasoningEffort.optional()
+  })
+  .strict()
+export type RolesConfig = z.infer<typeof RolesConfigSchema>
+
 export const KunConfigSchema = z
   .object({
     serve: KunServeConfigSchema.optional(),
     models: ModelConfigSchema.optional(),
     contextCompaction: ContextCompactionConfigSchema.optional(),
     runtime: RuntimeTuningConfigSchema.optional(),
+    roles: RolesConfigSchema.optional(),
     capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG),
     hooks: HooksConfigSchema.optional(),
     quality: QualityConfigSchema.optional()

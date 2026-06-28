@@ -36,13 +36,15 @@ function settings(): AppSettingsV1 {
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -122,6 +124,35 @@ describe('registerAppIpcHandlers', () => {
     const handler = handlers.get('settings:set')
     await expect(handler?.({}, payload)).resolves.toEqual(settings())
     expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('accepts checkpoint cleanup settings patches', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const payload = {
+      checkpointCleanup: {
+        intervalDays: 5
+      }
+    }
+    const handler = handlers.get('settings:set')
+    await expect(handler?.({}, payload)).resolves.toEqual(settings())
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('rejects unsupported checkpoint cleanup intervals', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const handler = handlers.get('settings:set')
+    await expect(
+      handler?.({}, { checkpointCleanup: { intervalDays: 4 } })
+    ).rejects.toThrow(/Invalid payload for settings:set/)
+    expect(applySettingsPatch).not.toHaveBeenCalled()
   })
 
   it('accepts telegram phone connection settings patches', async () => {
@@ -426,5 +457,32 @@ describe('registerAppIpcHandlers', () => {
     expect(webContents.setZoomLevel).toHaveBeenCalledWith(1)
     expect(mainWindow.maximize).toHaveBeenCalledTimes(1)
     expect(mainWindow.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('creates a unique conversation workspace, suffixing on timestamp collision', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const root = mkdtempSync(join(tmpdir(), 'kun-conv-'))
+    try {
+      registerAppIpcHandlers(registerOptions({
+        store: { load: vi.fn(async () => ({ ...settings(), conversationWorkspaceRoot: root })) } as never
+      }))
+
+      const handler = handlers.get('conversation:create-workspace')
+      expect(handler).toBeTypeOf('function')
+
+      const first = await handler?.({}) as { ok: boolean; path: string }
+      const second = await handler?.({}) as { ok: boolean; path: string }
+
+      expect(first.ok).toBe(true)
+      expect(second.ok).toBe(true)
+      // 两次创建即使落在同一秒,目录路径也必须不同,否则会静默共用目录。
+      expect(first.path).not.toBe(second.path)
+      expect(existsSync(first.path)).toBe(true)
+      expect(existsSync(second.path)).toBe(true)
+      expect(first.path.startsWith(root)).toBe(true)
+      expect(second.path.startsWith(root)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

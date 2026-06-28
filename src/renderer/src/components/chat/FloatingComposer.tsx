@@ -24,6 +24,7 @@ import {
   MessageCircleMore,
   Mic,
   Minimize2,
+  Paperclip,
   PauseCircle,
   Pencil,
   Plus,
@@ -44,6 +45,7 @@ import type { AttachmentReference, ChatBlock, ReviewTarget } from '../../agent/t
 import { useChatStore } from '../../store/chat-store'
 import { normalizeWorkspaceRoot } from '../../lib/workspace-path'
 import {
+  composerFileReferenceFromPath,
   filterWorkspaceFileMentionSuggestions,
   formatComposerFileMentionToken,
   getFileMentionAtCursor,
@@ -91,6 +93,10 @@ import {
   FloatingComposerModelPicker,
   type ComposerReasoningEffort
 } from './FloatingComposerModelPicker'
+import { FloatingComposerAgentPicker } from './FloatingComposerAgentPicker'
+import { FloatingComposerUserInputPanel } from './FloatingComposerUserInputPanel'
+import { useComposerUserInput, type PendingUserInputBlock } from './use-composer-user-input'
+import { selectLivePendingUserInput } from './user-input-panel-logic'
 import {
   FloatingComposerQueuedMessages,
   type QueuedComposerMessage
@@ -108,8 +114,8 @@ import type { ComposerChangedFile } from '../../lib/composer-change-summary'
 export type { ComposerFileReference } from '../../lib/composer-file-references'
 export type { ComposerExecutionSettings } from './FloatingComposerExecutionPicker'
 
-const CONTEXT_CAPACITY_RING_SIZE = 18
-const CONTEXT_CAPACITY_RING_STROKE = 2.25
+const CONTEXT_CAPACITY_RING_SIZE = 24
+const CONTEXT_CAPACITY_RING_STROKE = 2.5
 const CONTEXT_CAPACITY_RING_RADIUS = (CONTEXT_CAPACITY_RING_SIZE - CONTEXT_CAPACITY_RING_STROKE) / 2
 const CONTEXT_CAPACITY_RING_CIRCUMFERENCE = 2 * Math.PI * CONTEXT_CAPACITY_RING_RADIUS
 
@@ -117,6 +123,12 @@ function contextCapacityColor(usedRatio: number): string {
   if (usedRatio >= 0.9) return '#d9544e'
   if (usedRatio >= 0.75) return '#d9920f'
   return 'var(--ds-accent)'
+}
+
+function formatContextCapacityChipNumber(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '-'
+  const percent = Math.max(0, Math.min(100, value * 100))
+  return String(Math.round(percent))
 }
 
 type Props = {
@@ -171,6 +183,8 @@ type Props = {
   onPasteClipboardImage?: (options?: { silentNoImage?: boolean }) => void | Promise<void>
   onRemoveAttachment?: (id: string) => void
   onAddFileReference?: (reference: ComposerFileReference) => void
+  onPickFileReferences?: () => void
+  onOpenFileReferencePicker?: () => void
   onRemoveFileReference?: (relativePath: string) => void
   onSend: () => void
   onInterrupt: (options?: { discard?: boolean }) => void
@@ -306,6 +320,10 @@ function imageMimeTypeFromFileName(name: string | undefined): string | undefined
   if (lower.endsWith('.heic')) return 'image/heic'
   if (lower.endsWith('.heif')) return 'image/heif'
   return undefined
+}
+
+function isPdfFile(file: File): boolean {
+  return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
 }
 
 function comparablePath(path: string | undefined): string {
@@ -480,6 +498,8 @@ export function FloatingComposer({
   onPasteClipboardImage,
   onRemoveAttachment,
   onAddFileReference,
+  onPickFileReferences,
+  onOpenFileReferencePicker,
   onRemoveFileReference,
   onSend,
   onInterrupt,
@@ -516,7 +536,21 @@ export function FloatingComposer({
   const clearActiveThreadGoal = useChatStore((s) => s.clearActiveThreadGoal)
   const clawChannels = useChatStore((s) => s.clawChannels)
   const activeClawChannelId = useChatStore((s) => s.activeClawChannelId)
+  const blocks = useChatStore((s) => s.blocks)
+  const resolveUserInput = useChatStore((s) => s.resolveUserInput)
   const compact = variant === 'compact'
+  // The pending ask-user request for the active thread, surfaced as a panel
+  // docked above this composer. Only the main chat composer hosts it: `blocks`
+  // is the active thread's, so a compact side composer would otherwise mirror
+  // it. The timeline bubble remains the record in every surface.
+  const pendingUserInputBlock = useMemo<PendingUserInputBlock | null>(() => {
+    if (compact || route !== 'chat') return null
+    // Only surface a request the live runtime is actively awaiting. A stale
+    // `pending` block rehydrated from a finished thread must not re-prompt the
+    // user (issue #606) — resolving it would hit a dead gate.
+    return selectLivePendingUserInput(blocks)
+  }, [blocks, compact, route])
+  const userInput = useComposerUserInput(pendingUserInputBlock, resolveUserInput)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const speechToTextSettings = useSpeechToTextSettings()
   const dictationInputRef = useRef(input)
@@ -586,6 +620,8 @@ export function FloatingComposer({
     (fileReferenceEnabled && fileReferences.length > 0)
   )
   const canPickAttachment = canCompose && attachmentUploadEnabled && !attachmentUploadBusy
+  const canPickFileReference = canCompose && fileReferenceEnabled && Boolean(effectiveWorkspaceRoot) && Boolean(onOpenFileReferencePicker)
+  const canPickLocalFileReference = canCompose && fileReferenceEnabled && Boolean(onPickFileReferences)
   const showIntentToolbar = !compact && route === 'chat'
   const showComposerMenuButton = showIntentToolbar
   const canTogglePlanMode = canCompose && Boolean(onPlanCommand)
@@ -594,7 +630,7 @@ export function FloatingComposer({
   const canRunReview = canCompose && route !== 'claw' && Boolean(onReviewCommand)
   const canToggleWorktreeMode = canCompose && route !== 'claw' && Boolean(onToggleWorktreeMode)
   const canOpenComposerMenu = showComposerMenuButton
-    && (canTogglePlanMode || canCreateNewThread || canOpenGoalPanel || canRunReview || canToggleWorktreeMode)
+    && (canPickFileReference || canPickLocalFileReference || canTogglePlanMode || canCreateNewThread || canOpenGoalPanel || canRunReview || canToggleWorktreeMode)
   const showToolbarStartControls = showComposerMenuButton
   const showExecutionSettingsPicker = showIntentToolbar
     && Boolean(executionSettings)
@@ -652,26 +688,19 @@ export function FloatingComposer({
     typeof runtimeSkillCount === 'number' ? runtimeSkillCount : lastKnownSkillCountRef.current
   const canShowContextCapacity =
     !compact && route === 'chat' && Boolean(activeThreadId) && effectiveContextWindow > 0
-  // Freeze the measured total for the duration of a turn: the runtime can emit
-  // several `usage` events while streaming, and tracking them live makes the
-  // chip jitter (visible flicker). Adopt the latest value only while idle.
   const liveMeasuredTotal =
     lastTurnUsage && lastTurnUsage.threadId === activeThreadId
       ? lastTurnUsage.snapshot.inputTokens
       : null
-  const measuredTotalRef = useRef<number | null>(null)
-  if (!busy) measuredTotalRef.current = liveMeasuredTotal
-  const measuredContextTotal = busy ? measuredTotalRef.current : liveMeasuredTotal
+  const measuredContextTotal = liveMeasuredTotal
   // The message estimate feeds the per-category split (popover), the
   // no-measured-total fallback, AND the sanity check that rejects an inflated
   // measured total (some providers over-report prompt_tokens — see
-  // buildContextCapacity). We therefore need it whenever the gauge is idle, not
-  // just when the popover is open. Never subscribe to `blocks` while streaming
-  // with the popover closed — blocks churn on every delta and re-render the
-  // whole composer; the frozen ref is good enough for that transient window.
-  const needMessageEstimate =
-    canShowContextCapacity && (contextCapacityOpen || measuredContextTotal == null || !busy)
-  const subscribeContextBlocks = needMessageEstimate && (contextCapacityOpen || !busy)
+  // buildContextCapacity). We therefore keep it live whenever the gauge can render, not
+  // just when the popover is open. Subscribe while streaming too so the context
+  // usage ring reflects the assistant reply as it becomes future context.
+  const needMessageEstimate = canShowContextCapacity
+  const subscribeContextBlocks = needMessageEstimate
   const contextBlocks = useChatStore((s) => (subscribeContextBlocks ? s.blocks : EMPTY_CONTEXT_BLOCKS))
   const conversationTokensRef = useRef(0)
   const conversationTokens = useMemo(() => {
@@ -724,6 +753,8 @@ export function FloatingComposer({
   const goalRuntimeStartedAtRef = useRef<number | null>(null)
   const placeholder = !runtimeReady
     ? t('runtimeActionNeedsConnection')
+    : pendingUserInputBlock
+      ? t('userInputComposerPlaceholder')
     : !hasActiveThread && !effectiveWorkspaceRoot
       ? t('workspaceRequiredToCreateThread')
       : goalPanelOpen && route !== 'claw'
@@ -1247,6 +1278,20 @@ export function FloatingComposer({
     draft.focusComposer()
   }
 
+  const handleFileReferenceMenuClick = (): void => {
+    if (!canPickFileReference) return
+    setComposerMenuOpen(false)
+    onOpenFileReferencePicker?.()
+    draft.focusComposer()
+  }
+
+  const handleLocalFileReferenceMenuClick = (): void => {
+    if (!canPickLocalFileReference) return
+    setComposerMenuOpen(false)
+    onPickFileReferences?.()
+    draft.focusComposer()
+  }
+
   const handlePlanToolbarClick = (): void => {
     if (!canTogglePlanMode) return
     setComposerMenuOpen(false)
@@ -1314,6 +1359,21 @@ export function FloatingComposer({
   }
 
   const handlePrimaryAction = (): void => {
+    // While an ask-user request is pending, a plain text reply answers the
+    // current question instead of being sent/queued as a chat message. Routing
+    // through resolveUserInput (not onSend) bypasses the busy-turn queue. Slash
+    // commands (input starting with "/") fall through so they stay escape
+    // hatches; an empty composer is a no-op (chips still work via the panel).
+    if (userInput.active) {
+      const trimmed = input.trim()
+      if (!trimmed.startsWith('/')) {
+        if (trimmed && userInput.submitTypedText(input)) {
+          setInput('')
+          draft.focusComposer()
+        }
+        return
+      }
+    }
     if (highlightedSlashCommand) {
       if (highlightedSlashCommand.disabled) return
       applySlashCommand(highlightedSlashCommand.id)
@@ -1372,6 +1432,14 @@ export function FloatingComposer({
         return
       }
     }
+    // Trailing fallback for a pending ask: text that began with "/" but matched
+    // no real command (e.g. a free-form answer like "/usr/local/bin") still
+    // answers the current question instead of leaking into chat via onSend.
+    if (userInput.active && input.trim() && userInput.submitTypedText(input)) {
+      setInput('')
+      draft.focusComposer()
+      return
+    }
     onSend()
   }
   dictationPrimaryActionRef.current = primaryActionDisabled ? null : handlePrimaryAction
@@ -1425,6 +1493,15 @@ export function FloatingComposer({
         setInput('')
         return
       }
+    }
+
+    // Esc cancels a pending ask-user request. (Option picking is click-only:
+    // a bare-digit accelerator would hijack the first character of a
+    // digit-leading custom answer, which the type-to-answer design must allow.)
+    if (!composing && userInput.active && event.key === 'Escape') {
+      event.preventDefault()
+      userInput.cancel()
+      return
     }
 
     if (!sendByEnter || composing) return
@@ -1489,32 +1566,10 @@ export function FloatingComposer({
   const handleComposerDragOver = (event: ReactDragEvent<HTMLDivElement>): void => {
     const dataTransferTypes = Array.from(event.dataTransfer.types ?? [])
     const canAcceptImages = canPickAttachment && imageTransferHasImages(event.dataTransfer)
-    if (!dataTransferTypes.includes('Files') && !canAcceptImages) return
+    const canAcceptPdf = canPickAttachment && Array.from(event.dataTransfer.files ?? []).some(isPdfFile)
+    if (!dataTransferTypes.includes('Files') && !canAcceptImages && !canAcceptPdf) return
     event.preventDefault()
     event.dataTransfer.dropEffect = 'copy'
-  }
-
-  const insertTextAtComposerCursor = (text: string): void => {
-    if (!text) return
-    const textarea = draft.textareaRef.current
-    const currentValue = input
-    const selectionStart = textarea?.selectionStart ?? composerCursor ?? currentValue.length
-    const selectionEnd = textarea?.selectionEnd ?? selectionStart
-    const before = currentValue.slice(0, selectionStart)
-    const after = currentValue.slice(selectionEnd)
-    const leadingPad = before.length > 0 && !/\s$/.test(before) ? ' ' : ''
-    const trailingPad = after.length > 0 && !/^\s/.test(after) ? ' ' : ''
-    const insertion = `${leadingPad}${text}${trailingPad}`
-    const nextInput = `${before}${insertion}${after}`
-    const nextCursor = before.length + insertion.length - trailingPad.length
-    setInput(nextInput)
-    window.requestAnimationFrame(() => {
-      const el = draft.textareaRef.current
-      if (!el) return
-      el.focus()
-      el.setSelectionRange(nextCursor, nextCursor)
-      setComposerCursor(nextCursor)
-    })
   }
 
   const handleComposerDrop = (event: ReactDragEvent<HTMLDivElement>): void => {
@@ -1522,11 +1577,14 @@ export function FloatingComposer({
     const rawFiles = Array.from(event.dataTransfer.files ?? [])
     const isImageLike = (file: File): boolean =>
       isImageMimeType(file.type) || Boolean(imageMimeTypeFromFileName(file.name))
-    const pathFiles = rawFiles.filter((file) => !isImageLike(file))
-    if (imageFiles.length === 0 && pathFiles.length === 0) return
+    const pdfFiles = canPickAttachment ? rawFiles.filter(isPdfFile) : []
+    const pathFiles = canPickLocalFileReference && onAddFileReference
+      ? rawFiles.filter((file) => !isImageLike(file) && !isPdfFile(file))
+      : []
+    if (imageFiles.length === 0 && pdfFiles.length === 0 && pathFiles.length === 0) return
     event.preventDefault()
-    if (imageFiles.length > 0 && onPickAttachments) {
-      onPickAttachments(imageFiles)
+    if ((imageFiles.length > 0 || pdfFiles.length > 0) && onPickAttachments) {
+      onPickAttachments([...imageFiles, ...pdfFiles])
     }
     if (pathFiles.length > 0) {
       const paths: string[] = []
@@ -1538,7 +1596,9 @@ export function FloatingComposer({
           // ignore files we cannot resolve a filesystem path for
         }
       }
-      if (paths.length > 0) insertTextAtComposerCursor(paths.join(' '))
+      for (const path of paths) {
+        onAddFileReference?.(composerFileReferenceFromPath(path, effectiveWorkspaceRoot))
+      }
     }
     draft.focusComposer()
   }
@@ -1556,9 +1616,9 @@ export function FloatingComposer({
       />
 
       <div className="relative">
-        {showGoalFloater && activeThreadGoal ? (
+        {showGoalFloater && activeThreadGoal && !pendingUserInputBlock ? (
           <div className="pointer-events-none absolute inset-x-3 bottom-full z-20 mb-2 flex justify-center">
-            <div className="pointer-events-auto flex min-h-11 w-full max-w-[46rem] items-center gap-2 rounded-full border border-ds-border bg-ds-card/95 px-3 py-1.5 text-ds-muted shadow-[0_12px_34px_rgba(20,47,95,0.10)] backdrop-blur-xl dark:bg-ds-card/90">
+            <div className="pointer-events-auto flex min-h-11 w-full max-w-[46rem] items-center gap-2 rounded-full border border-ds-border bg-white px-3 py-1.5 text-ds-muted shadow-[0_12px_34px_rgba(20,47,95,0.10)] backdrop-blur-xl dark:bg-ds-card">
               <Target className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.9} />
               <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[13px] leading-5">
                 <span className="shrink-0 font-semibold text-ds-ink">
@@ -1620,8 +1680,31 @@ export function FloatingComposer({
             ref={composerMenuPanelRef}
             className="absolute bottom-12 left-1 z-40 w-48 overflow-hidden rounded-[18px] border border-ds-border bg-white py-1.5 text-[13px] text-ds-muted shadow-[0_18px_48px_rgba(20,47,95,0.16)] dark:bg-ds-card"
           >
+            {fileReferenceEnabled ? (
+              <button
+                type="button"
+                disabled={!canPickLocalFileReference}
+                onClick={handleLocalFileReferenceMenuClick}
+                className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
+              >
+                <FileText className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+                <span className="min-w-0 flex-1 truncate">{t('composerAddLocalFiles')}</span>
+              </button>
+            ) : null}
+            {fileReferenceEnabled ? (
+              <button
+                type="button"
+                disabled={!canPickFileReference}
+                onClick={handleFileReferenceMenuClick}
+                className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
+              >
+                <Paperclip className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+                <span className="min-w-0 flex-1 truncate">{t('composerBrowseWorkspaceFiles')}</span>
+              </button>
+            ) : null}
             {attachmentUploadEnabled ? (
               <>
+                {fileReferenceEnabled ? <div className="my-1 h-px bg-ds-border-muted/70" /> : null}
                 <button
                   type="button"
                   disabled={!canPickAttachment || !onPickAttachments}
@@ -1838,10 +1921,10 @@ export function FloatingComposer({
           </div>
         ) : null}
 
-        {goalPanelOpen && slashQuery == null ? (
+        {goalPanelOpen && slashQuery == null && !pendingUserInputBlock ? (
           <div
             ref={goalPanelRef}
-            className="absolute inset-x-2 bottom-full z-30 mb-3 overflow-hidden rounded-[26px] border border-ds-border bg-ds-card/95 p-3 shadow-[0_18px_52px_rgba(20,47,95,0.14)] backdrop-blur-xl dark:bg-ds-card/90"
+            className="absolute inset-x-2 bottom-full z-30 mb-3 overflow-hidden rounded-[26px] border border-ds-border bg-white p-3 shadow-[0_18px_52px_rgba(20,47,95,0.14)] backdrop-blur-xl dark:bg-ds-card"
           >
             <div className="flex items-start gap-3">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-ds-border-muted text-ds-muted">
@@ -1924,6 +2007,10 @@ export function FloatingComposer({
           </div>
         ) : null}
 
+        {userInput.active ? (
+          <FloatingComposerUserInputPanel controller={userInput} t={t} />
+        ) : null}
+
         <div
           className={`ds-composer-shell ds-chat-composer ds-frosted ds-no-drag flex flex-col gap-1 px-3 pb-2 pt-2 transition ${
             draft.focused ? 'ds-chat-composer-focus' : ''
@@ -1934,7 +2021,7 @@ export function FloatingComposer({
           onDrop={handleComposerDrop}
         >
           {showChangeSummary ? (
-            <div className="ds-no-drag mb-1 rounded-2xl border border-ds-border-muted bg-ds-card/78 px-3 py-2 shadow-sm">
+            <div className="ds-no-drag mb-1 rounded-2xl border border-ds-border-muted bg-ds-card px-3 py-2 shadow-sm">
               <div className="flex min-w-0 items-center gap-2">
                 <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-ds-hover text-ds-muted">
                   <FileEdit className="h-4 w-4" strokeWidth={1.8} />
@@ -2016,7 +2103,7 @@ export function FloatingComposer({
                 return (
                   <span
                     key={`${reference.type ?? 'file'}:${reference.relativePath}`}
-                    className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/80 px-2 text-[12px] font-medium text-ds-muted"
+                    className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card px-2 text-[12px] font-medium text-ds-muted"
                     title={displayPath}
                   >
                     {isDirectory ? (
@@ -2053,11 +2140,20 @@ export function FloatingComposer({
                 ) : (
                   <span
                     key={attachment.id}
-                    className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/80 px-2 text-[12px] font-medium text-ds-muted"
-                    title={attachment.id}
+                    className="ds-no-drag inline-flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card px-2 text-[12px] font-medium text-ds-muted"
+                    title={attachment.name || attachment.id}
                   >
-                    <ImagePlus className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
+                    {attachment.kind === 'document' ? (
+                      <FileText className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
+                    ) : (
+                      <ImagePlus className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.8} />
+                    )}
                     <span className="max-w-40 truncate">{attachment.name || attachment.id}</span>
+                    {attachment.kind === 'document' && attachment.pageCount ? (
+                      <span className="shrink-0 text-[11px] text-ds-faint">
+                        {attachment.pageCount}p{attachment.truncated ? '+' : ''}
+                      </span>
+                    ) : null}
                     {onRemoveAttachment ? (
                       <button
                         type="button"
@@ -2083,7 +2179,7 @@ export function FloatingComposer({
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/png,image/jpeg,image/webp"
+              accept="image/png,image/jpeg,image/webp,application/pdf,.pdf"
               multiple
               className="hidden"
               onChange={handleAttachmentInput}
@@ -2185,7 +2281,7 @@ export function FloatingComposer({
                   <button
                     type="button"
                     onClick={() => setContextCapacityOpen((open) => !open)}
-                    className="ds-composer-context ds-no-drag inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border border-ds-border-muted bg-ds-card/70 px-2.5 text-[12.5px] font-medium text-ds-muted transition hover:bg-ds-hover"
+                    className="ds-composer-context ds-no-drag relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-ds-border-muted bg-ds-card p-0 text-[9px] font-semibold leading-none text-ds-muted transition hover:bg-ds-hover"
                     aria-label={t('contextCapacityChipAria', {
                       percent: formatPercent(contextCapacity.usedRatio)
                     })}
@@ -2193,7 +2289,7 @@ export function FloatingComposer({
                     title={t('contextCapacityTitle')}
                   >
                     <svg
-                      className="h-[18px] w-[18px] -rotate-90 shrink-0"
+                      className="h-6 w-6 -rotate-90 shrink-0"
                       viewBox={`0 0 ${CONTEXT_CAPACITY_RING_SIZE} ${CONTEXT_CAPACITY_RING_SIZE}`}
                       aria-hidden="true"
                     >
@@ -2220,8 +2316,8 @@ export function FloatingComposer({
                         }
                       />
                     </svg>
-                    <span className="shrink-0 tabular-nums">
-                      {formatPercent(contextCapacity.usedRatio)}
+                    <span className="pointer-events-none absolute inset-0 flex items-center justify-center tabular-nums">
+                      {formatContextCapacityChipNumber(contextCapacity.usedRatio)}
                     </span>
                   </button>
                   {contextCapacityOpen ? (
@@ -2247,6 +2343,9 @@ export function FloatingComposer({
                   onComposerReasoningEffortChange={onComposerReasoningEffortChange}
                   onConfigureProviders={onConfigureProviders}
                 />
+              )}
+              {hideModelPicker ? null : (
+                <FloatingComposerAgentPicker compact={compact} disabled={!canChangeModel} />
               )}
               {showVoiceDictation ? (
                 <button
@@ -2311,7 +2410,7 @@ export function FloatingComposer({
             ) : null}
             <GitBranchPicker workspaceRoot={effectiveWorkspaceRoot} />
             {useWorktreePool && worktreeBranches.length > 0 ? (
-              <label className="ds-no-drag inline-flex min-h-7 max-w-[220px] items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card/72 px-2 py-0.5 text-[12.5px] font-medium text-ds-muted shadow-sm">
+              <label className="ds-no-drag inline-flex min-h-7 max-w-[220px] items-center gap-1.5 rounded-lg border border-ds-border-muted bg-ds-card px-2 py-0.5 text-[12.5px] font-medium text-ds-muted shadow-sm">
                 <GitBranch className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
                 <select
                   value={worktreeBranch || worktreeBranches[0]}
@@ -2329,7 +2428,7 @@ export function FloatingComposer({
             ) : null}
             {showThreadUsageFooter ? (
               <div
-                className="ds-composer-usage ds-no-drag inline-flex min-h-7 max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 overflow-visible rounded-lg border border-ds-border-muted bg-ds-card/72 px-2.5 py-0.5 text-[12.5px] font-medium leading-5 text-ds-muted shadow-sm"
+                className="ds-composer-usage ds-no-drag inline-flex min-h-7 max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 overflow-visible rounded-lg border border-ds-border-muted bg-ds-card px-2.5 py-0.5 text-[12.5px] font-medium leading-5 text-ds-muted shadow-sm"
                 title={
                   threadUsage
                     ? t(

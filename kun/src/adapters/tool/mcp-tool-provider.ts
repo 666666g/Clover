@@ -271,7 +271,7 @@ export async function buildMcpToolProviders(
           throw error
         }
       },
-      isServerTrusted: isMcpServerTrusted
+      isServerAvailable: canUseMcpServer
     }))
   } else {
     providers.push(...directProviders)
@@ -437,8 +437,21 @@ export function normalizeMcpToolName(serverId: string, toolName: string): string
 
 export function isMcpServerTrusted(server: McpServerConfig, workspace: string): boolean {
   if (server.trustScope === 'user') return true
+  return workspaceMatchesRoots(workspace, server.trustedWorkspaceRoots)
+}
+
+export function isMcpServerVisible(server: McpServerConfig, workspace: string): boolean {
+  if (server.workspaceRoots.length === 0) return true
+  return workspaceMatchesRoots(workspace, server.workspaceRoots)
+}
+
+export function canUseMcpServer(server: McpServerConfig, workspace: string): boolean {
+  return isMcpServerVisible(server, workspace) && isMcpServerTrusted(server, workspace)
+}
+
+function workspaceMatchesRoots(workspace: string, roots: readonly string[]): boolean {
   const normalizedWorkspace = normalizePathForTrust(workspace)
-  return server.trustedWorkspaceRoots.some((root) => {
+  return roots.some((root) => {
     const normalizedRoot = normalizePathForTrust(root)
     return normalizedWorkspace === normalizedRoot || normalizedWorkspace.startsWith(`${normalizedRoot}/`)
   })
@@ -463,13 +476,16 @@ async function createSdkMcpClient(serverId: string, server: McpServerConfig): Pr
 
 function createTransport(server: McpServerConfig): Transport {
   switch (server.transport) {
-    case 'stdio':
+    case 'stdio': {
+      const cwd = resolveMcpServerCwd(server)
       return new StdioClientTransport({
         command: server.command ?? '',
         args: server.args,
         env: buildMcpStdioEnvironment(server.env),
+        ...(cwd ? { cwd } : {}),
         stderr: 'pipe'
       })
+    }
     case 'streamable-http':
       return new StreamableHTTPClientTransport(new URL(server.url ?? ''), {
         requestInit: { headers: server.headers }
@@ -480,6 +496,14 @@ function createTransport(server: McpServerConfig): Transport {
         eventSourceInit: { fetch: fetchWithHeaders(server.headers) }
       })
   }
+}
+
+export function resolveMcpServerCwd(server: McpServerConfig): string | undefined {
+  if (server.transport !== 'stdio') return undefined
+  const configured = server.cwd?.trim()
+  if (configured) return configured
+  if (server.trustScope !== 'workspace') return undefined
+  return server.trustedWorkspaceRoots.map((root) => root.trim()).find(Boolean)
 }
 
 function fetchWithHeaders(headers: Record<string, string>): typeof fetch {
@@ -501,8 +525,14 @@ function createMcpLocalTool(
     description: descriptor.description ?? `MCP tool ${descriptor.name} from ${state.serverId}`,
     inputSchema: descriptor.inputSchema ?? { type: 'object' },
     policy: policyFromAnnotations(descriptor.annotations),
-    shouldAdvertise: (context: ToolHostContext) => isMcpServerTrusted(state.server, context.workspace),
+    shouldAdvertise: (context: ToolHostContext) => canUseMcpServer(state.server, context.workspace),
     execute: async (args, context) => {
+      if (!isMcpServerVisible(state.server, context.workspace)) {
+        return {
+          output: { error: `MCP server ${state.serverId} is not enabled for this workspace` },
+          isError: true
+        }
+      }
       if (!isMcpServerTrusted(state.server, context.workspace)) {
         return {
           output: { error: `MCP server ${state.serverId} is not trusted for this workspace` },

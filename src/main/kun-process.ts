@@ -16,6 +16,7 @@ import {
   type ModelProviderModelProfileV1,
   type ModelProviderProfileV1,
   type KunRuntimeSettingsV1,
+  type KunSubagentsSettingsV1,
   type AppSettingsV1
 } from '../shared/app-settings'
 import {
@@ -28,7 +29,8 @@ import {
   ModelConfigSchema,
   ContextCompactionConfigSchema,
   QualityConfigSchema,
-  RuntimeTuningConfigSchema
+  RuntimeTuningConfigSchema,
+  RolesConfigSchema
 } from '../../kun/src/config/kun-config.js'
 import { HooksConfigSchema } from '../../kun/src/hooks/hook-config.js'
 import {
@@ -54,15 +56,19 @@ import {
 } from './claw-schedule-mcp-config'
 import { defaultKunDataDir } from './runtime/kun-adapter'
 import { isKunHealthResponseBody } from './kun-health'
+import { resolveClaudeBinary } from './agent-sdk-installer'
 import { appendManagedLogLine } from './logger'
 import {
   comparableSkillRootPath,
   guiSkillManagedComparablePaths,
+  guiSkillWorkspaceRootsForRuntime,
   guiSkillRootsForRuntime,
+  isCodexPluginCacheRoot,
   normalizeSkillRootPath
 } from './services/skill-service'
 
 let child: ChildProcess | null = null
+let childPort: number | null = null
 let childLogCapture: KunChildLogCapture | null = null
 let lastResolvedBinary: string | null = null
 let kunStartPromise: Promise<void> | null = null
@@ -93,10 +99,45 @@ export function setKunUnexpectedExitHandler(
 
 const execFileAsync = promisify(execFile)
 const KUN_READY_PREFIX = 'KUN_READY '
-// Cold starts on slow disks (Windows + antivirus scans, sqlite rebuilds,
-// MCP server connects) routinely exceed 15s; killing kun that early left
-// fresh installs permanently "unable to connect" (#188).
-const KUN_STARTUP_TIMEOUT_MS = 45_000
+const KUN_STARTUP_TIMEOUT_FLOOR_MS = 15_000
+const KUN_STARTUP_TIMEOUT_CEILING_MS = 600_000
+
+/**
+ * How long to wait for a freshly spawned kun to report ready before giving
+ * up and killing it. kun emits its ready marker only after the HTTP server
+ * is actually listening, which it does only after sqlite opens, the thread
+ * store finishes its backfill, usage carryover replays every thread's
+ * events, and the MCP fast-connect race runs. On a slow disk (Windows +
+ * antivirus scans) with a large history this routinely exceeds 45s, leaving
+ * the runtime stuck in a "did not report ready within 45000ms" → SIGTERM →
+ * respawn loop (#188, #544).
+ *
+ * A generous ceiling is free on fast machines: the parallel /health probe
+ * in waitForKunStartup settles the moment the server responds, and a process
+ * that actually crashes rejects immediately via its exit event rather than
+ * waiting out the timeout. Only a slow-but-progressing boot uses the extra
+ * runway. Windows gets the larger default; everything is overridable via the
+ * KUN_STARTUP_TIMEOUT_MS env var (milliseconds, clamped to 15s–10min) for
+ * extreme cases without a rebuild.
+ */
+export function resolveKunStartupTimeoutMs(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv
+): number {
+  const raw = env.KUN_STARTUP_TIMEOUT_MS
+  if (raw && raw.trim()) {
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed)) {
+      return Math.min(
+        KUN_STARTUP_TIMEOUT_CEILING_MS,
+        Math.max(KUN_STARTUP_TIMEOUT_FLOOR_MS, Math.floor(parsed))
+      )
+    }
+  }
+  return platform === 'win32' ? 90_000 : 60_000
+}
+
+const KUN_STARTUP_TIMEOUT_MS = resolveKunStartupTimeoutMs(process.platform, process.env)
 const KUN_STARTUP_HEALTH_POLL_MS = 500
 const KUN_STARTUP_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const KUN_STOP_GRACE_MS = 5_000
@@ -260,6 +301,21 @@ function isCurrentKunChildPid(pid: number): boolean {
   return Boolean(child?.pid === pid && isKunChildRunning())
 }
 
+/**
+ * Resolve once any in-flight kun launch has settled — whether it became
+ * ready or failed. The settings/MCP-apply paths use this to avoid
+ * SIGTERM-ing a child that is still inside its (deliberately generous)
+ * startup window: interrupting a slow-but-healthy boot only restarts the
+ * clock and is what turns one slow start into the #544 restart storm.
+ *
+ * Deadlock-safe by construction: `kunStartPromise` is only set once a launch
+ * has already passed the settings-apply gate, so an apply that awaits it can
+ * never be the thing that launch is itself waiting on.
+ */
+export function waitForKunStartupSettled(): Promise<void> {
+  return kunStartPromise ? kunStartPromise.catch(() => undefined) : Promise.resolve()
+}
+
 export function startKunChild(settings: AppSettingsV1): Promise<void> {
   if (kunStartPromise) return kunStartPromise
   const runtime = resolveKunRuntimeSettings(settings)
@@ -325,10 +381,22 @@ async function startKunChildOnce(
   // when the user actually opted into host control.
   const runAsElectron = process.platform === 'darwin' && runtime.computerUse?.enabled === true
   const command = runAsElectron ? resolution.command : resolveNodeScriptCommand(resolution.command)
+  // When the runtime's own (default) provider is the Claude subscription, tell
+  // the runtime so its dispatch routes default-provider turns (thread.providerId
+  // absent or equal to it) to the embedded SDK instead of the HTTP default.
+  const activeProviderKind = (getModelProviderSettings(settings).providers as ModelProviderProfileV1[]).find(
+    (provider) => provider.id?.trim() === getKunRuntimeSettings(settings).providerId.trim()
+  )?.kind
+  // Point the runtime at the on-demand Claude Code binary (the ~222MB binary is
+  // not bundled; it's downloaded into userData). Absent in dev when it's still
+  // resolvable from kun/node_modules — the SDK auto-resolves it there.
+  const claudeBinary = resolveClaudeBinary(app.getPath('userData'), [join(appRoot(), 'kun')])
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     KUN_RUNTIME_TOKEN: runtime.runtimeToken,
-    DEEPSEEK_API_KEY: runtime.apiKey || process.env.DEEPSEEK_API_KEY || ''
+    DEEPSEEK_API_KEY: runtime.apiKey || process.env.DEEPSEEK_API_KEY || '',
+    ...(activeProviderKind === 'agent-sdk' ? { KUN_RUNTIME_PROVIDER_KIND: 'agent-sdk' } : {}),
+    ...(claudeBinary ? { KUN_CLAUDE_BINARY: claudeBinary } : {})
   }
   if (!runAsElectron) childEnv.ELECTRON_RUN_AS_NODE = '1'
   else delete childEnv.ELECTRON_RUN_AS_NODE
@@ -338,6 +406,7 @@ async function startKunChildOnce(
     detached: false
   })
   const startedChild = child
+  childPort = runtime.port
   const startedLogCapture = createKunChildLogCapture(startedChild.pid)
   childLogCapture = startedLogCapture
   childStderrTail = ''
@@ -354,7 +423,10 @@ async function startKunChildOnce(
         : `exited with code ${code ?? 'unknown'}`
     )
     void startedLogCapture.close()
-    if (child === startedChild) child = null
+    if (child === startedChild) {
+      child = null
+      childPort = null
+    }
     if (readyChildren.has(startedChild) && !intentionalStops.has(startedChild)) {
       onUnexpectedKunExit?.({
         code: code ?? null,
@@ -399,6 +471,15 @@ export async function syncGuiManagedKunConfig(
     | 'modelProfiles'
     | 'memoryEnabled'
     | 'quality'
+    | 'subagents'
+    | 'smallModel'
+    | 'smallModelProviderId'
+    | 'titleModel'
+    | 'titleProviderId'
+    | 'summaryModel'
+    | 'summaryProviderId'
+    | 'codeReviewModel'
+    | 'codeReviewProviderId'
   >,
   options?: {
     scheduleMcp?: {
@@ -458,6 +539,10 @@ export async function syncGuiManagedKunConfig(
     contextCompaction: contextCompactionConfigForRuntime(runtime.contextCompaction, existingContextCompaction),
     runtime: runtimeTuningConfigForRuntime(runtime.runtimeTuning, existingRuntimeTuning),
     quality: qualityConfigForRuntime(runtime.quality, existingQuality),
+    ...(() => {
+      const roles = rolesConfigForRuntime(runtime)
+      return Object.keys(roles).length ? { roles } : {}
+    })(),
     capabilities: {
       ...capabilities,
       attachments: {
@@ -479,6 +564,7 @@ export async function syncGuiManagedKunConfig(
         ...memory,
         enabled: runtime.memoryEnabled
       },
+      subagents: subagentProfilesForRuntime(runtime.subagents ?? { enabled: true, profiles: [] }),
       mcp: {
         ...mcp,
         ...(options?.scheduleMcp || mcpSearch.enabled || hasImportedEnabledMcpServer
@@ -546,10 +632,17 @@ async function skillCapabilityConfigForRuntime(
   // Drop previously-persisted GUI-managed roots so disabling a directory in
   // settings actually removes it — otherwise a toggled-off root would stick
   // around forever via `existing.roots`.
+  // GUI-managed roots are dropped from the carried-over set and rebuilt fresh
+  // below. Besides the common/extra candidates, auto-discovered Codex plugin
+  // caches count as managed too — otherwise old version directories from a
+  // plugin upgrade stay in `roots` forever (#392).
   const managed = guiSkillManagedComparablePaths(settings)
   const manualExisting = stringArrayValue(existing.roots)
     .map(normalizeSkillRootPath)
-    .filter((path) => path.length > 0 && !managed.has(comparableSkillRootPath(path)))
+    .filter((path) =>
+      path.length > 0 &&
+      !managed.has(comparableSkillRootPath(path)) &&
+      !isCodexPluginCacheRoot(path))
   const roots = uniqueStrings([
     ...manualExisting,
     ...(await guiSkillRootsForRuntime(settings)).map((root) => root.path)
@@ -562,6 +655,13 @@ async function skillCapabilityConfigForRuntime(
     // skills. An explicit `true` still forces on even with no roots.
     enabled: roots.length > 0 || existing.enabled === true,
     roots,
+    workspaceRoots: guiSkillWorkspaceRootsForRuntime(settings),
+    // #149: Pass global skill roots from settings (e.g. ~/.kun/skills)
+    globalRoots: existing.globalRoots ?? [],
+    // Skills the user disabled in the GUI. Forwarded so the runtime drops them
+    // from discovery — without this they stay loadable via load_skill and keep
+    // appearing in the catalog despite the GUI toggle (#392).
+    disabledIds: settings?.disabledSkillIds ?? stringArrayValue(existing.disabledIds),
     legacySkillMd: existing.legacySkillMd === false ? false : true
   }
 }
@@ -583,7 +683,7 @@ function uniqueStrings(values: string[]): string[] {
   return out
 }
 
-async function readGuiManagedMcpServers(path: string): Promise<Record<string, unknown>> {
+async function readGuiManagedMcpServers(path: string): Promise<Record<string, Record<string, unknown>>> {
   const parsed = await readJsonObjectIfExists(path)
   if (!parsed) return {}
 
@@ -610,6 +710,7 @@ function mcpServersFromGuiConfig(config: Record<string, unknown>): Record<string
 function normalizeGuiManagedMcpServer(server: unknown): Record<string, unknown> | null {
   const raw = objectValue(server)
   const command = scalarStringValue(raw.command)
+  const cwd = scalarStringValue(raw.cwd)?.trim()
   const url = scalarStringValue(raw.url)
   const args = stringArrayValue(raw.args)
   const headers = stringRecordValue(raw.headers)
@@ -617,6 +718,7 @@ function normalizeGuiManagedMcpServer(server: unknown): Record<string, unknown> 
   const transport = normalizeMcpTransport(raw.transport, command, url)
   if (!transport) return null
 
+  const workspaceRoots = stringArrayValue(raw.workspaceRoots)
   const trustedWorkspaceRoots = stringArrayValue(raw.trustedWorkspaceRoots)
   const trustScope = normalizeMcpTrustScope(raw.trustScope, trustedWorkspaceRoots)
   if (trustScope === 'workspace' && trustedWorkspaceRoots.length === 0) return null
@@ -626,10 +728,12 @@ function normalizeGuiManagedMcpServer(server: unknown): Record<string, unknown> 
     enabled: raw.enabled === false || raw.disabled === true ? false : true,
     transport,
     ...(command ? { command } : {}),
+    ...(transport === 'stdio' && cwd ? { cwd } : {}),
     ...(args.length > 0 ? { args } : {}),
     ...(url ? { url } : {}),
     ...(Object.keys(headers).length > 0 ? { headers } : {}),
     ...(Object.keys(env).length > 0 ? { env } : {}),
+    ...(workspaceRoots.length > 0 ? { workspaceRoots } : {}),
     trustScope,
     ...(trustedWorkspaceRoots.length > 0 ? { trustedWorkspaceRoots } : {}),
     ...(timeoutMs ? { timeoutMs } : {})
@@ -724,6 +828,7 @@ function modelConfigProfilesFromProviderProfiles(
     out[trimmed] = {
       ...(profile.aliases?.length ? { aliases: profile.aliases } : {}),
       ...(profile.contextWindowTokens ? { contextWindowTokens: profile.contextWindowTokens } : {}),
+      ...(profile.maxOutputTokens ? { maxOutputTokens: profile.maxOutputTokens } : {}),
       inputModalities: profile.inputModalities,
       outputModalities: profile.outputModalities,
       supportsToolCalling: profile.supportsToolCalling,
@@ -753,14 +858,19 @@ function providersConfigForRuntime(settings: AppSettingsV1): Record<string, Reco
   for (const provider of getModelProviderSettings(settings).providers as ModelProviderProfileV1[]) {
     const id = provider.id?.trim()
     const baseUrl = provider.baseUrl?.trim()
-    if (!id || !baseUrl) continue
-    // The runtime's own provider is already wired via the default CLI args;
-    // skipping it keeps the map smaller and avoids paying twice for one
-    // provider that happens to be the active runtime binding.
-    if (id === runtimeProviderId) continue
+    const isAgentSdk = provider.kind === 'agent-sdk'
+    if (!id) continue
+    // agent-sdk providers carry no usable HTTP endpoint; everyone else needs one.
+    if (!baseUrl && !isAgentSdk) continue
+    // The runtime's own provider is already wired via the default CLI args, so
+    // we normally skip it here — EXCEPT agent-sdk: its turns must be routable to
+    // the embedded SDK via `serve.providers`, otherwise they fall back to the
+    // HTTP default client and 401 on api.anthropic.com (invalid x-api-key).
+    if (id === runtimeProviderId && !isAgentSdk) continue
     out[id] = {
       apiKey: provider.apiKey?.trim() ?? '',
-      baseUrl,
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(provider.kind ? { kind: provider.kind } : {}),
       ...(provider.endpointFormat ? { endpointFormat: provider.endpointFormat } : {}),
       ...(proxyUrl ? { modelProxyUrl: proxyUrl } : {})
     }
@@ -821,8 +931,52 @@ function contextCompactionConfigForRuntime(
     summaryMode: contextCompaction.summaryMode,
     summaryTimeoutMs: contextCompaction.summaryTimeoutMs,
     summaryMaxTokens: contextCompaction.summaryMaxTokens,
-    summaryInputMaxBytes: contextCompaction.summaryInputMaxBytes
+    summaryInputMaxBytes: contextCompaction.summaryInputMaxBytes,
+    ...(contextCompaction.summaryModel ? { summaryModel: contextCompaction.summaryModel } : {}),
+    ...(contextCompaction.summaryProviderId ? { summaryProviderId: contextCompaction.summaryProviderId } : {})
   }
+}
+
+/**
+ * Build the kun `roles` config (internal-LLM model routing) from GUI settings.
+ * Only non-empty fields are emitted so the strict RolesConfigSchema accepts the
+ * result and a cleared field removes itself from config.json.
+ */
+function rolesConfigForRuntime(
+  runtime: Pick<
+    KunRuntimeSettingsV1,
+    | 'smallModel'
+    | 'smallModelProviderId'
+    | 'titleModel'
+    | 'titleProviderId'
+    | 'summaryModel'
+    | 'summaryProviderId'
+    | 'codeReviewModel'
+    | 'codeReviewProviderId'
+    | 'titleReasoningEffort'
+    | 'summaryReasoningEffort'
+    | 'codeReviewReasoningEffort'
+  >
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  const put = (key: string, value: string | undefined): void => {
+    const trimmed = typeof value === 'string' ? value.trim() : ''
+    if (trimmed) out[key] = trimmed
+  }
+  put('smallModel', runtime.smallModel)
+  put('smallModelProviderId', runtime.smallModelProviderId)
+  put('titleModel', runtime.titleModel)
+  put('titleProviderId', runtime.titleProviderId)
+  put('summaryModel', runtime.summaryModel)
+  put('summaryProviderId', runtime.summaryProviderId)
+  put('codeReviewModel', runtime.codeReviewModel)
+  put('codeReviewProviderId', runtime.codeReviewProviderId)
+  // Per-role reasoning depth. 'off' is the default and is intentionally omitted
+  // by the normalizer, so only an opted-in level (low/medium/high/max) is emitted.
+  put('titleReasoningEffort', runtime.titleReasoningEffort)
+  put('summaryReasoningEffort', runtime.summaryReasoningEffort)
+  put('codeReviewReasoningEffort', runtime.codeReviewReasoningEffort)
+  return out
 }
 
 function computerUseConfigForRuntime(
@@ -979,6 +1133,75 @@ function qualityConfigForRuntime(
   }
 }
 
+const VALID_PROFILE_REASONING = new Set(['auto', 'low', 'medium', 'high', 'max'])
+
+/**
+ * Remove optional fields the runtime schema rejects when blank: empty/whitespace
+ * strings (every optional string there is `.min(1)`) and empty arrays. Leaving
+ * them in throws on SubagentsCapabilityConfig.parse and stops the runtime from
+ * starting; dropping them lets the field fall back to its server default.
+ */
+function stripBlankProfileFields(profile: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(profile)) {
+    if (typeof value === 'string' && value.trim() === '') continue
+    if (Array.isArray(value) && value.length === 0) continue
+    next[key] = value
+  }
+  return next
+}
+
+export function subagentProfilesForRuntime(subagents: KunSubagentsSettingsV1): SubagentsCapabilityConfig {
+  const profiles: Record<string, unknown> = {}
+  for (const profile of subagents.profiles) {
+    if (!profile.enabled) continue
+    const { id: _id, enabled: _enabled, name, reasoningEffort, ...rest } = profile
+    // Coerce the per-profile reasoning enum so a hand-edited invalid value can't
+    // throw SubagentsCapabilityConfig.parse below ('off'/invalid → omitted).
+    const effort = typeof reasoningEffort === 'string' && VALID_PROFILE_REASONING.has(reasoningEffort)
+      ? { reasoningEffort }
+      : {}
+    // Built-in profiles carry an empty `name` (the GUI localizes their display
+    // labels rather than storing them), and the user can blank any optional
+    // field in the editor. The runtime schema marks every optional string as
+    // `.min(1)`, so forwarding an empty string throws and the runtime never
+    // connects. Drop blank strings / empty arrays so they fall back to defaults.
+    profiles[profile.id] = stripBlankProfileFields({ name, ...rest, ...effort })
+  }
+  const candidate = {
+    // Subagents are a first-class feature with no GUI "enable" toggle; default ON
+    // (only an explicit `false` disables) so delegate_task + the built-in profiles
+    // (design-reviewer / over-engineering-reviewer) are always offered to the model.
+    // maxParallel/maxChildRuns MUST be >=1 or DelegationRuntime can never run a child.
+    enabled: subagents.enabled !== false,
+    maxParallel: subagents.maxParallel && subagents.maxParallel > 0 ? subagents.maxParallel : 3,
+    maxChildRuns: subagents.maxChildRuns && subagents.maxChildRuns > 0 ? subagents.maxChildRuns : 12,
+    ...(subagents.defaultToolPolicy ? { defaultToolPolicy: subagents.defaultToolPolicy } : {}),
+    ...(subagents.defaultProfile ? { defaultProfile: subagents.defaultProfile } : {}),
+    profiles
+  }
+  // A single malformed profile must never brick the whole runtime connection.
+  // If the GUI somehow persisted a value the schema rejects, drop the custom
+  // profiles and fall back to a minimal valid block — the runtime still merges
+  // in the built-in reviewers, so subagents keep working.
+  const parsed = SubagentsCapabilityConfig.safeParse(candidate)
+  if (parsed.success) return parsed.data
+  void appendManagedLogLine(
+    'kun',
+    formatKunLogLine(
+      'lifecycle',
+      undefined,
+      `[settings] dropped invalid subagent profiles: ${JSON.stringify(parsed.error.issues)}`
+    )
+  )
+  return SubagentsCapabilityConfig.parse({
+    enabled: candidate.enabled,
+    maxParallel: candidate.maxParallel,
+    maxChildRuns: candidate.maxChildRuns,
+    ...(subagents.defaultToolPolicy ? { defaultToolPolicy: subagents.defaultToolPolicy } : {})
+  })
+}
+
 async function readJsonObjectIfExists(path: string): Promise<Record<string, unknown> | null> {
   try {
     const text = await readFile(path, 'utf8')
@@ -1067,6 +1290,9 @@ function sanitizeKunConfigSections(
     runtime: parseKunConfigSection(RuntimeTuningConfigSchema, existing.runtime),
     quality: parseKunConfigSection(QualityConfigSchema, existing.quality),
     capabilities: sanitizeKunCapabilitiesConfig(existing.capabilities),
+    ...('roles' in existing
+      ? { roles: parseKunConfigSection(RolesConfigSchema, existing.roles) }
+      : {}),
     ...(hooks.length ? { hooks } : {})
   }
 }
@@ -1106,7 +1332,10 @@ export async function stopKunChildAndWait(): Promise<void> {
     }
     await waitForChildExit(stoppingChild, KUN_STOP_FORCE_MS)
   }
-  if (child === stoppingChild) child = null
+  if (child === stoppingChild) {
+    child = null
+    childPort = null
+  }
   if (capture) {
     childLogCapture = null
     await capture.close()
@@ -1148,6 +1377,12 @@ export async function resolveAvailableKunPort(
   preferredPort: number
 ): Promise<{ port: number; changed: boolean; message?: string }> {
   if (preferredPort > 0) {
+    // A temporarily unresponsive managed child still owns its configured
+    // endpoint. Moving settings to another port here strands the live child
+    // and makes every concurrent request launch/probe a port with no server.
+    if (isKunChildRunning() && childPort === preferredPort) {
+      return { port: preferredPort, changed: false }
+    }
     if (await canBindTcpPort(preferredPort, '127.0.0.1')) {
       return { port: preferredPort, changed: false }
     }
@@ -1370,22 +1605,30 @@ async function waitForKunStartup(startedChild: ChildProcess, port?: number): Pro
     let stdoutBuffer = ''
     let stderrTail = ''
     let healthProbeInFlight = false
+    let healthConfirmed = false
+    let readyMarkerSeen = false
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
       cleanup()
-      reject(new Error(describeKunStartupTimeout(stderrTail)))
+      reject(new Error(describeKunStartupTimeout(stderrTail, readyMarkerSeen && Boolean(port))))
     }, KUN_STARTUP_TIMEOUT_MS)
     // The stdout ready marker can lag behind the actual server (pipe
     // buffering) or get lost in unusual spawn environments; the HTTP
     // health endpoint is the ground truth, so poll it in parallel.
+    // A passing health probe alone is enough to settle (it proves the
+    // server responds). The stdout marker alone is NOT enough — it only
+    // proves the process started, not that the HTTP server can serve.
     const healthTimer = port
       ? setInterval(() => {
           if (settled || healthProbeInFlight) return
           healthProbeInFlight = true
           void probeKunHealth(port)
             .then((healthy) => {
-              if (healthy) settleReady()
+              if (healthy) {
+                healthConfirmed = true
+                settleReady()
+              }
             })
             .finally(() => {
               healthProbeInFlight = false
@@ -1423,7 +1666,11 @@ async function waitForKunStartup(startedChild: ChildProcess, port?: number): Pro
     }
     const onStdout = (chunk: Buffer | string): void => {
       stdoutBuffer = appendTail(stdoutBuffer, String(chunk), STDERR_TAIL_MAX_CHARS * 2)
-      if (tryParseReady()) settleReady()
+      if (!tryParseReady()) return
+      readyMarkerSeen = true
+      if (healthConfirmed || !healthTimer) {
+        settleReady()
+      }
     }
     const onStderr = (chunk: Buffer | string): void => {
       stderrTail = appendTail(stderrTail, String(chunk))
@@ -1458,8 +1705,11 @@ function describeKunExit(
   return `Kun exited during startup${suffix}`
 }
 
-function describeKunStartupTimeout(stderrTail: string): string {
+function describeKunStartupTimeout(stderrTail: string, sawReadyMarker = false): string {
   const suffix = stderrTail.trim() ? `\n${stderrTail.trim()}` : ''
+  if (sawReadyMarker) {
+    return `Kun reported ready but did not pass health checks within ${KUN_STARTUP_TIMEOUT_MS}ms${suffix}`
+  }
   return `Kun did not report ready within ${KUN_STARTUP_TIMEOUT_MS}ms${suffix}`
 }
 

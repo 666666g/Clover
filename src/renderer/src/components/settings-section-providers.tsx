@@ -65,6 +65,7 @@ import {
 } from './settings-controls'
 import { classifyProviderModelIds, providerModelListEntries } from './provider-model-editor'
 import { ProviderModelsManager } from './settings-section-provider-models'
+import { ClaudeSubscriptionSection } from './claude-subscription-section'
 import {
   ProviderModelImportDialog,
   type ProviderModelImportResult
@@ -141,6 +142,10 @@ function tokenPlanPresetForProfileId(id: string): ModelProviderPreset | null {
 
 // 「套餐订阅」组 = Token Plan 套餐档(<id>-token-plan)或本身就是订阅制的预设(category==='subscription');
 // 其余(默认 / 按量预设 / 自定义)归入「按量 API」组,便于一眼分辨两类计费方式。
+function isAgentSdkProvider(provider: ModelProviderProfileV1): boolean {
+  return provider.kind === 'agent-sdk'
+}
+
 function isSubscriptionProviderId(id: string): boolean {
   if (tokenPlanPresetForProfileId(id)) return true
   return getModelProviderPreset(id)?.category === 'subscription'
@@ -845,6 +850,50 @@ export function ProvidersSettingsSection({ ctx }: { ctx: Record<string, any> }):
   const runProbe = async (target: ModelProviderProfileV1, mode: 'test' | 'fetch'): Promise<void> => {
     if (typeof window.kunGui?.probeModelProvider !== 'function') return
     const fingerprint = providerConnectionFingerprint(target)
+    // Subscription (agent-sdk) providers have no HTTP /models endpoint — the turn
+    // is delegated to the Claude Agent SDK. "Test" reports login readiness instead
+    // of probing api.anthropic.com, which would 401 on the x-api-key header.
+    if (isAgentSdkProvider(target)) {
+      setProbeStates((prev) => ({ ...prev, [target.id]: { fingerprint, mode, status: 'busy' } }))
+      if (mode === 'fetch') {
+        // No HTTP /models endpoint — list the subscription's models via the SDK.
+        let modelIds: string[] = []
+        try {
+          modelIds = await window.kunGui.claudeSubscriptionModels(target.apiKey.trim() || undefined)
+        } catch {
+          modelIds = []
+        }
+        if (modelIds.length > 0) {
+          setProbeStates((prev) => ({
+            ...prev,
+            [target.id]: { fingerprint, mode, status: 'ok', latencyMs: 0, total: modelIds.length }
+          }))
+          setPendingImport({ providerId: target.id, modelIds: [...modelIds], latencyMs: 0 })
+        } else {
+          setProbeStates((prev) => ({
+            ...prev,
+            [target.id]: { fingerprint, mode, status: 'error', message: t('claudeSubProbeNotReady') }
+          }))
+        }
+        return
+      }
+      // mode === 'test': report login/token readiness instead of an HTTP probe.
+      let ready = target.apiKey.trim().length > 0
+      if (!ready) {
+        try {
+          ready = (await window.kunGui.claudeSubscriptionStatus()).loggedIn
+        } catch {
+          ready = false
+        }
+      }
+      setProbeStates((prev) => ({
+        ...prev,
+        [target.id]: ready
+          ? { fingerprint, mode, status: 'ok', latencyMs: 0, total: target.models.length }
+          : { fingerprint, mode, status: 'error', message: t('claudeSubProbeNotReady') }
+      }))
+      return
+    }
     if (providerPresetRequiresApiKey(target) && !target.apiKey.trim()) {
       setProbeStates((prev) => ({
         ...prev,
@@ -1121,28 +1170,6 @@ export function ProvidersSettingsSection({ ctx }: { ctx: Record<string, any> }):
     <>
     <SettingsCard title={t('providers')}>
       <SettingRow
-        title={t('proxyUrl')}
-        description={t('proxyUrlDesc')}
-        control={
-          <div className="flex w-full min-w-0 flex-col gap-2 md:max-w-md">
-            <label className="flex items-center justify-between gap-3 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] text-ds-muted shadow-sm">
-              <span>{t('proxyEnabled')}</span>
-              <Toggle
-                checked={providerProxy.enabled === true}
-                onChange={(enabled) => updateProviderProxy({ enabled })}
-              />
-            </label>
-            <input
-              className={textInputClass}
-              placeholder={t('proxyUrlPlaceholder')}
-              value={providerProxy.url}
-              spellCheck={false}
-              onChange={(e) => updateProviderProxy({ url: e.target.value })}
-            />
-          </div>
-        }
-      />
-      <SettingRow
         title={t('providers')}
         description={t('providersDesc')}
         wideControl
@@ -1267,6 +1294,15 @@ export function ProvidersSettingsSection({ ctx }: { ctx: Record<string, any> }):
                   </div>
                 </DetailSection>
                 <DetailSection title={t('modelProviderSectionConnection')}>
+                  {isAgentSdkProvider(activeProvider) ? (
+                    <ClaudeSubscriptionSection
+                      provider={activeProvider}
+                      onTokenChange={(token) => updateModelProvider(activeProvider.id, { apiKey: token })}
+                      onModelsChange={(models) => updateModelProvider(activeProvider.id, { models })}
+                      t={t}
+                    />
+                  ) : (
+                    <>
                   <label className={fieldLabelClass}>
                     {t('modelProviderApiKey')}
                     <SecretInput
@@ -1354,6 +1390,8 @@ export function ProvidersSettingsSection({ ctx }: { ctx: Record<string, any> }):
                       {t('modelEndpointCustomEndpointDesc')}
                     </p>
                   ) : null}
+                    </>
+                  )}
                 </DetailSection>
                 <DetailSection
                   title={`${t('modelProviderModels')} · ${providerModelCount(activeProvider)}`}
@@ -1737,6 +1775,28 @@ export function ProvidersSettingsSection({ ctx }: { ctx: Record<string, any> }):
                 ) : null}
               </div>
             ) : null}
+          </div>
+        }
+      />
+      <SettingRow
+        title={t('proxyUrl')}
+        description={t('proxyUrlDesc')}
+        control={
+          <div className="flex w-full min-w-0 flex-col gap-2 md:max-w-md">
+            <label className="flex items-center justify-between gap-3 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] text-ds-muted shadow-sm">
+              <span>{t('proxyEnabled')}</span>
+              <Toggle
+                checked={providerProxy.enabled === true}
+                onChange={(enabled) => updateProviderProxy({ enabled })}
+              />
+            </label>
+            <input
+              className={textInputClass}
+              placeholder={t('proxyUrlPlaceholder')}
+              value={providerProxy.url}
+              spellCheck={false}
+              onChange={(e) => updateProviderProxy({ url: e.target.value })}
+            />
           </div>
         }
       />

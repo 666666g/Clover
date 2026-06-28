@@ -4,7 +4,8 @@ import {
   buildRuntimeContextInstruction,
   isStalePlanContext,
   resolvePlanModeToolSpecs,
-  shouldInjectInitialRuntimeContext
+  shouldInjectInitialRuntimeContext,
+  turnHasUnverifiedSourceChanges
 } from './agent-loop.js'
 import type { ModelToolSpec } from '../ports/model-client.js'
 
@@ -18,6 +19,71 @@ function spec(name: string): ModelToolSpec {
     inputSchema: { type: 'object', properties: {} }
   }
 }
+
+function result(input: {
+  id: string
+  toolName: string
+  toolKind: 'file_change' | 'command_execution'
+  path?: string
+  turnId?: string
+  isError?: boolean
+}) {
+  return {
+    id: input.id,
+    threadId: 'thread_1',
+    turnId: input.turnId ?? 'turn_1',
+    role: 'tool' as const,
+    kind: 'tool_result' as const,
+    toolName: input.toolName,
+    callId: `call_${input.id}`,
+    toolKind: input.toolKind,
+    output: input.path ? { relative_path: input.path } : {},
+    isError: input.isError ?? false,
+    status: 'completed' as const,
+    createdAt: '2000-01-02T03:04:05.000Z'
+  }
+}
+
+describe('turnHasUnverifiedSourceChanges', () => {
+  it('flags an unverified source edit so the optional nudge can appear', () => {
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'write', toolName: 'write', toolKind: 'file_change', path: 'src/app.ts' })
+    ], 'turn_1')).toBe(true)
+  })
+
+  it('ignores non-source changes (docs/HTML written in write/design/SDD modes)', () => {
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'doc', toolName: 'write', toolKind: 'file_change', path: 'notes.md' }),
+      result({ id: 'page', toolName: 'write', toolKind: 'file_change', path: '.kun-design/a/v1.html' })
+    ], 'turn_1')).toBe(false)
+  })
+
+  it('ignores failed edits and create_plan artifacts', () => {
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'failed', toolName: 'edit', toolKind: 'file_change', path: 'src/a.ts', isError: true }),
+      result({ id: 'plan', toolName: 'create_plan', toolKind: 'file_change', path: 'plan.md' })
+    ], 'turn_1')).toBe(false)
+  })
+
+  it('clears after a verify_changes run and re-arms on the next source edit', () => {
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'write', toolName: 'write', toolKind: 'file_change', path: 'src/a.ts' }),
+      result({ id: 'verify', toolName: 'verify_changes', toolKind: 'command_execution' })
+    ], 'turn_1')).toBe(false)
+
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'write', toolName: 'write', toolKind: 'file_change', path: 'src/a.ts' }),
+      result({ id: 'verify', toolName: 'verify_changes', toolKind: 'command_execution' }),
+      result({ id: 'repair', toolName: 'edit', toolKind: 'file_change', path: 'src/a.ts' })
+    ], 'turn_1')).toBe(true)
+  })
+
+  it('ignores changes from other turns', () => {
+    expect(turnHasUnverifiedSourceChanges([
+      result({ id: 'other', toolName: 'write', toolKind: 'file_change', path: 'src/a.ts', turnId: 'turn_2' })
+    ], 'turn_1')).toBe(false)
+  })
+})
 
 const ALL_TOOLS: ModelToolSpec[] = [
   spec('read'),
@@ -148,6 +214,51 @@ describe('resolvePlanModeToolSpecs', () => {
     expect(names).toContain('custom-plan')
     expect(names).not.toContain('write')
     expect(names).not.toContain('bash')
+  })
+
+  const WITH_INPUT_TOOLS: ModelToolSpec[] = [
+    spec('read'),
+    spec('write'),
+    spec('create_plan'),
+    spec('user_input'),
+    spec('request_user_input')
+  ]
+
+  it('step 0: allows the structured user-input tools (so plan turns can ask)', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 0,
+      readOnlyToolNames: READ_ONLY_TOOLS
+    })
+    const names = result.map((t) => t.name)
+    expect(names).toContain('user_input')
+    expect(names).toContain('request_user_input')
+    expect(names).toContain('create_plan')
+    expect(names).not.toContain('write')
+  })
+
+  it('step > 0: drops the user-input tools, leaving only create_plan', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 1,
+      readOnlyToolNames: READ_ONLY_TOOLS
+    })
+    expect(result.map((t) => t.name)).toEqual(['create_plan'])
+  })
+
+  it('custom interactiveToolNames overrides the default user-input set', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 0,
+      readOnlyToolNames: READ_ONLY_TOOLS,
+      interactiveToolNames: new Set(['user_input'])
+    })
+    const names = result.map((t) => t.name)
+    expect(names).toContain('user_input')
+    expect(names).not.toContain('request_user_input')
   })
 })
 

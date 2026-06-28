@@ -180,14 +180,31 @@ export async function getGitBranches(workspaceRoot: string): Promise<GitBranches
       .filter(Boolean)
     const branchSet = new Set(branchLines)
     if (currentBranch && !branchSet.has(currentBranch)) branchSet.add(currentBranch)
-    const branches = [...branchSet].map((name) => ({
-      name,
-      current: currentBranch === name
-    }))
+    const worktreeRows = parseWorktreeListPorcelain(
+      (await runGit(cwd, ['worktree', 'list', '--porcelain'])).stdout
+    )
+    const primaryRepositoryRoot = worktreeRows[0]?.path || repositoryRoot
+    const worktreeByBranch = new Map<string, { path: string; primary: boolean }>()
+    for (const row of worktreeRows) {
+      if (row.branch && !worktreeByBranch.has(row.branch)) {
+        worktreeByBranch.set(row.branch, { path: row.path, primary: row.path === primaryRepositoryRoot })
+      }
+    }
+    const branches = [...branchSet].map((name) => {
+      // A branch checked out in *another* worktree cannot be switched to here.
+      // (The current branch lives in this worktree, so it's never "elsewhere".)
+      const elsewhere = name === currentBranch ? undefined : worktreeByBranch.get(name)
+      const offsite = elsewhere && elsewhere.path !== repositoryRoot ? elsewhere : undefined
+      return {
+        name,
+        current: currentBranch === name,
+        ...(offsite ? { worktreePath: offsite.path, worktreePrimary: offsite.primary } : {})
+      }
+    })
     const dirtyCount = (await runGit(cwd, ['status', '--porcelain=v1'])).stdout
       .split('\n')
       .filter((line) => line.trim().length > 0).length
-    return { ok: true, repositoryRoot, currentBranch, branches, dirtyCount }
+    return { ok: true, repositoryRoot, primaryRepositoryRoot, currentBranch, branches, dirtyCount }
   } catch (error) {
     return gitFailure(error)
   }
@@ -249,7 +266,9 @@ export async function checkoutGitBranchWorktree(
     const wtPath = await allocateBranchWorktreePath(sourceRepositoryRoot, worktreeRoot)
     const worktreeBranch = await allocateDerivedWorktreeBranch(cwd)
     await mkdir(join(wtPath, '..'), { recursive: true })
-    await runGit(cwd, ['worktree', 'add', '-b', worktreeBranch, wtPath, branch], 30_000)
+    // Always add from the primary checkout so multiple derived worktrees can be
+    // created from the same source branch regardless of the caller's cwd.
+    await runGit(sourceRepositoryRoot, ['worktree', 'add', '-b', worktreeBranch, wtPath, branch], 30_000)
     return worktreeCheckoutResult(wtPath, sourceRepositoryRoot)
   } catch (error) {
     return gitWorktreeFailure(error)
@@ -271,7 +290,7 @@ export async function createGitBranchWorktree(
     const sourceRepositoryRoot = await getPrimaryWorktreeRoot(cwd, currentRepositoryRoot)
     const wtPath = await allocateBranchWorktreePath(sourceRepositoryRoot, worktreeRoot)
     await mkdir(join(wtPath, '..'), { recursive: true })
-    await runGit(cwd, ['worktree', 'add', '-b', branch, wtPath, 'HEAD'], 30_000)
+    await runGit(sourceRepositoryRoot, ['worktree', 'add', '-b', branch, wtPath, 'HEAD'], 30_000)
     return worktreeCheckoutResult(wtPath, sourceRepositoryRoot)
   } catch (error) {
     return gitWorktreeFailure(error)

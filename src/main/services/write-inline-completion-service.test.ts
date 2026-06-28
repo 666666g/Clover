@@ -29,7 +29,7 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
@@ -38,10 +38,12 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
       }
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: {
       enabled: true,
       retentionDays: 2
     },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: {
       turnComplete: true
     },
