@@ -144,6 +144,14 @@ type StreamReadResult =
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 45_000
 const DEFAULT_MESSAGES_MAX_TOKENS = 4096
+const REASONING_MESSAGES_MAX_TOKENS = 8_192
+const MAX_REASONING_MESSAGES_MAX_TOKENS = 32_768
+
+function defaultMessagesMaxTokens(reasoningEffort?: string): number {
+  if (!reasoningEffort || reasoningEffort === 'off') return DEFAULT_MESSAGES_MAX_TOKENS
+  if (reasoningEffort === 'max') return MAX_REASONING_MESSAGES_MAX_TOKENS
+  return REASONING_MESSAGES_MAX_TOKENS
+}
 
 /**
  * Multi-provider HTTP model client.
@@ -579,7 +587,7 @@ export class CompatModelClient implements ModelClient {
     const body: Record<string, unknown> = {
       model,
       stream,
-      max_tokens: request.maxTokens ?? DEFAULT_MESSAGES_MAX_TOKENS,
+      max_tokens: request.maxTokens ?? defaultMessagesMaxTokens(request.reasoningEffort),
       messages: converted.messages
     }
     const systemText = request.responseFormat === 'json_object'
@@ -1569,6 +1577,11 @@ function messagesToResponsesInput(messages: ChatMessage[]): Array<Record<string,
   return input
 }
 
+function isToolResultUserContent(content: string | AnthropicContentBlock[]): boolean {
+  if (typeof content === 'string') return false
+  return content.every((block) => block.type === 'tool_result' || block.type === 'image')
+}
+
 function messagesToAnthropic(
   messages: ChatMessage[],
   includeThinkingBlocks = false
@@ -1614,7 +1627,14 @@ function messagesToAnthropic(
           if (image) blocks.push({ type: 'image', source: image })
         }
       }
-      out.push({ role: 'user', content: blocks })
+      // 多个并行工具调用的结果必须合并到同一个 user 消息中，否则 Anthropic
+      // API 会报 "tool_use ids were found without tool_result blocks immediately after"。
+      const last = out[out.length - 1]
+      if (last && last.role === 'user' && isToolResultUserContent(last.content)) {
+        last.content = [...(last.content as AnthropicContentBlock[]), ...blocks]
+      } else {
+        out.push({ role: 'user', content: blocks })
+      }
       continue
     }
     const content = chatContentToAnthropicContent(message.content)

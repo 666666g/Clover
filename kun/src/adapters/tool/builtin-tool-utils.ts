@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -57,25 +57,51 @@ export function workspaceRoot(workspace: string): string {
   return isAbsolute(workspace) ? resolve(workspace) : resolve(process.cwd(), workspace)
 }
 
-function resolveRealPath(absolutePath: string): string {
+/**
+ * Resolves symbolic links in `absolutePath` while detecting loops.
+ * For paths that do not exist yet (e.g. writes to new files) it walks up to
+ * the nearest existing ancestor, then resolves each remaining component,
+ * including dangling symlinks, so that path-escape checks cannot be bypassed
+ * by a symlink inside the workspace pointing outside of it.
+ */
+function resolveRealPath(absolutePath: string, visited = new Set<string>()): string {
+  if (visited.has(absolutePath)) {
+    throw new Error(`symbolic link loop detected: ${absolutePath}`)
+  }
   try {
     return realpathSync(absolutePath)
-  } catch {
-    // 路径不存在时（如写入新文件），向上找到最近存在的祖先目录解析真实路径，再拼接后缀。
-    let prefix = absolutePath
-    const suffixes: string[] = []
-    while (prefix !== dirname(prefix)) {
-      suffixes.unshift(basename(prefix))
-      prefix = dirname(prefix)
-      try {
-        const realPrefix = realpathSync(prefix)
-        return resolve(realPrefix, ...suffixes)
-      } catch {
-        // continue walking up
-      }
-    }
-    return absolutePath
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT') throw error
   }
+
+  // 路径不存在时，向上找到最近存在的祖先目录解析真实路径。
+  let prefix = absolutePath
+  const suffixes: string[] = []
+  while (prefix !== dirname(prefix)) {
+    suffixes.unshift(basename(prefix))
+    prefix = dirname(prefix)
+    if (existsSync(prefix)) {
+      prefix = realpathSync(prefix)
+      break
+    }
+  }
+
+  // 逐个处理后缀组件，遇到符号链接时解析其目标路径（含悬挂链接）。
+  let resolved = prefix
+  for (const part of suffixes) {
+    resolved = resolve(resolved, part)
+    const stat = lstatSync(resolved, { throwIfNoEntry: false })
+    if (stat?.isSymbolicLink()) {
+      const target = readlinkSync(resolved)
+      const realTarget = isAbsolute(target) ? resolve(target) : resolve(dirname(resolved), target)
+      visited.add(absolutePath)
+      const remaining = suffixes.slice(suffixes.indexOf(part) + 1)
+      return resolve(resolveRealPath(realTarget, visited), ...remaining)
+    }
+  }
+
+  return resolved
 }
 
 export function resolveWorkspacePath(inputPath: string, context: ToolHostContext): {
@@ -85,6 +111,14 @@ export function resolveWorkspacePath(inputPath: string, context: ToolHostContext
 } {
   const root = workspaceRoot(context.workspace)
   const absolutePath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath)
+  // danger-full-access 模式下允许访问工作区外路径，不再进行逃逸检查。
+  if (context.sandboxMode === 'danger-full-access') {
+    return {
+      workspaceRoot: root,
+      absolutePath,
+      relativePath: relative(root, absolutePath) || '.'
+    }
+  }
   const realAbsolutePath = resolveRealPath(absolutePath)
   const relativePath = relative(root, realAbsolutePath)
   if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
