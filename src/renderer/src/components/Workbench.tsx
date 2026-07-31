@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useChatStore } from '../store/chat-store'
 import type { RightPanelMode } from './chat/WorkbenchTopBar'
@@ -113,9 +113,6 @@ const WorkspaceFilePreviewPanel = lazy(() =>
 )
 const PlanPanel = lazy(() =>
   import('./plan/PlanPanel').then((module) => ({ default: module.PlanPanel }))
-)
-const TodoPanel = lazy(() =>
-  import('./todo/TodoPanel').then((module) => ({ default: module.TodoPanel }))
 )
 const TerminalPanel = lazy(() =>
   import('./terminal/TerminalPanel').then((module) => ({ default: module.TerminalPanel }))
@@ -1272,7 +1269,6 @@ export function Workbench(): ReactElement {
         onScheduleOpen={openScheduleView}
         onWorkflowOpen={openWorkflowView}
         onImageEditOpen={openImageEdit}
-        onNewConversation={startNewConversation}
         onBeginResize={beginLeftResize}
       />
 

@@ -733,6 +733,7 @@ function mergeMediaReferences(
 type MediaPreviewRequest =
   | { key: string; id: string; mode: 'attachment' }
   | { key: string; path: string; mode: 'workspace-media' }
+  | { key: string; path: string; mode: 'workspace-image' }
 
 type GeneratedMediaScrollAvailability = {
   canScrollBackward: boolean
@@ -796,27 +797,30 @@ function useMediaPreviews(
     [previewFailures, scopeKey]
   )
   const [resolvedPreviews, setResolvedPreviews] = useState<Record<string, AttachmentPreview>>({})
-  const previewRequests = useMemo(
+  const previewRequests = useMemo<MediaPreviewRequest[]>(
     () =>
       media
-        .map((item) => {
+        .map((item): MediaPreviewRequest | null => {
           const key = mediaKey(item)
           if (item.previewUrl || resolvedPreviews[key] || failedPreviewIds[key]) return null
           if (item.id && !item.artifactId && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
-            return { key, id: item.id, mode: 'attachment' } satisfies MediaPreviewRequest
+            return { key, id: item.id, mode: 'attachment' }
           }
           const path = mediaIsImage(item) || mediaIsVideo(item) ? mediaPath(item) : undefined
-          if (path) return { key, path, mode: 'workspace-media' } satisfies MediaPreviewRequest
+          if (path) {
+            const mode = mediaIsImage(item) ? 'workspace-image' : 'workspace-media'
+            return { key, path, mode }
+          }
           return null
         })
-        .filter(isMediaPreviewRequest),
+        .filter((entry): entry is MediaPreviewRequest => entry !== null),
     [failedPreviewIds, media, resolvedPreviews]
   )
   const missingPreviewKey = previewRequests
     .map((request) =>
       request.mode === 'attachment'
         ? `attachment:${request.id}`
-        : `workspace-media:${request.path}`
+        : `workspace-${request.mode === 'workspace-image' ? 'image' : 'media'}:${request.path}`
     )
     .join('\n')
 

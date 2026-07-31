@@ -38,6 +38,7 @@ import {
   MAX_ID_LENGTH,
   MAX_MODEL_ID_LENGTH,
   MAX_PATH_LENGTH,
+  MAX_SAVE_FILE_BASE64_BYTES,
   MAX_URL_LENGTH,
   defaultPathSchema,
   optionalTrimmedString,
@@ -69,6 +70,15 @@ export const cursorSubscriptionDiscoveryPayloadSchema = z
     apiKey: z.string().trim().min(1).max(MAX_BODY_BYTES)
   })
   .strict()
+
+export const imageEditPayloadSchema = z
+  .object({
+    originalImage: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    maskImage: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    prompt: z.string().trim().min(1).max(4_000)
+  })
+  .strict()
+
 const writeInlineCompletionModelSchema = z.union([
   z.enum(WRITE_INLINE_COMPLETION_MODEL_IDS),
   modelIdSchema

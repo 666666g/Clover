@@ -40,6 +40,7 @@ export function useWorkbenchChatStoreState() {
       openClaw: s.openClaw,
       openSchedule: s.openSchedule,
       openWorkflow: s.openWorkflow,
+      openImageEdit: s.openImageEdit,
       chooseWorkspace: s.chooseWorkspace,
       clawChannels: s.clawChannels,
       activeClawChannelId: s.activeClawChannelId,

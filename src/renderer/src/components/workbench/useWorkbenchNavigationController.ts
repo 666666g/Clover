@@ -12,7 +12,7 @@ import { formatWorkspacePickerError } from '../../lib/format-workspace-picker-er
 import type { RightPanelMode } from '../chat/WorkbenchTopBar'
 import { BUILTIN_RIGHT_PANEL_IDS } from '../../extensions/contribution-ids'
 
-export type WorkbenchSidebarView = 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'subagents'
+export type WorkbenchSidebarView = 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'image-edit'
 
 type UseWorkbenchNavigationControllerParams = {
   activeSddDraft: boolean
@@ -126,6 +126,7 @@ export function useWorkbenchNavigationController({
     if (route === 'schedule') return 'schedule'
     if (route === 'workflow') return 'workflow'
     if (route === 'write') return 'write'
+    if (route === 'image-edit') return 'image-edit'
     return 'chat'
   }, [pluginHostRoute, route])
 

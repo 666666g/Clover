@@ -82,7 +82,13 @@ import {
   KUN_GRAPH_PROJECT_CONSOLIDATE_TEMPLATE
 } from '../../../shared/kun-endpoints'
 import { MODEL_ENDPOINT_FORMATS } from '../../../shared/app-settings'
-import { MAX_BODY_BYTES, MAX_URL_LENGTH, trimmedString } from './common'
+import {
+  MAX_BODY_BYTES,
+  MAX_PATH_LENGTH,
+  MAX_SAVE_FILE_BASE64_BYTES,
+  MAX_URL_LENGTH,
+  trimmedString
+} from './common'
 export const providerProbePayloadSchema = z
   .object({
     baseUrl: trimmedString(MAX_URL_LENGTH),
@@ -252,5 +258,29 @@ export const kunProtectedApprovalPayloadSchema = z
     approvalId: z.string().trim().min(1).max(256).regex(/^[A-Za-z0-9._:-]+$/),
     decision: z.enum(['allow', 'deny']),
     source: z.enum(['policy', 'user'])
+  })
+  .strict()
+
+// 保留本地行为：大于 2MB 的图片附件仍通过 runtime:upload-attachment IPC 上传。
+const runtimeUploadAttachmentTextFallbackSchema = z
+  .object({
+    dataBase64: z.string().min(1).max(MAX_BODY_BYTES),
+    mimeType: z.string().min(1).max(128),
+    byteSize: z.number().int().nonnegative(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    wasCompressed: z.boolean().optional()
+  })
+  .strict()
+
+export const runtimeUploadAttachmentPayloadSchema = z
+  .object({
+    name: z.string().min(1).max(256),
+    mimeType: z.string().max(128).optional(),
+    dataBase64: z.string().min(1).max(MAX_SAVE_FILE_BASE64_BYTES),
+    localFilePath: z.string().max(MAX_PATH_LENGTH).optional(),
+    textFallback: runtimeUploadAttachmentTextFallbackSchema.optional(),
+    threadId: z.string().max(64).optional(),
+    workspace: z.string().max(MAX_PATH_LENGTH).optional()
   })
   .strict()

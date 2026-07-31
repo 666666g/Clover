@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,9 +12,29 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../.
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))
+    temporaryDirectories.splice(0).map((directory) => rmWithRetry(directory))
   )
 })
+
+/**
+ * Recursively remove a directory, retrying transient Windows locks.
+ */
+async function rmWithRetry(directory: string, retries = 20, delayMs = 500): Promise<void> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      await rm(directory, { recursive: true, force: true })
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code === 'ENOENT') return
+      if ((code === 'EBUSY' || code === 'EPERM') && attempt < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+        continue
+      }
+      throw error
+    }
+  }
+}
 
 describe('create-kun-extension', () => {
   it.each([
@@ -73,7 +93,7 @@ describe('create-kun-extension', () => {
   })
 
   it('builds a framework-neutral Webview with browser-resolvable bundled assets', async () => {
-    const parent = await mkdtemp(join(repositoryRoot, '.kun-scaffold-build-'))
+    const parent = await mkdtemp(join(tmpdir(), 'kun-scaffold-build-'))
     temporaryDirectories.push(parent)
     const targetDirectory = join(parent, 'browser-app')
     await scaffoldExtension({
@@ -83,10 +103,19 @@ describe('create-kun-extension', () => {
       displayName: 'Browser App',
       template: 'webview'
     })
+    // Link the workspace node_modules so the scaffolded project can build and
+    // test without an actual npm install, while keeping the temp directory
+    // outside OneDrive to avoid transient file locks on Windows.
+    await symlink(
+      join(repositoryRoot, 'node_modules'),
+      join(targetDirectory, 'node_modules'),
+      process.platform === 'win32' ? 'junction' : 'dir'
+    )
 
-    const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], {
+    const result = spawnSync('npm test', {
       cwd: targetDirectory,
       encoding: 'utf8',
+      shell: true,
       env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' }
     })
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
@@ -112,7 +141,7 @@ describe('create-kun-extension', () => {
       expect(source).not.toContain('@kun/extension-api')
       expect(moduleSpecifiers(source).filter((specifier) => !specifier.startsWith('.'))).toEqual([])
     }
-  })
+  }, 30000)
 })
 
 async function collectJavaScript(directory: string): Promise<string[]> {

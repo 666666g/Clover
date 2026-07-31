@@ -605,9 +605,9 @@ describe('CompatModelClient', () => {
     })
     expect(sentBodies[0]).toMatchObject({
       model: 'deepseek-chat',
-      // Non-reasoning messages default (raised from 4096 so reasoning models
-      // don't truncate their tool calls; this model has no reasoning metadata).
-      max_tokens: 8192,
+      // Local default: non-reasoning / 'off' models keep 4096 to avoid
+      // over-allocating output tokens on non-reasoning requests.
+      max_tokens: 4096,
       system: [{
         type: 'text',
         text: 'You are a helpful assistant.',

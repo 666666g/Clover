@@ -45,7 +45,7 @@ export type WorkbenchLeftSidebarProps = {
   onDesignOpen: CodeSidebarProps['onDesignOpen']
   onScheduleOpen: CodeSidebarProps['onScheduleOpen']
   onWorkflowOpen: CodeSidebarProps['onWorkflowOpen']
-  onNewConversation: CodeSidebarProps['onNewConversation']
+  onImageEditOpen: CodeSidebarProps['onImageEditOpen']
   onBeginResize: PointerEventHandler<HTMLDivElement>
 }
 
@@ -90,7 +90,7 @@ export function WorkbenchLeftSidebar({
   onDesignOpen,
   onScheduleOpen,
   onWorkflowOpen,
-  onNewConversation,
+  onImageEditOpen,
   onBeginResize
 }: WorkbenchLeftSidebarProps): ReactElement | null {
   if (collapsed) return null
@@ -156,7 +156,7 @@ export function WorkbenchLeftSidebar({
             onDesignOpen={onDesignOpen}
             onScheduleOpen={onScheduleOpen}
             onWorkflowOpen={onWorkflowOpen}
-            onNewConversation={onNewConversation}
+            onImageEditOpen={onImageEditOpen}
           />
         )}
       </div>

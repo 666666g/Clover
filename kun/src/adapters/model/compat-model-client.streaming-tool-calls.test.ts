@@ -764,17 +764,18 @@ describe('CompatModelClient output-token cap', () => {
     return drain(client.stream(request(req))).then(() => calls[0].body)
   }
 
-  it('gives reasoning (anthropic-thinking) models a large messages max_tokens default', async () => {
+  // Local default policy: 'off'/unset -> 4096, 'max' -> 32768, other reasoning -> 8192.
+  it('uses the medium messages default for non-max reasoning models', async () => {
     const body = await captureMessagesBody(
       capability({ reasoning: { supportedEfforts: ['auto', 'off'], defaultEffort: 'auto', requestProtocol: 'anthropic-thinking' } }),
       { reasoningEffort: 'auto' }
     )
-    expect(body.max_tokens).toBe(32_768)
+    expect(body.max_tokens).toBe(8_192)
   })
 
   it('uses the smaller messages default for non-reasoning models', async () => {
     const body = await captureMessagesBody(capability())
-    expect(body.max_tokens).toBe(8_192)
+    expect(body.max_tokens).toBe(4_096)
   })
 
   it('lets a per-model maxOutputTokens capability override the default', async () => {

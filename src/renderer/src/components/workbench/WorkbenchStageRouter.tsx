@@ -44,6 +44,7 @@ export type WorkbenchStageRouterProps = {
   design: DesignStageProps
   write: WriteStageProps
   conversation: WorkbenchConversationStageProps
+  imageEdit?: ReactNode
   imageAnnotationHost: ReactNode
   planOverlay: ReactNode
   extensions: {
@@ -65,6 +66,7 @@ export function WorkbenchStageRouter({
   design,
   write,
   conversation,
+  imageEdit,
   imageAnnotationHost,
   planOverlay,
   extensions
@@ -112,6 +114,8 @@ export function WorkbenchStageRouter({
           </Suspense>
         ) : route === 'design' ? (
           <WorkbenchDesignStage {...design} />
+        ) : route === 'image-edit' ? (
+          imageEdit
         ) : route === 'write' ? (
           <Suspense fallback={<WorkbenchPaneFallback />}>
             {write.runtimeBanner}

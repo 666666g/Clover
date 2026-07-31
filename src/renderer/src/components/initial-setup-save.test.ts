@@ -60,21 +60,21 @@ describe('initialSetupSelection', () => {
     expect(initialSetupSelection(settings())).toEqual({
       presetId: 'agnes',
       mode: 'api',
-      permissionMode: 'bypass',
+      permissionMode: 'ask-for-approval',
       permissionTouched: false
     })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'custom-provider-2' } } })))
       .toEqual({
         presetId: 'agnes',
         mode: 'api',
-        permissionMode: 'bypass',
+        permissionMode: 'ask-for-approval',
         permissionTouched: false
       })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'litellm' } } })))
       .toEqual({
         presetId: 'agnes',
         mode: 'api',
-        permissionMode: 'bypass',
+        permissionMode: 'ask-for-approval',
         permissionTouched: false
       })
   })
@@ -83,6 +83,7 @@ describe('initialSetupSelection', () => {
     const current = settings({
       agents: {
         kun: {
+          providerId: 'xiaomi',
           approvalPolicy: 'on-request',
           sandboxMode: 'workspace-write',
           approvalReviewer: 'user'
@@ -94,6 +95,7 @@ describe('initialSetupSelection', () => {
     const delegated = settings({
       agents: {
         kun: {
+          providerId: 'xiaomi',
           approvalPolicy: 'on-request',
           sandboxMode: 'workspace-write',
           approvalReviewer: 'agent'
@@ -103,7 +105,7 @@ describe('initialSetupSelection', () => {
     expect(initialSetupSelection(delegated).permissionMode).toBe('approve-for-me')
 
     const nonCanonical = settings({
-      agents: { kun: { approvalPolicy: 'auto', sandboxMode: 'workspace-write' } }
+      agents: { kun: { providerId: 'xiaomi', approvalPolicy: 'auto', sandboxMode: 'workspace-write' } }
     })
     expect(initialSetupSelection(nonCanonical).permissionMode).toBe('ask-for-approval')
   })
@@ -143,7 +145,7 @@ describe('initialSetupDrafts', () => {
         .toEqual({
           presetId: 'agnes',
           mode: 'api',
-          permissionMode: 'bypass',
+          permissionMode: 'ask-for-approval',
           permissionTouched: false
         })
     }
