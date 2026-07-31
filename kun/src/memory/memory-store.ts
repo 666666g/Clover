@@ -1,19 +1,24 @@
-import { mkdir, readFile, readdir } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { MemoryCapabilityConfig } from '../contracts/capabilities.js'
 import { atomicWriteFile } from '../adapters/file/atomic-write.js'
 import {
   MemoryDiagnostics,
   MemoryRecord,
+  type MemoryProvenance,
   type MemoryCreateRequest,
   type MemoryUpdateRequest
 } from '../contracts/memory.js'
 
+const DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS = 180 * 24 * 60 * 60 * 1_000
+
 export interface MemoryStore {
   create(input: MemoryCreateRequest): Promise<MemoryRecord>
+  createWithId?(id: string, input: MemoryCreateRequest): Promise<MemoryRecord>
   update(id: string, patch: MemoryUpdateRequest, access?: MemoryAccess): Promise<MemoryRecord>
   delete(id: string, access?: MemoryAccess): Promise<MemoryRecord>
-  list(filter?: { workspace?: string; includeDeleted?: boolean }): Promise<MemoryRecord[]>
+  purge?(id: string): Promise<void>
+  list(filter?: { workspace?: string; includeDeleted?: boolean; all?: boolean }): Promise<MemoryRecord[]>
   retrieve(input: { query: string; workspace?: string; limit: number }): Promise<MemoryRecord[]>
   diagnostics(): Promise<MemoryDiagnostics>
   setLastInjected(ids: string[]): void
@@ -30,28 +35,54 @@ export class FileMemoryStore implements MemoryStore {
       config: MemoryCapabilityConfig
       nowIso?: () => string
       idGenerator?: () => string
+      confidenceHalfLifeMs?: number
+      minConfidence?: number
     }
   ) {}
 
   async create(input: MemoryCreateRequest): Promise<MemoryRecord> {
-    await mkdir(this.options.rootDir, { recursive: true })
+    return this.createRecord(
+      this.options.idGenerator?.() ?? `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      input
+    )
+  }
+
+  async createWithId(id: string, input: MemoryCreateRequest): Promise<MemoryRecord> {
+    const existing = (await this.list({ includeDeleted: true, all: true })).find((record) => record.id === id)
+    if (existing) return existing
+    return this.createRecord(id, input)
+  }
+
+  private async createRecord(id: string, input: MemoryCreateRequest): Promise<MemoryRecord> {
+    await this.ensureRoot()
     const now = this.now()
     const scope = input.scope ?? 'workspace'
     const workspace = normalizeScopePath(input.workspace)
     const project = normalizeScopePath(input.project ?? (scope === 'project' ? input.workspace : undefined))
+    const provenance = input.provenance ?? defaultProvenance(input)
     const parsed = MemoryRecord.parse({
-      id: this.options.idGenerator?.() ?? `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      id,
       content: input.content,
       scope,
       ...(scope !== 'user' && workspace ? { workspace } : {}),
       ...(scope === 'project' && project ? { project } : {}),
       sourceThreadId: input.sourceThreadId,
       sourceTurnId: input.sourceTurnId,
+      provenance,
       tags: input.tags ?? [],
-      confidence: input.confidence ?? 1,
+      confidence: input.confidence ?? defaultConfidence(provenance.kind),
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      ...(input.ttlMs ? { expiresAt: new Date(Date.parse(now) + input.ttlMs).toISOString() } : {}),
+      ...(input.supersedes ? { supersedes: input.supersedes } : {})
     })
+    if (input.supersedes) {
+      const older = await this.mustGet(input.supersedes, { workspace })
+      if (older.scope !== parsed.scope) {
+        throw new Error('a memory can only supersede another memory in the same scope')
+      }
+      await this.write(MemoryRecord.parse({ ...older, supersededAt: now, updatedAt: now }))
+    }
     await this.write(parsed)
     return parsed
   }
@@ -59,11 +90,23 @@ export class FileMemoryStore implements MemoryStore {
   async update(id: string, patch: MemoryUpdateRequest, access?: MemoryAccess): Promise<MemoryRecord> {
     const current = await this.mustGet(id, access)
     const now = this.now()
+    const corrected = patch.content !== undefined && patch.content !== current.content
     const next = MemoryRecord.parse({
       ...current,
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
-      ...(patch.confidence !== undefined ? { confidence: patch.confidence } : {}),
+      ...(patch.confidence !== undefined
+        ? { confidence: patch.confidence }
+        : corrected
+          ? { confidence: 1 }
+          : {}),
+      ...(corrected
+        ? {
+            correctedFrom: current.correctedFrom ?? current.content,
+            provenance: { ...(current.provenance ?? defaultLegacyProvenance(current)), kind: 'user' }
+          }
+        : {}),
+      ...(patch.expiresAt !== undefined ? { expiresAt: patch.expiresAt ?? undefined } : {}),
       ...(patch.disabled === true ? { disabledAt: current.disabledAt ?? now } : {}),
       ...(patch.disabled === false ? { disabledAt: undefined } : {}),
       updatedAt: now
@@ -84,18 +127,29 @@ export class FileMemoryStore implements MemoryStore {
     return next
   }
 
-  async list(filter: { workspace?: string; includeDeleted?: boolean } = {}): Promise<MemoryRecord[]> {
+  async purge(id: string): Promise<void> {
+    if (!/^mem_[A-Za-z0-9_-]+$/.test(id)) throw new Error(`invalid memory id: ${id}`)
+    await rm(join(this.options.rootDir, `${id}.json`), { force: true })
+  }
+
+  async list(filter: { workspace?: string; includeDeleted?: boolean; all?: boolean } = {}): Promise<MemoryRecord[]> {
     const records = await this.readAll()
     return records
       .filter((record) => filter.includeDeleted || !record.deletedAt)
-      .filter((record) => inScope(record, filter.workspace))
+      .filter((record) => filter.all || inScope(record, filter.workspace))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
 
   async retrieve(input: { query: string; workspace?: string; limit: number }): Promise<MemoryRecord[]> {
     if (!this.options.config.enabled) return []
+    const nowMs = Date.parse(this.now())
     const active = (await this.list({ workspace: input.workspace }))
-      .filter((record) => !record.disabledAt)
+      .filter((record) => isMemoryActive(
+        record,
+        nowMs,
+        this.options.minConfidence ?? 0,
+        this.options.confidenceHalfLifeMs ?? DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS
+      ))
     // User-scope memories are persistent identity facts (name, preferences,
     // account) — small in number, high in value, and frequently queried by
     // semantic prompts ("who am I?", "what do you know about me") that share
@@ -105,7 +159,12 @@ export class FileMemoryStore implements MemoryStore {
     const userMemories = active.filter((record) => record.scope === 'user')
     const scored = active
       .filter((record) => record.scope !== 'user')
-      .map((record) => ({ record, score: scoreMemory(record, input.query) }))
+      .map((record) => ({ record, score: scoreMemory(
+        record,
+        input.query,
+        nowMs,
+        this.options.confidenceHalfLifeMs ?? DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS
+      ) }))
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score || b.record.updatedAt.localeCompare(a.record.updatedAt))
       .map((entry) => entry.record)
@@ -114,10 +173,16 @@ export class FileMemoryStore implements MemoryStore {
 
   async diagnostics(): Promise<MemoryDiagnostics> {
     const records = await this.readAll()
+    const nowMs = Date.parse(this.now())
     return {
       enabled: this.options.config.enabled,
       rootDir: this.options.rootDir,
-      activeCount: records.filter((record) => !record.deletedAt && !record.disabledAt).length,
+      activeCount: records.filter((record) => isMemoryActive(
+        record,
+        nowMs,
+        this.options.minConfidence ?? 0,
+        this.options.confidenceHalfLifeMs ?? DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS
+      )).length,
       tombstoneCount: records.filter((record) => Boolean(record.deletedAt)).length,
       lastInjectedIds: [...this.lastInjectedIds]
     }
@@ -136,7 +201,7 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   private async readAll(): Promise<MemoryRecord[]> {
-    await mkdir(this.options.rootDir, { recursive: true })
+    await this.ensureRoot()
     const entries = await readdir(this.options.rootDir).catch(() => [])
     const records = await Promise.all(entries
       .filter((entry) => entry.endsWith('.json'))
@@ -151,6 +216,11 @@ export class FileMemoryStore implements MemoryStore {
       join(this.options.rootDir, `${record.id}.json`),
       JSON.stringify(record, null, 2)
     )
+  }
+
+  private async ensureRoot(): Promise<void> {
+    await mkdir(this.options.rootDir, { recursive: true, mode: 0o700 })
+    await chmod(this.options.rootDir, 0o700)
   }
 
   private now(): string {
@@ -176,7 +246,12 @@ function normalizeScopePath(value: string | undefined): string | undefined {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
-function scoreMemory(record: MemoryRecord, query: string): number {
+function scoreMemory(
+  record: MemoryRecord,
+  query: string,
+  nowMs: number,
+  confidenceHalfLifeMs: number
+): number {
   // Build n-gram fingerprints so matching works for both Latin words and CJK
   // text. The previous implementation split on `[^a-z0-9_]+`, which treated
   // every Chinese/Japanese/Korean character as a separator and produced an
@@ -190,7 +265,61 @@ function scoreMemory(record: MemoryRecord, query: string): number {
   }
   // Normalize by query coverage so long queries do not drown out short ones.
   const coverage = overlap / queryGrams.size
-  return (overlap + coverage) * record.confidence
+  return (overlap + coverage) * effectiveMemoryConfidence(record, nowMs, confidenceHalfLifeMs)
+}
+
+export function isMemoryActive(
+  record: MemoryRecord,
+  nowMs: number,
+  minConfidence = 0,
+  halfLifeMs = DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS
+): boolean {
+  if (record.deletedAt || record.disabledAt || record.supersededAt) return false
+  if (record.expiresAt && Date.parse(record.expiresAt) <= nowMs) return false
+  return effectiveMemoryConfidence(
+    record,
+    nowMs,
+    halfLifeMs
+  ) >= minConfidence
+}
+
+export function effectiveMemoryConfidence(
+  record: MemoryRecord,
+  nowMs: number,
+  halfLifeMs = DEFAULT_MEMORY_CONFIDENCE_HALF_LIFE_MS
+): number {
+  const provenance = record.provenance ?? defaultLegacyProvenance(record)
+  if (provenance.kind === 'user' || halfLifeMs <= 0) return record.confidence
+  const createdAtMs = Date.parse(record.createdAt)
+  if (!Number.isFinite(createdAtMs)) return record.confidence
+  const ageMs = Math.max(0, nowMs - createdAtMs)
+  return record.confidence * Math.pow(0.5, ageMs / halfLifeMs)
+}
+
+function defaultProvenance(input: MemoryCreateRequest): MemoryProvenance {
+  return {
+    kind: 'user',
+    ...(input.sourceTurnId ? { turnId: input.sourceTurnId } : {}),
+    origin: 'memory'
+  }
+}
+
+function defaultLegacyProvenance(record: Pick<MemoryRecord, 'sourceTurnId'>): MemoryProvenance {
+  return {
+    kind: 'user',
+    ...(record.sourceTurnId ? { turnId: record.sourceTurnId } : {}),
+    origin: 'legacy'
+  }
+}
+
+function defaultConfidence(kind: MemoryProvenance['kind']): number {
+  switch (kind) {
+    case 'user': return 1
+    case 'file': return 0.8
+    case 'tool': return 0.7
+    case 'web': return 0.5
+    case 'inference': return 0.4
+  }
 }
 
 /**

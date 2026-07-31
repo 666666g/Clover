@@ -4,16 +4,23 @@ import {
   USER_INPUT_FREEFORM_LABEL,
   USER_INPUT_OTHER_LABEL,
   allAnswered,
+  answerDisplayValues,
   answerFromOption,
+  answerFromOptions,
   answerFromTypedText,
   answersByQuestionId,
+  isMultipleChoiceQuestion,
   isLivePendingUserInput,
   isQuestionAnswered,
   nextUnansweredIndex,
   optionsNeedRows,
   orderedAnswers,
+  questionMaxSelections,
+  questionMinSelections,
   selectLivePendingUserInput,
-  shouldShowQuestionHeader
+  selectedOptionValues,
+  shouldShowQuestionHeader,
+  toggleOptionAnswer
 } from './user-input-panel-logic'
 
 const optionQuestion: UserInputQuestion = {
@@ -31,6 +38,20 @@ const freeformQuestion: UserInputQuestion = {
   header: '',
   question: 'Service name?',
   options: []
+}
+
+const multiQuestion: UserInputQuestion = {
+  id: 'requirements',
+  header: 'Requirements',
+  question: 'Pick requirements',
+  selectionMode: 'multiple',
+  minSelections: 2,
+  maxSelections: 2,
+  options: [
+    { label: 'Keep ratio', description: '' },
+    { label: 'App icon', description: '' },
+    { label: 'Redesign outline', description: '' }
+  ]
 }
 
 function userInputBlock(overrides: Partial<Extract<ChatBlock, { kind: 'user_input' }>>): ChatBlock {
@@ -77,6 +98,49 @@ describe('answerFromOption', () => {
       label: 'PostgreSQL',
       value: 'PostgreSQL'
     })
+  })
+})
+
+describe('multi-select answers', () => {
+  it('builds a compatible joined answer with structured values', () => {
+    expect(answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2))).toEqual({
+      id: 'requirements',
+      label: 'Keep ratio, App icon',
+      value: 'Keep ratio, App icon',
+      labels: ['Keep ratio', 'App icon'],
+      values: ['Keep ratio', 'App icon']
+    })
+  })
+
+  it('toggles selected options in question order', () => {
+    const first = toggleOptionAnswer(multiQuestion, undefined, multiQuestion.options[1])
+    const second = toggleOptionAnswer(multiQuestion, first ?? undefined, multiQuestion.options[0])
+    expect(selectedOptionValues(second ?? undefined)).toEqual(['Keep ratio', 'App icon'])
+    expect(toggleOptionAnswer(multiQuestion, second ?? undefined, multiQuestion.options[0])).toEqual({
+      id: 'requirements',
+      label: 'App icon',
+      value: 'App icon',
+      labels: ['App icon'],
+      values: ['App icon']
+    })
+  })
+
+  it('enforces min and max selections', () => {
+    const one = answerFromOptions(multiQuestion, [multiQuestion.options[0]])
+    const two = answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2))
+    expect(isMultipleChoiceQuestion(multiQuestion)).toBe(true)
+    expect(questionMinSelections(multiQuestion)).toBe(2)
+    expect(questionMaxSelections(multiQuestion)).toBe(2)
+    expect(isQuestionAnswered(multiQuestion, one)).toBe(false)
+    expect(isQuestionAnswered(multiQuestion, two)).toBe(true)
+  })
+
+  it('uses display values for multi-select and legacy answers', () => {
+    expect(answerDisplayValues(answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2)))).toEqual([
+      'Keep ratio',
+      'App icon'
+    ])
+    expect(answerDisplayValues({ id: 'db', label: 'PostgreSQL', value: 'PostgreSQL' })).toEqual(['PostgreSQL'])
   })
 })
 

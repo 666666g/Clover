@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ModelProviderProfileV1 } from '@shared/app-settings'
+import type { ModelsDevCatalogResult } from '@shared/kun-gui-api'
 import { ProviderModelImportDialog } from './provider-model-import-dialog'
 
 const labels: Record<string, string> = {
@@ -12,18 +13,36 @@ const labels: Record<string, string> = {
   providerModelKindMusic: 'Music generation',
   providerModelKindVideo: 'Video generation',
   providerModelImportTitle: 'Pick models to import',
-  providerModelImportSubtitle: 'Fetched {{total}} from {{provider}}; {{existing}} already added.',
+  providerModelImportSubtitle: 'Found {{total}} for {{provider}}; {{existing}} already added.',
   providerModelImportSearchPlaceholder: 'Search by model name',
-  providerModelImportFilterAll: 'All ({{count}})',
+  providerModelImportFilterAll: 'All types ({{count}})',
+  providerModelImportSourceAll: 'All sources ({{count}})',
+  providerModelImportSourceApi: 'Provider API ({{count}})',
+  providerModelImportSourceCatalog: 'models.dev ({{count}})',
+  providerModelImportSourceApiBadge: 'Provider API',
+  providerModelImportSourceCatalogBadge: 'models.dev only',
+  providerModelImportSourceBothBadge: 'API + models.dev',
   providerModelImportHideExisting: 'Hide already added ({{count}})',
   providerModelImportAlreadyAdded: 'Already added',
-  providerModelImportNoneFetched: 'Provider returned 0 models',
+  providerModelImportNoneFetched: 'No models available',
   providerModelImportNoneMatch: 'No matches',
   providerModelImportSelectAllVisible: 'Select all ({{count}})',
   providerModelImportClearVisible: 'Clear all',
   providerModelImportSelectedCount: '{{count}} selected',
   providerModelImportCancel: 'Cancel',
-  providerModelImportConfirm: 'Import {{count}}'
+  providerModelImportConfirm: 'Import {{count}}',
+  providerModelImportApplyMetadata: 'Apply model metadata',
+  providerModelImportMetadataUpdates: '{{count}} existing models can be updated',
+  providerModelImportProviderWarning: 'Provider verification failed: {{message}}',
+  providerModelImportCatalogError: 'Catalog unavailable: {{message}}',
+  providerModelImportCatalogUnmapped: 'No exact catalog mapping.',
+  providerModelImportCatalogStale: 'Using cached catalog data.',
+  providerModelImportContextBadge: 'Context {{value}}',
+  providerModelImportOutputBadge: 'Output {{value}}',
+  providerModelImportVisionBadge: 'Vision',
+  providerModelImportToolsBadge: 'Tools',
+  providerModelImportNoToolsBadge: 'No tools',
+  providerModelImportReasoningBadge: 'Reasoning'
 }
 
 function t(key: string, params?: Record<string, unknown>): string {
@@ -44,10 +63,32 @@ function provider(overrides: Partial<ModelProviderProfileV1> = {}): ModelProvide
   }
 }
 
-function render(target: ModelProviderProfileV1, fetched: string[]): string {
+function catalog(
+  models: Extract<ModelsDevCatalogResult, { status: 'ok' }>['models'],
+  overrides: Partial<Extract<ModelsDevCatalogResult, { status: 'ok' }>> = {}
+): ModelsDevCatalogResult {
+  return {
+    status: 'ok',
+    providerKey: 'acme',
+    providerName: 'Acme Catalog',
+    matchMode: 'catalog',
+    stale: false,
+    models,
+    ...overrides
+  }
+}
+
+function render(input: {
+  target?: ModelProviderProfileV1
+  providerModelIds?: string[]
+  catalogResult?: ModelsDevCatalogResult
+  providerError?: string
+} = {}): string {
   return renderToStaticMarkup(createElement(ProviderModelImportDialog, {
-    provider: target,
-    fetchedModelIds: fetched,
+    provider: input.target ?? provider(),
+    providerModelIds: input.providerModelIds ?? [],
+    catalogResult: input.catalogResult ?? { status: 'unmapped', models: [] },
+    providerError: input.providerError,
     t,
     onCancel: () => undefined,
     onConfirm: () => undefined
@@ -55,33 +96,134 @@ function render(target: ModelProviderProfileV1, fetched: string[]): string {
 }
 
 describe('ProviderModelImportDialog', () => {
-  it('shows the fetched count, a search input, and per-kind filter chips', () => {
-    const html = render(provider(), ['gpt-4o', 'gpt-4o-mini', 'whisper-1', 'dall-e-3'])
-    expect(html).toContain('Pick models to import')
-    expect(html).toContain('Fetched 4 from Acme')
-    expect(html).toContain('Search by model name')
-    expect(html).toContain('All (4)')
-    expect(html).toContain('Text chat · 2')
+  it('shows merged source counts, metadata, and selects only provider-confirmed models', () => {
+    const html = render({
+      providerModelIds: ['GPT-4o'],
+      catalogResult: catalog([
+        {
+          id: 'gpt-4o',
+          name: 'GPT 4o',
+          description: 'Multimodal flagship',
+          inputModalities: ['text', 'image'],
+          outputModalities: ['text'],
+          contextWindowTokens: 128_000,
+          maxOutputTokens: 16_000,
+          toolCalling: true,
+          reasoning: true
+        },
+        {
+          id: 'catalog-candidate',
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+          toolCalling: false
+        }
+      ])
+    })
+
+    expect(html).toContain('Found 2 for Acme')
+    expect(html).toContain('Provider API (1)')
+    expect(html).toContain('models.dev (2)')
+    expect(html).toContain('API + models.dev')
+    expect(html).toContain('models.dev only')
+    expect(html).toContain('Multimodal flagship')
+    expect(html).toContain('Context 128K')
+    expect(html).toContain('Output 16K')
+    expect(html).toContain('Vision')
+    expect(html).toContain('Tools')
+    expect(html).toContain('Reasoning')
+    expect(html).toContain('No tools')
+    expect(html).toContain('Import 1')
   })
 
-  it('pre-selects only fresh models, hides already-added rows by default, and offers a toggle to show them', () => {
-    const html = render(
-      provider({ models: ['gpt-4o'] }),
-      ['gpt-4o', 'gpt-4o-mini']
-    )
-    // Subtitle calls out the duplicate count even though the row itself is hidden
-    expect(html).toContain('Fetched 2 from Acme; 1 already added.')
-    // Default hideExisting=true → existing row gone, fresh row visible and pre-selected → Import shows 1
+  it('hides existing rows by default and does not preselect them', () => {
+    const html = render({
+      target: provider({ models: ['gpt-4o'] }),
+      providerModelIds: ['gpt-4o', 'gpt-4o-mini']
+    })
+    expect(html).toContain('Found 2 for Acme; 1 already added.')
     expect(html).toContain('gpt-4o-mini')
-    expect(html).not.toContain('Already added') // badge hidden because filtered out
+    expect(html).not.toContain('Already added')
     expect(html).toContain('Hide already added (1)')
     expect(html).toContain('Import 1')
   })
 
-  it('renders an empty state when the provider returned no models', () => {
-    const html = render(provider(), [])
-    expect(html).toContain('Provider returned 0 models')
-    // Import button shows 0 selected and is disabled
+  it('allows catalog metadata to be applied when every matching model already exists', () => {
+    const html = render({
+      target: provider({ models: ['gpt-4o'] }),
+      providerModelIds: ['gpt-4o'],
+      catalogResult: catalog([{
+        id: 'gpt-4o',
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        contextWindowTokens: 128_000,
+        reasoning: true
+      }])
+    })
+    expect(html).toContain('1 existing models can be updated')
+    expect(html).toContain('Apply model metadata')
+    const applyButton = html.match(/<button[^>]*>Apply model metadata<\/button>/)?.[0]
+    expect(applyButton).toBeDefined()
+    expect(applyButton).not.toContain('disabled=""')
+  })
+
+  it('does not claim that a fully configured existing model needs an update', () => {
+    const html = render({
+      target: provider({
+        models: ['gpt-4o'],
+        modelProfiles: {
+          'gpt-4o': {
+            contextWindowTokens: 128_000,
+            maxOutputTokens: 16_000,
+            inputModalities: ['text', 'image'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text', 'image_url']
+          }
+        }
+      }),
+      providerModelIds: ['gpt-4o'],
+      catalogResult: catalog([{
+        id: 'gpt-4o',
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        contextWindowTokens: 128_000,
+        maxOutputTokens: 16_000,
+        reasoning: true
+      }])
+    })
+    expect(html).not.toContain('existing models can be updated')
+    expect(html).toContain('Import 0')
+    expect(html).toContain('disabled=""')
+  })
+
+  it('shows independent provider and stale-catalog warnings', () => {
+    const html = render({
+      providerError: '401 unauthorized',
+      catalogResult: catalog([{ id: 'candidate', inputModalities: ['text'], outputModalities: ['text'] }], {
+        stale: true
+      })
+    })
+    expect(html).toContain('Provider verification failed: 401 unauthorized')
+    expect(html).toContain('Using cached catalog data.')
+    expect(html).toContain('Import 0')
+  })
+
+  it('does not offer catalog-only rows in enrichment-only mode', () => {
+    const html = render({
+      providerModelIds: ['gpt-5.5'],
+      catalogResult: catalog([
+        { id: 'gpt-5.5', inputModalities: ['text', 'image'], outputModalities: ['text'] },
+        { id: 'unavailable-subscription-model', inputModalities: ['text'], outputModalities: ['text'] }
+      ], { matchMode: 'enrichment-only' })
+    })
+    expect(html).toContain('gpt-5.5')
+    expect(html).not.toContain('unavailable-subscription-model')
+    expect(html).toContain('Import 1')
+  })
+
+  it('renders an empty state when neither source returned models', () => {
+    const html = render()
+    expect(html).toContain('No models available')
     expect(html).toContain('Import 0')
     expect(html).toContain('disabled=""')
   })

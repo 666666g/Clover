@@ -116,6 +116,107 @@ describe('SkillRuntime', () => {
     }
   })
 
+  it('rejects manifest entry and asset paths that escape a skill package', async () => {
+    const secret = join(root, 'outside-secret.md')
+    await writeFile(secret, 'PRIVATE KEY MATERIAL', 'utf8')
+    const escaped = join(root, 'escaped')
+    const assetEscaped = join(root, 'asset-escaped')
+    await mkdir(escaped, { recursive: true })
+    await mkdir(assetEscaped, { recursive: true })
+    await writeFile(join(escaped, 'skill.json'), JSON.stringify({
+      id: 'escaped', name: 'Escaped', entry: '../outside-secret.md'
+    }), 'utf8')
+    await writeFile(join(assetEscaped, 'skill.json'), JSON.stringify({
+      id: 'asset-escaped', name: 'Asset Escaped', assets: ['../outside-secret.md']
+    }), 'utf8')
+    await writeFile(join(assetEscaped, 'SKILL.md'), 'safe body', 'utf8')
+
+    const runtime = await createRuntime()
+
+    expect(runtime.diagnostics().skills.map((skill) => skill.id)).not.toContain('escaped')
+    expect(runtime.diagnostics().skills.map((skill) => skill.id)).not.toContain('asset-escaped')
+    expect(runtime.diagnostics().validationErrors.map((error) => error.message).join('\n')).toMatch(/escapes its root/)
+  })
+
+  it('rejects a skill entry symlinked outside its package', async (ctx) => {
+    const outside = await mkdtemp(join(tmpdir(), 'kun-skill-secret-'))
+    try {
+      const secret = join(outside, 'secret.md')
+      await writeFile(secret, 'PRIVATE KEY MATERIAL', 'utf8')
+      const skillDir = join(root, 'linked-entry')
+      await mkdir(skillDir, { recursive: true })
+      await writeFile(join(skillDir, 'skill.json'), JSON.stringify({ id: 'linked-entry', name: 'Linked Entry' }), 'utf8')
+      try {
+        await symlink(secret, join(skillDir, 'SKILL.md'))
+      } catch {
+        ctx.skip()
+        return
+      }
+
+      const runtime = await createRuntime()
+
+      expect(runtime.diagnostics().skills.map((skill) => skill.id)).not.toContain('linked-entry')
+      expect(runtime.diagnostics().validationErrors.map((error) => error.message).join('\n')).toMatch(/resolves outside its root/)
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects workspace-discovered skill packages symlinked outside the workspace', async (ctx) => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-skill-workspace-boundary-'))
+    const external = await mkdtemp(join(tmpdir(), 'kun-skill-external-'))
+    try {
+      await writeSkillAt(external, 'outside', {
+        id: 'outside', name: 'Outside', triggers: { commands: ['/outside'] }
+      }, 'PRIVATE KEY MATERIAL')
+      await mkdir(join(workspace, '.kun', 'skills'), { recursive: true })
+      try {
+        await symlink(join(external, 'outside'), join(workspace, '.kun', 'skills', 'outside'), 'dir')
+      } catch {
+        ctx.skip()
+        return
+      }
+      const config = KunCapabilitiesConfig.parse({
+        skills: { enabled: true, roots: [], workspaceRoots: [], legacySkillMd: true }
+      })
+      const runtime = await SkillRuntime.create(config.skills)
+
+      const resolution = await runtime.resolveTurn({ prompt: '/outside run', workspace })
+
+      expect(resolution.catalogInstruction).toBeUndefined()
+      expect(resolution.activeSkillIds).toEqual([])
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(external, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects regular-expression prompt patterns instead of running them per turn', async () => {
+    await writeSkill('redos', {
+      id: 'redos',
+      name: 'Redos',
+      triggers: { promptPatterns: ['^(a+)+$'] }
+    }, 'unsafe pattern')
+
+    const runtime = await createRuntime()
+    const resolution = await runtime.resolveTurn({ prompt: `${'a'.repeat(20_000)}!`, workspace: root })
+
+    expect(runtime.diagnostics().skills.map((skill) => skill.id)).not.toContain('redos')
+    expect(runtime.diagnostics().validationErrors.map((error) => error.message).join('\n')).toContain('promptPatterns must be literal text')
+    expect(resolution.activeSkillIds).toEqual([])
+  })
+
+  it('rejects oversized skill entries before retaining them in the catalog cache', async () => {
+    await writeSkill('oversized', {
+      id: 'oversized', name: 'Oversized'
+    }, 'x'.repeat(256 * 1024 + 1))
+
+    const runtime = await createRuntime()
+
+    expect(runtime.diagnostics().skills.map((skill) => skill.id)).not.toContain('oversized')
+    expect(runtime.diagnostics().validationErrors.map((error) => error.message).join('\n')).toMatch(/exceeds 262144 byte limit/)
+  })
+
   it('matches triggers deterministically and respects injection budgets', async () => {
     await writeSkill('big', {
       id: 'big',
@@ -209,6 +310,38 @@ describe('SkillRuntime', () => {
     } finally {
       await rm(workspaceA, { recursive: true, force: true })
       await rm(workspaceB, { recursive: true, force: true })
+    }
+  })
+
+  it('discovers workspace-local Kun skills from .kun/skills', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-skill-workspace-kun-'))
+    try {
+      const skillRoot = join(workspace, '.kun', 'skills')
+      await writeSkillAt(skillRoot, 'pm', {
+        id: 'pm',
+        name: 'Project Manager',
+        triggers: { commands: ['/pm'] }
+      }, 'PM instructions')
+
+      const config = KunCapabilitiesConfig.parse({
+        skills: {
+          enabled: true,
+          roots: [],
+          workspaceRoots: [],
+          legacySkillMd: true
+        }
+      })
+      const runtime = await SkillRuntime.create(config.skills)
+      const resolution = await runtime.resolveTurn({ prompt: '/pm plan the work', workspace })
+
+      expect(resolution.catalogInstruction).toContain('Project Manager')
+      expect(resolution.activeSkillIds).toEqual(['pm'])
+      await expect(runtime.loadSkillById('pm', workspace)).resolves.toMatchObject({
+        skillId: 'pm',
+        name: 'Project Manager'
+      })
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
     }
   })
 

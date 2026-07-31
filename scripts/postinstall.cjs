@@ -8,9 +8,11 @@ function run(command, args, options = {}) {
   })
 }
 
-require('./ensure-kun-install.cjs')
-
-const buildKun = run('npm', ['--prefix', 'kun', 'run', 'build'])
+// Keep clean-checkout bootstrap on the same canonical order as release builds:
+// build the workspace API first, install Kun's separate dependency tree, then
+// compile Kun. `npm --prefix kun ci` does not run this root lifecycle script, so
+// delegating to build:kun cannot recurse back into postinstall.
+const buildKun = run('npm', ['run', 'build:kun'])
 if (buildKun.status !== 0) {
   process.exit(buildKun.status || 1)
 }

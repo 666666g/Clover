@@ -663,7 +663,7 @@ function RunInputDialog({
         className="flex max-h-[80vh] w-[460px] flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-card shadow-xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <header className="flex items-center justify-between border-b border-ds-border px-5 py-3.5">
+        <header className="flex shrink-0 items-center justify-between border-b border-ds-border px-5 py-3.5">
           <span className="text-[14px] font-semibold text-ds-ink">{t('workflowRunWithInputs')}</span>
           <button
             type="button"
@@ -673,7 +673,7 @@ function RunInputDialog({
             <X className="h-4 w-4" strokeWidth={1.8} />
           </button>
         </header>
-        <div className="flex flex-col gap-3 overflow-y-auto px-5 py-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4">
           {schema.map((field) => (
             <label key={field.key} className="flex flex-col gap-1.5">
               <span className="text-[12px] font-medium text-ds-muted">

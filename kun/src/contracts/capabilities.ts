@@ -3,7 +3,7 @@ import { MODEL_ENDPOINT_FORMATS } from './model-endpoint-format.js'
 
 export const RUNTIME_CAPABILITY_CONTRACT_VERSION = 1
 
-export const RuntimeCapabilityStatus = z.enum(['available', 'disabled', 'unavailable'])
+export const RuntimeCapabilityStatus = z.enum(['available', 'disabled', 'unavailable', 'interaction-required'])
 export type RuntimeCapabilityStatus = z.infer<typeof RuntimeCapabilityStatus>
 
 export const RuntimeCapabilityState = z
@@ -25,11 +25,17 @@ export type ModelMessagePartSupport = z.infer<typeof ModelMessagePartSupport>
 export const ModelReasoningEffort = z.enum(['auto', 'off', 'low', 'medium', 'high', 'max'])
 export type ModelReasoningEffort = z.infer<typeof ModelReasoningEffort>
 
+export const ModelServiceTier = z.enum(['priority', 'flex'])
+export type ModelServiceTier = z.infer<typeof ModelServiceTier>
+
 export const ModelReasoningRequestProtocol = z.enum([
   'none',
   'deepseek-chat-completions',
   'glm-chat-completions',
   'mimo-chat-completions',
+  'openai-chat-completions',
+  'qwen-chat-completions',
+  'thinking-toggle-chat-completions',
   'openai-responses',
   'anthropic-thinking'
 ])
@@ -58,10 +64,15 @@ export const ModelCapabilityMetadata = z
     maxOutputTokens: z.number().int().positive().optional(),
     messageParts: z.array(ModelMessagePartSupport).min(1),
     reasoning: ModelReasoningCapabilityMetadata.optional(),
+    /** Provider-advertised request service tiers supported by this model. */
+    serviceTiers: z.array(ModelServiceTier).min(1).optional(),
     // Per-model wire-format override. Lets one provider route some models to
     // chat completions and others to Anthropic Messages / OpenAI Responses
     // (e.g. OpenCode Go). Absent means "inherit the provider/runtime format".
-    endpointFormat: z.enum(MODEL_ENDPOINT_FORMATS).optional()
+    endpointFormat: z.enum(MODEL_ENDPOINT_FORMATS).optional(),
+    // Codex-only Responses Lite transport. Omitted uses the standard
+    // Responses request shape.
+    responsesMode: z.literal('lite').optional()
   })
   .strict()
 export type ModelCapabilityMetadata = z.infer<typeof ModelCapabilityMetadata>
@@ -82,6 +93,19 @@ export type McpTrustScope = z.infer<typeof McpTrustScope>
 
 export const McpToolDiscoveryMode = z.enum(['direct', 'search', 'auto'])
 export type McpToolDiscoveryMode = z.infer<typeof McpToolDiscoveryMode>
+
+export const McpOAuthConfig = z
+  .object({
+    enabled: z.boolean().default(true),
+    clientName: z.string().min(1).optional(),
+    clientId: z.string().min(1).optional(),
+    clientSecret: z.string().min(1).optional(),
+    scopes: z.array(z.string().min(1)).default([]),
+    redirectPort: z.number().int().min(1024).max(65535).optional(),
+    callbackTimeoutMs: z.number().int().positive().default(120_000)
+  })
+  .strict()
+export type McpOAuthConfig = z.infer<typeof McpOAuthConfig>
 
 export const McpSearchConfig = z
   .object({
@@ -124,8 +148,11 @@ export const McpServerConfig = z
     // Visibility scope: empty means globally visible; otherwise the server is
     // advertised only when ToolHostContext.workspace is under one of these roots.
     workspaceRoots: z.array(z.string().min(1)).default([]),
+    oauth: McpOAuthConfig.optional(),
     trustScope: McpTrustScope.default('workspace'),
     trustedWorkspaceRoots: z.array(z.string().min(1)).default([]),
+    /** MCP tool names explicitly trusted by the host as read-only in Plan mode. */
+    planModeReadOnlyTools: z.array(z.string().min(1)).default([]),
     timeoutMs: z.number().int().positive().default(30_000)
   })
   .strict()
@@ -170,7 +197,10 @@ export const McpServerConfig = z
       })
     }
   })
-export type McpServerConfig = z.infer<typeof McpServerConfig>
+type ParsedMcpServerConfig = z.infer<typeof McpServerConfig>
+export type McpServerConfig = Omit<ParsedMcpServerConfig, 'planModeReadOnlyTools'> & {
+  planModeReadOnlyTools?: string[]
+}
 
 export const McpCapabilityConfig = CapabilityToggleConfig.extend({
   servers: z.record(z.string().min(1), McpServerConfig).default({}),
@@ -194,6 +224,8 @@ export const SkillsCapabilityConfig = CapabilityToggleConfig.extend({
   workspaceRoots: z.array(z.string().min(1)).default([]),
   /** Global skill roots (e.g. ~/.kun/skills). Scanned after project roots. */
   globalRoots: z.array(z.string().min(1)).default([]),
+  /** Read workspace-local `.kun/project.json` Skill policy on demand. */
+  projectConfigEnabled: z.boolean().default(true),
   /**
    * Skill ids the user disabled in the GUI. Excluded everywhere a skill can
    * surface (catalog, auto-match, load_skill, diagnostics) so a disabled skill
@@ -203,7 +235,16 @@ export const SkillsCapabilityConfig = CapabilityToggleConfig.extend({
   disabledIds: z.array(z.string().min(1)).default([]),
   legacySkillMd: z.boolean().default(true)
 }).strict()
-export type SkillsCapabilityConfig = z.infer<typeof SkillsCapabilityConfig>
+type ParsedSkillsCapabilityConfig = z.infer<typeof SkillsCapabilityConfig>
+export type SkillsCapabilityConfig = Omit<ParsedSkillsCapabilityConfig, 'projectConfigEnabled'> & {
+  projectConfigEnabled?: boolean
+}
+
+export const InstructionsCapabilityConfig = CapabilityToggleConfig.extend({
+  maxFileBytes: z.number().int().positive().default(64 * 1024),
+  maxTotalBytes: z.number().int().positive().default(96 * 1024)
+}).strict()
+export type InstructionsCapabilityConfig = z.infer<typeof InstructionsCapabilityConfig>
 
 export const SubagentToolPolicy = z.enum(['readOnly', 'inherit'])
 export type SubagentToolPolicy = z.infer<typeof SubagentToolPolicy>
@@ -212,6 +253,10 @@ export type SubagentToolPolicy = z.infer<typeof SubagentToolPolicy>
 export const SubagentMode = z.enum(['subagent', 'primary', 'all'])
 export type SubagentMode = z.infer<typeof SubagentMode>
 
+/** Product surfaces where a profile is available for delegation. */
+export const SubagentSurface = z.enum(['shared', 'code', 'write', 'design'])
+export type SubagentSurface = z.infer<typeof SubagentSurface>
+
 /**
  * Tools a `readOnly` subagent may call. The list is enforced twice: the
  * child loop advertises only these names (schema filter) and the
@@ -219,7 +264,20 @@ export type SubagentMode = z.infer<typeof SubagentMode>
  * to side-effect-free investigation tools — no bash/edit/write, and no
  * nested `delegate_task`.
  */
-export const SUBAGENT_READ_ONLY_TOOL_NAMES = ['read', 'grep', 'find', 'ls'] as const
+/**
+ * Host-enforced upper bound for read-only subagents. Profile `allowedTools`
+ * may narrow this set but can never add mutation, command, delegation, memory,
+ * or arbitrary connector tools to it.
+ */
+export const SUBAGENT_READ_ONLY_TOOL_NAMES = [
+  'read',
+  'grep',
+  'glob',
+  'ls',
+  'repo_map',
+  'web_fetch',
+  'web_search'
+] as const
 
 export const SubagentProfileConfig = z
   .object({
@@ -231,12 +289,23 @@ export const SubagentProfileConfig = z
     color: z.string().min(1).optional(),
     /** Where the agent can be used: delegated subagent, primary session persona, or both. */
     mode: SubagentMode.default('subagent'),
+    /**
+     * Product surfaces where this role participates in routing. `shared`
+     * makes the role available everywhere and is canonicalized without other
+     * values. Missing values retain legacy global availability.
+     */
+    surfaces: z.array(SubagentSurface).max(4).optional(),
     /** Overrides the child model for this role (falls back to the server default). */
     model: z.string().min(1).optional(),
     /** Routes this role's child to a specific provider id (falls back to the runtime default provider). */
     providerId: z.string().min(1).optional(),
     /** Persona/instructions appended to the base system prompt for this role (not a full replace). */
     systemPrompt: z.string().min(1).optional(),
+    /**
+     * When true, the child's immutable system prompt is only `systemPrompt`
+     * (no Kun base prefix). Empty/missing role prompts still fall back to base.
+     */
+    omitBasePrompt: z.boolean().optional(),
     /** Short instruction prepended to the delegated task prompt. */
     promptPreamble: z.string().min(1).optional(),
     /**
@@ -246,7 +315,7 @@ export const SubagentProfileConfig = z
      * explicitly (e.g. the built-in reviewers).
      */
     toolPolicy: SubagentToolPolicy.default('inherit'),
-    /** Exact tool allow-list; overrides toolPolicy when set (e.g. ['read','grep','bash']). */
+    /** Exact tool allow-list; narrows toolPolicy and the parent capability snapshot. */
     allowedTools: z.array(z.string().min(1)).min(1).optional(),
     /** Built-in tool names blocked for this profile (deny-list, layered on `inherit`; e.g. ['bash','write']). */
     blockedTools: z.array(z.string().min(1)).optional(),
@@ -254,6 +323,8 @@ export const SubagentProfileConfig = z
     blockedMcpServers: z.array(z.string().min(1)).optional(),
     /** Skill ids blocked for this profile (deny-list; default inherits every available skill). */
     blockedSkills: z.array(z.string().min(1)).optional(),
+    /** Disable skill discovery, auto-activation, and load_skill for this child. */
+    skillsEnabled: z.boolean().optional(),
     /**
      * Reasoning depth applied to this profile's child model requests. Default
      * 'off' (cheap); a profile opts into deeper thinking explicitly. Flows to
@@ -262,11 +333,23 @@ export const SubagentProfileConfig = z
     reasoningEffort: ModelReasoningEffort.optional()
   })
   .strict()
+  .superRefine((profile, ctx) => {
+    const hasModel = Boolean(profile.model?.trim())
+    const hasProvider = Boolean(profile.providerId?.trim())
+    if (hasModel === hasProvider) return
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: hasModel ? ['providerId'] : ['model'],
+      message: 'subagent model and providerId must be configured together'
+    })
+  })
 export type SubagentProfileConfig = z.infer<typeof SubagentProfileConfig>
 
 export const SubagentsCapabilityConfig = CapabilityToggleConfig.extend({
+  /** Reuse configured profiles instead of requiring the parent to define a one-run role. */
+  useExistingAgents: z.boolean().default(true),
   /** Max children running at once; extra spawns queue instead of erroring. */
-  maxParallel: z.number().int().nonnegative().default(0),
+  maxParallel: z.number().int().nonnegative().default(256),
   /** Hard cap on total children per parent thread. */
   maxChildRuns: z.number().int().nonnegative().default(0),
   /**
@@ -288,7 +371,7 @@ export const SubagentsCapabilityConfig = CapabilityToggleConfig.extend({
 })
   .strict()
   .superRefine((config, ctx) => {
-    if (config.defaultProfile && !(config.defaultProfile in config.profiles)) {
+    if (config.defaultProfile && !Object.prototype.hasOwnProperty.call(config.profiles, config.defaultProfile)) {
       ctx.addIssue({
         code: 'custom',
         path: ['defaultProfile'],
@@ -302,11 +385,29 @@ export type SubagentsCapabilityConfig = z.output<typeof SubagentsCapabilityConfi
 export const DEFAULT_ATTACHMENT_TEXT_FALLBACK_MAX_BASE64_BYTES = 512 * 1024
 export const DEFAULT_ATTACHMENT_TEXT_FALLBACK_MAX_IMAGE_DIMENSION = 1280
 export const DEFAULT_ATTACHMENT_TEXT_FALLBACK_PREFERRED_MIME_TYPE = 'image/webp'
+export const DEFAULT_ATTACHMENT_DOCUMENT_MIME_TYPES = [
+  'application/pdf',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'text/tab-separated-values',
+  'application/json',
+  'application/xml',
+  'text/xml',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+]
+export const DEFAULT_ATTACHMENT_MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+export const DEFAULT_ATTACHMENT_MAX_DOCUMENT_TEXT_CHARS = 200_000
 
 export const AttachmentsCapabilityConfig = CapabilityToggleConfig.extend({
   maxImageBytes: z.number().int().positive().default(5 * 1024 * 1024),
   maxImageDimension: z.number().int().positive().default(4096),
   allowedMimeTypes: z.array(z.string().min(1)).default(['image/png', 'image/jpeg', 'image/webp']),
+  allowedDocumentMimeTypes: z.array(z.string().min(1)).default(DEFAULT_ATTACHMENT_DOCUMENT_MIME_TYPES),
+  maxDocumentBytes: z.number().int().positive().default(DEFAULT_ATTACHMENT_MAX_DOCUMENT_BYTES),
+  maxDocumentTextChars: z.number().int().positive().default(DEFAULT_ATTACHMENT_MAX_DOCUMENT_TEXT_CHARS),
   textFallbackMaxBase64Bytes: z.number().int().positive().default(DEFAULT_ATTACHMENT_TEXT_FALLBACK_MAX_BASE64_BYTES),
   textFallbackMaxImageDimension: z.number().int().positive().default(DEFAULT_ATTACHMENT_TEXT_FALLBACK_MAX_IMAGE_DIMENSION),
   textFallbackPreferredMimeType: z.string().min(1).default(DEFAULT_ATTACHMENT_TEXT_FALLBACK_PREFERRED_MIME_TYPE)
@@ -319,15 +420,29 @@ export const MemoryCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type MemoryCapabilityConfig = z.infer<typeof MemoryCapabilityConfig>
 
-export const ImageGenerationProtocol = z.enum(['openai-images', 'minimax-image', 'agnes-image'])
+export const ImageGenerationProtocol = z.enum([
+  'openai-images',
+  'minimax-image',
+  'codex-responses-image',
+  'grok-imagine-image',
+  'volcengine-ark-image',
+  'agnes-image'
+])
 export type ImageGenerationProtocol = z.infer<typeof ImageGenerationProtocol>
+export const ImageGenerationQuality = z.enum(['auto', 'low', 'medium', 'high'])
+export type ImageGenerationQuality = z.infer<typeof ImageGenerationQuality>
+export const ImageGenerationResolution = z.enum(['auto', '1K', '2K', '3K', '4K'])
+export type ImageGenerationResolution = z.infer<typeof ImageGenerationResolution>
 
 export const ImageGenCapabilityConfig = CapabilityToggleConfig.extend({
   protocol: ImageGenerationProtocol.default('openai-images'),
   baseUrl: z.string().min(1).optional(),
   apiKey: z.string().min(1).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   model: z.string().min(1).optional(),
   defaultSize: z.string().min(1).optional(),
+  defaultResolution: ImageGenerationResolution.default('1K'),
+  quality: ImageGenerationQuality.default('auto'),
   timeoutMs: z.number().int().positive().default(180_000),
   maxReferenceImages: z.number().int().positive().max(8).default(4)
 }).strict()
@@ -360,13 +475,19 @@ export const MusicGenCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type MusicGenCapabilityConfig = z.infer<typeof MusicGenCapabilityConfig>
 
-export const VideoGenerationProtocol = z.enum(['minimax-video', 'agnes-video'])
+export const VideoGenerationProtocol = z.enum([
+  'minimax-video',
+  'grok-imagine-video',
+  'volcengine-ark-video',
+  'agnes-video'
+])
 export type VideoGenerationProtocol = z.infer<typeof VideoGenerationProtocol>
 
 export const VideoGenCapabilityConfig = CapabilityToggleConfig.extend({
   protocol: VideoGenerationProtocol.default('minimax-video'),
   baseUrl: z.string().min(1).optional(),
   apiKey: z.string().min(1).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   model: z.string().min(1).optional(),
   defaultDuration: z.number().int().positive().default(6),
   defaultResolution: z.string().min(1).default('1080P'),
@@ -393,10 +514,29 @@ export const ComputerUseCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type ComputerUseCapabilityConfig = z.infer<typeof ComputerUseCapabilityConfig>
 
+export const BrowserUseMode = z.enum(['public', 'local-development'])
+export type BrowserUseMode = z.infer<typeof BrowserUseMode>
+export const BrowserUseApprovalMode = z.enum(['auto-safe', 'always-ask'])
+export type BrowserUseApprovalMode = z.infer<typeof BrowserUseApprovalMode>
+
+export const BrowserUseCapabilityConfig = CapabilityToggleConfig.extend({
+  mode: BrowserUseMode.default('public'),
+  approvalMode: BrowserUseApprovalMode.default('auto-safe'),
+  maxTabs: z.number().int().min(1).max(3).default(2),
+  maxObservationActionsPerTurn: z.number().int().min(1).max(100).default(30),
+  maxInteractionActionsPerTurn: z.number().int().min(1).max(50).default(12),
+  maxSnapshotNodes: z.number().int().min(10).max(500).default(250),
+  maxSnapshotTextChars: z.number().int().min(1000).max(50_000).default(20_000),
+  maxImageDimension: z.number().int().min(320).max(2048).default(1280),
+  idleTimeoutMs: z.number().int().min(30_000).max(30 * 60_000).default(5 * 60_000)
+}).strict()
+export type BrowserUseCapabilityConfig = z.infer<typeof BrowserUseCapabilityConfig>
+
 export const KunCapabilitiesConfig = z
   .object({
     mcp: McpCapabilityConfig.default(() => McpCapabilityConfig.parse({})),
     web: WebCapabilityConfig.default(() => WebCapabilityConfig.parse({})),
+    instructions: InstructionsCapabilityConfig.default(() => InstructionsCapabilityConfig.parse({ enabled: true })),
     skills: SkillsCapabilityConfig.default(() => SkillsCapabilityConfig.parse({})),
     subagents: SubagentsCapabilityConfig.default(() => SubagentsCapabilityConfig.parse({})),
     attachments: AttachmentsCapabilityConfig.default(() => AttachmentsCapabilityConfig.parse({})),
@@ -405,7 +545,8 @@ export const KunCapabilitiesConfig = z
     speechGen: SpeechGenCapabilityConfig.default(() => SpeechGenCapabilityConfig.parse({})),
     musicGen: MusicGenCapabilityConfig.default(() => MusicGenCapabilityConfig.parse({})),
     videoGen: VideoGenCapabilityConfig.default(() => VideoGenCapabilityConfig.parse({})),
-    computerUse: ComputerUseCapabilityConfig.default(() => ComputerUseCapabilityConfig.parse({}))
+    computerUse: ComputerUseCapabilityConfig.default(() => ComputerUseCapabilityConfig.parse({})),
+    browserUse: BrowserUseCapabilityConfig.default(() => BrowserUseCapabilityConfig.parse({}))
   })
   .strict()
 export type KunCapabilitiesConfig = z.infer<typeof KunCapabilitiesConfig>
@@ -447,7 +588,12 @@ export const RuntimeCapabilityManifest = z
       configuredRoots: z.number().int().nonnegative(),
       discoveredSkills: z.number().int().nonnegative()
     }).strict(),
+    instructions: RuntimeCapabilityState.extend({
+      lastSourceCount: z.number().int().nonnegative(),
+      lastInjectedBytes: z.number().int().nonnegative()
+    }).strict(),
     subagents: RuntimeCapabilityState.extend({
+      useExistingAgents: z.boolean(),
       maxParallel: z.number().int().nonnegative(),
       maxChildRuns: z.number().int().nonnegative(),
       defaultToolPolicy: SubagentToolPolicy,
@@ -468,6 +614,9 @@ export const RuntimeCapabilityManifest = z
       maxImageBytes: z.number().int().positive(),
       maxImageDimension: z.number().int().positive(),
       allowedMimeTypes: z.array(z.string().min(1)),
+      allowedDocumentMimeTypes: z.array(z.string().min(1)),
+      maxDocumentBytes: z.number().int().positive(),
+      maxDocumentTextChars: z.number().int().positive(),
       textFallbackMaxBase64Bytes: z.number().int().positive(),
       textFallbackMaxImageDimension: z.number().int().positive(),
       textFallbackPreferredMimeType: z.string().min(1)
@@ -490,6 +639,10 @@ export const RuntimeCapabilityManifest = z
     }).strict(),
     computerUse: RuntimeCapabilityState.extend({
       mode: ComputerUseMode
+    }).strict(),
+    browserUse: RuntimeCapabilityState.extend({
+      mode: BrowserUseMode,
+      approvalMode: BrowserUseApprovalMode
     }).strict()
   })
   .strict()
@@ -519,6 +672,12 @@ export function buildRuntimeCapabilityManifest(input: {
     configuredRoots?: number
     discoveredSkills?: number
     reason?: string
+  }
+  instructions?: {
+    available?: boolean
+    reason?: string
+    lastSourceCount?: number
+    lastInjectedBytes?: number
   }
   attachments?: {
     available?: boolean
@@ -552,6 +711,11 @@ export function buildRuntimeCapabilityManifest(input: {
     available?: boolean
     reason?: string
   }
+  browserUse?: {
+    available?: boolean
+    interactionRequired?: boolean
+    reason?: string
+  }
 }): RuntimeCapabilityManifest {
   const config = KunCapabilitiesConfig.parse(input.config ?? {})
   const configuredMcpServers = input.mcp?.configuredServers ?? Object.keys(config.mcp.servers).length
@@ -574,14 +738,20 @@ export function buildRuntimeCapabilityManifest(input: {
   const configuredSkillRoots = input.skills?.configuredRoots ?? config.skills.roots.length
   const discoveredSkills = input.skills?.discoveredSkills ?? 0
   const skillsState = skillsCapabilityState(config.skills.enabled, discoveredSkills, input.skills?.reason)
+  const instructionsState = providerCapabilityState(
+    config.instructions.enabled,
+    'instructions are disabled by config',
+    input.instructions?.available !== false,
+    input.instructions?.reason ?? 'instructions runtime is unavailable'
+  )
   return RuntimeCapabilityManifest.parse({
     contractVersion: RUNTIME_CAPABILITY_CONTRACT_VERSION,
     model: input.model,
     cli: {
       serve: available(),
-      run: unavailable('not implemented'),
-      chat: unavailable('not implemented'),
-      exec: unavailable('not implemented')
+      run: available(),
+      chat: available(),
+      exec: available()
     },
     mcp: {
       ...mcpState,
@@ -607,6 +777,11 @@ export function buildRuntimeCapabilityManifest(input: {
       configuredRoots: configuredSkillRoots,
       discoveredSkills
     },
+    instructions: {
+      ...instructionsState,
+      lastSourceCount: input.instructions?.lastSourceCount ?? 0,
+      lastInjectedBytes: input.instructions?.lastInjectedBytes ?? 0
+    },
     subagents: {
       ...providerCapabilityState(
         config.subagents.enabled,
@@ -614,6 +789,7 @@ export function buildRuntimeCapabilityManifest(input: {
         input.subagents?.available === true,
         input.subagents?.reason ?? 'subagent runtime is unavailable'
       ),
+      useExistingAgents: config.subagents.useExistingAgents,
       maxParallel: config.subagents.maxParallel,
       maxChildRuns: config.subagents.maxChildRuns,
       defaultToolPolicy: config.subagents.defaultToolPolicy,
@@ -634,6 +810,9 @@ export function buildRuntimeCapabilityManifest(input: {
       maxImageBytes: config.attachments.maxImageBytes,
       maxImageDimension: config.attachments.maxImageDimension,
       allowedMimeTypes: config.attachments.allowedMimeTypes,
+      allowedDocumentMimeTypes: config.attachments.allowedDocumentMimeTypes,
+      maxDocumentBytes: config.attachments.maxDocumentBytes,
+      maxDocumentTextChars: config.attachments.maxDocumentTextChars,
       textFallbackMaxBase64Bytes: config.attachments.textFallbackMaxBase64Bytes,
       textFallbackMaxImageDimension: config.attachments.textFallbackMaxImageDimension,
       textFallbackPreferredMimeType: config.attachments.textFallbackPreferredMimeType
@@ -692,6 +871,16 @@ export function buildRuntimeCapabilityManifest(input: {
         input.computerUse?.reason ?? 'computer-use backend is unavailable on this platform'
       ),
       mode: config.computerUse.mode
+    },
+    browserUse: {
+      ...browserUseCapabilityState(
+        config.browserUse.enabled,
+        input.browserUse?.available === true,
+        input.browserUse?.interactionRequired === true,
+        input.browserUse?.reason
+      ),
+      mode: config.browserUse.mode,
+      approvalMode: config.browserUse.approvalMode
     }
   })
 }
@@ -724,6 +913,38 @@ function providerCapabilityState(
   return availableProvider
     ? { status: 'available', enabled: true, available: true }
     : { status: 'unavailable', enabled: true, available: false, reason: unavailableReason }
+}
+
+function browserUseCapabilityState(
+  enabled: boolean,
+  hostAvailable: boolean,
+  interactionRequired: boolean,
+  reason: string | undefined
+): RuntimeCapabilityState {
+  if (!enabled) {
+    return {
+      status: 'disabled',
+      enabled: false,
+      available: false,
+      reason: 'browser use is disabled by config'
+    }
+  }
+  if (interactionRequired) {
+    return {
+      status: 'interaction-required',
+      enabled: true,
+      available: false,
+      reason: reason ?? 'browser use requires a visible authenticated GUI'
+    }
+  }
+  return hostAvailable
+    ? { status: 'available', enabled: true, available: true }
+    : {
+        status: 'unavailable',
+        enabled: true,
+        available: false,
+        reason: reason ?? 'browser-use host bridge is unavailable'
+      }
 }
 
 function webCapabilityState(

@@ -43,6 +43,9 @@ let activeDownload: {
   tempPath: string
   canceled: boolean
 } | null = null
+const activeWhisperChildren = new Set<ReturnType<typeof spawn>>()
+const activeWhisperRuns = new Set<Promise<void>>()
+let whisperShuttingDown = false
 
 type RunnerCommand = {
   command: string
@@ -96,6 +99,13 @@ export async function downloadLocalWhisperModel(
   sourceId: unknown
 ): Promise<LocalWhisperModelDownloadResult> {
   const model = localWhisperModelById(modelId)
+  if (whisperShuttingDown) {
+    return {
+      ok: false,
+      message: 'local Whisper service is shutting down',
+      status: baseStatus(model.id, 'not_downloaded')
+    }
+  }
   const current = await getLocalWhisperModelStatus(model.id)
   if (current.state === 'ready') return { ok: true, status: current }
   if (downloadPromise) return downloadPromise
@@ -114,9 +124,11 @@ export async function cancelLocalWhisperModel(
   if (!activeDownload || activeDownload.modelId !== model.id) {
     return { ok: true, status: await getLocalWhisperModelStatus(model.id) }
   }
-  activeDownload.canceled = true
-  activeDownload.controller.abort()
-  await rm(activeDownload.tempPath, { force: true }).catch(() => undefined)
+  const canceledDownload = activeDownload
+  canceledDownload.canceled = true
+  canceledDownload.controller.abort()
+  await downloadPromise?.catch(() => undefined)
+  await rm(canceledDownload.tempPath, { force: true }).catch(() => undefined)
   return { ok: true, status: baseStatus(model.id, 'not_downloaded') }
 }
 
@@ -151,6 +163,7 @@ export async function transcribeViaLocalWhisper(
   request: SpeechTranscriptionRequest,
   speechToText: KunSpeechToTextSettingsV1
 ): Promise<string> {
+  if (whisperShuttingDown) throw new Error('local Whisper service is shutting down')
   const modelId = normalizeModelId(speechToText.model)
   const status = await getLocalWhisperModelStatus(modelId)
   if (status.state !== 'ready' || !status.path) {
@@ -502,13 +515,23 @@ async function runWhisper(
   timeoutMs: number,
   runner: Pick<RunnerCommand, 'cwd' | 'env'> = {}
 ): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+  const run = new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, { cwd: runner.cwd, env: runner.env, windowsHide: true })
+    activeWhisperChildren.add(child)
     let stderr = ''
     let stdout = ''
+    let settled = false
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      activeWhisperChildren.delete(child)
+      if (error) reject(error)
+      else resolve()
+    }
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
-      reject(new Error(`local Whisper timed out after ${timeoutMs}ms`))
+      finish(new Error(`local Whisper timed out after ${timeoutMs}ms`))
     }, timeoutMs)
     child.stdout?.on('data', (chunk) => {
       stdout += String(chunk)
@@ -517,22 +540,53 @@ async function runWhisper(
       stderr += String(chunk)
     })
     child.on('error', (error) => {
-      clearTimeout(timer)
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error(`local Whisper runner is missing (${basename(command)})`))
+        finish(new Error(`local Whisper runner is missing (${basename(command)})`))
         return
       }
-      reject(error)
+      finish(error)
     })
     child.on('exit', (code) => {
-      clearTimeout(timer)
       if (code === 0) {
-        resolve()
+        finish()
         return
       }
-      reject(new Error((stderr || stdout || `local Whisper exited with code ${code}`).trim().slice(0, 1000)))
+      finish(new Error((stderr || stdout || `local Whisper exited with code ${code}`).trim().slice(0, 1000)))
     })
   })
+  activeWhisperRuns.add(run)
+  try {
+    await run
+  } finally {
+    activeWhisperRuns.delete(run)
+  }
+}
+
+export async function shutdownLocalWhisperService(): Promise<void> {
+  whisperShuttingDown = true
+  if (activeDownload) {
+    activeDownload.canceled = true
+    activeDownload.controller.abort()
+  }
+  for (const child of activeWhisperChildren) {
+    try { child.kill('SIGKILL') } catch { /* already exited */ }
+  }
+  const pending = [
+    ...activeWhisperRuns,
+    ...(downloadPromise ? [downloadPromise] : [])
+  ]
+  if (pending.length > 0) {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>((resolve) => { timeout = setTimeout(resolve, 2_000) })
+      ])
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
+  }
+  progressEmitter = null
 }
 
 export function localWhisperAvailableModels(): typeof LOCAL_WHISPER_MODELS {
@@ -544,6 +598,10 @@ export const _internals = {
   checkLocalWhisperDownloadSource,
   localWhisperDownloadUrl,
   localWhisperModelPath,
+  runWhisper,
+  resetShutdownForTest(): void {
+    whisperShuttingDown = false
+  },
   setLocalWhisperDownloadStateForTest(progress: LocalWhisperModelProgress | null): void {
     lastProgress = progress
     downloadPromise = progress

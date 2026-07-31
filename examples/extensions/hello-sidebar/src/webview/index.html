@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>Hello Sidebar</title>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow" id="locale">Kun Extension</p>
+      <h1>Hello Sidebar</h1>
+      <p>This View runs in Kun's sandbox and persists only non-secret View state.</p>
+      <button id="greet" type="button">Say hello</button>
+      <output id="count" aria-live="polite"></output>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

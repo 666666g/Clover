@@ -13,8 +13,8 @@ The name Kun is inspired by the great fish in Zhuangzi's line,
 "In the northern sea there is a fish; its name is Kun." In
 this project, it means a deeper local runtime rather than a thin model
 UI: one agent loop that can carry project context, call tools
-reliably, resume sessions, and serve desktop chat, writing, phone
-connections, and scheduled tasks.
+reliably, resume sessions, and serve desktop chat, design, writing,
+phone connections, and scheduled tasks.
 
 Kun's core goal is to improve the ROI of every token. Tokens should be
 spent on user requirements, code, decisions, and results, not repeated
@@ -51,6 +51,60 @@ Run from the `kun/` directory.
 - `npm run serve` – start the runtime after a build.
 - `npm run dev` – rebuild in watch mode.
 
+- `npm run benchmark:replay -- --suite <file>` - run a read-only HTTP/SSE agent replay suite.
+
+### Agent replay benchmark
+
+Start a Kun runtime, set `KUN_RUNTIME_URL` and `KUN_RUNTIME_TOKEN`, then run the five-task smoke set:
+
+```bash
+npm run benchmark:replay -- --suite benchmarks/agent-core.json --tag smoke --output replay-smoke.json
+```
+
+Run all 20 tasks twice and compare with an earlier report:
+
+```bash
+npm run benchmark:replay -- --suite benchmarks/agent-core.json --repeat 2 \
+  --baseline replay-baseline.json --output replay-current.json --fail-on-regression
+```
+
+Use a comparison policy when providers or local models need different variance tolerances:
+
+```bash
+npm run benchmark:replay -- --suite benchmarks/agent-core.json \
+  --baseline replay-baseline.json --comparison-policy replay-policy.json \
+  --output replay-current.json --fail-on-regression
+```
+
+```json
+{
+  "defaults": {
+    "maxSuccessRateDrop": 0,
+    "maxTtftRelativeIncrease": 0.2,
+    "maxTtftAbsoluteIncreaseMs": 300
+  },
+  "models": {
+    "local-model": {
+      "maxTtftRelativeIncrease": 0.5,
+      "maxTtftAbsoluteIncreaseMs": 800
+    }
+  }
+}
+```
+
+Reports must use the same suite, task iterations, repeat count, concurrency, thread-retention mode, and tag. Model changes are rejected
+unless the policy sets `allowModelChange` to `true`. Each run records its effective task/suite/runtime model, so
+mixed-model suites resolve and evaluate thresholds separately for every current model. New reports also include a
+stable hash of normalized prompts, expectations, timeouts, provider/reasoning selections, and non-model suite defaults; regenerate
+legacy baselines that do not contain this hash before comparing them with a new report.
+
+Peak RSS is a process-lifetime metric, so its regression thresholds are evaluated once from policy `defaults` for
+the whole suite. It is intentionally not attributed to individual models in a mixed-model run.
+
+Replay threads always use the `read-only` sandbox and disable interactive input. Reports include success rate,
+TTFT, full latency, tool time, SSE delivery delay, token/cache/cost counters, and Kun process peak RSS. The runtime
+token is accepted only through `KUN_RUNTIME_TOKEN`, so it does not leak through process arguments.
+
 ## CLI
 
 `kun serve` accepts the following flags:
@@ -73,10 +127,10 @@ Example:
 
 ```bash
 kun serve \
-  --config ~/.deepseekgui/kun/config.json \
+  --config ~/.kun/data/config.json \
   --host 127.0.0.1 \
   --port 18899 \
-  --data-dir ~/.deepseekgui/kun \
+  --data-dir ~/.kun/data \
   --runtime-token dev-token \
   --api-key "$DEEPSEEK_API_KEY" \
   --model deepseek-v4-pro
@@ -85,14 +139,16 @@ kun serve \
 Kun can also run as a standalone agent without the GUI:
 
 ```bash
-kun run --data-dir ~/.deepseekgui/kun --workspace "$PWD" "summarize this repo"
-kun chat --data-dir ~/.deepseekgui/kun --workspace "$PWD"
-kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" --list-tools
-kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" read --args '{"path":"README.md"}'
+kun run --data-dir ~/.kun/data --workspace "$PWD" "summarize this repo"
+kun chat --data-dir ~/.kun/data --workspace "$PWD"
+kun --data-dir ~/.kun/data --workspace "$PWD"
+kun exec --data-dir ~/.kun/data --workspace "$PWD" --list-tools
+kun exec --data-dir ~/.kun/data --workspace "$PWD" read --args '{"path":"README.md"}'
 ```
 
 - `kun run` creates a thread, runs one turn, streams assistant text, and exits.
 - `kun chat` starts a line-oriented REPL. Use `/exit`, `/quit`, or an empty line to stop.
+- Bare `kun` (or its `kun tui` alias) attaches to or starts the shared background runtime. Its inline pi-tui interface preserves terminal scrollback and shares live HTTP/SSE state with the GUI. See [the TUI guide](../docs/kun-tui.en.md).
 - `kun exec --list-tools` prints the effective dynamic tool registry for the chosen config/workspace.
 - `kun exec <tool> --args <json>` invokes one tool directly. Use `--json` on `run` or `exec` for machine-readable output.
 
@@ -130,7 +186,7 @@ Kun also reads `{data-dir}/config.json` when it exists. In the GUI's
 default setup this is:
 
 ```text
-~/.deepseekgui/kun/config.json
+~/.kun/data/config.json
 ```
 
 Shape:
@@ -140,7 +196,7 @@ Shape:
   "serve": {
     "host": "127.0.0.1",
     "port": 18899,
-    "dataDir": "~/.deepseekgui/kun",
+    "dataDir": "~/.kun/data",
     "runtimeToken": "",
     "apiKey": "",
     "baseUrl": "https://api.deepseek.com/beta",
@@ -199,6 +255,13 @@ Shape:
           "transport": "streamable-http",
           "url": "https://mcp.example.com/mcp",
           "headers": { "authorization": "Bearer <docs-mcp-token>" },
+          "oauth": {
+            "enabled": true,
+            "clientName": "Kun",
+            "clientId": "<optional-oauth-client-id>",
+            "clientSecret": "<optional-oauth-client-secret>",
+            "scopes": ["docs.readonly"]
+          },
           "trustScope": "user",
           "timeoutMs": 30000
         }
@@ -258,17 +321,40 @@ See `../docs/KUN_CONFIG.md` for the detailed file layout and examples.
 
 Feature flags are intentionally explicit:
 
-- `capabilities.mcp` starts configured MCP clients and imports their tools into the dynamic registry. Workspace-scoped servers require `trustedWorkspaceRoots`.
+- `capabilities.mcp` starts configured MCP clients and imports their tools into the dynamic registry. Workspace-scoped servers require `trustedWorkspaceRoots`. Remote HTTP/SSE servers can use `oauth`; Kun stores OAuth tokens under the data directory instead of the config file. Use `GET /v1/mcp/oauth` to inspect redacted OAuth state and `DELETE /v1/mcp/oauth/{serverId}` to clear a server's saved authorization.
 - `serve.mcpSearch` can collapse a large MCP catalog into four entry points: `mcp_search`, `mcp_describe`, `mcp_call`, and `mcp_refresh_catalog`. When the catalog is too large, the model searches for relevant tools first, then describes and calls the exact tool instead of carrying every MCP schema on every turn.
 - `serve.tokenEconomy` / `tokenEconomyMode` compresses tool descriptions, tool results, and history context while preserving code, paths, commands, URLs, errors, and other high-value signals.
 - `contextCompaction` controls fallback long-thread compaction thresholds and summary behavior. Per-model thresholds live in `models.profiles`. Compaction preserves goals, constraints, decisions, touched files, tool outcomes, and unresolved next steps.
 - `serve.runtimeTuning.toolStorm` suppresses repeated identical tool calls within a turn so useless tool loops do not keep spending tokens.
-- `runtime.streamIdleTimeoutMs` (top-level in `config.json`) caps the idle gap between streaming chunks before a turn fails with `stream_idle_timeout` (default `45000`). Raise it for local model servers that stay silent while prefilling a very large prompt; set `0` to disable the guard.
+- `runtime.streamIdleTimeoutMs` (top-level in `config.json`) caps the idle gap between streaming chunks before a turn fails with `stream_idle_timeout` (default `450000`, or 7.5 minutes). Raise it for local model servers that stay silent while prefilling a very large prompt; set `0` to disable the guard.
 - `capabilities.web` exposes `web_fetch` and/or `web_search`. The built-in provider can fetch HTTP(S) pages; search requires a provider implementation and may report unavailable.
 - `capabilities.skills` scans configured roots for `skill.json` manifests and, when `legacySkillMd` is true, older `SKILL.md` directories.
 - `capabilities.attachments` stores image bytes outside thread logs and allows turns to reference `attachmentIds`. Vision-capable models receive image parts; text-only models receive a bounded compressed base64 text fallback.
 - `capabilities.memory` stores long-term records under the data dir, retrieves scoped matches before turns, and exposes `memory_create`, `memory_update`, and `memory_delete` tools.
 - `capabilities.subagents` exposes `delegate_task` with `maxParallel` and `maxChildRuns` concurrency budgets.
+  Workspace overlays under `<workspace>/.kun/agents/*.md` enter automatic
+  BM25/LLM routing (id/name/description only), appear in Settings and the
+  workbench subagent sidebar with a Custom tag, default to read-only, and may
+  set `toolPolicy: inherit` or `omit_base_prompt: true`. Model/provider overrides
+  and nested delegation stay blocked.
+
+Kun installs 33 fixed standalone subagent profiles. Nine are Kun's existing
+general/design and specialist personas; 24 engineering workflows adapted from
+`addyosmani/agent-skills` are rebuilt as independent agents with their own
+self-contained system prompts. They do not load a Skill by id and remain usable
+when Skills are disabled. Interactive upstream workflows are child-safe:
+`interview-me` produces prioritized requirement questions for the parent, and
+`doubt-driven-development` performs one fresh-context adversarial review.
+
+The main agent can choose an exact `profile`, provide a one-run `custom_agent`,
+or omit both. Automatic routing runs BM25 Top-5 over agent profiles and uses a
+small-model judge to select an existing agent. If none fits, a separate
+generator recalls up to three trusted built-in agent examples, creates a
+self-contained temporary role, and runs it. `generate_subagent` exposes that
+same design-and-run path explicitly. Generated roles are not installed into
+settings or the reusable catalog; their exact definitions remain in the
+permission-protected child-run audit record. They cannot delegate or load Skills. Router and generator usage are recorded
+separately. See `../THIRD_PARTY_NOTICES.md` for attribution.
 
 Use `GET /v1/runtime/info` for the runtime capability manifest and
 `GET /v1/runtime/tools` for redacted provider diagnostics. The GUI
@@ -279,7 +365,7 @@ Settings page reads both routes.
 Hooks let external commands observe and intervene in the agent
 lifecycle without rebuilding Kun. They are configured under the
 top-level `hooks` key in `config.json` (so the GUI's
-`~/.deepseekgui/kun/config.json` works out of the box) and run inside
+`~/.kun/data/config.json` works out of the box) and run inside
 the serve runtime — main loop, subagents, and CLI alike.
 
 ```json
@@ -375,9 +461,9 @@ The HTTP server exposes the following routes under `/v1/*`:
 | GET | `/v1/threads?include=side` | list threads (most recently updated first); side threads are hidden unless `include=side` is passed |
 | POST | `/v1/threads` | create a thread |
 | GET | `/v1/threads/{id}` | read a thread with its turns |
-| PATCH | `/v1/threads/{id}` | update title/status/approval/sandbox/relation (promote a side thread by setting `relation: "primary"`) |
+| PATCH | `/v1/threads/{id}` | update title/status/mode/approval/sandbox/relation and `additionalWorkspaces` (promote a side thread by setting `relation: "primary"`) |
 | DELETE | `/v1/threads/{id}` | delete a thread |
-| POST | `/v1/threads/{id}/fork` | fork the thread. Optional JSON body: `{ "relation": "fork" \| "side", "title"?: string }` (defaults to `fork` when omitted). `relation: "side"` marks the result as a side conversation and tags `parentThreadId`. |
+| POST | `/v1/threads/{id}/fork` | fork the thread. Optional JSON body: `{ "relation": "fork" \| "side", "title"?: string, "turnId"?: string, "beforeTurn"?: boolean }` (defaults to `fork` when omitted). `turnId` limits the snapshot to one turn and `beforeTurn` excludes that turn for non-destructive undo. `relation: "side"` marks the result as a side conversation and tags `parentThreadId`. |
 | POST | `/v1/threads/{id}/turns` | start a turn |
 | GET | `/v1/threads/{id}/turns/{turnId}` | read a single turn |
 | POST | `/v1/threads/{id}/turns/{turnId}/steer` | queue steering text |
@@ -447,6 +533,28 @@ and replay exactly as before. If a constraint should become
 cross-thread recall, create an explicit memory record through the
 GUI memory review surface or the `memory_create` tool. If it should
 stay local to one thread, leave it as a pinned constraint.
+
+## Agent observability
+
+Sanitized agent spans can stay in the default local JSONL file or be
+exported to an OpenTelemetry collector with OTLP/HTTP JSON. The OTLP
+exporter is opt-in, bounded, batched, and runs outside the runtime event
+persistence path. Runtime shutdown drains queued batches within the configured
+export timeout and leaves no background retry timer behind. Set the standard variables below before starting Kun:
+
+```sh
+OTEL_TRACES_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is used as-is when set. Otherwise
+Kun appends `/v1/traces` to `OTEL_EXPORTER_OTLP_ENDPOINT`. Standard
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT` values are
+also supported, including their trace-specific variants. Prompts,
+assistant text, tool arguments, tool output, commands, and arbitrary
+error messages are excluded by default. `includeSensitiveContent` must
+be explicitly enabled before arbitrary error messages are exported.
 
 ## Troubleshooting
 

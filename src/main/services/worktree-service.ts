@@ -28,12 +28,17 @@ function getTaskId(projectPath: string, poolIndex: number): string | null {
 
 function setTaskId(projectPath: string, poolIndex: number, taskId: string | null): void {
   let inner = taskMap.get(projectPath)
-  if (!inner) {
+  if (!inner && taskId !== null) {
     inner = new Map()
     taskMap.set(projectPath, inner)
   }
-  if (taskId === null) inner.delete(poolIndex)
-  else inner.set(poolIndex, taskId)
+  if (!inner) return
+  if (taskId === null) {
+    inner.delete(poolIndex)
+    if (inner.size === 0) taskMap.delete(projectPath)
+  } else {
+    inner.set(poolIndex, taskId)
+  }
 }
 
 function poolBranch(poolIndex: number): string {

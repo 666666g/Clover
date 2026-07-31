@@ -109,9 +109,30 @@ let packageInfoCache: WeixinPackageInfo | null = null
 const activeLogins = new Map<string, WeixinLoginSession>()
 const contextTokenStore = new Map<string, string>()
 const monitors = new Map<string, WeixinMonitor>()
+const runtimeAbortController = new AbortController()
+let runtimeStopped = false
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted || ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function requestSignal(timeoutMs: number | undefined, signal?: AbortSignal): AbortSignal {
+  const signals: AbortSignal[] = [runtimeAbortController.signal]
+  if (signal) signals.push(signal)
+  if (timeoutMs !== undefined) signals.push(AbortSignal.timeout(timeoutMs))
+  return signals.length === 1 ? signals[0]! : AbortSignal.any(signals)
 }
 
 function resolveRpcUrl(port = activeBridgePort): string {
@@ -217,13 +238,14 @@ async function apiGet(
   baseUrl: string,
   endpoint: string,
   timeoutMs: number,
-  label: string
+  label: string,
+  signal?: AbortSignal
 ): Promise<JsonRecord> {
   const url = new URL(endpoint, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`)
   const res = await fetch(url.toString(), {
     method: 'GET',
     headers: buildCommonHeaders(),
-    signal: AbortSignal.timeout(timeoutMs)
+    signal: requestSignal(timeoutMs, signal)
   })
   const data = await readJsonResponse(res)
   if (!res.ok) {
@@ -236,14 +258,14 @@ async function apiPost(
   baseUrl: string,
   endpoint: string,
   body: JsonRecord,
-  options: { token?: string; timeoutMs?: number; label: string }
+  options: { token?: string; timeoutMs?: number; label: string; signal?: AbortSignal }
 ): Promise<JsonRecord> {
   const url = new URL(endpoint, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`)
   const res = await fetch(url.toString(), {
     method: 'POST',
     headers: buildHeaders(options.token),
     body: JSON.stringify(body),
-    signal: options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined
+    signal: requestSignal(options.timeoutMs, options.signal)
   })
   const data = await readJsonResponse(res)
   if (!res.ok) {
@@ -515,13 +537,14 @@ async function fetchQRCode(botType = WEIXIN_DEFAULT_BOT_TYPE): Promise<JsonRecor
   )
 }
 
-async function pollQRStatus(baseUrl: string, qrcode: string): Promise<JsonRecord> {
+async function pollQRStatus(baseUrl: string, qrcode: string, signal?: AbortSignal): Promise<JsonRecord> {
   try {
     return await apiGet(
       baseUrl,
       `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
       QR_LONG_POLL_TIMEOUT_MS,
-      'pollQRStatus'
+      'pollQRStatus',
+      signal
     )
   } catch (error) {
     if (error instanceof Error && error.name === 'TimeoutError') return { status: 'wait' }
@@ -582,7 +605,13 @@ async function waitForWeixinLogin(params: JsonRecord): Promise<JsonRecord> {
   const timeoutMs = Math.max(Number(params.timeoutMs) || 480_000, 1_000)
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const status = await pollQRStatus(login.currentApiBaseUrl ?? WEIXIN_API_BASE_URL, login.qrcode)
+    const signal = runtimeAbortController.signal
+    if (signal.aborted) return { connected: false, message: '微信连接已停止。' }
+    const status = await pollQRStatus(
+      login.currentApiBaseUrl ?? WEIXIN_API_BASE_URL,
+      login.qrcode,
+      signal
+    )
     switch (recordString(status, 'status')) {
       case 'wait':
       case 'scaned':
@@ -635,7 +664,7 @@ async function waitForWeixinLogin(params: JsonRecord): Promise<JsonRecord> {
         }
       }
     }
-    await sleep(1_000)
+    await sleep(1_000, signal)
   }
   activeLogins.delete(sessionKey)
   return { connected: false, message: '登录超时，请重试。' }
@@ -711,7 +740,8 @@ async function notifyStop(account: WeixinAccount): Promise<void> {
 async function getUpdates(
   account: WeixinAccount,
   getUpdatesBuf: string,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<JsonRecord> {
   try {
     return await apiPost(
@@ -721,7 +751,7 @@ async function getUpdates(
         get_updates_buf: getUpdatesBuf,
         base_info: buildBaseInfo()
       },
-      { token: account.token, timeoutMs, label: 'getUpdates' }
+      { token: account.token, timeoutMs, label: 'getUpdates', ...(signal ? { signal } : {}) }
     )
   } catch (error) {
     if (error instanceof Error && error.name === 'TimeoutError') {
@@ -741,6 +771,7 @@ async function sendMessageWeixin(params: {
   text: string
   contextToken?: string
   timeoutMs?: number
+  signal?: AbortSignal
 }): Promise<{ messageId: string }> {
   const messageId = generateMessageId()
   await apiPost(
@@ -761,7 +792,8 @@ async function sendMessageWeixin(params: {
     {
       token: params.account.token,
       timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
-      label: 'sendMessage'
+      label: 'sendMessage',
+      ...(params.signal ? { signal: params.signal } : {})
     }
   )
   return { messageId }
@@ -864,9 +896,11 @@ async function sendGeneratedFilesWeixin(
   account: WeixinAccount,
   to: string,
   files: readonly WeixinOutboundFile[],
-  contextToken: string | undefined
+  contextToken: string | undefined,
+  signal?: AbortSignal
 ): Promise<void> {
   for (const file of files) {
+    if (signal?.aborted) return
     try {
       const sendWeixinMediaFile = await loadSendWeixinMediaFile()
       await sendWeixinMediaFile({
@@ -886,13 +920,18 @@ async function sendGeneratedFilesWeixin(
         account,
         to,
         text: `文件 ${file.fileName} 发送失败，请稍后再试。`,
-        contextToken
+        contextToken,
+        ...(signal ? { signal } : {})
       }).catch(() => undefined)
     }
   }
 }
 
-async function postToDeepSeekGuiWebhook(message: WeixinMessage, accountId: string): Promise<JsonRecord> {
+async function postToDeepSeekGuiWebhook(
+  message: WeixinMessage,
+  accountId: string,
+  signal?: AbortSignal
+): Promise<JsonRecord> {
   const settings = await resolveRuntimeContext()
   const text = textFromItemList(message.item_list)
   if (!text) return { reply: 'Only text messages are supported right now.' }
@@ -911,9 +950,11 @@ async function postToDeepSeekGuiWebhook(message: WeixinMessage, accountId: strin
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(650_000)
+    signal: requestSignal(650_000, signal)
   })
   const data = await readJsonResponse(res)
+  const reply = recordString(data, 'reply') || recordString(data, 'text')
+  if (reply) return data
   if (!res.ok || data.ok === false) {
     throw new Error(recordString(data, 'message') || `Kun webhook HTTP ${res.status}`)
   }
@@ -944,23 +985,26 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
   const dispatchToSender = (message: WeixinMessage, to: string, contextToken: string | undefined): void => {
     const task = async (): Promise<void> => {
       if (signal.aborted) return
-      const result = await postToDeepSeekGuiWebhook(message, account.accountId)
+      const result = await postToDeepSeekGuiWebhook(message, account.accountId, signal)
+      if (signal.aborted) return
       const reply = recordString(result, 'reply') || recordString(result, 'text')
       if (reply) {
         await sendMessageWeixin({
           account,
           to,
           text: reply,
-          contextToken
+          contextToken,
+          signal
         })
       }
       // Generated media files arrive alongside the text reply and go out as
       // native image / file messages.
-      await sendGeneratedFilesWeixin(account, to, webhookGeneratedFiles(result), contextToken)
+      await sendGeneratedFilesWeixin(account, to, webhookGeneratedFiles(result), contextToken, signal)
     }
     const chained = (senderChains.get(to) ?? Promise.resolve())
       .then(task)
       .catch((error) => {
+        if (signal.aborted) return
         logWarn('weixin-bridge', 'WeChat message dispatch failed.', {
           accountId: account.accountId,
           message: error instanceof Error ? error.message : String(error)
@@ -973,7 +1017,8 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
   }
   while (!signal.aborted) {
     try {
-      const resp = await getUpdates(account, getUpdatesBuf, nextTimeoutMs)
+      const resp = await getUpdates(account, getUpdatesBuf, nextTimeoutMs, signal)
+      if (signal.aborted) break
       if (typeof resp.longpolling_timeout_ms === 'number' && resp.longpolling_timeout_ms > 0) {
         nextTimeoutMs = resp.longpolling_timeout_ms
       }
@@ -981,7 +1026,7 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
       const errcode = Number(resp.errcode ?? 0)
       if (ret !== 0 || errcode !== 0) {
         consecutiveFailures += 1
-        await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
+        await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS, signal)
         if (consecutiveFailures >= 3) consecutiveFailures = 0
         continue
       }
@@ -993,7 +1038,7 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
       }
       const messages = Array.isArray(resp.msgs) ? resp.msgs as WeixinMessage[] : []
       for (const message of messages) {
-        if (signal.aborted) return
+        if (signal.aborted) break
         if (message.message_type === MessageType.BOT) continue
         const to = message.from_user_id || ''
         if (!to) continue
@@ -1002,16 +1047,18 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
         dispatchToSender(message, to, contextToken)
       }
     } catch (error) {
-      if (signal.aborted) return
+      if (signal.aborted) break
       logWarn('weixin-bridge', 'WeChat monitor iteration failed.', {
         accountId: account.accountId,
         message: error instanceof Error ? error.message : String(error)
       })
       consecutiveFailures += 1
-      await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
+      await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS, signal)
       if (consecutiveFailures >= 3) consecutiveFailures = 0
     }
   }
+
+  await Promise.allSettled([...senderChains.values()])
 
   try {
     await notifyStop(account)
@@ -1020,10 +1067,12 @@ async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Pro
   }
 }
 
-function startAccountMonitor(accountId: string): void {
+async function startAccountMonitor(accountId: string): Promise<void> {
+  if (runtimeStopped) return
   const normalized = normalizeAccountId(accountId)
   const existing = monitors.get(normalized)
   if (existing && !existing.controller.signal.aborted) return
+  if (existing) await existing.promise
   const controller = new AbortController()
   const promise = monitorWeixinAccount(normalized, controller.signal).catch((error) => {
     if (!controller.signal.aborted) {
@@ -1039,20 +1088,27 @@ function startAccountMonitor(accountId: string): void {
 }
 
 async function startWeixinChannels(params: JsonRecord): Promise<JsonRecord> {
+  if (runtimeStopped) return { started: [] }
   const requestedAccountId = recordString(params, 'accountId')
   const accountIds = requestedAccountId
     ? [normalizeAccountId(requestedAccountId)]
     : await listIndexedWeixinAccountIds()
-  for (const accountId of accountIds) startAccountMonitor(accountId)
+  for (const accountId of accountIds) await startAccountMonitor(accountId)
   return { started: accountIds }
 }
 
 async function stopWeixinChannels(params: JsonRecord): Promise<JsonRecord> {
   const requestedAccountId = recordString(params, 'accountId')
   const targets = requestedAccountId ? [normalizeAccountId(requestedAccountId)] : [...monitors.keys()]
-  for (const accountId of targets) {
-    monitors.get(accountId)?.controller.abort()
-    monitors.delete(accountId)
+  const active = targets.flatMap((accountId) => {
+    const monitor = monitors.get(accountId)
+    if (!monitor) return []
+    monitor.controller.abort()
+    return [monitor]
+  })
+  await Promise.allSettled(active.map((monitor) => monitor.promise))
+  for (const monitor of active) {
+    if (monitors.get(monitor.accountId) === monitor) monitors.delete(monitor.accountId)
   }
   return { stopped: targets }
 }
@@ -1167,20 +1223,27 @@ async function listen(serverToStart: HttpServer, port: number): Promise<void> {
 }
 
 async function startBridgeServer(): Promise<string> {
+  if (runtimeStopped) throw new Error('Built-in WeChat bridge is stopped.')
   if (server && await fetchBridgeHealth(activeBridgePort)) return resolveRpcUrl()
   const port = await resolveAvailableBridgePort()
   activeBridgePort = port
   await prepareBridgeState(port)
+  if (runtimeStopped) throw new Error('Built-in WeChat bridge is stopped.')
   server = createHttpServer((request, response) => {
     void handleBridgeRequest(request, response)
   })
   await listen(server, port)
+  if (runtimeStopped) {
+    await closeBridgeServer()
+    throw new Error('Built-in WeChat bridge is stopped.')
+  }
   logInfo('weixin-bridge', `started built-in GUI WeChat bridge on port ${port}`)
   await startWeixinChannels({})
   return resolveRpcUrl()
 }
 
 export async function ensureWeixinBridgeRpcUrl(): Promise<string> {
+  if (runtimeStopped) throw new Error('Built-in WeChat bridge is stopped.')
   if (!startPromise) {
     startPromise = startBridgeServer().catch((error) => {
       startPromise = null
@@ -1209,14 +1272,16 @@ export async function getWeixinBridgeAccountUserId(accountId: string): Promise<s
 export async function sendWeixinBridgeMessage(options: {
   accountId: string
   to: string
-  text: string
+  text?: string
+  files?: readonly WeixinOutboundFile[]
 }): Promise<WeixinBridgeSendResult> {
   const accountId = normalizeAccountId(options.accountId)
   const to = options.to.trim()
-  const text = options.text.trim()
+  const text = options.text?.trim() ?? ''
+  const files = options.files ?? []
   if (!accountId) return { ok: false, message: 'WeChat account id is missing.' }
   if (!to) return { ok: false, message: 'WeChat recipient is missing.' }
-  if (!text) return { ok: false, message: 'Message is empty.' }
+  if (!text && files.length === 0) return { ok: false, message: 'Message is empty.' }
 
   try {
     await ensureWeixinBridgeRpcUrl()
@@ -1227,13 +1292,21 @@ export async function sendWeixinBridgeMessage(options: {
       return { ok: false as const, message: 'WeChat account is not configured.' }
     }
     await restoreContextTokens(account.accountId)
-    const result = await sendMessageWeixin({
-      account,
-      to,
-      text,
-      contextToken: getContextToken(account.accountId, to)
-    })
-    return { ok: true as const, messageId: result.messageId }
+    const contextToken = getContextToken(account.accountId, to)
+    let messageId = ''
+    if (text) {
+      const result = await sendMessageWeixin({
+        account,
+        to,
+        text,
+        contextToken
+      })
+      messageId = result.messageId
+    }
+    if (files.length > 0) {
+      await sendGeneratedFilesWeixin(account, to, files, contextToken)
+    }
+    return { ok: true as const, messageId }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     logError('weixin-bridge', 'Failed to send WeChat message from GUI.', {
@@ -1245,18 +1318,37 @@ export async function sendWeixinBridgeMessage(options: {
   }
 }
 
-export function stopWeixinBridgeRuntime(): void {
-  startPromise = null
-  for (const monitor of monitors.values()) monitor.controller.abort()
-  monitors.clear()
-  if (!server) return
+async function closeBridgeServer(): Promise<void> {
   const runningServer = server
   server = null
-  runningServer.close()
+  if (!runningServer) return
+  await new Promise<void>((resolve) => {
+    runningServer.close(() => resolve())
+    runningServer.closeAllConnections?.()
+  })
+}
+
+export async function stopWeixinBridgeRuntime(): Promise<void> {
+  runtimeStopped = true
+  runtimeAbortController.abort()
+  const starting = startPromise
+  startPromise = null
+  const activeMonitors = [...monitors.values()]
+  for (const monitor of activeMonitors) monitor.controller.abort()
+  activeLogins.clear()
+  contextTokenStore.clear()
+  await Promise.allSettled(activeMonitors.map((monitor) => monitor.promise))
+  monitors.clear()
+  await closeBridgeServer()
+  await starting?.catch(() => undefined)
+  // A start that was between its final checks when shutdown began may have
+  // published a server after the first close. Close that generation too.
+  await closeBridgeServer()
 }
 
 export const weixinBridgeRuntimeInternals = {
   buildBaseInfo,
   normalizeAccountId,
+  postToDeepSeekGuiWebhook,
   webhookGeneratedFiles
 }

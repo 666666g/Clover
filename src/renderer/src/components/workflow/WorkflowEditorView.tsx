@@ -87,9 +87,9 @@ export const WORKFLOW_EDITOR_HEADER_CLASS =
 export const WORKFLOW_EDITOR_HEADER_SIDEBAR_COLLAPSED_CLASS =
   'workflow-editor-header-sidebar-collapsed'
 export const WORKFLOW_EDITOR_SIDEBAR_CLASS =
-  'workflow-editor-sidebar ds-drag flex w-[184px] shrink-0 flex-col border-r border-ds-border bg-ds-card/40'
+  'workflow-editor-sidebar ds-sidebar-surface ds-drag flex w-[184px] shrink-0 flex-col border-r border-ds-border'
 export const WORKFLOW_EDITOR_BACK_BUTTON_CLASS =
-  'ds-no-drag flex h-9 items-center gap-2 rounded-xl px-2 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink'
+  'workflow-editor-back-button ds-no-drag flex h-9 items-center gap-2 rounded-xl px-2 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink'
 
 type WorkflowConnectionsArg = ReturnType<typeof flowToWorkflowGraph>['connections']
 
@@ -437,28 +437,28 @@ function WorkflowEditorInner({
   )
 
   return (
-    <div className="ds-no-drag ds-titlebar-fixed-overlay fixed inset-x-0 bottom-0 top-0 z-[60] flex bg-ds-main">
+    <div className="workflow-editor-overlay ds-no-drag ds-titlebar-fixed-overlay fixed inset-x-0 bottom-0 top-0 z-[60] flex bg-ds-main">
       {!leftPanelCollapsed ? (
         <aside className={WORKFLOW_EDITOR_SIDEBAR_CLASS}>
-          <div className="shrink-0 px-2 pb-2 pt-3">
+          <div className="workflow-editor-sidebar-header shrink-0 px-2 pb-2 pt-3">
             <div aria-hidden className="ds-titlebar-safe-block" />
             <button type="button" onClick={onBack} className={WORKFLOW_EDITOR_BACK_BUTTON_CLASS}>
               <ArrowLeft className="h-4 w-4" strokeWidth={1.8} />
               {t('workflowBack')}
             </button>
           </div>
-          <div className="ds-no-drag flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 pb-3">
-            <span className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-ds-faint">
+          <div className="workflow-editor-palette ds-no-drag flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-2 pb-3">
+            <span className="workflow-editor-palette-title px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-ds-faint">
               {t('workflowPalette')}
             </span>
             {WORKFLOW_PALETTE_GROUPS.map((group) => {
               const collapsed = collapsedGroups.has(group.id)
               return (
-                <div key={group.id} className="flex flex-col">
+                <div key={group.id} className="workflow-editor-palette-group flex flex-col">
                   <button
                     type="button"
                     onClick={() => toggleGroup(group.id)}
-                    className="flex items-center gap-1 px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide text-ds-faint transition hover:text-ds-muted"
+                    className="workflow-editor-palette-group-toggle flex items-center gap-1 px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide text-ds-faint transition hover:text-ds-muted"
                   >
                     <ChevronRight
                       className={`h-3 w-3 shrink-0 transition-transform ${collapsed ? '' : 'rotate-90'}`}
@@ -476,9 +476,9 @@ function WorkflowEditorInner({
                             draggable
                             onDragStart={(event) => onPaletteDragStart(event, kind)}
                             onClick={() => addNode(kind)}
-                            className="flex cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
+                            className="workflow-editor-palette-item flex cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
                           >
-                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
+                            <span className="workflow-editor-palette-icon flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
                               <Icon className="h-3.5 w-3.5" strokeWidth={1.9} />
                             </span>
                             <span className="min-w-0 flex-1 truncate">{t(`workflowNode_${kind}`)}</span>
@@ -496,7 +496,7 @@ function WorkflowEditorInner({
                 <button
                   type="button"
                   onClick={() => toggleGroup('custom')}
-                  className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide text-ds-faint transition hover:text-ds-muted"
+                  className="workflow-editor-palette-group-toggle flex min-w-0 flex-1 items-center gap-1 px-2 py-1 text-[10.5px] font-semibold uppercase tracking-wide text-ds-faint transition hover:text-ds-muted"
                 >
                   <ChevronRight
                     className={`h-3 w-3 shrink-0 transition-transform ${collapsedGroups.has('custom') ? '' : 'rotate-90'}`}
@@ -526,9 +526,9 @@ function WorkflowEditorInner({
                         onDragStart={(event) => onModuleDragStart(event, module.id)}
                         onClick={() => addModuleNode(module)}
                         title={module.description || module.name}
-                        className="flex cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
+                        className="workflow-editor-palette-item flex cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
                       >
-                        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
+                        <span className="workflow-editor-palette-icon flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
                           <Icon className="h-3.5 w-3.5" strokeWidth={1.9} />
                         </span>
                         <span className="min-w-0 flex-1 truncate">{module.name}</span>
@@ -545,9 +545,9 @@ function WorkflowEditorInner({
                           draggable
                           onDragStart={(event) => onPresetDragStart(event, preset.id)}
                           onClick={() => addPresetNode(preset)}
-                          className="flex min-w-0 flex-1 cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 pr-7 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
+                          className="workflow-editor-palette-item flex min-w-0 flex-1 cursor-grab items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 pr-7 text-left text-[12.5px] text-ds-ink transition hover:border-ds-border hover:bg-ds-hover active:cursor-grabbing"
                         >
-                          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
+                          <span className="workflow-editor-palette-icon flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
                             <Icon className="h-3.5 w-3.5" strokeWidth={1.9} />
                           </span>
                           <span className="min-w-0 flex-1 truncate">{preset.label}</span>
@@ -585,7 +585,7 @@ function WorkflowEditorInner({
             </button>
           ) : null}
           <input
-            className="min-w-0 flex-1 rounded-xl border border-transparent bg-transparent px-2 py-1.5 text-[15px] font-medium text-ds-ink outline-none focus:border-ds-border focus:bg-ds-card"
+            className="workflow-editor-name min-w-0 flex-1 rounded-xl border border-transparent bg-transparent px-2 py-1.5 text-[15px] font-medium text-ds-ink outline-none focus:border-ds-border focus:bg-ds-card"
             value={name}
             placeholder={t('workflowNamePlaceholder')}
             onChange={(event) => {
@@ -658,8 +658,12 @@ function WorkflowEditorInner({
           )}
         </header>
 
-        <div className="flex min-h-0 flex-1">
-          <div className="relative min-w-0 flex-1" onDrop={onCanvasDrop} onDragOver={onCanvasDragOver}>
+        <div className="workflow-editor-body flex min-h-0 flex-1">
+          <div
+            className="workflow-editor-canvas-shell relative min-w-0 flex-1"
+            onDrop={onCanvasDrop}
+            onDragOver={onCanvasDragOver}
+          >
             <WorkflowRunStatusContext.Provider value={runStatus}>
               <WorkflowNodeActionsContext.Provider value={nodeActions}>
                 <ReactFlow
@@ -741,7 +745,7 @@ function WorkflowEditorInner({
               onClick={() => setLeftPanelCollapsed((value) => !value)}
               title={leftPanelCollapsed ? t('workflowExpandPanel') : t('workflowCollapsePanel')}
               aria-label={leftPanelCollapsed ? t('workflowExpandPanel') : t('workflowCollapsePanel')}
-              className="absolute left-0 top-1/2 z-10 flex h-12 w-5 -translate-y-1/2 items-center justify-center rounded-r-lg border border-l-0 border-ds-border bg-ds-card text-ds-faint shadow-sm transition hover:text-ds-ink"
+              className="workflow-editor-panel-toggle workflow-editor-panel-toggle-left absolute left-0 top-1/2 z-10 flex h-12 w-5 -translate-y-1/2 items-center justify-center rounded-r-lg border border-l-0 border-ds-border bg-ds-card text-ds-faint shadow-sm transition hover:text-ds-ink"
             >
               {leftPanelCollapsed ? (
                 <ChevronRight className="h-4 w-4" strokeWidth={2} />
@@ -754,7 +758,7 @@ function WorkflowEditorInner({
               onClick={() => setRightPanelCollapsed((value) => !value)}
               title={rightPanelCollapsed ? t('workflowExpandPanel') : t('workflowCollapsePanel')}
               aria-label={rightPanelCollapsed ? t('workflowExpandPanel') : t('workflowCollapsePanel')}
-              className="absolute right-0 top-1/2 z-10 flex h-12 w-5 -translate-y-1/2 items-center justify-center rounded-l-lg border border-r-0 border-ds-border bg-ds-card text-ds-faint shadow-sm transition hover:text-ds-ink"
+              className="workflow-editor-panel-toggle workflow-editor-panel-toggle-right absolute right-0 top-1/2 z-10 flex h-12 w-5 -translate-y-1/2 items-center justify-center rounded-l-lg border border-r-0 border-ds-border bg-ds-card text-ds-faint shadow-sm transition hover:text-ds-ink"
             >
               {rightPanelCollapsed ? (
                 <ChevronLeft className="h-4 w-4" strokeWidth={2} />
@@ -765,14 +769,15 @@ function WorkflowEditorInner({
           </div>
 
           {!rightPanelCollapsed ? (
-            <aside className="flex w-[320px] shrink-0 flex-col overflow-hidden border-l border-ds-border bg-ds-card/40">
-              <div className="flex shrink-0 items-center gap-1 border-b border-ds-border px-2 pt-2">
+            <aside className="workflow-editor-inspector ds-sidebar-surface flex w-[320px] shrink-0 flex-col overflow-hidden border-l border-ds-border">
+              <div className="workflow-editor-inspector-tabs flex shrink-0 items-center gap-1 border-b border-ds-border px-2 pt-2">
                 {(['config', 'log'] as const).map((tab) => (
                   <button
                     key={tab}
                     type="button"
                     onClick={() => setRightTab(tab)}
-                    className={`relative flex items-center gap-1.5 px-3 py-2 text-[12.5px] font-medium transition ${
+                    data-active={rightTab === tab ? 'true' : 'false'}
+                    className={`workflow-editor-inspector-tab relative flex items-center gap-1.5 px-3 py-2 text-[12.5px] font-medium transition ${
                       rightTab === tab ? 'text-ds-ink' : 'text-ds-faint hover:text-ds-muted'
                     }`}
                   >
@@ -858,7 +863,7 @@ function EnvVarsModal({
         className="flex max-h-[80vh] w-[560px] flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-card shadow-xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <header className="flex items-center justify-between border-b border-ds-border px-5 py-3.5">
+        <header className="flex shrink-0 items-center justify-between border-b border-ds-border px-5 py-3.5">
           <div className="flex flex-col">
             <span className="text-[14px] font-semibold text-ds-ink">{t('workflowEnvVars')}</span>
             <span className="text-[11.5px] text-ds-faint">{t('workflowEnvVarsHint')}</span>
@@ -871,7 +876,7 @@ function EnvVarsModal({
             <X className="h-4 w-4" strokeWidth={1.8} />
           </button>
         </header>
-        <div className="flex flex-col gap-2 overflow-y-auto px-5 py-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-5 py-4">
           {env.length === 0 ? (
             <p className="py-6 text-center text-[12.5px] text-ds-faint">{t('workflowEnvEmpty')}</p>
           ) : (

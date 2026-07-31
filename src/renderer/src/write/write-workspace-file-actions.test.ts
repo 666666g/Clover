@@ -3,11 +3,52 @@ import { defaultWriteSettings } from '@shared/app-settings'
 import { createWriteFileActions } from './write-workspace-file-actions'
 import { initialState } from './write-workspace-store-helpers'
 import type { WriteWorkspaceGet, WriteWorkspaceSet, WriteWorkspaceState } from './write-workspace-store-types'
+import {
+  activeWriteThreadForWorkspace,
+  emptyWriteThreadRegistry,
+  markWriteThread,
+  readWriteThreadRegistry,
+  saveWriteThreadRegistry
+} from './write-thread-registry'
+import type { NormalizedThread } from '../agent/types'
+
+class MemoryStorage {
+  private values = new Map<string, string>()
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value)
+  }
+}
+
+function writeThread(id: string, workspace: string): NormalizedThread {
+  return {
+    id,
+    title: 'Write Assistant',
+    updatedAt: '2026-07-11T00:00:00.000Z',
+    model: 'auto',
+    mode: 'agent',
+    workspace
+  }
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve
+  })
+  return { promise, resolve }
+}
 
 function makeBaseState(): WriteWorkspaceState {
   return {
     defaultWorkspaceRoot: '',
     workspaceRoots: [],
+    autoSaveEnabled: true,
+    autoSaveDelayMs: defaultWriteSettings().autoSaveDelayMs,
     inlineCompletion: defaultWriteSettings().inlineCompletion,
     inlineCompletionApiReady: false,
     selectionAssist: defaultWriteSettings().selectionAssist,
@@ -26,6 +67,7 @@ function makeBaseState(): WriteWorkspaceState {
     selectWriteWorkspace: async () => undefined,
     addWriteWorkspace: async () => undefined,
     removeWriteWorkspace: async () => undefined,
+    setInlineCompletionEnabled: async () => undefined,
     initializeWorkspace: async () => undefined,
     loadDirectory: async () => null,
     toggleDirectory: async () => undefined,
@@ -58,6 +100,7 @@ function makeBaseState(): WriteWorkspaceState {
 function createHarness(): {
   actions: ReturnType<typeof createWriteFileActions>
   get: WriteWorkspaceGet
+  set: WriteWorkspaceSet
 } {
   let state = makeBaseState()
   const set: WriteWorkspaceSet = (partial) => {
@@ -68,11 +111,10 @@ function createHarness(): {
   const actions = createWriteFileActions({
     set,
     get,
-    cancelExternalSyncAnimation: vi.fn(),
-    setLastSavedContent: vi.fn()
+    cancelExternalSyncAnimation: vi.fn()
   })
   state = { ...state, ...actions }
-  return { actions, get }
+  return { actions, get, set }
 }
 
 function installDsGui(overrides: Partial<Window['kunGui']>): void {
@@ -86,6 +128,44 @@ afterEach(() => {
 })
 
 describe('write workspace file actions', () => {
+  it('refreshes an initialized workspace without resetting the active draft', async () => {
+    const listWorkspaceDirectory = vi.fn(async () => ({
+      ok: true as const,
+      root: '/tmp/write',
+      entries: [{
+        name: 'new.md',
+        path: '/tmp/write/new.md',
+        type: 'file' as const,
+        ext: '.md'
+      }]
+    }))
+    installDsGui({ listWorkspaceDirectory })
+    const { actions, get, set } = createHarness()
+    set({
+      workspaceRoot: '/tmp/write',
+      rootDirectory: '/tmp/write',
+      expandedDirs: new Set(['/tmp/write']),
+      activeFilePath: '/tmp/write/draft.md',
+      fileContent: 'unsaved draft',
+      saveStatus: 'dirty'
+    })
+
+    await actions.initializeWorkspace('/tmp/write')
+
+    expect(listWorkspaceDirectory).toHaveBeenCalledWith({
+      workspaceRoot: '/tmp/write',
+      path: '/tmp/write'
+    })
+    expect(get().entriesByDir['/tmp/write']).toEqual([
+      expect.objectContaining({ name: 'new.md' })
+    ])
+    expect(get()).toMatchObject({
+      activeFilePath: '/tmp/write/draft.md',
+      fileContent: 'unsaved draft',
+      saveStatus: 'dirty'
+    })
+  })
+
   it('clears loading state and records list errors when directory IPC throws', async () => {
     installDsGui({
       listWorkspaceDirectory: vi.fn(async () => {
@@ -99,6 +179,43 @@ describe('write workspace file actions', () => {
     expect(result).toBeNull()
     expect(get().loadingDirs).toEqual({})
     expect(get().treeError).toBe('bridge down')
+  })
+
+  it('keeps the latest directory listing when responses finish out of order', async () => {
+    const first = deferred<{
+      ok: true
+      root: string
+      entries: Array<{ name: string; path: string; type: 'file'; ext: string }>
+    }>()
+    const second = deferred<{
+      ok: true
+      root: string
+      entries: Array<{ name: string; path: string; type: 'file'; ext: string }>
+    }>()
+    installDsGui({
+      listWorkspaceDirectory: vi.fn()
+        .mockImplementationOnce(() => first.promise)
+        .mockImplementationOnce(() => second.promise)
+    })
+    const { actions, get, set } = createHarness()
+    set({ workspaceRoot: '/tmp/write' })
+
+    const olderLoad = actions.loadDirectory('/tmp/write', '/tmp/write')
+    const latestLoad = actions.loadDirectory('/tmp/write', '/tmp/write')
+    second.resolve({
+      ok: true,
+      root: '/tmp/write',
+      entries: [{ name: 'latest.md', path: '/tmp/write/latest.md', type: 'file', ext: '.md' }]
+    })
+    await latestLoad
+    first.resolve({
+      ok: true,
+      root: '/tmp/write',
+      entries: [{ name: 'stale.md', path: '/tmp/write/stale.md', type: 'file', ext: '.md' }]
+    })
+    await olderLoad
+
+    expect(get().entriesByDir['/tmp/write']?.map((entry) => entry.name)).toEqual(['latest.md'])
   })
 
   it('returns null and reports file errors when create file IPC throws', async () => {
@@ -129,36 +246,122 @@ describe('write workspace file actions', () => {
     expect(get().fileError).toBe('rename failed')
   })
 
+  it('keeps dirty content when auto-save is disabled and file navigation is cancelled', async () => {
+    const readWorkspaceFile = vi.fn()
+    const confirm = vi.fn(() => false)
+    vi.stubGlobal('window', {
+      kunGui: { readWorkspaceFile },
+      confirm
+    })
+    const { actions, get, set } = createHarness()
+    const flushSave = vi.fn(async () => true)
+    set({
+      autoSaveEnabled: false,
+      activeFilePath: '/tmp/write/draft.md',
+      activeFileKind: 'text',
+      fileContent: 'unsaved draft',
+      saveStatus: 'dirty',
+      flushSave
+    })
+
+    await actions.openFile('/tmp/write', '/tmp/write/next.md')
+
+    expect(confirm).toHaveBeenCalled()
+    expect(flushSave).not.toHaveBeenCalled()
+    expect(readWorkspaceFile).not.toHaveBeenCalled()
+    expect(get()).toMatchObject({
+      activeFilePath: '/tmp/write/draft.md',
+      fileContent: 'unsaved draft',
+      saveStatus: 'dirty'
+    })
+  })
+
+  it('opens another text file without saving dirty content when auto-save is disabled and discard is confirmed', async () => {
+    const readWorkspaceFile = vi.fn(async () => ({
+      ok: true as const,
+      path: '/tmp/write/next.md',
+      content: 'next content',
+      size: 12,
+      truncated: false
+    }))
+    const confirm = vi.fn(() => true)
+    vi.stubGlobal('window', {
+      kunGui: { readWorkspaceFile },
+      confirm
+    })
+    const { actions, get, set } = createHarness()
+    const flushSave = vi.fn(async () => true)
+    set({
+      autoSaveEnabled: false,
+      activeFilePath: '/tmp/write/draft.md',
+      activeFileKind: 'text',
+      fileContent: 'unsaved draft',
+      saveStatus: 'dirty',
+      flushSave
+    })
+
+    await actions.openFile('/tmp/write', '/tmp/write/next.md')
+
+    expect(confirm).toHaveBeenCalled()
+    expect(flushSave).not.toHaveBeenCalled()
+    expect(readWorkspaceFile).toHaveBeenCalledWith({
+      workspaceRoot: '/tmp/write',
+      path: '/tmp/write/next.md'
+    })
+    expect(get()).toMatchObject({
+      activeFilePath: '/tmp/write/next.md',
+      fileContent: 'next content',
+      saveStatus: 'saved'
+    })
+  })
+
   it('keeps markdown files visible when renaming without an extension', async () => {
+    const workspace = '/Users/zxy/write'
+    const storage = new MemoryStorage()
+    saveWriteThreadRegistry(markWriteThread(
+      workspace,
+      'thread-draft',
+      emptyWriteThreadRegistry(),
+      `${workspace}/draft.md`
+    ), storage)
     const renameWorkspaceEntry = vi.fn(async () => ({
       ok: true as const,
-      path: '/tmp/write/final.md',
-      previousPath: '/tmp/write/draft.md',
+      path: `${workspace}/final.md`,
+      previousPath: `${workspace}/draft.md`,
       renamedAt: '2026-06-21T00:00:00.000Z'
     }))
-    installDsGui({
-      renameWorkspaceEntry,
-      listWorkspaceDirectory: vi.fn(async () => ({
-        ok: true as const,
-        root: '/tmp/write',
-        entries: [{
-          name: 'final.md',
-          path: '/tmp/write/final.md',
-          type: 'file' as const,
-          ext: '.md'
-        }]
-      }))
+    vi.stubGlobal('window', {
+      localStorage: storage,
+      kunGui: {
+        renameWorkspaceEntry,
+        listWorkspaceDirectory: vi.fn(async () => ({
+          ok: true as const,
+          root: workspace,
+          entries: [{
+            name: 'final.md',
+            path: `${workspace}/final.md`,
+            type: 'file' as const,
+            ext: '.md'
+          }]
+        }))
+      }
     })
     const { actions } = createHarness()
 
-    const result = await actions.renameEntry('/tmp/write', '/tmp/write/draft.md', 'final')
+    const result = await actions.renameEntry(workspace, `${workspace}/draft.md`, 'final')
 
-    expect(result).toBe('/tmp/write/final.md')
+    expect(result).toBe(`${workspace}/final.md`)
     expect(renameWorkspaceEntry).toHaveBeenCalledWith({
-      workspaceRoot: '/tmp/write',
-      path: '/tmp/write/draft.md',
+      workspaceRoot: workspace,
+      path: `${workspace}/draft.md`,
       newName: 'final.md'
     })
+    expect(activeWriteThreadForWorkspace(
+      workspace,
+      [writeThread('thread-draft', workspace)],
+      readWriteThreadRegistry(storage),
+      `${workspace}/final.md`
+    )?.id).toBe('thread-draft')
   })
 
   it('returns false and reports file errors when delete IPC throws', async () => {
@@ -173,6 +376,44 @@ describe('write workspace file actions', () => {
 
     expect(result).toBe(false)
     expect(get().fileError).toBe('delete failed')
+  })
+
+  it('removes deleted file conversation mappings without deleting thread history', async () => {
+    const workspace = '/Users/zxy/write'
+    const storage = new MemoryStorage()
+    saveWriteThreadRegistry(markWriteThread(
+      workspace,
+      'thread-draft',
+      emptyWriteThreadRegistry(),
+      `${workspace}/drafts/chapter.md`
+    ), storage)
+    vi.stubGlobal('window', {
+      localStorage: storage,
+      kunGui: {
+        deleteWorkspaceEntry: vi.fn(async () => ({
+          ok: true as const,
+          path: `${workspace}/drafts`,
+          deletedAt: '2026-07-11T00:00:00.000Z'
+        })),
+        listWorkspaceDirectory: vi.fn(async () => ({
+          ok: true as const,
+          root: workspace,
+          entries: []
+        }))
+      }
+    })
+    const { actions } = createHarness()
+
+    await expect(actions.deleteEntry(workspace, `${workspace}/drafts`)).resolves.toBe(true)
+
+    const registry = readWriteThreadRegistry(storage)
+    expect(activeWriteThreadForWorkspace(
+      workspace,
+      [writeThread('thread-draft', workspace)],
+      registry,
+      `${workspace}/drafts/chapter.md`
+    )).toBeNull()
+    expect(registry.workspaces[workspace].threadIds).toContain('thread-draft')
   })
 
   it('opens PDF files through the read-only PDF preview state', async () => {
@@ -203,5 +444,54 @@ describe('write workspace file actions', () => {
     expect(get().pdfMtimeMs).toBe(1234)
     expect(get().fileContent).toBe('')
     expect(get().imageDataUrl).toBe('')
+  })
+
+  it('keeps the latest file when earlier and later opens resolve out of order', async () => {
+    const first = deferred<{
+      ok: true
+      path: string
+      content: string
+      size: number
+      truncated: false
+    }>()
+    const second = deferred<{
+      ok: true
+      path: string
+      content: string
+      size: number
+      truncated: false
+    }>()
+    const readWorkspaceFile = vi.fn(({ path }: { path: string }) =>
+      path.endsWith('/a.md') ? first.promise : second.promise
+    )
+    installDsGui({ readWorkspaceFile })
+    const { actions, get, set } = createHarness()
+    set({ workspaceRoot: '/tmp/write' })
+
+    const openA = actions.openFile('/tmp/write', '/tmp/write/a.md')
+    const openB = actions.openFile('/tmp/write', '/tmp/write/b.md')
+    second.resolve({
+      ok: true,
+      path: '/tmp/write/b.md',
+      content: 'content B',
+      size: 9,
+      truncated: false
+    })
+    await openB
+    first.resolve({
+      ok: true,
+      path: '/tmp/write/a.md',
+      content: 'content A',
+      size: 9,
+      truncated: false
+    })
+    await openA
+
+    expect(get()).toMatchObject({
+      activeFilePath: '/tmp/write/b.md',
+      fileContent: 'content B',
+      persistedContent: 'content B',
+      saveStatus: 'saved'
+    })
   })
 })

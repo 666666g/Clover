@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -55,9 +55,10 @@ describe('loadWorkspaceAgentProfiles', () => {
         '---',
         'id: security-reviewer',
         'name: Security Reviewer',
-        'allowedTools: [read, grep, ls]',
+        'allowedTools: [read, grep, ls, web_search, bash]',
         'model: deepseek-chat',
         'providerId: deepseek',
+        'reasoningEffort: max',
         'color: "#10b981"',
         '---'
       ].join('\n')
@@ -67,9 +68,13 @@ describe('loadWorkspaceAgentProfiles', () => {
     const entry = profiles[0]!
     expect(entry.id).toBe('security-reviewer')
     expect(entry.profile.allowedTools).toEqual(['read', 'grep', 'ls'])
-    expect(entry.profile.providerId).toBe('deepseek')
+    expect(entry.profile.model).toBeUndefined()
+    expect(entry.profile.providerId).toBeUndefined()
+    expect(entry.profile.reasoningEffort).toBeUndefined()
     expect(entry.profile.color).toBe('#10b981')
     expect(entry.profile.mode).toBe('subagent')
+    expect(entry.profile.toolPolicy).toBe('readOnly')
+    expect(entry.profile.skillsEnabled).toBe(false)
   })
 
   it('parses blockedTools / blockedMcpServers / blockedSkills deny-lists from frontmatter', async () => {
@@ -88,9 +93,54 @@ describe('loadWorkspaceAgentProfiles', () => {
     )
     const profiles = await loadWorkspaceAgentProfiles(workspace)
     const entry = profiles.find((p) => p.id === 'scoped')!
-    expect(entry.profile.blockedTools).toEqual(['bash', 'write'])
+    expect(entry.profile.blockedTools).toEqual([
+      'delegate_task', 'generate_subagent', 'load_skill', 'bash', 'write'
+    ])
     expect(entry.profile.blockedMcpServers).toEqual(['github'])
     expect(entry.profile.blockedSkills).toEqual(['deep-research', 'pdf'])
+    expect(entry.profile.toolPolicy).toBe('inherit')
+  })
+
+  it('honors inherit toolPolicy and allowedTools without local-read clamping', async () => {
+    await writeFile(
+      join(workspace, '.kun', 'agents', 'fixer.md'),
+      [
+        '---',
+        'id: api-fixer',
+        'name: API Fixer',
+        'description: Fix API contract mismatches',
+        'toolPolicy: inherit',
+        'allowedTools: [read, bash, write]',
+        'omit_base_prompt: true',
+        'model: external-model',
+        '---',
+        'You fix API contracts in this repo.'
+      ].join('\n')
+    )
+    const profiles = await loadWorkspaceAgentProfiles(workspace)
+    const entry = profiles.find((p) => p.id === 'api-fixer')!
+    expect(entry.profile.toolPolicy).toBe('inherit')
+    expect(entry.profile.allowedTools).toEqual(['read', 'bash', 'write'])
+    expect(entry.profile.omitBasePrompt).toBe(true)
+    expect(entry.profile.systemPrompt).toBe('You fix API contracts in this repo.')
+    expect(entry.profile.model).toBeUndefined()
+    expect(entry.profile.skillsEnabled).toBe(false)
+  })
+
+  it('defaults omitted toolPolicy to readOnly', async () => {
+    await writeFile(
+      join(workspace, '.kun', 'agents', 'default-policy.md'),
+      [
+        '---',
+        'name: Default Policy',
+        'description: Defaults to read-only',
+        '---',
+        'Stay read-only unless told otherwise.'
+      ].join('\n')
+    )
+    const profiles = await loadWorkspaceAgentProfiles(workspace)
+    expect(profiles[0]?.profile.toolPolicy).toBe('readOnly')
+    expect(profiles[0]?.profile.omitBasePrompt).toBeUndefined()
   })
 
   it('drops files without frontmatter silently', async () => {
@@ -104,5 +154,27 @@ describe('loadWorkspaceAgentProfiles', () => {
     )
     const profiles = await loadWorkspaceAgentProfiles(workspace)
     expect(profiles.map((p) => p.id)).toEqual(['real'])
+  })
+
+  it('rejects a workspace agent file symlinked outside the workspace', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'kun-ws-agent-secret-'))
+    try {
+      const secret = join(outside, 'secret.md')
+      await writeFile(secret, '---\nname: Secret\n---\nPRIVATE KEY MATERIAL')
+      await symlink(secret, join(workspace, '.kun', 'agents', 'secret.md'))
+
+      expect(await loadWorkspaceAgentProfiles(workspace)).toEqual([])
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('skips oversized workspace agent profiles before parsing them', async () => {
+    await writeFile(
+      join(workspace, '.kun', 'agents', 'large.md'),
+      `---\nname: Large\n---\n${'x'.repeat(64 * 1024)}`
+    )
+
+    expect(await loadWorkspaceAgentProfiles(workspace)).toEqual([])
   })
 })

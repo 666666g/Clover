@@ -4,6 +4,9 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import { resolveWorkspacePath } from './builtin-tool-utils.js'
+import { resolveBackgroundShellOutputPaths } from '../../services/background-shell-output.js'
+
+const directoryLinkType = process.platform === 'win32' ? 'junction' : 'dir'
 
 function context(workspace: string): ToolHostContext {
   return {
@@ -36,12 +39,12 @@ describe('resolveWorkspacePath symlink escape', () => {
   it('rejects a DANGLING symlink whose target is outside the workspace (write/create case)', async () => {
     // `outside` deliberately does NOT exist — realpath() reports ENOENT for the
     // link exactly as for a missing file. This is the hole the fix closes.
-    await symlink(outside, join(workspace, 'evil'))
+    await symlink(outside, join(workspace, 'evil'), directoryLinkType)
     await expect(resolveWorkspacePath('evil', context(workspace))).rejects.toThrow(/escapes the workspace root/)
   })
 
   it('rejects a path that traverses through a dangling symlink to an outside dir', async () => {
-    await symlink(outside, join(workspace, 'dlink'))
+    await symlink(outside, join(workspace, 'dlink'), directoryLinkType)
     await expect(resolveWorkspacePath('dlink/sub/new.txt', context(workspace))).rejects.toThrow(
       /escapes the workspace root/
     )
@@ -49,7 +52,7 @@ describe('resolveWorkspacePath symlink escape', () => {
 
   it('rejects an EXISTING symlink that points outside the workspace', async () => {
     await mkdir(outside, { recursive: true })
-    await symlink(outside, join(workspace, 'link'))
+    await symlink(outside, join(workspace, 'link'), directoryLinkType)
     await expect(resolveWorkspacePath('link/file.txt', context(workspace))).rejects.toThrow(
       /escapes the workspace root/
     )
@@ -57,9 +60,9 @@ describe('resolveWorkspacePath symlink escape', () => {
 
   it('allows a dangling symlink that stays inside the workspace', async () => {
     // Link target is absent but in-workspace — a legitimate write/create target.
-    await symlink(join(workspace, 'data', 'note.txt'), join(workspace, 'good'))
-    const resolved = await resolveWorkspacePath('good', context(workspace))
-    expect(resolved.absolutePath).toBe(join(workspace, 'good'))
+    await symlink(join(workspace, 'data'), join(workspace, 'good'), directoryLinkType)
+    const resolved = await resolveWorkspacePath('good/note.txt', context(workspace))
+    expect(resolved.absolutePath).toBe(join(workspace, 'good', 'note.txt'))
   })
 
   it('allows creating a new nested file with no symlinks involved', async () => {
@@ -114,10 +117,61 @@ describe('resolveWorkspacePath sandbox mode', () => {
     ).rejects.toThrow(/escapes the workspace root/)
   })
 
+  it('allows absolute paths inside an explicitly added workspace root', async () => {
+    const target = join(outside, 'shared.txt')
+    await writeFile(target, 'shared')
+    const resolved = await resolveWorkspacePath(target, {
+      ...context(workspace),
+      additionalWorkspaces: [outside]
+    })
+    expect(resolved).toMatchObject({ absolutePath: target, workspaceRoot: outside, relativePath: 'shared.txt' })
+  })
+
+  it('keeps the primary workspace usable when a persisted additional root disappears', async () => {
+    const target = join(workspace, 'primary.txt')
+    await writeFile(target, 'primary')
+    const resolved = await resolveWorkspacePath(target, {
+      ...context(workspace),
+      additionalWorkspaces: [join(base, 'removed-root')]
+    })
+    expect(resolved.absolutePath).toBe(target)
+  })
+
+  it('allows background shell output files outside the workspace in read-only sandbox', async () => {
+    const runtimeDataDir = join(base, 'runtime-data')
+    const { outputFilePath } = resolveBackgroundShellOutputPaths(runtimeDataDir, 'thr_1', 'abcd1234')
+    await mkdir(join(runtimeDataDir, 'threads', 'thr_1', 'background-shells'), { recursive: true })
+    await writeFile(outputFilePath, 'full log')
+    const resolved = await resolveWorkspacePath(outputFilePath, {
+      ...context(workspace),
+      sandboxMode: 'read-only',
+      runtimeDataDir,
+      threadId: 'thr_1'
+    })
+    expect(resolved.absolutePath).toBe(outputFilePath)
+  })
+
   it('does not require the workspace root to exist under danger-full-access', async () => {
     const missingWs = join(base, 'does-not-exist')
     const target = join(outside, 'sys.txt')
     const resolved = await resolveWorkspacePath(target, fullAccessContext(missingWs))
     expect(resolved.absolutePath).toBe(target)
+  })
+
+  it('enforces delegated read scopes even under danger-full-access', async () => {
+    const scoped = {
+      ...fullAccessContext(workspace),
+      allowedReadPaths: ['src']
+    }
+    await mkdir(join(workspace, 'src'), { recursive: true })
+    await expect(resolveWorkspacePath('src/app.ts', scoped)).resolves.toMatchObject({
+      relativePath: 'src/app.ts'
+    })
+    await expect(resolveWorkspacePath('secrets/key.txt', scoped)).rejects.toThrow(
+      /outside the delegated child read scopes/
+    )
+    await expect(resolveWorkspacePath(join(outside, 'sys.txt'), scoped)).rejects.toThrow(
+      /outside the delegated child read scopes/
+    )
   })
 })

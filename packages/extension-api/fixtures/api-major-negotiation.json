@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "host": {
+    "current": "2.4.0",
+    "previous": "1.9.0",
+    "capabilitiesByVersion": {
+      "2.4.0": ["agent.run", "modelProviders.stream", "ui.viewState"],
+      "1.9.0": ["agent.run", "ui.viewState"]
+    }
+  },
+  "cases": [
+    {
+      "name": "current major",
+      "declaredApiVersion": "2.1.0",
+      "requiredCapabilities": ["modelProviders.stream"],
+      "compatible": true,
+      "adapter": "current"
+    },
+    {
+      "name": "previous major",
+      "declaredApiVersion": "1.5.0",
+      "requiredCapabilities": ["agent.run"],
+      "compatible": true,
+      "adapter": "previous"
+    },
+    {
+      "name": "removed major",
+      "declaredApiVersion": "0.8.0",
+      "requiredCapabilities": [],
+      "compatible": false,
+      "code": "API_MAJOR_UNSUPPORTED"
+    },
+    {
+      "name": "future major",
+      "declaredApiVersion": "3.0.0",
+      "requiredCapabilities": [],
+      "compatible": false,
+      "code": "API_MAJOR_UNSUPPORTED"
+    },
+    {
+      "name": "future minor",
+      "declaredApiVersion": "2.5.0",
+      "requiredCapabilities": [],
+      "compatible": false,
+      "code": "API_MINOR_UNSUPPORTED"
+    },
+    {
+      "name": "required capability missing",
+      "declaredApiVersion": "1.5.0",
+      "requiredCapabilities": ["modelProviders.stream"],
+      "compatible": false,
+      "code": "CAPABILITY_REQUIRED"
+    }
+  ]
+}

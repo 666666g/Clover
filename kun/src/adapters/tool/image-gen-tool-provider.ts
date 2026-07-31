@@ -1,26 +1,65 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
-import type { KunCapabilitiesConfig } from '../../contracts/capabilities.js'
+import { dirname } from 'node:path'
+import type {
+  ImageGenerationResolution,
+  KunCapabilitiesConfig
+} from '../../contracts/capabilities.js'
 import type { AttachmentStore } from '../../attachments/attachment-store.js'
 import { detectImage } from '../../attachments/attachment-store.js'
+import type { ToolHostContext } from '../../ports/tool-host.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
+import { resolveWorkspacePath } from './builtin-tool-utils.js'
 import { LocalToolHost } from './local-tool-host.js'
 
 const GENERATED_IMAGE_DIR = '.deepseekgui-images'
 const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
 const REFERENCE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const ASPECT_RATIOS = new Set(['1:1', '4:3', '3:4', '16:9', '9:16', '3:2', '2:3', '21:9'])
-const SIZE_TIERS: Record<string, number> = { '1K': 1024, '2K': 2048 }
+const GROK_IMAGINE_ASPECT_RATIOS = [
+  '1:1',
+  '16:9',
+  '9:16',
+  '4:3',
+  '3:4',
+  '3:2',
+  '2:3',
+  '2:1',
+  '1:2',
+  '19.5:9',
+  '9:19.5',
+  '20:9',
+  '9:20'
+] as const
+const KNOWN_ASPECT_RATIOS = new Set([...ASPECT_RATIOS, ...GROK_IMAGINE_ASPECT_RATIOS])
+const SIZE_TIERS: Record<string, number> = {
+  '1K': 1024,
+  '2K': 2048,
+  '3K': 3072,
+  '4K': 4096
+}
+const DEFAULT_IMAGE_SIZE_TIERS = ['1K', '2K'] as const
+const VOLCENGINE_IMAGE_SIZE_TIERS = ['2K', '3K', '4K'] as const
+const COMPATIBLE_SIZE_FALLBACK = SIZE_TIERS['1K']
 const SIZE_STEP = 64
 const MIN_EDGE = 256
+const CODEX_IMAGE_RESPONSES_MODEL = 'gpt-5.5'
+const CODEX_IMAGE_INSTRUCTIONS = 'You must fulfill image generation requests by using the image_generation tool.'
+const MAX_CODEX_IMAGE_SSE_BYTES = 64 * 1024 * 1024
+const MAX_CODEX_IMAGE_SSE_EVENTS = 512
+const MAX_CODEX_IMAGE_BASE64_CHARS = 64 * 1024 * 1024
+
+type CodexImageToolChoiceMode = 'allowed_tools' | 'required' | 'none'
+type ImageGenerationQuality = 'auto' | 'low' | 'medium' | 'high'
 
 export type GeneratedImage = { data: Buffer; mimeType: string }
 
 export type ImageGenRequest = {
   prompt: string
   model: string
+  aspectRatio?: string
   size?: string
+  quality?: ImageGenerationQuality
   timeoutMs: number
   signal: AbortSignal
 }
@@ -113,30 +152,79 @@ export type ImageGenToolProviderBuildResult = {
 
 /**
  * Map UI-friendly aspect ratio + size tier to an OpenAI-compatible "WxH"
- * size string. Long edge anchors to the tier (1K→1024, 2K→2048), short edge
- * follows the ratio snapped to multiples of 64 with a 256px floor. Both args
- * absent → fall back to the configured default (may be undefined or 'auto').
+ * size string. Long edge anchors to the explicit tier first, then a custom
+ * default size, then the configured default resolution. Short edge follows the
+ * ratio snapped to multiples of 64 with a 256px floor. `auto` is passed through
+ * when no ratio is requested; a ratio needs concrete dimensions, so an `auto`
+ * resolution uses a compatible 1K fallback.
  */
 export function mapImageSize(
   aspectRatio: string | undefined,
   imageSize: string | undefined,
-  defaultSize: string | undefined
+  defaultSize: string | undefined,
+  defaultResolution: ImageGenerationResolution = '1K'
 ): string | undefined {
-  if (!aspectRatio && !imageSize) return defaultSize
-  const tier = SIZE_TIERS[imageSize ?? ''] ?? SIZE_TIERS['1K']
+  if (imageSize) {
+    return sizeForLongEdge(aspectRatio, SIZE_TIERS[imageSize] ?? COMPATIBLE_SIZE_FALLBACK)
+  }
+
+  if (defaultSize) {
+    if (!aspectRatio) return defaultSize
+    const longEdge = parseSizeLongEdge(defaultSize)
+    if (longEdge) return sizeForLongEdge(aspectRatio, longEdge)
+  }
+
+  if (!aspectRatio && defaultResolution === 'auto') return 'auto'
+  return sizeForLongEdge(
+    aspectRatio,
+    SIZE_TIERS[defaultResolution] ?? COMPATIBLE_SIZE_FALLBACK
+  )
+}
+
+function sizeForLongEdge(aspectRatio: string | undefined, longEdge: number): string {
   const parsed = parseRatio(aspectRatio)
-  if (!parsed) return `${tier}x${tier}`
+  if (!parsed) return `${longEdge}x${longEdge}`
   const { w, h } = parsed
-  if (w === h) return `${tier}x${tier}`
-  const short = Math.max(MIN_EDGE, Math.round((tier * Math.min(w, h)) / Math.max(w, h) / SIZE_STEP) * SIZE_STEP)
-  return w > h ? `${tier}x${short}` : `${short}x${tier}`
+  if (w === h) return `${longEdge}x${longEdge}`
+  const short = Math.max(
+    MIN_EDGE,
+    Math.round((longEdge * Math.min(w, h)) / Math.max(w, h) / SIZE_STEP) * SIZE_STEP
+  )
+  return w > h ? `${longEdge}x${short}` : `${short}x${longEdge}`
+}
+
+function parseSizeLongEdge(size: string): number | undefined {
+  const match = /^(\d+)x(\d+)$/.exec(size.trim())
+  if (!match) return undefined
+  const width = Number(match[1])
+  const height = Number(match[2])
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined
+  return Math.max(width, height)
 }
 
 function parseRatio(aspectRatio: string | undefined): { w: number; h: number } | null {
-  if (!aspectRatio || !ASPECT_RATIOS.has(aspectRatio)) return null
+  if (!aspectRatio || !KNOWN_ASPECT_RATIOS.has(aspectRatio)) return null
   const [w, h] = aspectRatio.split(':').map(Number)
   if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null
   return { w, h }
+}
+
+/**
+ * Whether the configured image protocol performs a GENUINE image-to-image edit
+ * (real `/images/edits`). Allowlist on purpose: a new protocol defaults to "no
+ * edit" until its edit path is verified. Codex's Responses image_generation
+ * path accepts `input_image` references and an explicit `action: "edit"`.
+ * MiniMax's reference feature is `subject_reference` = character/identity
+ * preservation, NOT a general edit, so routing canvas "edit this image"
+ * requests through it silently produces a fresh (wrong) generation — better to
+ * fail loudly and have the agent retry without references. `undefined` = the
+ * default factory path (OpenAI-compat /images/edits).
+ */
+export function protocolSupportsImageEdit(protocol: string | undefined): boolean {
+  return protocol === undefined ||
+    protocol === 'openai-images' ||
+    protocol === 'codex-responses-image' ||
+    protocol === 'volcengine-ark-image'
 }
 
 export function buildImageGenToolProviders(
@@ -164,27 +252,65 @@ export function buildImageGenToolProviders(
 
   const client = options.client ?? createImageGenClient(config)
   const model = config.model!
+  // Only advertise (and accept) image-to-image when the active protocol can truly
+  // edit; otherwise the param is dropped so the model never tries a reference edit
+  // the provider would silently mishandle.
+  const supportsEdit = protocolSupportsImageEdit(config.protocol)
+  const isGrokImagine = config.protocol === 'grok-imagine-image'
+  const isVolcengineArk = config.protocol === 'volcengine-ark-image'
+  const imageSizeTiers = isVolcengineArk
+    ? VOLCENGINE_IMAGE_SIZE_TIERS
+    : DEFAULT_IMAGE_SIZE_TIERS
+  const imageSizeTierDescription = isVolcengineArk
+    ? '2K, 3K, or 4K'
+    : '1K or 2K'
+  const effectiveDefaultResolution: ImageGenerationResolution = isVolcengineArk
+    ? config.defaultResolution === '3K' || config.defaultResolution === '4K'
+      ? config.defaultResolution
+      : '2K'
+    : config.defaultResolution === 'auto' ||
+        config.defaultResolution === '1K' ||
+        config.defaultResolution === '2K'
+      ? config.defaultResolution
+      : '1K'
 
   const tool = LocalToolHost.defineTool({
     name: 'generate_image',
+    toolKind: 'file_change',
     description: [
       'Generate an image from a text prompt using the configured image provider.',
-      'Optionally pass reference_image_paths (image files inside the workspace) to guide the result (image-to-image).',
+      supportsEdit
+        ? 'Optionally pass reference_image_paths (image files inside the workspace) to guide the result (image-to-image).'
+        : '',
       `The generated image is saved under ${GENERATED_IMAGE_DIR}/ in the workspace and returned as an inline attachment preview.`,
-      'Generates exactly one image per call; call again for variations.'
-    ].join(' '),
+      'Generates exactly one image per call; call again for variations.',
+      'Image quality is applied automatically from Settings and is independent of resolution.',
+      'If you can see images, the generated result is shown back to you — inspect it and call again to refine if it does not match what was asked.'
+    ].filter(Boolean).join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Detailed description of the image to generate' },
-        aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS] },
-        image_size: { type: 'string', enum: Object.keys(SIZE_TIERS), description: 'Resolution tier, defaults to 1K' },
-        reference_image_paths: {
-          type: 'array',
-          items: { type: 'string' },
-          maxItems: config.maxReferenceImages,
-          description: 'Workspace-relative paths of reference images for image-to-image guidance'
-        }
+        aspect_ratio: {
+          type: 'string',
+          enum: isGrokImagine ? [...GROK_IMAGINE_ASPECT_RATIOS] : [...ASPECT_RATIOS],
+          description: 'Optional output aspect ratio. It changes proportions while preserving the selected or default resolution.'
+        },
+        image_size: {
+          type: 'string',
+          enum: [...imageSizeTiers],
+          description: `Optional resolution override. Set it only when the user explicitly requests ${imageSizeTierDescription}; otherwise omit it so the Settings default resolution is used. Resolution is independent of image quality.`
+        },
+        ...(supportsEdit
+          ? {
+              reference_image_paths: {
+                type: 'array',
+                items: { type: 'string' },
+                maxItems: config.maxReferenceImages,
+                description: 'Workspace-relative paths of reference images for image-to-image guidance'
+              }
+            }
+          : {})
       },
       required: ['prompt'],
       additionalProperties: false
@@ -197,22 +323,39 @@ export function buildImageGenToolProviders(
 
       const aspectRatio = pickString(args.aspect_ratio)
       const imageSize = pickString(args.image_size)
-      const size = mapImageSize(aspectRatio, imageSize, config.defaultSize)
+      const size = mapImageSize(
+        aspectRatio,
+        imageSize,
+        isGrokImagine ? undefined : config.defaultSize,
+        effectiveDefaultResolution
+      )
 
       const references = await collectReferenceImages(
         args.reference_image_paths,
-        context.workspace,
+        context,
         config.maxReferenceImages
       )
       if ('error' in references) return references.error
 
       const endpoint = references.images.length > 0 ? 'edits' : 'generations'
+      // Fail loudly BEFORE any network call when the active provider can't truly
+      // edit (e.g. MiniMax, whose subject_reference is identity preservation, not
+      // a general edit) — a silently-wrong fresh generation is worse than an error
+      // the agent recovers from by retrying without references.
+      if (endpoint === 'edits' && !supportsEdit) {
+        return toolError(
+          'edits_unsupported',
+          'the active image provider does not support editing an existing image (its reference feature is subject/identity guidance, not a faithful edit); retry generate_image WITHOUT reference_image_paths'
+        )
+      }
       let image: GeneratedImage
       try {
         const request = {
           prompt,
           model,
+          ...(aspectRatio ? { aspectRatio } : {}),
           ...(size && size !== 'auto' ? { size } : {}),
+          quality: config.quality,
           timeoutMs: config.timeoutMs,
           signal: context.abortSignal
         }
@@ -224,7 +367,7 @@ export function buildImageGenToolProviders(
           if (endpoint === 'edits' && (error.status === 404 || error.status === 405 || error.status === 501)) {
             return toolError(
               'edits_unsupported',
-              'the configured image provider does not support reference images (/images/edits); retry generate_image without reference_image_paths'
+              'the configured image provider does not support reference image edits; retry generate_image without reference_image_paths'
             )
           }
           return toolError('provider_error', error.message, telemetry(startedAt, client.id))
@@ -240,9 +383,20 @@ export function buildImageGenToolProviders(
       // Forward slashes regardless of platform: the path is echoed back to the
       // model and rendered in chat, where POSIX-style relative paths are expected.
       const relativePath = `${GENERATED_IMAGE_DIR}/${fileName}`
-      const absolutePath = join(context.workspace, GENERATED_IMAGE_DIR, fileName)
-      await mkdir(join(context.workspace, GENERATED_IMAGE_DIR), { recursive: true })
-      await writeFile(absolutePath, image.data)
+      let absolutePath: string
+      try {
+        const target = await resolveWorkspacePath(relativePath, context, { enforceWorkspaceBoundary: true })
+        await mkdir(dirname(target.absolutePath), { recursive: true })
+        // Re-check after directory creation: an existing generated-dir symlink
+        // is the common escape path, and a racing replacement must not turn an
+        // otherwise lexical in-workspace path into an outside write.
+        absolutePath = (await resolveWorkspacePath(relativePath, context, {
+          enforceWorkspaceBoundary: true
+        })).absolutePath
+        await writeFile(absolutePath, image.data)
+      } catch (error) {
+        return toolError('workspace_path_escape', errorMessage(error), telemetry(startedAt, client.id))
+      }
 
       const warnings: string[] = []
       const attachments: { id: string; name: string; mimeType: string; width?: number; height?: number }[] = []
@@ -282,6 +436,7 @@ export function buildImageGenToolProviders(
           attachments,
           model,
           ...(size ? { size } : {}),
+          quality: config.quality,
           endpoint,
           warnings,
           telemetry: telemetry(startedAt, client.id)
@@ -302,7 +457,7 @@ type ReferenceError = { error: { output: unknown; isError: true } }
 
 async function collectReferenceImages(
   value: unknown,
-  workspace: string,
+  context: ToolHostContext,
   maxCount: number
 ): Promise<ReferenceImages | ReferenceError> {
   if (value === undefined || value === null) return { images: [] }
@@ -315,9 +470,10 @@ async function collectReferenceImages(
   }
   const images: ReferenceImages['images'] = []
   for (const rawPath of paths) {
-    const resolved = resolve(workspace, rawPath)
-    const rel = relative(workspace, resolved)
-    if (rel.startsWith('..') || isAbsolute(rel)) {
+    let resolved: string
+    try {
+      resolved = (await resolveWorkspacePath(rawPath, context, { enforceWorkspaceBoundary: true })).absolutePath
+    } catch {
       return { error: toolError('invalid_reference_path', `reference image must be inside the workspace: ${rawPath}`) }
     }
     let data: Buffer
@@ -339,6 +495,31 @@ async function collectReferenceImages(
 }
 
 type ImagesApiPayload = { data?: { b64_json?: string; url?: string }[] }
+type VolcengineArkImagesPayload = {
+  data?: { b64_json?: string; url?: string }[]
+  error?: { code?: string; message?: string }
+}
+type CodexResponsesImageEvent = {
+  type?: string
+  partial_image_b64?: string
+  item?: {
+    type?: string
+    result?: string
+    revised_prompt?: string
+  }
+  response?: {
+    output?: Array<{
+      type?: string
+      result?: string
+      revised_prompt?: string
+    }>
+  }
+  error?: {
+    code?: string
+    message?: string
+  }
+  message?: string
+}
 type MiniMaxImagePayload = {
   data?: {
     image_base64?: string[]
@@ -354,9 +535,19 @@ export function createImageGenClient(config: {
   protocol?: string
   baseUrl?: string
   apiKey?: string
+  headers?: Record<string, string>
 }): ImageGenClient {
   if (config.protocol === 'minimax-image') {
     return new MiniMaxImageClient(config.baseUrl!, config.apiKey!)
+  }
+  if (config.protocol === 'codex-responses-image') {
+    return new CodexResponsesImageClient(config.baseUrl!, config.apiKey!, config.headers)
+  }
+  if (config.protocol === 'grok-imagine-image') {
+    return new GrokImagineImageClient(config.baseUrl!, config.apiKey!, config.headers)
+  }
+  if (config.protocol === 'volcengine-ark-image') {
+    return new VolcengineArkImageClient(config.baseUrl!, config.apiKey!)
   }
   if (config.protocol === 'agnes-image') {
     return new AgnesImageClient(config.baseUrl!, config.apiKey!)
@@ -392,6 +583,167 @@ export function openAiCompatImageUrl(
   return `${normalized}/v1/${path}`
 }
 
+export function codexResponsesImageUrl(baseUrl: string): string {
+  const normalized = trimTrailingSlashes(baseUrl.trim())
+  if (!normalized) return '/responses'
+  if (normalized.toLowerCase().endsWith('/responses')) return normalized
+  return `${normalized}/responses`
+}
+
+export function volcengineArkImageUrl(baseUrl: string): string {
+  const normalized = trimTrailingSlashes(baseUrl.trim())
+  if (!normalized) return '/images/generations'
+  if (normalized.toLowerCase().endsWith('/images/generations')) return normalized
+  return `${normalized}/images/generations`
+}
+
+function imageDataUrl(image: { mimeType: string; data: Buffer }): string {
+  const mimeType = image.mimeType.trim() || 'image/png'
+  return `data:${mimeType};base64,${image.data.toString('base64')}`
+}
+
+async function readLimitedResponseText(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) {
+    const text = await response.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new Error('Codex image generation response exceeded size limit')
+    }
+    return text
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  const chunks: string[] = []
+  let byteLength = 0
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (value) {
+        byteLength += value.byteLength
+        if (byteLength > maxBytes) {
+          await reader.cancel().catch(() => undefined)
+          throw new Error('Codex image generation response exceeded size limit')
+        }
+        chunks.push(decoder.decode(value, { stream: !done }))
+      }
+      if (done) {
+        const tail = decoder.decode()
+        if (tail) chunks.push(tail)
+        return chunks.join('')
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function parseCodexResponsesImageEvents(body: string): CodexResponsesImageEvent[] {
+  const events: CodexResponsesImageEvent[] = []
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith('data: ')) continue
+    const data = line.slice(6).trim()
+    if (!data || data === '[DONE]') continue
+    try {
+      events.push(JSON.parse(data) as CodexResponsesImageEvent)
+    } catch {
+      continue
+    }
+    if (events.length > MAX_CODEX_IMAGE_SSE_EVENTS) {
+      throw new Error('Codex image generation response exceeded event limit')
+    }
+  }
+  return events
+}
+
+function decodeCodexImagePayload(payload: string): Buffer {
+  if (payload.length > MAX_CODEX_IMAGE_BASE64_CHARS) {
+    throw new Error('Codex image generation result exceeded size limit')
+  }
+  return Buffer.from(payload, 'base64')
+}
+
+function codexImageFromResult(result: string | undefined): GeneratedImage | null {
+  if (!result) return null
+  return { data: decodeCodexImagePayload(result), mimeType: 'image/png' }
+}
+
+function codexResponseOutputText(event: CodexResponsesImageEvent): string {
+  const output = event.response?.output ?? []
+  const parts: string[] = []
+  for (const item of output) {
+    const record = item as Record<string, unknown>
+    const content = record.content
+    if (!Array.isArray(content)) continue
+    for (const entry of content) {
+      if (!entry || typeof entry !== 'object') continue
+      const text = (entry as Record<string, unknown>).text
+      if (typeof text === 'string' && text.trim()) parts.push(text.trim())
+    }
+  }
+  return parts.join(' ').replace(/\s+/g, ' ').slice(0, 300)
+}
+
+function summarizeCodexResponsesImage(body: string): string {
+  try {
+    const events = parseCodexResponsesImageEvents(body)
+    const types = [...new Set(events.map((event) => event.type).filter((type): type is string => Boolean(type)))]
+      .slice(0, 8)
+      .join(', ')
+    const completed = events.find((event) => event.type === 'response.completed')
+    const outputTypes = [...new Set((completed?.response?.output ?? []).map((item) => item.type).filter(Boolean))]
+      .slice(0, 8)
+      .join(', ')
+    const text = completed ? codexResponseOutputText(completed) : ''
+    const parts = [
+      types ? `events: ${types}` : '',
+      outputTypes ? `output: ${outputTypes}` : '',
+      text ? `text: ${text}` : ''
+    ].filter(Boolean)
+    return parts.length > 0 ? ` (${parts.join('; ')})` : ''
+  } catch {
+    return ''
+  }
+}
+
+function isCodexToolChoiceError(status: number, body: string): boolean {
+  if (status !== 400) return false
+  return /tool[_ ]choice|allowed_tools|image_generation.*tools|tools.*image_generation/i.test(body)
+}
+
+function extractCodexResponsesImage(body: string): GeneratedImage | null {
+  const events = parseCodexResponsesImageEvents(body)
+  const failure = events.find((event) => event.type === 'response.failed' || event.type === 'error')
+  if (failure) {
+    const message = failure.error?.message ??
+      failure.message ??
+      (failure.error?.code ? `Codex image generation failed (${failure.error.code})` : '')
+    throw new Error(message || 'Codex image generation failed')
+  }
+
+  for (const event of events) {
+    if (
+      event.type === 'response.output_item.done' &&
+      event.item?.type === 'image_generation_call'
+    ) {
+      const image = codexImageFromResult(event.item.result)
+      if (image) return image
+    }
+  }
+
+  let latestPartial: GeneratedImage | null = null
+  for (const event of events) {
+    if (event.type !== 'response.image_generation_call.partial_image') continue
+    latestPartial = codexImageFromResult(event.partial_image_b64) ?? latestPartial
+  }
+
+  const completed = events.find((event) => event.type === 'response.completed')
+  for (const item of completed?.response?.output ?? []) {
+    if (item.type !== 'image_generation_call') continue
+    const image = codexImageFromResult(item.result)
+    if (image) return image
+  }
+  return latestPartial
+}
+
 export class OpenAiCompatImageClient implements ImageGenClient {
   readonly id = 'openai-compat'
   private readonly baseUrl: string
@@ -404,30 +756,32 @@ export class OpenAiCompatImageClient implements ImageGenClient {
   }
 
   async generate(request: ImageGenRequest): Promise<GeneratedImage> {
-    const body = (includeResponseFormat: boolean) =>
+    const body = (includeResponseFormat: boolean, includeQuality: boolean) =>
       JSON.stringify({
         model: request.model,
         prompt: request.prompt,
         n: 1,
         ...(request.size ? { size: request.size } : {}),
+        ...(includeQuality && request.quality && request.quality !== 'auto' ? { quality: request.quality } : {}),
         ...(includeResponseFormat ? { response_format: 'b64_json' } : {})
       })
     return this.requestImage(
       openAiCompatImageUrl(this.baseUrl, 'generations'),
-      (includeResponseFormat) => ({
+      (includeResponseFormat, includeQuality) => ({
         headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
-        body: body(includeResponseFormat)
+        body: body(includeResponseFormat, includeQuality)
       }),
       request
     )
   }
 
   async edit(request: ImageGenEditRequest): Promise<GeneratedImage> {
-    const buildForm = (includeResponseFormat: boolean) => {
+    const buildForm = (includeResponseFormat: boolean, includeQuality: boolean) => {
       const form = new FormData()
       form.set('model', request.model)
       form.set('prompt', request.prompt)
       if (request.size) form.set('size', request.size)
+      if (includeQuality && request.quality && request.quality !== 'auto') form.set('quality', request.quality)
       if (includeResponseFormat) form.set('response_format', 'b64_json')
       const field = request.images.length > 1 ? 'image[]' : 'image'
       for (const image of request.images) {
@@ -444,9 +798,9 @@ export class OpenAiCompatImageClient implements ImageGenClient {
     }
     return this.requestImage(
       openAiCompatImageUrl(this.baseUrl, 'edits'),
-      (includeResponseFormat) => ({
+      (includeResponseFormat, includeQuality) => ({
         headers: { Authorization: `Bearer ${this.apiKey}` },
-        body: buildForm(includeResponseFormat)
+        body: buildForm(includeResponseFormat, includeQuality)
       }),
       request
     )
@@ -459,22 +813,37 @@ export class OpenAiCompatImageClient implements ImageGenClient {
    */
   private async requestImage(
     url: string,
-    init: (includeResponseFormat: boolean) => { headers: Record<string, string>; body: string | FormData },
-    request: { timeoutMs: number; signal: AbortSignal }
+    init: (
+      includeResponseFormat: boolean,
+      includeQuality: boolean
+    ) => { headers: Record<string, string>; body: string | FormData },
+    request: { timeoutMs: number; signal: AbortSignal; quality?: ImageGenerationQuality }
   ): Promise<GeneratedImage> {
     const signal = withTimeout(request.signal, request.timeoutMs)
-    const post = async (includeResponseFormat: boolean): Promise<Response> => {
+    const post = async (includeResponseFormat: boolean, includeQuality: boolean): Promise<Response> => {
       try {
-        return await fetch(url, { method: 'POST', ...init(includeResponseFormat), signal })
+        return await fetch(url, { method: 'POST', ...init(includeResponseFormat, includeQuality), signal })
       } catch (error) {
         throw imageFetchFailure(url, error, request)
       }
     }
-    let response = await post(true)
+    let includeResponseFormat = true
+    let includeQuality = Boolean(request.quality && request.quality !== 'auto')
+    let response = await post(includeResponseFormat, includeQuality)
     if (!response.ok && response.status >= 400 && response.status < 500) {
-      const errorBody = await response.text()
-      if (!/response_format/i.test(errorBody)) throw new ImageGenHttpError(response.status, errorBody)
-      response = await post(false)
+      let errorBody = await response.text()
+      if (includeQuality && /quality/i.test(errorBody)) {
+        includeQuality = false
+        response = await post(includeResponseFormat, includeQuality)
+        if (!response.ok && response.status >= 400 && response.status < 500) {
+          errorBody = await response.text()
+        }
+      }
+      if (!response.ok && response.status >= 400 && response.status < 500) {
+        if (!/response_format/i.test(errorBody)) throw new ImageGenHttpError(response.status, errorBody)
+        includeResponseFormat = false
+        response = await post(includeResponseFormat, includeQuality)
+      }
     }
     if (!response.ok) {
       throw new ImageGenHttpError(response.status, await response.text())
@@ -496,6 +865,245 @@ export class OpenAiCompatImageClient implements ImageGenClient {
       return { data: Buffer.from(await download.arrayBuffer()), mimeType }
     }
     throw new Error('image provider returned no image data')
+  }
+}
+
+export class VolcengineArkImageClient implements ImageGenClient {
+  readonly id = 'volcengine-ark-image'
+  private readonly endpointUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string
+  ) {
+    this.endpointUrl = volcengineArkImageUrl(baseUrl)
+  }
+
+  generate(request: ImageGenRequest): Promise<GeneratedImage> {
+    return this.requestImage(request)
+  }
+
+  edit(request: ImageGenEditRequest): Promise<GeneratedImage> {
+    return this.requestImage(request, request.images)
+  }
+
+  private async requestImage(
+    request: ImageGenRequest,
+    images: ImageGenEditRequest['images'] = []
+  ): Promise<GeneratedImage> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    let response: Response
+    try {
+      response = await fetch(this.endpointUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: request.model,
+          prompt: request.prompt,
+          ...(images.length > 0 ? { image: images.map(imageDataUrl) } : {}),
+          ...(request.size ? { size: request.size } : { size: '2K' }),
+          output_format: 'png',
+          response_format: 'b64_json',
+          sequential_image_generation: 'disabled',
+          stream: false,
+          watermark: false
+        }),
+        signal
+      })
+    } catch (error) {
+      throw imageFetchFailure(this.endpointUrl, error, request)
+    }
+    if (!response.ok) {
+      throw new ImageGenHttpError(response.status, await response.text())
+    }
+    const payload = (await response.json()) as VolcengineArkImagesPayload
+    const entry = payload.data?.[0]
+    if (entry?.b64_json) {
+      return { data: Buffer.from(entry.b64_json, 'base64'), mimeType: 'image/png' }
+    }
+    if (entry?.url) {
+      let download: Response
+      try {
+        download = await fetch(entry.url, { signal })
+      } catch (error) {
+        throw imageFetchFailure(entry.url, error, request)
+      }
+      if (!download.ok) throw new ImageGenHttpError(download.status, await download.text())
+      const mimeType = download.headers.get('content-type')?.split(';')[0] || 'image/png'
+      return { data: Buffer.from(await download.arrayBuffer()), mimeType }
+    }
+    const detail = payload.error?.message?.trim() || payload.error?.code?.trim()
+    throw new Error(detail
+      ? `Volcano Ark image provider returned no image data: ${detail}`
+      : 'Volcano Ark image provider returned no image data')
+  }
+}
+
+export class GrokImagineImageClient implements ImageGenClient {
+  readonly id = 'grok-imagine-image'
+  private readonly endpointUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string,
+    private readonly headers: Record<string, string> = {}
+  ) {
+    this.endpointUrl = openAiCompatImageUrl(baseUrl, 'generations')
+  }
+
+  async generate(request: ImageGenRequest): Promise<GeneratedImage> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    let response: Response
+    try {
+      response = await fetch(this.endpointUrl, {
+        method: 'POST',
+        headers: {
+          ...this.headers,
+          Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: request.model,
+          prompt: request.prompt,
+          n: 1,
+          aspect_ratio: request.aspectRatio ?? 'auto',
+          resolution: grokImagineResolution(request.size),
+          response_format: 'b64_json'
+        }),
+        signal
+      })
+    } catch (error) {
+      throw imageFetchFailure(this.endpointUrl, error, request)
+    }
+    const text = await response.text()
+    if (!response.ok) throw new ImageGenHttpError(response.status, text)
+    let payload: ImagesApiPayload
+    try {
+      payload = JSON.parse(text) as ImagesApiPayload
+    } catch {
+      throw new Error('Grok Imagine image provider returned invalid JSON')
+    }
+    const b64 = payload.data?.[0]?.b64_json
+    if (!b64) throw new Error('Grok Imagine image provider returned no image data')
+    return { data: Buffer.from(b64, 'base64'), mimeType: 'image/jpeg' }
+  }
+
+  async edit(_request: ImageGenEditRequest): Promise<GeneratedImage> {
+    throw new Error('Grok Imagine image editing is not supported by this tool')
+  }
+}
+
+function grokImagineResolution(size: string | undefined): '1k' | '2k' {
+  const longEdge = size ? parseSizeLongEdge(size) : undefined
+  return longEdge && longEdge >= SIZE_TIERS['2K'] ? '2k' : '1k'
+}
+
+export class CodexResponsesImageClient implements ImageGenClient {
+  readonly id = 'codex-responses-image'
+  private readonly endpointUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string,
+    private readonly headers: Record<string, string> = {}
+  ) {
+    this.endpointUrl = codexResponsesImageUrl(baseUrl)
+  }
+
+  async generate(request: ImageGenRequest): Promise<GeneratedImage> {
+    return this.requestImage(request, [])
+  }
+
+  async edit(request: ImageGenEditRequest): Promise<GeneratedImage> {
+    return this.requestImage(request, request.images)
+  }
+
+  private async requestImage(
+    request: ImageGenRequest,
+    inputImages: { name: string; mimeType: string; data: Buffer }[]
+  ): Promise<GeneratedImage> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    const buildBody = (toolChoiceMode: CodexImageToolChoiceMode) => JSON.stringify({
+      model: CODEX_IMAGE_RESPONSES_MODEL,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: request.prompt },
+            ...inputImages.map((image) => ({
+              type: 'input_image',
+              image_url: imageDataUrl(image),
+              detail: 'auto'
+            }))
+          ]
+        }
+      ],
+      instructions: CODEX_IMAGE_INSTRUCTIONS,
+      tools: [
+        {
+          type: 'image_generation',
+          action: inputImages.length > 0 ? 'edit' : 'generate',
+          model: request.model,
+          quality: request.quality ?? 'auto',
+          output_format: 'png',
+          background: 'opaque',
+          partial_images: 1,
+          ...(request.size ? { size: request.size } : {})
+        }
+      ],
+      ...(toolChoiceMode === 'allowed_tools'
+        ? {
+            tool_choice: {
+              type: 'allowed_tools',
+              mode: 'required',
+              tools: [{ type: 'image_generation' }]
+            }
+          }
+        : toolChoiceMode === 'required'
+          ? { tool_choice: 'required' }
+          : {}),
+      stream: true,
+      store: false
+    })
+
+    let lastHttpError: ImageGenHttpError | null = null
+    let lastEmptyResponse = ''
+    for (const mode of ['allowed_tools', 'required', 'none'] satisfies CodexImageToolChoiceMode[]) {
+      let response: Response
+      try {
+        response = await fetch(this.endpointUrl, {
+          method: 'POST',
+          headers: {
+            ...this.headers,
+            Authorization: `Bearer ${this.apiKey}`,
+            Accept: 'text/event-stream',
+            'Content-Type': 'application/json'
+          },
+          body: buildBody(mode),
+          signal
+        })
+      } catch (error) {
+        throw imageFetchFailure(this.endpointUrl, error, request)
+      }
+      const text = await readLimitedResponseText(response, MAX_CODEX_IMAGE_SSE_BYTES)
+      if (!response.ok) {
+        const error = new ImageGenHttpError(response.status, text)
+        lastHttpError = error
+        if (isCodexToolChoiceError(response.status, text)) continue
+        throw error
+      }
+      const image = extractCodexResponsesImage(text)
+      if (image) return image
+      lastEmptyResponse = `Codex image provider returned no image data${summarizeCodexResponsesImage(text)}`
+      if (mode !== 'none') continue
+    }
+    if (lastEmptyResponse) throw new Error(lastEmptyResponse)
+    if (lastHttpError) throw lastHttpError
+    throw new Error('Codex image provider returned no image data')
   }
 }
 

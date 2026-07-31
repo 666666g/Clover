@@ -14,6 +14,7 @@ import { COMPACTION_SYSTEM_PROMPT } from '../src/loop/compaction-summary.js'
 import { effectiveHistoryAfterLatestCompaction } from '../src/loop/compaction-history.js'
 import { resolveModelContextProfile } from '../src/loop/model-context-profile.js'
 import { isPlanClarifyingQuestion } from '../src/loop/agent-loop.js'
+import { LoopTelemetry } from '../src/loop/loop-telemetry.js'
 import {
   makeApprovalItem,
   makeAssistantReasoningItem,
@@ -28,6 +29,7 @@ import { createImmutablePrefix, setSystemPrompt } from '../src/cache/immutable-p
 import { InflightTracker } from '../src/loop/inflight-tracker.js'
 import { SteeringQueue } from '../src/loop/steering-queue.js'
 import { SequentialIdGenerator } from '../src/ports/id-generator.js'
+import type { SessionStore } from '../src/ports/session-store.js'
 import { TurnService } from '../src/services/turn-service.js'
 import type { TurnItem } from '../src/contracts/items.js'
 import type { ModelRequest, ModelStreamChunk } from '../src/ports/model-client.js'
@@ -48,7 +50,84 @@ describe('AgentLoop', () => {
     expect(h.inflight.size()).toBe(0)
   })
 
-  it('injects the current shell runtime when bash is available', async () => {
+  it('clears turn-scoped manual skill activation after terminal settlement', async () => {
+    const clearTurnActivation = vi.fn()
+    const skillRuntime = {
+      resolveTurn: async () => ({
+        activeSkillIds: [],
+        activations: [],
+        instructions: [],
+        injectedBytes: 0
+      }),
+      clearTurnActivation
+    }
+    const h = makeHarness(makeSilentModel(), { skillRuntime: skillRuntime as never })
+    await bootstrapThread(h)
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+    expect(clearTurnActivation).toHaveBeenCalledWith(h.threadId, h.turnId)
+  })
+
+  it('runs delegated SDK turns through the shared steering lifecycle', async () => {
+    let h!: ReturnType<typeof makeHarness>
+    let observedSteering = false
+    const sdkRuntime = {
+      handlesProvider: () => true,
+      runTurn: async (threadId: string, turnId: string) => {
+        observedSteering = (await h.sessionStore.loadItems(threadId)).some(
+          (item) => item.turnId === turnId && item.kind === 'user_message' && item.text === 'Also do this'
+        )
+        await h.turns.finishTurn({ threadId, turnId, status: 'completed' })
+        return 'completed' as const
+      }
+    }
+    h = makeHarness(makeSilentModel(), { sdkRuntime: sdkRuntime as never })
+    await bootstrapThread(h)
+    h.steering.enqueue(h.turnId, { text: 'Also do this' })
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+
+    expect(observedSteering).toBe(true)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'pipeline_stage', stage: 'post_start' }))
+  })
+
+  it('uses the durable terminal winner when an SDK turn is interrupted first', async () => {
+    let h!: ReturnType<typeof makeHarness>
+    const sdkRuntime = {
+      handlesProvider: () => true,
+      runTurn: async (threadId: string, turnId: string) => {
+        await h.turns.interruptTurn({ threadId, turnId })
+        // Simulate a stale SDK completion reported after the interrupt won.
+        return 'completed' as const
+      }
+    }
+    h = makeHarness(makeSilentModel(), { sdkRuntime: sdkRuntime as never })
+    await bootstrapThread(h)
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('aborted')
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events.filter((event) =>
+      event.kind === 'turn_completed' || event.kind === 'turn_failed' || event.kind === 'turn_aborted'
+    )).toEqual([expect.objectContaining({ kind: 'turn_aborted' })])
+  })
+
+  it('bounds cached prompt-pressure hydration markers', () => {
+    const telemetry = new LoopTelemetry({} as unknown as SessionStore) as unknown as {
+      rememberHydratedPressureThread(threadId: string): void
+      hydratedPressureThreads: Set<string>
+    }
+
+    for (let index = 0; index <= 512; index += 1) {
+      telemetry.rememberHydratedPressureThread(`thread_${index}`)
+    }
+
+    expect(telemetry.hydratedPressureThreads).toHaveLength(512)
+    expect(telemetry.hydratedPressureThreads.has('thread_0')).toBe(false)
+    expect(telemetry.hydratedPressureThreads.has('thread_512')).toBe(true)
+  })
+
+  it('injects the current shell runtime under the full-access sandbox', async () => {
     let observedRequest: ModelRequest | null = null
     const h = makeHarness({
       provider: 'shell-context',
@@ -58,7 +137,7 @@ describe('AgentLoop', () => {
         yield { kind: 'completed', stopReason: 'stop' }
       }
     })
-    await bootstrapThread(h)
+    await bootstrapThread(h, { request: { prompt: 'hello', sandboxMode: 'danger-full-access' } })
 
     await h.loop.runTurn(h.threadId, h.turnId)
 
@@ -67,6 +146,55 @@ describe('AgentLoop', () => {
     expect(request.tools.map((tool) => tool.name)).toContain('bash')
     expect(request.contextInstructions?.join('\n')).toContain('<shell_environment>')
     expect(request.contextInstructions?.join('\n')).toContain('<syntax>')
+    expect(request.contextInstructions?.join('\n')).not.toContain('Specialized MCP tools are available')
+  })
+
+  it('prefers specialized MCP tools only when they are advertised', async () => {
+    let observedRequest: ModelRequest | null = null
+    const sourceExplorer = LocalToolHost.defineTool({
+      name: 'mcp_semantic_find_symbol',
+      description: 'Find source-code symbols and their references.',
+      inputSchema: { type: 'object' },
+      policy: 'auto',
+      execute: async () => ({ output: {} })
+    })
+    const registry = new CapabilityRegistry([
+      {
+        id: 'builtin',
+        kind: 'built-in',
+        enabled: true,
+        available: true,
+        tools: buildDefaultLocalTools()
+      },
+      {
+        id: 'mcp:semantic',
+        kind: 'mcp',
+        enabled: true,
+        available: true,
+        tools: [sourceExplorer]
+      }
+    ])
+    const h = makeHarness({
+      provider: 'tool-preference',
+      model: 'tool-preference',
+      async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+        observedRequest = request
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { toolHost: new LocalToolHost({ registry }) })
+    await bootstrapThread(h)
+
+    await h.loop.runTurn(h.threadId, h.turnId)
+
+    const request = observedRequest as ModelRequest | null
+    if (!request) throw new Error('expected model request')
+    const instructions = request.contextInstructions?.join('\n') ?? ''
+    expect(instructions).toContain('Specialized source-code MCP tools are available')
+    expect(instructions).toContain('`mcp_semantic_find_symbol`')
+    expect(instructions).toContain('before broad scans')
+    expect(instructions).toContain(
+      'Use `read`, `grep`, `glob`, `ls`, `repo_map` for unsupported files'
+    )
   })
 
   it('records elapsed seconds for active goals after a turn finishes', async () => {
@@ -97,15 +225,19 @@ describe('AgentLoop', () => {
   })
 
   it('includes the failure reason on turn_failed events', async () => {
-    const h = makeHarness({
+    const model = {
       provider: 'throwing',
       model: 'throwing',
+      config: { baseUrl: 'https://user:secret@example.invalid/v1', model: 'throwing' },
       async *stream(): AsyncIterable<ModelStreamChunk> {
         const chunks: ModelStreamChunk[] = []
         for (const chunk of chunks) yield chunk
         throw new Error('model stream exploded')
       }
-    })
+    } satisfies import('../src/ports/model-client.js').ModelClient & {
+      config: { baseUrl: string; model: string }
+    }
+    const h = makeHarness(model)
     await bootstrapThread(h)
 
     const status = await h.loop.runTurn(h.threadId, h.turnId)
@@ -118,6 +250,8 @@ describe('AgentLoop', () => {
       message: expect.stringContaining('model stream exploded')
     })
     expect(failed?.kind === 'turn_failed' ? failed.message : '').toContain('[Kun turn failed]')
+    expect(failed?.kind === 'turn_failed' ? failed.message : '').not.toContain('user:secret')
+    expect(failed?.kind === 'turn_failed' ? failed.message : '').not.toContain('secret')
   })
 
   it('fails the turn when the model stream yields an error chunk', async () => {
@@ -165,12 +299,147 @@ describe('AgentLoop', () => {
       'input_received',
       'input_cached',
       'input_routed',
-      'input_compressed',
       'input_remembered',
+      'input_compressed',
       'pre_send',
       'post_send',
       'response_received'
     ])
+  })
+
+  it('emits the selected model window and runtime compaction thresholds', async () => {
+    const h = makeHarness(makeSilentModel(), {
+      tools: [],
+      compactor: new ContextCompactor({
+        softThreshold: 750,
+        hardThreshold: 850
+      }),
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 1_000,
+        messageParts: ['text']
+      })
+    })
+    await bootstrapThread(h)
+
+    await h.loop.runTurn(h.threadId, h.turnId)
+
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const snapshot = events.find((event) => event.kind === 'context_snapshot')
+    expect(snapshot).toMatchObject({
+      kind: 'context_snapshot',
+      model: 'fake',
+      contextWindowTokens: 1_000,
+      softThresholdTokens: 750,
+      hardThresholdTokens: 850
+    })
+  })
+
+  it('compacts from complete request overhead before dispatching the rebuilt request', async () => {
+    const requests: ModelRequest[] = []
+    const h = makeHarness({
+      provider: 'preflight',
+      model: 'preflight',
+      async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+        requests.push(request)
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, {
+      tools: [],
+      compactor: new ContextCompactor({ softThreshold: 220, hardThreshold: 320 }),
+      instructionRuntime: {
+        resolveTurn: async () => ({
+          instruction: `Large dynamic instruction ${'z'.repeat(1_200)}`,
+          sources: [],
+          injectedBytes: 1_226
+        })
+      } as never,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 2_000,
+        messageParts: ['text']
+      })
+    })
+    await h.threadStore.upsert(
+      createThreadRecord({ id: h.threadId, title: 'demo', workspace: '/tmp', model: 'preflight' })
+    )
+    for (let index = 0; index < 4; index += 1) {
+      await h.sessionStore.appendItem(h.threadId, makeUserItem({
+        id: `old_preflight_${index}`,
+        turnId: `old_turn_${index}`,
+        threadId: h.threadId,
+        text: `old context ${index} ${'x'.repeat(80)}`
+      }))
+    }
+    const started = await h.turns.startTurn({
+      threadId: h.threadId,
+      request: { prompt: 'keep this current request' }
+    })
+    h.turnId = started.turnId
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.history[0]).toMatchObject({ kind: 'compaction' })
+    expect(requests[0]?.history).toContainEqual(expect.objectContaining({
+      kind: 'user_message',
+      text: 'keep this current request'
+    }))
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'compaction_completed',
+      replacedTokens: expect.any(Number)
+    }))
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'pipeline_stage',
+      stage: 'input_compressed',
+      details: expect.objectContaining({
+        requestOverheadTokens: expect.any(Number)
+      })
+    }))
+  })
+
+  it('blocks an uncompactable oversized request before model transport dispatch', async () => {
+    let dispatches = 0
+    const h = makeHarness({
+      provider: 'preflight-block',
+      model: 'preflight-block',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        dispatches += 1
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, {
+      tools: [],
+      compactor: new ContextCompactor({ softThreshold: 100, hardThreshold: 200 }),
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 500,
+        messageParts: ['text']
+      })
+    })
+    await bootstrapThread(h, {
+      request: { prompt: `uncompactable current input ${'x'.repeat(4_000)}` }
+    })
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('failed')
+
+    expect(dispatches).toBe(0)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'error',
+      code: 'context_window_exceeded',
+      message: expect.stringContaining('request exceeds the 425-token context cap')
+    }))
+    expect(events.some((event) => event.kind === 'context_snapshot')).toBe(false)
   })
 
   it('records provider endpoint diagnostics for model send stages', async () => {
@@ -219,6 +488,29 @@ describe('AgentLoop', () => {
         providerBaseUrl: 'https://api.minimaxi.com/anthropic'
       }
     })
+  })
+
+  it('redacts credentials from malformed provider URLs in pipeline diagnostics', async () => {
+    const model = {
+      provider: 'compat',
+      model: 'test-model',
+      config: { baseUrl: 'https://user:secret@%', endpointFormat: 'messages', model: 'test-model' },
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    } satisfies import('../src/ports/model-client.js').ModelClient & {
+      config: { baseUrl: string; endpointFormat: string; model: string }
+    }
+    const h = makeHarness(model)
+    await bootstrapThread(h)
+
+    await h.loop.runTurn(h.threadId, h.turnId)
+
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const preSend = events.find((event) => event.kind === 'pipeline_stage' && event.stage === 'pre_send')
+    const diagnostics = JSON.stringify(preSend)
+    expect(diagnostics).not.toContain('user:secret')
+    expect(diagnostics).not.toContain('secret')
   })
 
   it('aborts the turn when the abort signal fires', async () => {
@@ -353,6 +645,21 @@ describe('AgentLoop', () => {
     expect(events.some((event) =>
       event.kind === 'tool_result_upload_wait' && event.toolResultCount === 1
     )).toBe(true)
+    const contextSnapshots = events.filter((event) => event.kind === 'context_snapshot')
+    expect(contextSnapshots).toHaveLength(2)
+    expect(contextSnapshots.map((event) => event.stepIndex)).toEqual([0, 1])
+    for (const snapshot of contextSnapshots) {
+      expect(snapshot.estimatedInputTokens).toBe(
+        snapshot.breakdown.tools +
+        snapshot.breakdown.system +
+        snapshot.breakdown.skills +
+        snapshot.breakdown.messages +
+        snapshot.breakdown.other
+      )
+      expect(snapshot.toolCount).toBeGreaterThan(0)
+    }
+    expect(contextSnapshots[1]?.breakdown.messages)
+      .toBeGreaterThan(contextSnapshots[0]?.breakdown.messages ?? 0)
     const thread = await h.threadStore.get(h.threadId)
     const toolCall = thread?.turns
       .flatMap((turn) => turn.items)
@@ -416,6 +723,7 @@ describe('AgentLoop', () => {
 
   it('fails visibly when the model repeats an empty post-tool continuation', async () => {
     let calls = 0
+    const requests: ModelRequest[] = []
     const writeHelper = LocalToolHost.defineTool({
       name: 'write_helper',
       description: 'Write a helper script.',
@@ -428,7 +736,8 @@ describe('AgentLoop', () => {
       {
         provider: 'repeated-empty-after-tool',
         model: 'repeated-empty-after-tool',
-        async *stream(): AsyncIterable<ModelStreamChunk> {
+        async *stream(request): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
           calls += 1
           if (calls === 1) {
             yield {
@@ -451,7 +760,9 @@ describe('AgentLoop', () => {
     const items = await h.sessionStore.loadItems(h.threadId)
 
     expect(status).toBe('failed')
-    expect(calls).toBe(3)
+    expect(calls).toBe(4)
+    expect(requests[3]?.tools).toEqual([])
+    expect(requests[3]?.contextInstructions?.join('\n')).toContain('Tool final-answer recovery')
     expect(items).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'error',
@@ -460,8 +771,74 @@ describe('AgentLoop', () => {
     ]))
   })
 
+  it('forces a tool-free final answer after two empty post-tool continuations', async () => {
+    let calls = 0
+    const requests: ModelRequest[] = []
+    const writeHelper = LocalToolHost.defineTool({
+      name: 'write_helper',
+      description: 'Write a helper script.',
+      inputSchema: { type: 'object', properties: {} },
+      policy: 'auto',
+      toolKind: 'file_change',
+      execute: async () => ({ output: { ok: true } })
+    })
+    const h = makeHarness(
+      {
+        provider: 'final-answer-after-repeated-empty',
+        model: 'final-answer-after-repeated-empty',
+        async *stream(request): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_write_helper',
+              toolName: 'write_helper',
+              arguments: {}
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          if (calls < 4) {
+            yield { kind: 'completed', stopReason: 'stop' }
+            return
+          }
+          yield { kind: 'assistant_text_delta', text: 'The helper was written successfully.' }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: [writeHelper] }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+
+    expect(status).toBe('completed')
+    expect(calls).toBe(4)
+    expect(requests[2]?.tools.map((tool) => tool.name)).toContain('write_helper')
+    expect(requests[3]?.tools).toEqual([])
+    expect(requests[3]?.contextInstructions?.join('\n')).toContain('Tool final-answer recovery')
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'assistant_text',
+        text: 'The helper was written successfully.'
+      })
+    ]))
+    expect(items).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'empty_post_tool_continuation' })
+    ]))
+  })
+
   it('keeps running past the legacy eight-step ceiling until the model stops', async () => {
     let calls = 0
+    const noop = LocalToolHost.defineTool({
+      name: 'noop',
+      description: 'Complete without side effects.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      policy: 'auto',
+      execute: async () => ({ output: { ok: true } })
+    })
     const h = makeHarness(
       {
         provider: 'long-runner',
@@ -471,9 +848,9 @@ describe('AgentLoop', () => {
           if (calls <= 9) {
             yield {
               kind: 'tool_call_complete',
-              callId: `call_ls_${calls}`,
-              toolName: 'ls',
-              arguments: { path: '.' }
+              callId: `call_noop_${calls}`,
+              toolName: 'noop',
+              arguments: {}
             }
             yield { kind: 'completed', stopReason: 'tool_calls' }
             return
@@ -482,7 +859,7 @@ describe('AgentLoop', () => {
           yield { kind: 'completed', stopReason: 'stop' }
         }
       },
-      { tools: buildDefaultLocalTools(), toolStorm: { enabled: false } }
+      { tools: [noop], toolStorm: { enabled: false } }
     )
     await bootstrapThread(h)
 
@@ -548,8 +925,9 @@ describe('AgentLoop', () => {
     })
   })
 
-  it('surfaces tool catalog drift to the UI and next model request', async () => {
+  it('defers additive tool catalog changes until the next turn', async () => {
     const seenInstructions: string[][] = []
+    const seenToolNames: string[][] = []
     let modelCalls = 0
     let advertiseExtra = false
     const echoTool = LocalToolHost.defineTool({
@@ -580,6 +958,7 @@ describe('AgentLoop', () => {
         model: 'catalog-drift',
         async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
           seenInstructions.push(request.contextInstructions ?? [])
+          seenToolNames.push((request.tools ?? []).map((tool) => tool.name))
           modelCalls += 1
           if (modelCalls === 1) {
             yield {
@@ -602,70 +981,77 @@ describe('AgentLoop', () => {
     const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
     const items = await h.sessionStore.loadItems(h.threadId)
 
-	    expect(events.some((event) => event.kind === 'tool_catalog_changed')).toBe(true)
-	    expect(events.find((event) => event.kind === 'tool_catalog_changed')).toMatchObject({
-	      kind: 'tool_catalog_changed',
-	      changeKind: 'additive'
-	    })
-	    expect(items.some((item) => item.kind === 'error' && item.code === 'tool_catalog_changed')).toBe(true)
-	    expect(seenInstructions[1]?.some((text) => text.includes('Tool catalog changed'))).toBe(true)
-	  })
+    expect(events.some((event) => event.kind === 'tool_catalog_changed')).toBe(true)
+    expect(events.find((event) => event.kind === 'tool_catalog_changed')).toMatchObject({
+      kind: 'tool_catalog_changed',
+      changeKind: 'additive'
+    })
+    expect(items.some((item) => item.kind === 'error' && item.code === 'tool_catalog_changed')).toBe(false)
+    expect(seenInstructions[1]?.some((text) => text.includes('Tool catalog changed'))).toBe(true)
+    expect(seenInstructions[1]?.some((text) => text.includes('next turn'))).toBe(true)
+    expect(seenToolNames[0]).toEqual(['echo'])
+    expect(seenToolNames[1]).toEqual(['echo'])
+  })
 
-	  it('stops the turn when an existing tool schema mutates in-place', async () => {
-	    let modelCalls = 0
-	    const inputSchema: Record<string, unknown> = {
-	      type: 'object',
-	      properties: { text: { type: 'string' } },
-	      required: ['text']
-	    }
-	    const echoTool = LocalToolHost.defineTool({
-	      name: 'echo',
-	      description: 'Echo text.',
-	      inputSchema,
-	      policy: 'auto',
-	      execute: async () => {
-	        inputSchema.properties = {
-	          text: { type: 'string' },
-	          unexpected: { type: 'boolean' }
-	        }
-	        return { output: { ok: true } }
-	      }
-	    })
-	    const h = makeHarness(
-	      {
-	        provider: 'catalog-breaking-drift',
-	        model: 'catalog-breaking-drift',
-	        async *stream(): AsyncIterable<ModelStreamChunk> {
-	          modelCalls += 1
-	          yield {
-	            kind: 'tool_call_complete',
-	            callId: 'call_echo',
-	            toolName: 'echo',
-	            arguments: { text: 'hi' }
-	          }
-	          yield { kind: 'completed', stopReason: 'tool_calls' }
-	        }
-	      },
-	      { tools: [echoTool] }
-	    )
-	    await bootstrapThread(h)
+  it('deep-freezes an existing tool schema for every model step in a turn', async () => {
+    let modelCalls = 0
+    const seenSchemas: Record<string, unknown>[] = []
+    const inputSchema: Record<string, unknown> = {
+      type: 'object',
+      properties: { text: { type: 'string' } },
+      required: ['text']
+    }
+    const echoTool = LocalToolHost.defineTool({
+      name: 'echo',
+      description: 'Echo text.',
+      inputSchema,
+      policy: 'auto',
+      execute: async () => {
+        inputSchema.properties = {
+          text: { type: 'string' },
+          unexpected: { type: 'boolean' }
+        }
+        return { output: { ok: true } }
+      }
+    })
+    const h = makeHarness(
+      {
+        provider: 'catalog-breaking-drift',
+        model: 'catalog-breaking-drift',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          modelCalls += 1
+          seenSchemas.push(structuredClone(request.tools?.[0]?.inputSchema ?? {}))
+          if (modelCalls > 1) {
+            yield { kind: 'completed', stopReason: 'stop' }
+            return
+          }
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_echo',
+            toolName: 'echo',
+            arguments: { text: 'hi' }
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+        }
+      },
+      { tools: [echoTool] }
+    )
+    await bootstrapThread(h)
 
-	    const status = await h.loop.runTurn(h.threadId, h.turnId)
-	    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
-	    const items = await h.sessionStore.loadItems(h.threadId)
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const items = await h.sessionStore.loadItems(h.threadId)
 
-	    expect(status).toBe('completed')
-	    expect(modelCalls).toBe(1)
-	    expect(events.find((event) => event.kind === 'tool_catalog_changed')).toMatchObject({
-	      kind: 'tool_catalog_changed',
-	      changeKind: 'breaking'
-	    })
-	    expect(items.find((item) => item.kind === 'error' && item.code === 'tool_catalog_changed'))
-	      .toMatchObject({
-	        kind: 'error',
-	        message: expect.stringContaining('Kun stopped this turn')
-	      })
-	  })
+    expect(status).toBe('completed')
+    expect(modelCalls).toBe(2)
+    expect(seenSchemas[1]).toEqual(seenSchemas[0])
+    expect(JSON.stringify(seenSchemas[1])).not.toContain('unexpected')
+    expect(events.find((event) => event.kind === 'tool_catalog_changed')).toMatchObject({
+      kind: 'tool_catalog_changed',
+      changeKind: 'breaking'
+    })
+    expect(items.some((item) => item.kind === 'error' && item.code === 'tool_catalog_changed')).toBe(false)
+  })
 
 	  it('runs consecutive built-in read-only tool calls in a deterministic parallel batch', async () => {
     const started: string[] = []
@@ -941,6 +1327,72 @@ describe('AgentLoop', () => {
 	      toolName: 'echo'
 	    })
 	  })
+
+  it('suppresses the third identical Graph run inspection within a turn', async () => {
+    let executions = 0
+    const inspectTool = LocalToolHost.defineTool({
+      name: 'graph_control_run',
+      description: 'Inspect a durable Graph run.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string' },
+          runId: { type: 'string' }
+        },
+        required: ['action', 'runId']
+      },
+      policy: 'auto',
+      execute: async () => {
+        executions += 1
+        return { output: { seq: executions } }
+      }
+    })
+    let calls = 0
+    const h = makeHarness(
+      {
+        provider: 'graph-inspect-model',
+        model: 'graph-inspect-model',
+        async *stream(): AsyncIterable<ModelStreamChunk> {
+          calls += 1
+          if (calls <= 3) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: `call_graph_inspect_${calls}`,
+              toolName: 'graph_control_run',
+              arguments: { action: 'inspect', runId: 'run_1' }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: [inspectTool] }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const stormResult = items.find(
+      (item) => item.kind === 'tool_result' && item.callId === 'call_graph_inspect_3'
+    )
+    const thirdCall = items.find(
+      (item) => item.kind === 'tool_call' && item.callId === 'call_graph_inspect_3'
+    )
+
+    expect(status).toBe('completed')
+    expect(executions).toBe(2)
+    expect(thirdCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+    expect(stormResult?.kind === 'tool_result' ? stormResult.isError : false).toBe(true)
+    expect(stormResult?.kind === 'tool_result' ? JSON.stringify(stormResult.output) : '')
+      .toContain('repeat-loop guard suppressed')
+    expect(events.find((event) => event.kind === 'tool_storm_suppressed')).toMatchObject({
+      kind: 'tool_storm_suppressed',
+      callId: 'call_graph_inspect_3',
+      toolName: 'graph_control_run'
+    })
+  })
 
 	  it('can disable the storm breaker through loop config', async () => {
 	    let executions = 0
@@ -1281,7 +1733,98 @@ describe('AgentLoop', () => {
     })
     const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
     expect(events.some((event) => event.kind === 'user_input_requested')).toBe(true)
-    expect(events.some((event) => event.kind === 'user_input_resolved')).toBe(true)
+    expect(events.filter((event) => event.kind === 'user_input_resolved')).toHaveLength(1)
+  })
+
+  it('arms the user-input gate before publishing the request event', async () => {
+    let calls = 0
+    const h = makeHarness({
+      provider: 'immediate-input',
+      model: 'immediate-input',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_input',
+            toolName: 'request_user_input',
+            arguments: { prompt: 'Continue?' }
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    })
+    await bootstrapThread(h)
+    let immediatelyResolved = false
+    const unsubscribe = h.bus.subscribe(h.threadId, (event) => {
+      if (event.kind !== 'user_input_requested') return
+      immediatelyResolved = h.userInputGate.resolve(event.inputId, {
+        status: 'submitted',
+        answers: []
+      })
+    })
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    unsubscribe()
+
+    expect(status).toBe('completed')
+    expect(immediatelyResolved).toBe(true)
+  })
+
+  it('arms the approval gate before publishing the request event', async () => {
+    const executed: string[] = []
+    const tool = LocalToolHost.defineTool({
+      name: 'requires_approval',
+      description: 'Requires approval',
+      inputSchema: { type: 'object', properties: {} },
+      policy: 'on-request',
+      execute: async () => {
+        executed.push('requires_approval')
+        return { output: { ok: true } }
+      }
+    })
+    let calls = 0
+    const h = makeHarness({
+      provider: 'immediate-approval',
+      model: 'immediate-approval',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_approval',
+            toolName: 'requires_approval',
+            arguments: {}
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [tool] })
+    await h.threadStore.upsert(createThreadRecord({
+      id: h.threadId,
+      title: 'demo',
+      workspace: '/tmp',
+      model: 'fake',
+      approvalPolicy: 'always'
+    }))
+    const started = await h.turns.startTurn({ threadId: h.threadId, request: { prompt: 'hello' } })
+    h.turnId = started.turnId
+    let immediatelyAllowed = false
+    const unsubscribe = h.bus.subscribe(h.threadId, (event) => {
+      if (event.kind !== 'approval_requested') return
+      immediatelyAllowed = h.approvalGate.decide(event.approvalId, 'allow')
+    })
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    unsubscribe()
+
+    expect(status).toBe('completed')
+    expect(immediatelyAllowed).toBe(true)
+    expect(executed).toEqual(['requires_approval'])
   })
 
   it('uses the thread approval policy when executing auto tools', async () => {
@@ -1342,6 +1885,210 @@ describe('AgentLoop', () => {
 
     expect(status).toBe('completed')
     expect(approvalDecisions).toEqual(['dangerous_auto'])
+  })
+
+  it('expires a pending approval and releases tool inflight work when interrupted', async () => {
+    const guardedTool = LocalToolHost.defineTool({
+      name: 'guarded_action',
+      description: 'Waits for explicit approval.',
+      inputSchema: { type: 'object' },
+      policy: 'on-request',
+      execute: async () => ({ output: { ok: true } })
+    })
+    const h = makeHarness(makeFakeModel([
+      {
+        kind: 'tool_call_complete',
+        callId: 'call_guarded',
+        toolName: 'guarded_action',
+        arguments: {}
+      },
+      { kind: 'completed', stopReason: 'tool_calls' }
+    ]), { tools: [guardedTool] })
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected thread')
+    await h.threadStore.upsert({ ...thread, approvalPolicy: 'on-request' })
+
+    const running = h.loop.runTurn(h.threadId, h.turnId)
+    let pendingApprovalId = ''
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      pendingApprovalId = h.approvalGate.pending(h.threadId)[0]?.id ?? ''
+      if (pendingApprovalId) break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    expect(pendingApprovalId).toMatch(/^appr_[a-f0-9]{32}$/)
+
+    await h.turns.interruptTurn({ threadId: h.threadId, turnId: h.turnId })
+    await expect(running).resolves.toBe('aborted')
+
+    expect(h.approvalGate.get(pendingApprovalId)).toMatchObject({ status: 'expired' })
+    expect(h.approvalGate.pending(h.threadId)).toEqual([])
+    expect(h.inflight.size()).toBe(0)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'approval_resolved',
+        approvalId: pendingApprovalId,
+        status: 'expired',
+        reason: 'turn aborted while awaiting approval'
+      })
+    ]))
+  })
+
+  it('interrupts immediately while approval request persistence is blocked', async () => {
+    const guardedTool = LocalToolHost.defineTool({
+      name: 'guarded_action',
+      description: 'Waits for explicit approval.',
+      inputSchema: { type: 'object' },
+      policy: 'on-request',
+      execute: async () => ({ output: { ok: true } })
+    })
+    const h = makeHarness(makeFakeModel([
+      {
+        kind: 'tool_call_complete',
+        callId: 'call_blocked_event',
+        toolName: 'guarded_action',
+        arguments: {}
+      },
+      { kind: 'completed', stopReason: 'tool_calls' }
+    ]), { tools: [guardedTool] })
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected thread')
+    await h.threadStore.upsert({ ...thread, approvalPolicy: 'on-request' })
+    const originalAppend = h.sessionStore.appendEvent.bind(h.sessionStore)
+    let releaseRequest!: () => void
+    const requestBlocked = new Promise<void>((resolve) => { releaseRequest = resolve })
+    let requestWriteStarted = false
+    vi.spyOn(h.sessionStore, 'appendEvent').mockImplementation(async (threadId, event) => {
+      if (event.kind === 'approval_requested') {
+        requestWriteStarted = true
+        await requestBlocked
+      }
+      await originalAppend(threadId, event)
+    })
+
+    const running = h.loop.runTurn(h.threadId, h.turnId)
+    await vi.waitFor(() => expect(requestWriteStarted).toBe(true))
+    const interrupting = h.turns.interruptTurn({ threadId: h.threadId, turnId: h.turnId })
+    const status = await Promise.race([
+      running,
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 500))
+    ])
+    releaseRequest()
+
+    expect(status).toBe('aborted')
+    await expect(interrupting).resolves.toEqual({ status: 'aborted' })
+    await expect(running).resolves.toBe('aborted')
+    await vi.waitFor(async () => {
+      const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'approval_resolved', status: 'expired' })
+      ]))
+    })
+  })
+
+  it('persists a denied approval as a failed tool call with model-visible feedback', async () => {
+    const guardedTool = LocalToolHost.defineTool({
+      name: 'guarded_action',
+      description: 'Waits for explicit approval.',
+      inputSchema: { type: 'object' },
+      policy: 'on-request',
+      execute: async () => ({ output: { ok: true } })
+    })
+    let modelStep = 0
+    const modelRequests: ModelRequest[] = []
+    const h = makeHarness({
+      provider: 'approval-denied',
+      model: 'approval-denied',
+      async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+        modelRequests.push(request)
+        modelStep += 1
+        if (modelStep === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_denied',
+            toolName: 'guarded_action',
+            arguments: {}
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [guardedTool] })
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected thread')
+    await h.threadStore.upsert({ ...thread, approvalPolicy: 'on-request' })
+
+    const running = h.loop.runTurn(h.threadId, h.turnId)
+    let approvalId = ''
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      approvalId = h.approvalGate.pending(h.threadId)[0]?.id ?? ''
+      if (approvalId) break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    expect(h.approvalGate.decide(approvalId, 'deny', 'not approved for this task')).toBe(true)
+    await expect(running).resolves.toBe('completed')
+
+    const items = await h.sessionStore.loadItems(h.threadId)
+    expect(items.find((item) => item.kind === 'tool_call' && item.callId === 'call_denied'))
+      .toMatchObject({ status: 'failed' })
+    expect(items.find((item) => item.kind === 'tool_result' && item.callId === 'call_denied'))
+      .toMatchObject({
+        isError: true,
+        output: {
+          code: 'approval_denied',
+          approvalId,
+          reason: 'not approved for this task'
+        }
+      })
+    expect(modelRequests).toHaveLength(2)
+    expect(JSON.stringify(modelRequests[1]?.history)).toContain('not approved for this task')
+  })
+
+  it('registers an approval before publishing it to live event subscribers', async () => {
+    const guardedTool = LocalToolHost.defineTool({
+      name: 'guarded_action',
+      description: 'Waits for explicit approval.',
+      inputSchema: { type: 'object' },
+      policy: 'on-request',
+      execute: async () => ({ output: { ok: true } })
+    })
+    let modelStep = 0
+    const h = makeHarness({
+      provider: 'approval-immediate',
+      model: 'approval-immediate',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        modelStep += 1
+        if (modelStep === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_immediate',
+            toolName: 'guarded_action',
+            arguments: {}
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [guardedTool] })
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected thread')
+    await h.threadStore.upsert({ ...thread, approvalPolicy: 'on-request' })
+    let registeredBeforePublish = false
+    const unsubscribe = h.bus.subscribe(h.threadId, (event) => {
+      if (event.kind !== 'approval_requested') return
+      registeredBeforePublish = h.approvalGate.get(event.approvalId)?.status === 'pending'
+      h.approvalGate.decide(event.approvalId, 'deny', 'decided immediately')
+    })
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+    unsubscribe()
+    expect(registeredBeforePublish).toBe(true)
   })
 
   it('persists toolKind from the advertised tool metadata', async () => {
@@ -1651,7 +2398,7 @@ describe('AgentLoop', () => {
       const status = await h.loop.runTurn(h.threadId, h.turnId)
       expect(status).toBe('completed')
       expect(observedToolLists[0]).toContain(CREATE_PLAN_TOOL_NAME)
-      expect(observedRequiredToolNames).toEqual([CREATE_PLAN_TOOL_NAME, undefined])
+      expect(observedRequiredToolNames).toEqual([undefined, undefined])
       await expect(readFile(join(workspace, '.kunsdd/plan/auth.md'), 'utf8')).resolves.toBe('# Generated plan')
       const turn = await h.turns.getTurn(h.threadId, h.turnId)
       expect(turn?.guiPlan?.relativePath).toBe('.kunsdd/plan/auth.md')
@@ -1854,15 +2601,12 @@ describe('AgentLoop', () => {
       const writeResult = items.find((item) => item.kind === 'tool_result' && item.toolName === 'write')
 
       expect(status).toBe('completed')
-      expect(observedToolLists[0]).not.toEqual(expect.arrayContaining(['write', 'edit', 'bash']))
+      expect(observedToolLists[0]).toEqual(expect.arrayContaining(['write', 'edit', 'git_inspect']))
+      expect(observedToolLists[0]).not.toContain('bash')
       expect(writeCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
       expect(writeResult).toMatchObject({ kind: 'tool_result', isError: true })
       expect(writeResult?.kind === 'tool_result' ? JSON.stringify(writeResult.output) : '')
-        .toContain('not advertised by active tool policy')
-      // Plan-mode rejection steers the model to create_plan rather than the
-      // generic "use advertised tools" note.
-      expect(writeResult?.kind === 'tool_result' ? JSON.stringify(writeResult.output) : '')
-        .toContain('create_plan')
+        .toContain('plan_mode_write_blocked')
       await expect(readFile(join(workspace, 'forbidden.txt'), 'utf8')).rejects.toThrow()
       await expect(readFile(join(workspace, '.kunsdd/plan/plan-a-safe-change.md'), 'utf8')).resolves.toBe(
         '## Plan\nStay read-only until build mode.'
@@ -1970,7 +2714,7 @@ describe('AgentLoop', () => {
     }
   })
 
-  it('keeps requiring create_plan after unrelated tool calls in a GUI plan turn', async () => {
+  it('keeps create_plan as a soft completion condition after unrelated tool calls', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-other-tool-'))
     const observedRequiredToolNames: Array<string | undefined> = []
     let calls = 0
@@ -2015,7 +2759,7 @@ describe('AgentLoop', () => {
       const status = await h.loop.runTurn(h.threadId, h.turnId)
 
       expect(status).toBe('completed')
-      expect(observedRequiredToolNames).toEqual([CREATE_PLAN_TOOL_NAME, CREATE_PLAN_TOOL_NAME, undefined])
+      expect(observedRequiredToolNames).toEqual([undefined, undefined, undefined])
       await expect(readFile(join(workspace, '.kunsdd/plan/auth.md'), 'utf8')).resolves.toBe(
         '## Plan\nImplement auth after checking context.'
       )
@@ -2024,10 +2768,108 @@ describe('AgentLoop', () => {
     }
   })
 
+  it('reopens the plan gate when guidance is accepted after a successful plan write', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-guidance-'))
+    const requests: ModelRequest[] = []
+    let releaseSecondResponse: (() => void) | undefined
+    let markSecondResponseStarted: (() => void) | undefined
+    const secondResponseStarted = new Promise<void>((resolve) => {
+      markSecondResponseStarted = resolve
+    })
+    const secondResponseRelease = new Promise<void>((resolve) => {
+      releaseSecondResponse = resolve
+    })
+    try {
+      const model = {
+        provider: 'planner',
+        model: 'plan-guidance-model',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_plan_initial',
+              toolName: CREATE_PLAN_TOOL_NAME,
+              arguments: {
+                markdown: '## Plan\nFollow the repository ignore rules.',
+                operation: 'draft',
+                source_request: 'Plan the restriction change'
+              }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          if (requests.length === 2) {
+            markSecondResponseStarted?.()
+            await secondResponseRelease
+            yield { kind: 'assistant_text_delta', text: 'Initial plan saved.' }
+            yield { kind: 'completed', stopReason: 'stop' }
+            return
+          }
+          if (requests.length === 3) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_plan_refined',
+              toolName: CREATE_PLAN_TOOL_NAME,
+              arguments: {
+                markdown: '## Plan\nFollow both repository ignore and hasconfig rules.',
+                operation: 'refine',
+                plan_relative_path: '.kunsdd/plan/plan-the-restriction-change.md',
+                source_request: 'Plan the restriction change'
+              }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'assistant_text_delta', text: 'Updated the plan with the added constraint.' }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      }
+      const h = makeHarness(model, { tools: buildDefaultLocalTools() })
+      await bootstrapThread(h, {
+        workspace,
+        request: {
+          prompt: 'Plan the restriction change',
+          mode: 'plan',
+          model: model.model
+        }
+      })
+
+      const run = h.loop.runTurn(h.threadId, h.turnId)
+      await secondResponseStarted
+      await h.turns.steerTurn({
+        threadId: h.threadId,
+        turnId: h.turnId,
+        text: 'Also follow the hasconfig rules'
+      })
+      releaseSecondResponse?.()
+
+      await expect(run).resolves.toBe('completed')
+      expect(requests).toHaveLength(4)
+      expect(requests[2]).toMatchObject({
+        model: model.model
+      })
+      expect(requests[2]?.requiredToolName).toBeUndefined()
+      expect(requests[2]?.modeInstruction).toContain('You are in Plan mode.')
+      expect(requests[2]?.history).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'user_message',
+          text: 'Also follow the hasconfig rules'
+        })
+      ]))
+      await expect(
+        readFile(join(workspace, '.kunsdd/plan/plan-the-restriction-change.md'), 'utf8')
+      ).resolves.toBe('## Plan\nFollow both repository ignore and hasconfig rules.')
+    } finally {
+      releaseSecondResponse?.()
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('steers the turn and injects user messages', async () => {
     const h = makeHarness(makeSilentModel())
     await bootstrapThread(h)
-    h.steering.enqueue(h.turnId, 'follow up')
+    h.steering.enqueue(h.turnId, { text: 'follow up' })
     await h.loop.runTurn(h.threadId, h.turnId)
     const items = await h.sessionStore.loadItems(h.threadId)
     const user = items.find((item) => item.kind === 'user_message' && item.text === 'follow up')
@@ -2063,10 +2905,10 @@ describe('AgentLoop', () => {
         id: 'long_history',
         turnId: 'turn_1',
         threadId: 'thr_1',
-        // ~125k estimated tokens: above the default soft threshold (96k) so a
-        // model-less check compacts, but below the DeepSeek v4 soft threshold
+        // ~200k estimated tokens: above the 256k fallback profile's 192k soft
+        // threshold, but below the DeepSeek v4 soft threshold
         // (750k = 0.75 * 1M) so the v4 profiles do not.
-        text: 'x'.repeat(500_000)
+        text: 'x'.repeat(800_000)
       })
     ]
 
@@ -2165,7 +3007,7 @@ describe('AgentLoop', () => {
     })
   })
 
-  it('trims trailing tool calls and preserves skill pins in compaction summaries', () => {
+  it('trims trailing tool calls and retains tail skill pins verbatim', () => {
     const compactor = new ContextCompactor({ softThreshold: 1, hardThreshold: 2 })
     const prefix = createImmutablePrefix({ systemPrompt: 'system' })
     const result = compactor.compact({
@@ -2195,7 +3037,12 @@ describe('AgentLoop', () => {
 
     expect(result.next.some((item) => item.kind === 'tool_call')).toBe(false)
     expect(result.summaryItem.kind === 'compaction' ? result.summaryItem.summary : '')
-      .toContain('Active Skill: documents (documents)')
+      .not.toContain('Active Skill: documents (documents)')
+    expect(result.next.at(-1)).toMatchObject({
+      kind: 'assistant_text',
+      id: 'a1',
+      text: 'Active Skill: documents (documents)'
+    })
   })
 
   it('keeps the latest user turn when force compaction would orphan a tool result', () => {
@@ -2424,6 +3271,201 @@ describe('AgentLoop', () => {
       .toContain('Model summary: preserve alpha.txt')
   })
 
+  it('uses heuristic compaction when an extension run with budget 1 has reserved its main request', async () => {
+    const requests: ModelRequest[] = []
+    const h = makeHarness(
+      {
+        provider: 'budget-one',
+        model: 'budget-one',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      {
+        compactor: new ContextCompactor({ softThreshold: 8, hardThreshold: 16 }),
+        contextCompaction: { summaryMode: 'model', summaryTimeoutMs: 5_000 }
+      }
+    )
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected extension budget thread')
+    await h.threadStore.upsert({
+      ...thread,
+      ownerExtensionId: 'acme.budget-one',
+      extensionBudget: {
+        maxTokens: 1_000_000,
+        maxElapsedMs: 60_000,
+        maxConcurrentRuns: 1,
+        maxModelRequests: 1,
+        maxToolInvocations: 10,
+        maxRetainedEvents: 1_000
+      },
+      turns: thread.turns.map((turn) =>
+        turn.id === h.turnId
+          ? { ...turn, extensionBudgetTokenBaseline: 0, extensionModelRequests: 0 }
+          : turn
+      )
+    })
+    for (let index = 0; index < 10; index += 1) {
+      await h.sessionStore.appendItem(h.threadId, makeUserItem({
+        id: `budget_one_history_${index}`,
+        turnId: h.turnId,
+        threadId: h.threadId,
+        text: `private budget one history ${index} ${'x'.repeat(24)}`
+      }))
+    }
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.systemPrompt).not.toBe(COMPACTION_SYSTEM_PROMPT)
+    expect((await h.threadStore.get(h.threadId))?.turns[0]?.extensionModelRequests).toBe(1)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    expect(items).toContainEqual(expect.objectContaining({
+      kind: 'compaction',
+      summary: expect.stringContaining('Conversation and work summary:')
+    }))
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: 'error',
+      code: 'compaction_summary_fallback',
+      message: expect.stringContaining('model-request budget exhausted')
+    }))
+  })
+
+  it('atomically charges summary and main requests to an extension run with budget 2', async () => {
+    const requests: ModelRequest[] = []
+    const h = makeHarness(
+      {
+        provider: 'budget-two',
+        model: 'budget-two',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          if (request.systemPrompt === COMPACTION_SYSTEM_PROMPT) {
+            yield { kind: 'assistant_text_delta', text: 'budget two model summary' }
+          }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      {
+        compactor: new ContextCompactor({ softThreshold: 8, hardThreshold: 16 }),
+        contextCompaction: { summaryMode: 'model', summaryTimeoutMs: 5_000 }
+      }
+    )
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected extension budget thread')
+    await h.threadStore.upsert({
+      ...thread,
+      ownerExtensionId: 'acme.budget-two',
+      extensionBudget: {
+        maxTokens: 1_000_000,
+        maxElapsedMs: 60_000,
+        maxConcurrentRuns: 1,
+        maxModelRequests: 2,
+        maxToolInvocations: 10,
+        maxRetainedEvents: 1_000
+      },
+      turns: thread.turns.map((turn) =>
+        turn.id === h.turnId
+          ? { ...turn, extensionBudgetTokenBaseline: 0, extensionModelRequests: 0 }
+          : turn
+      )
+    })
+    for (let index = 0; index < 10; index += 1) {
+      await h.sessionStore.appendItem(h.threadId, makeUserItem({
+        id: `budget_two_history_${index}`,
+        turnId: h.turnId,
+        threadId: h.threadId,
+        text: `private budget two history ${index} ${'x'.repeat(24)}`
+      }))
+    }
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.systemPrompt).toBe(COMPACTION_SYSTEM_PROMPT)
+    expect(requests[1]?.systemPrompt).not.toBe(COMPACTION_SYSTEM_PROMPT)
+    expect((await h.threadStore.get(h.threadId))?.turns[0]?.extensionModelRequests).toBe(2)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    expect(items).toContainEqual(expect.objectContaining({
+      kind: 'compaction',
+      summary: expect.stringContaining('budget two model summary')
+    }))
+  })
+
+  it('does not send a reserved main request after compaction exhausts the extension token budget', async () => {
+    const requests: ModelRequest[] = []
+    const h = makeHarness(
+      {
+        provider: 'budget-summary-tokens',
+        model: 'budget-summary-tokens',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          if (request.systemPrompt === COMPACTION_SYSTEM_PROMPT) {
+            yield { kind: 'assistant_text_delta', text: 'summary consumed the remaining token budget' }
+            yield {
+              kind: 'usage',
+              usage: {
+                promptTokens: 8,
+                completionTokens: 4,
+                totalTokens: 12,
+                cacheHitRate: null,
+                turns: 1
+              }
+            }
+          }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      {
+        compactor: new ContextCompactor({ softThreshold: 8, hardThreshold: 16 }),
+        contextCompaction: { summaryMode: 'model', summaryTimeoutMs: 5_000 }
+      }
+    )
+    await bootstrapThread(h)
+    const thread = await h.threadStore.get(h.threadId)
+    if (!thread) throw new Error('expected extension budget thread')
+    await h.threadStore.upsert({
+      ...thread,
+      ownerExtensionId: 'acme.budget-summary-tokens',
+      extensionBudget: {
+        maxTokens: 10,
+        maxElapsedMs: 60_000,
+        maxConcurrentRuns: 1,
+        maxModelRequests: 2,
+        maxToolInvocations: 10,
+        maxRetainedEvents: 1_000
+      },
+      turns: thread.turns.map((turn) =>
+        turn.id === h.turnId
+          ? { ...turn, extensionBudgetTokenBaseline: 0, extensionModelRequests: 0 }
+          : turn
+      )
+    })
+    for (let index = 0; index < 10; index += 1) {
+      await h.sessionStore.appendItem(h.threadId, makeUserItem({
+        id: `budget_summary_tokens_history_${index}`,
+        turnId: h.turnId,
+        threadId: h.threadId,
+        text: `token budget history ${index} ${'x'.repeat(24)}`
+      }))
+    }
+
+    await expect(h.loop.runTurn(h.threadId, h.turnId)).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.systemPrompt).toBe(COMPACTION_SYSTEM_PROMPT)
+    expect((await h.threadStore.get(h.threadId))?.turns[0]?.extensionModelRequests).toBe(2)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    expect(items).toContainEqual(expect.objectContaining({
+      kind: 'error',
+      code: 'extension_budget_exhausted',
+      message: expect.stringContaining('token budget exhausted')
+    }))
+  })
+
   it('records a visible fallback event when configured model compaction summaries fail', async () => {
     const requests: ModelRequest[] = []
     const h = makeHarness(
@@ -2645,7 +3687,7 @@ describe('AgentLoop', () => {
     )
     const { turnId } = await h.turns.startTurn({
       threadId: h.threadId,
-      request: { prompt: 'hello', model: 'auto' }
+      request: { prompt: 'Help me choose the appropriate approach', model: 'auto' }
     })
 
     await h.loop.runTurn(h.threadId, turnId)
@@ -2679,7 +3721,11 @@ describe('AgentLoop', () => {
     )
     const { turnId } = await h.turns.startTurn({
       threadId: h.threadId,
-      request: { prompt: 'hello', model: 'auto', reasoningEffort: 'low' }
+      request: {
+        prompt: 'Help me choose the appropriate approach',
+        model: 'auto',
+        reasoningEffort: 'low'
+      }
     })
 
     await h.loop.runTurn(h.threadId, turnId)
@@ -2712,7 +3758,7 @@ describe('AgentLoop', () => {
     )
     const { turnId } = await h.turns.startTurn({
       threadId: h.threadId,
-      request: { prompt: 'hello' }
+      request: { prompt: 'Help me choose the appropriate approach' }
     })
 
     await h.loop.runTurn(h.threadId, turnId)
@@ -2802,7 +3848,7 @@ describe('AgentLoop', () => {
     expect(replay.some((event) => event.kind === 'usage')).toBe(true)
   })
 
-  it('persists assistant text deltas for SSE replay before the final item', async () => {
+  it('persists coalesced assistant text deltas for SSE replay before the final item', async () => {
     const h = makeHarness(
       makeFakeModel([
         { kind: 'assistant_text_delta', text: 'he' },
@@ -2814,7 +3860,12 @@ describe('AgentLoop', () => {
     await h.loop.runTurn(h.threadId, h.turnId)
     const replay = await h.sessionStore.loadEventsSince(h.threadId, 0)
     const deltas = replay.filter((event) => event.kind === 'assistant_text_delta')
-    expect(deltas).toHaveLength(2)
+    expect(deltas).toHaveLength(1)
+    expect(deltas[0]).toMatchObject({ item: { text: 'hello', status: 'running' } })
+    const finalItemEvent = replay.find((event) =>
+      event.kind === 'item_created' && event.item.kind === 'assistant_text'
+    )
+    expect(finalItemEvent?.seq).toBeGreaterThan(deltas[0]!.seq)
     const items = await h.sessionStore.loadItems(h.threadId)
     expect(items.some((item) => item.kind === 'assistant_text' && item.text === 'hello')).toBe(true)
   })

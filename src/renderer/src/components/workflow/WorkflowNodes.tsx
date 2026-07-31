@@ -176,10 +176,13 @@ function WorkflowCanvasNode({ id, data, selected }: NodeProps): ReactElement {
 
   return (
     <div
-      className={`relative w-[210px] rounded-xl border bg-ds-card px-3 py-2.5 shadow-sm ${ring} ${disabled}`}
+      className={`workflow-canvas-node relative w-[210px] rounded-xl border bg-ds-card px-3 py-2.5 shadow-sm ${ring} ${disabled}`}
+      data-workflow-selected={selected ? 'true' : 'false'}
+      data-workflow-disabled={node.disabled ? 'true' : 'false'}
+      data-workflow-status={status ?? 'idle'}
     >
       <NodeToolbar isVisible={selected} position={Position.Top} offset={8}>
-        <div className="flex items-center gap-0.5 rounded-lg border border-ds-border bg-ds-card p-1 shadow-md">
+        <div className="workflow-canvas-node-toolbar flex items-center gap-0.5 rounded-lg border border-ds-border bg-ds-card p-1 shadow-md">
           {!isTrigger ? (
             <button
               type="button"
@@ -217,7 +220,7 @@ function WorkflowCanvasNode({ id, data, selected }: NodeProps): ReactElement {
       ) : null}
 
       <div className="flex items-center gap-2">
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-accent/10 text-accent">
+        <span className="workflow-canvas-node-icon flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-accent/10 text-accent">
           <Icon className="h-4 w-4" strokeWidth={1.9} />
         </span>
         <div className="min-w-0 flex-1">

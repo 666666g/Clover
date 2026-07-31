@@ -6,8 +6,7 @@ import { shellSpawnEnv, terminateSpawnTree, workspaceRoot } from './builtin-tool
 
 export const VERIFY_CHANGES_TOOL_NAME = 'verify_changes'
 
-const DEFAULT_TIMEOUT_SECONDS = 180
-const MAX_TIMEOUT_SECONDS = 600
+const TOOL_TIMEOUT_SECONDS = 60 * 60
 const MAX_OUTPUT_CHARS = 24_000
 const SOURCE_EXTENSION = /\.[cm]?[jt]sx?$/i
 const TEST_FILE = /\.(?:test|spec)\.[cm]?[jt]sx?$/i
@@ -50,8 +49,7 @@ export function createVerifyChangesLocalTool(
     inputSchema: {
       type: 'object',
       properties: {
-        scope: { type: 'string', enum: ['focused', 'full'] },
-        timeout: { type: 'number', minimum: 1, maximum: MAX_TIMEOUT_SECONDS }
+        scope: { type: 'string', enum: ['focused', 'full'] }
       },
       additionalProperties: false
     },
@@ -60,8 +58,12 @@ export function createVerifyChangesLocalTool(
     execute: async (args, context, onUpdate) => {
       const root = workspaceRoot(context.workspace)
       const scope = args.scope === 'full' ? 'full' : 'focused'
-      const timeoutSeconds = normalizeTimeout(args.timeout)
-      const changedFiles = await listChangedFiles(root, context.abortSignal, timeoutSeconds, operations)
+      const changedFiles = await listChangedFiles(
+        root,
+        context.abortSignal,
+        TOOL_TIMEOUT_SECONDS,
+        operations
+      )
       if (changedFiles.length === 0) {
         return {
           output: {
@@ -92,7 +94,7 @@ export function createVerifyChangesLocalTool(
       for (const command of commands) {
         const check = await runCommand(command, {
           signal: context.abortSignal,
-          timeoutSeconds
+          timeoutSeconds: TOOL_TIMEOUT_SECONDS
         })
         if (context.abortSignal.aborted) throw new Error('verification aborted')
         checks.push(check)
@@ -323,11 +325,6 @@ function dedupeCommands(commands: readonly VerificationCommand[]): VerificationC
     seen.add(key)
     return true
   })
-}
-
-function normalizeTimeout(value: unknown): number {
-  const parsed = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : DEFAULT_TIMEOUT_SECONDS
-  return Math.max(1, Math.min(MAX_TIMEOUT_SECONDS, parsed))
 }
 
 function isInside(root: string, candidate: string): boolean {

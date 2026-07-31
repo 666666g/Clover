@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
+  APP_LOCALES,
   applyKunRuntimePatch,
   kunSettingsEnvelope,
   kunSettingsPatch,
   DEFAULT_KUN_DATA_DIR,
   DEFAULT_KUN_MODEL,
+  DEFAULT_KUN_STREAM_IDLE_TIMEOUT_MS,
   DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_CURSOR_SPOTLIGHT_COLOR,
+  DEFAULT_GIT_BRANCH_PREFIX,
   DEFAULT_APPROVAL_POLICY,
   DEFAULT_SANDBOX_MODE,
   DEFAULT_WEIXIN_BRIDGE_RPC_URL,
   DEFAULT_SCHEDULE_INTERNAL_PORT,
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
   buildClawRuntimePrompt,
   defaultClawSettings,
   defaultModelProviderSettings,
@@ -21,6 +26,7 @@ import {
   defaultWorkflowSettings,
   defaultTerminalSettings,
   defaultWriteSelectionAssistSettings,
+  defaultDesignSettings,
   defaultWriteSettings,
   getModelProviderPreset,
   defaultKeyboardShortcuts,
@@ -32,6 +38,12 @@ import {
   isKunRuntimeInsecure,
   migrateLegacyAppSettings,
   normalizeAppSettings,
+  KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+  normalizeChatContentMaxWidth,
+  normalizeComposerSendKey,
+  isComposerSendHotkey,
+  normalizeGitBranchPrefix,
+  applyGitBranchPrefix,
   parseClawUserPromptForDisplay,
   inferModelEndpointFormatFromUrl,
   kunToolPermissionModeFromSettings,
@@ -52,6 +64,8 @@ function settings(): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
@@ -59,7 +73,7 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -67,12 +81,133 @@ function settings(): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
     disabledSkillIds: []
   }
 }
+
+describe('application locale settings', () => {
+  it.each(APP_LOCALES)('preserves the supported %s locale', (locale) => {
+    expect(normalizeAppSettings({ ...settings(), locale }).locale).toBe(locale)
+  })
+
+  it('falls back to English for an unsupported persisted locale', () => {
+    const input = { ...settings(), locale: 'fr' } as unknown as AppSettingsV1
+    expect(normalizeAppSettings(input).locale).toBe('en')
+  })
+})
+
+describe('notification settings', () => {
+  it('migrates legacy completion settings to main-agent on and subagent off', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      notifications: { turnComplete: false }
+    })
+
+    expect(normalized.notifications).toEqual({
+      turnComplete: false,
+      mainAgentTurnComplete: true,
+      subagentTurnComplete: false
+    })
+  })
+
+  it('preserves explicit source-specific completion preferences', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      notifications: {
+        turnComplete: true,
+        mainAgentTurnComplete: false,
+        subagentTurnComplete: true
+      }
+    })
+
+    expect(normalized.notifications).toEqual({
+      turnComplete: true,
+      mainAgentTurnComplete: false,
+      subagentTurnComplete: true
+    })
+  })
+})
+
+describe('initial setup completion', () => {
+  it('defaults a new keyless configuration to incomplete', () => {
+    expect(normalizeAppSettings(settings()).initialSetupCompleted).toBe(false)
+  })
+
+  it('keeps explicitly completed keyless configurations complete', () => {
+    expect(normalizeAppSettings({
+      ...settings(),
+      initialSetupCompleted: true
+    }).initialSetupCompleted).toBe(true)
+  })
+
+  it('migrates an existing configured API provider to complete', () => {
+    const current = settings()
+    const normalized = normalizeAppSettings({
+      ...current,
+      provider: {
+        ...current.provider,
+        apiKey: 'sk-existing'
+      }
+    })
+    expect(normalized.initialSetupCompleted).toBe(true)
+  })
+
+  it('migrates an existing keyless subscription provider to complete', () => {
+    const current = settings()
+    const preset = getModelProviderPreset('gemini-cli-subscription')
+    if (!preset) throw new Error('Gemini CLI subscription preset is missing')
+    const subscription = modelProviderPresetProfile(preset, '')
+    const normalized = normalizeAppSettings({
+      ...current,
+      provider: {
+        ...current.provider,
+        providers: [...current.provider.providers, subscription]
+      },
+      agents: {
+        kun: {
+          ...current.agents.kun,
+          providerId: subscription.id,
+          model: subscription.models[0]
+        }
+      }
+    })
+
+    expect(normalized.initialSetupCompleted).toBe(true)
+  })
+})
+
+describe('chat content max width', () => {
+  it('defaults invalid values to 896px', () => {
+    expect(normalizeChatContentMaxWidth(undefined)).toBe(896)
+    expect(normalizeChatContentMaxWidth('bad')).toBe(896)
+  })
+
+  it('clamps and rounds to 8px steps', () => {
+    expect(normalizeChatContentMaxWidth(500)).toBe(640)
+    expect(normalizeChatContentMaxWidth(896)).toBe(896)
+    expect(normalizeChatContentMaxWidth(1300)).toBe(1200)
+    expect(normalizeChatContentMaxWidth(905)).toBe(904)
+  })
+})
+
+describe('git branch prefix', () => {
+  it('normalizes separators and applies the default prefix once', () => {
+    expect(normalizeGitBranchPrefix(' feature ')).toBe('feature/')
+    expect(normalizeGitBranchPrefix('team\\')).toBe('team/')
+    expect(normalizeGitBranchPrefix(undefined)).toBe(DEFAULT_GIT_BRANCH_PREFIX)
+    expect(applyGitBranchPrefix('fix/workspace', 'codex/')).toBe('codex/fix/workspace')
+    expect(applyGitBranchPrefix('codex/fix/workspace', 'codex/')).toBe('codex/fix/workspace')
+  })
+
+  it('allows branch prefixes to be disabled', () => {
+    expect(normalizeGitBranchPrefix('')).toBe('')
+    expect(applyGitBranchPrefix('fix/workspace', '')).toBe('fix/workspace')
+  })
+})
 
 describe('model endpoint format inference', () => {
   it('treats /completions custom endpoints as Chat Completions-shaped', () => {
@@ -116,50 +251,101 @@ describe('kun defaults', () => {
     expect(defaultKunRuntimeSettings().model).toBe(DEFAULT_KUN_MODEL)
   })
 
-  it('defaults approval policy to auto', () => {
-    expect(defaultKunRuntimeSettings().approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
-    expect(defaultKunRuntimeSettings().approvalPolicy).toBe('auto')
-  })
-
-  it('defaults sandbox mode to full access', () => {
-    expect(defaultKunRuntimeSettings().sandboxMode).toBe(DEFAULT_SANDBOX_MODE)
-    expect(defaultKunRuntimeSettings().sandboxMode).toBe('danger-full-access')
-  })
-
-  it('maps unified tool permission modes to approval and sandbox settings', () => {
-    expect(kunToolPermissionModeSettings('always-ask')).toEqual({
-      approvalPolicy: 'always',
-      sandboxMode: 'danger-full-access'
-    })
-    expect(kunToolPermissionModeSettings('read-only')).toEqual({
-      approvalPolicy: 'on-request',
-      sandboxMode: 'danger-full-access'
-    })
-    expect(kunToolPermissionModeSettings('sensitive-ask')).toEqual({
-      approvalPolicy: 'untrusted',
-      sandboxMode: 'danger-full-access'
-    })
-    expect(kunToolPermissionModeSettings('workspace-write')).toEqual({
-      approvalPolicy: 'on-request',
-      sandboxMode: 'workspace-write'
-    })
-    expect(kunToolPermissionModeSettings('bypass')).toEqual({
+  it('defaults a fresh profile to full access with user review metadata', () => {
+    expect(defaultKunRuntimeSettings()).toEqual(expect.objectContaining({
       approvalPolicy: 'auto',
-      sandboxMode: 'danger-full-access'
+      sandboxMode: 'danger-full-access',
+      approvalReviewer: 'user'
+    }))
+  })
+
+  it('keeps compatibility defaults narrower than the fresh profile default', () => {
+    expect(DEFAULT_APPROVAL_POLICY).toBe('on-request')
+    expect(DEFAULT_SANDBOX_MODE).toBe('workspace-write')
+  })
+
+  it('defaults Agent Perspective capture off for newly created conversations', () => {
+    expect(defaultKunRuntimeSettings().llmDebug).toEqual({
+      defaultThreadCaptureEnabled: false
     })
-    expect(kunToolPermissionModeFromSettings(defaultKunRuntimeSettings())).toBe('bypass')
-    expect(kunToolPermissionModeFromSettings({
-      approvalPolicy: 'always',
-      sandboxMode: 'danger-full-access'
-    })).toBe('always-ask')
-    expect(kunToolPermissionModeFromSettings({
-      approvalPolicy: 'untrusted',
-      sandboxMode: 'danger-full-access'
-    })).toBe('sensitive-ask')
+  })
+
+  it('maps unified tool permission modes to complete authority settings', () => {
+    expect(kunToolPermissionModeSettings('ask-for-approval')).toEqual({
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'user'
+    })
+    expect(kunToolPermissionModeSettings('approve-for-me')).toEqual({
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })
+    expect(kunToolPermissionModeSettings('full-access')).toEqual({
+      approvalPolicy: 'auto',
+      sandboxMode: 'danger-full-access',
+      approvalReviewer: 'user'
+    })
+    expect(kunToolPermissionModeFromSettings(defaultKunRuntimeSettings())).toBe('full-access')
     expect(kunToolPermissionModeFromSettings({
       approvalPolicy: 'on-request',
-      sandboxMode: 'workspace-write'
-    })).toBe('workspace-write')
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'user'
+    })).toBe('ask-for-approval')
+    expect(kunToolPermissionModeFromSettings({
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })).toBe('approve-for-me')
+  })
+
+  it('preserves legacy approval and sandbox axes while defaulting a missing reviewer to user', () => {
+    const { approvalReviewer: _approvalReviewer, ...legacyKun } = defaultKunRuntimeSettings()
+    void _approvalReviewer
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      agents: {
+        kun: {
+          ...legacyKun,
+          approvalPolicy: 'never',
+          sandboxMode: 'read-only'
+        }
+      }
+    } as unknown as AppSettingsV1)
+
+    expect(normalized.agents.kun).toEqual(expect.objectContaining({
+      approvalPolicy: 'never',
+      sandboxMode: 'read-only',
+      approvalReviewer: 'user'
+    }))
+    expect(kunToolPermissionModeFromSettings(normalized.agents.kun)).toBe('ask-for-approval')
+  })
+
+  it('normalizes unknown persisted reviewers to user and preserves agent reviewers', () => {
+    const invalid = normalizeAppSettings({
+      ...settings(),
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          approvalReviewer: 'operator'
+        }
+      }
+    } as unknown as AppSettingsV1)
+    const delegated = normalizeAppSettings({
+      ...settings(),
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          approvalPolicy: 'on-request',
+          sandboxMode: 'workspace-write',
+          approvalReviewer: 'agent'
+        }
+      }
+    })
+
+    expect(invalid.agents.kun.approvalReviewer).toBe('user')
+    expect(delegated.agents.kun.approvalReviewer).toBe('agent')
+    expect(kunToolPermissionModeFromSettings(delegated.agents.kun)).toBe('approve-for-me')
   })
 
   it('defaults token economy mode to off', () => {
@@ -180,6 +366,15 @@ describe('kun defaults', () => {
     })
   })
 
+  it('defaults tool output limits to 500kb and 20000 lines', () => {
+    expect(defaultKunRuntimeSettings().toolOutputLimits).toEqual({
+      maxLines: DEFAULT_TOOL_OUTPUT_MAX_LINES,
+      maxBytes: DEFAULT_TOOL_OUTPUT_MAX_BYTES
+    })
+    expect(defaultKunRuntimeSettings().toolOutputLimits.maxLines).toBe(20_000)
+    expect(defaultKunRuntimeSettings().toolOutputLimits.maxBytes).toBe(500 * 1024)
+  })
+
   it('defaults MCP search discovery to off', () => {
     expect(defaultKunRuntimeSettings().mcpSearch).toMatchObject({
       enabled: false,
@@ -198,7 +393,9 @@ describe('kun defaults', () => {
       baseUrl: '',
       apiKey: '',
       model: '',
+      defaultResolution: '1K',
       defaultSize: '',
+      quality: 'auto',
       timeoutMs: 180000
     })
   })
@@ -246,15 +443,18 @@ describe('kun defaults', () => {
         sqlitePath: ''
       },
       contextCompaction: {
-        defaultSoftThreshold: 96000,
-        defaultHardThreshold: 108800,
+        defaultSoftThreshold: 192000,
+        defaultHardThreshold: 217600,
         summaryMode: 'model',
         summaryTimeoutMs: 15000,
-        summaryMaxTokens: 1200,
+        summaryMaxTokens: 2048,
         summaryInputMaxBytes: 98304
       },
       runtimeTuning: {
-        streamIdleTimeoutMs: 45000,
+        defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+        maxConcurrentTurns: 256,
+        maxWallTimeMs: 86400000,
+        streamIdleTimeoutMs: 450000,
         toolStorm: {
           enabled: true,
           windowSize: 8,
@@ -276,6 +476,111 @@ describe('log retention settings', () => {
     } as unknown as AppSettingsV1)
 
     expect(normalized.log.retentionDays).toBe(DEFAULT_LOG_RETENTION_DAYS)
+  })
+})
+
+describe('runtime model provider selection', () => {
+  it('repairs a legacy provider/model mismatch when the model has one owner', () => {
+    const raw = settings()
+    const codexPreset = getModelProviderPreset('codex')
+    const codex = codexPreset ? modelProviderPresetProfile(codexPreset) : null
+    expect(codex).not.toBeNull()
+    raw.provider.providers = [...raw.provider.providers, codex!]
+    raw.agents.kun.providerId = 'deepseek'
+    raw.agents.kun.model = 'gpt-5.3-codex-spark'
+
+    const normalized = normalizeAppSettings(raw)
+
+    expect(normalized.agents.kun.providerId).toBe('codex')
+    expect(normalized.agents.kun.model).toBe('gpt-5.3-codex-spark')
+  })
+
+  it('falls back to the selected provider model instead of retaining an ambiguous mismatch', () => {
+    const raw = settings()
+    const codex = modelProviderPresetProfile(getModelProviderPreset('codex')!)
+    const duplicate = {
+      ...codex,
+      id: 'codex-mirror',
+      name: 'Codex Mirror'
+    }
+    raw.provider.providers = [...raw.provider.providers, codex, duplicate]
+    raw.agents.kun.providerId = 'deepseek'
+    raw.agents.kun.model = 'gpt-5.3-codex-spark'
+
+    const normalized = normalizeAppSettings(raw)
+
+    expect(normalized.agents.kun.providerId).toBe('deepseek')
+    expect(normalized.agents.kun.model).toBe('deepseek-v4-flash')
+  })
+
+  it('repairs partial subagent profile selections into complete pairs', () => {
+    const raw = settings()
+    const codex = modelProviderPresetProfile(getModelProviderPreset('codex')!)
+    raw.provider.providers = [...raw.provider.providers, codex]
+    raw.agents.kun.subagents = {
+      enabled: true,
+      profiles: [
+        {
+          id: 'model-only', enabled: true, name: '', mode: 'subagent', toolPolicy: 'inherit',
+          model: 'gpt-5.3-codex-spark'
+        },
+        {
+          id: 'provider-only', enabled: true, name: '', mode: 'subagent', toolPolicy: 'inherit',
+          providerId: 'deepseek'
+        }
+      ]
+    }
+
+    const normalized = normalizeAppSettings(raw)
+
+    expect(normalized.agents.kun.subagents?.profiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'model-only',
+        model: 'gpt-5.3-codex-spark',
+        providerId: 'codex'
+      }),
+      expect.objectContaining({
+        id: 'provider-only',
+        model: 'deepseek-v4-flash',
+        providerId: 'deepseek'
+      })
+    ]))
+  })
+})
+
+describe('composer send key settings', () => {
+  it('defaults to enter send', () => {
+    const raw = {
+      ...settings(),
+      composerSendKey: undefined
+    } as unknown as AppSettingsV1
+
+    expect(normalizeAppSettings(raw).composerSendKey).toBe('enter')
+  })
+
+  it('keeps shiftEnter when configured', () => {
+    expect(normalizeAppSettings({
+      ...settings(),
+      composerSendKey: 'shiftEnter'
+    }).composerSendKey).toBe('shiftEnter')
+  })
+
+  it('rejects unknown values', () => {
+    expect(normalizeComposerSendKey('ctrlEnter')).toBe('enter')
+    expect(normalizeComposerSendKey(null)).toBe('enter')
+  })
+
+  it('matches Enter or Shift+Enter send hotkeys', () => {
+    const enter = { key: 'Enter', shiftKey: false, metaKey: false, ctrlKey: false }
+    const shiftEnter = { key: 'Enter', shiftKey: true, metaKey: false, ctrlKey: false }
+    const metaEnter = { key: 'Enter', shiftKey: false, metaKey: true, ctrlKey: false }
+
+    expect(isComposerSendHotkey(enter, 'enter')).toBe(true)
+    expect(isComposerSendHotkey(shiftEnter, 'enter')).toBe(false)
+    expect(isComposerSendHotkey(enter, 'shiftEnter')).toBe(false)
+    expect(isComposerSendHotkey(shiftEnter, 'shiftEnter')).toBe(true)
+    expect(isComposerSendHotkey(metaEnter, 'enter')).toBe(false)
+    expect(isComposerSendHotkey(metaEnter, 'shiftEnter')).toBe(false)
   })
 })
 
@@ -386,6 +691,24 @@ describe('claw settings', () => {
     expect(normalized.claw.im.weixinBridgeUrl).toBe('http://127.0.0.1:18787/rpc')
   })
 
+  it('normalizes the IM recent thread list limit', () => {
+    const defaults = defaultClawSettings()
+    expect(defaults.im.recentThreadListLimit).toBe(5)
+
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      claw: {
+        ...defaults,
+        im: {
+          ...defaults.im,
+          recentThreadListLimit: 500
+        }
+      }
+    })
+
+    expect(normalized.claw.im.recentThreadListLimit).toBe(50)
+  })
+
   it('migrates the legacy OpenClaw Gateway URL into the WeChat bridge URL', () => {
     const defaults = defaultClawSettings()
     const normalized = normalizeAppSettings({
@@ -472,14 +795,14 @@ describe('claw settings', () => {
 })
 
 describe('isKunRuntimeInsecure', () => {
-  it('treats an empty runtime token as effectively insecure', () => {
+  it('keeps auth enabled even when the runtime token is empty', () => {
     expect(
       isKunRuntimeInsecure({
         ...defaultKunRuntimeSettings(),
         insecure: false,
         runtimeToken: ''
       })
-    ).toBe(true)
+    ).toBe(false)
   })
 
   it('keeps auth enabled when a token exists and insecure is false', () => {
@@ -491,9 +814,65 @@ describe('isKunRuntimeInsecure', () => {
       })
     ).toBe(false)
   })
+
+  it('honors explicit insecure mode', () => {
+    expect(
+      isKunRuntimeInsecure({
+        ...defaultKunRuntimeSettings(),
+        insecure: true,
+        runtimeToken: 'tok-1'
+      })
+    ).toBe(true)
+  })
 })
 
 describe('mergeKunRuntimeSettings', () => {
+  it('merges the new-conversation Agent Perspective capture default', () => {
+    const current = defaultKunRuntimeSettings()
+    const next = mergeKunRuntimeSettings(current, {
+      llmDebug: { defaultThreadCaptureEnabled: true }
+    })
+
+    expect(next.llmDebug).toEqual({ defaultThreadCaptureEnabled: true })
+    expect(current.llmDebug).toEqual({ defaultThreadCaptureEnabled: false })
+  })
+
+  it('normalizes bounded digest-bound project config grants and replaces the grant roster', () => {
+    const digestA = 'a'.repeat(64)
+    const digestB = 'B'.repeat(64)
+    const current = mergeKunRuntimeSettings(defaultKunRuntimeSettings(), {
+      projectConfig: {
+        grants: [
+          { workspaceRoot: ' /workspace/a ', configDigest: digestA },
+          { workspaceRoot: '/workspace/b', configDigest: 'not-a-digest' }
+        ]
+      }
+    })
+
+    expect(current.projectConfig.grants).toEqual([
+      { workspaceRoot: '/workspace/a', configDigest: digestA }
+    ])
+
+    const next = mergeKunRuntimeSettings(current, {
+      projectConfig: {
+        grants: [{ workspaceRoot: '/workspace/b', configDigest: digestB }]
+      }
+    })
+
+    expect(next.projectConfig.grants).toEqual([
+      { workspaceRoot: '/workspace/b', configDigest: 'b'.repeat(64) }
+    ])
+  })
+
+  it('adds an empty project config grant list to legacy settings', () => {
+    const raw = settings() as AppSettingsV1 & {
+      agents: { kun: Omit<AppSettingsV1['agents']['kun'], 'projectConfig'> }
+    }
+    delete (raw.agents.kun as Partial<AppSettingsV1['agents']['kun']>).projectConfig
+
+    expect(normalizeAppSettings(raw as AppSettingsV1).agents.kun.projectConfig).toEqual({ grants: [] })
+  })
+
   it('merges a direct kun patch without the envelope wrapper', () => {
     const current = defaultKunRuntimeSettings()
     const next = mergeKunRuntimeSettings(current, {
@@ -506,6 +885,64 @@ describe('mergeKunRuntimeSettings', () => {
     expect(next.tokenEconomyMode).toBe(true)
     expect(next.tokenEconomy.enabled).toBe(true)
     expect(next.baseUrl).toBe(current.baseUrl)
+  })
+
+  it('deep-merges subagent settings while replacing an explicit profiles roster', () => {
+    const current = {
+      ...defaultKunRuntimeSettings(),
+      subagents: {
+        enabled: true,
+        useExistingAgents: true,
+        maxParallel: 3,
+        maxChildRuns: 12,
+        defaultToolPolicy: 'inherit' as const,
+        defaultProfile: 'researcher',
+        profiles: [{
+          id: 'researcher',
+          enabled: true,
+          name: 'Researcher',
+          mode: 'subagent' as const,
+          toolPolicy: 'readOnly' as const
+        }]
+      }
+    }
+
+    const limitsChanged = mergeKunRuntimeSettings(current, {
+      subagents: { maxParallel: 5 }
+    })
+    expect(limitsChanged.subagents).toEqual({
+      ...current.subagents,
+      maxParallel: 5
+    })
+
+    const rosterCleared = mergeKunRuntimeSettings(limitsChanged, {
+      subagents: { profiles: [] }
+    })
+    expect(rosterCleared.subagents).toEqual({
+      ...current.subagents,
+      maxParallel: 5,
+      profiles: []
+    })
+  })
+
+  it('completes a partial first subagent patch with safe defaults', () => {
+    const next = mergeKunRuntimeSettings(defaultKunRuntimeSettings(), {
+      subagents: { enabled: false }
+    })
+
+    expect(next.subagents).toEqual({
+      enabled: false,
+      useExistingAgents: true,
+      profiles: []
+    })
+    expect(normalizeAppSettings({
+      ...settings(),
+      agents: { kun: next }
+    }).agents.kun.subagents).toEqual({
+      enabled: false,
+      useExistingAgents: true,
+      profiles: []
+    })
   })
 
   it('deep-merges token economy settings and keeps the legacy switch synced', () => {
@@ -534,6 +971,27 @@ describe('mergeKunRuntimeSettings', () => {
     expect(legacySwitch.tokenEconomy.enabled).toBe(false)
   })
 
+  it('deep-merges tool output limits and normalizes out-of-range values', () => {
+    const current = defaultKunRuntimeSettings()
+    const next = mergeKunRuntimeSettings(current, {
+      toolOutputLimits: {
+        maxBytes: 2 * 1024 * 1024
+      }
+    })
+
+    expect(next.toolOutputLimits.maxLines).toBe(current.toolOutputLimits.maxLines)
+    expect(next.toolOutputLimits.maxBytes).toBe(2 * 1024 * 1024)
+
+    const clamped = mergeKunRuntimeSettings(next, {
+      toolOutputLimits: {
+        maxLines: 9_999_999,
+        maxBytes: 999 * 1024 * 1024
+      }
+    })
+    expect(clamped.toolOutputLimits.maxLines).toBe(1_000_000)
+    expect(clamped.toolOutputLimits.maxBytes).toBe(64 * 1024 * 1024)
+  })
+
   it('deep-merges MCP search settings', () => {
     const current = defaultKunRuntimeSettings()
     const next = mergeKunRuntimeSettings(current, {
@@ -550,21 +1008,37 @@ describe('mergeKunRuntimeSettings', () => {
     expect(next.mcpSearch.topKMax).toBe(current.mcpSearch.topKMax)
   })
 
-  it('preserves workspace-write when normalizing unified tool permission settings', () => {
+  it('preserves ask-for-approval when normalizing unified tool permission settings', () => {
     const current = defaultKunRuntimeSettings()
     const next = mergeKunRuntimeSettings(current, {
       approvalPolicy: 'on-request',
-      sandboxMode: 'workspace-write'
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'user'
     })
 
     expect(next.approvalPolicy).toBe('on-request')
     expect(next.sandboxMode).toBe('workspace-write')
-    expect(kunToolPermissionModeFromSettings(next)).toBe('workspace-write')
+    expect(next.approvalReviewer).toBe('user')
+    expect(kunToolPermissionModeFromSettings(next)).toBe('ask-for-approval')
+  })
+
+  it('preserves approve-for-me when normalizing unified tool permission settings', () => {
+    const current = defaultKunRuntimeSettings()
+    const next = mergeKunRuntimeSettings(current, {
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })
+
+    expect(next.approvalPolicy).toBe('on-request')
+    expect(next.sandboxMode).toBe('workspace-write')
+    expect(next.approvalReviewer).toBe('agent')
+    expect(kunToolPermissionModeFromSettings(next)).toBe('approve-for-me')
   })
 
   it('preserves non-UI approval/sandbox combinations instead of canonicalizing them', () => {
-    // The unified 5-mode selector cannot represent every approvalPolicy/sandboxMode
-    // combination. mergeKunRuntimeSettings must NOT snap these to a canonical mode,
+    // The unified 3-mode selector cannot represent every raw authority snapshot.
+    // mergeKunRuntimeSettings must NOT snap these to a canonical mode,
     // otherwise it would silently weaken a user's saved security posture.
     const current = defaultKunRuntimeSettings()
 
@@ -607,12 +1081,52 @@ describe('mergeKunRuntimeSettings', () => {
     expect(next.runtimeTuning.toolStorm.windowSize).toBe(current.runtimeTuning.toolStorm.windowSize)
     expect(next.runtimeTuning.toolStorm.threshold).toBe(5)
     expect(next.runtimeTuning.toolArgumentRepair).toEqual(current.runtimeTuning.toolArgumentRepair)
+    expect(next.runtimeTuning.maxConcurrentTurns).toBe(current.runtimeTuning.maxConcurrentTurns)
+    expect(next.runtimeTuning.maxWallTimeMs).toBe(current.runtimeTuning.maxWallTimeMs)
     expect(next.runtimeTuning.streamIdleTimeoutMs).toBe(current.runtimeTuning.streamIdleTimeoutMs)
+  })
+
+  it('normalizes the maximum turn duration', () => {
+    const current = defaultKunRuntimeSettings()
+    expect(current.runtimeTuning.maxWallTimeMs).toBe(86_400_000)
+
+    const set = mergeKunRuntimeSettings(current, {
+      runtimeTuning: { maxWallTimeMs: 7_200_000 }
+    })
+    expect(set.runtimeTuning.maxWallTimeMs).toBe(7_200_000)
+    expect(set.runtimeTuning.toolStorm).toEqual(current.runtimeTuning.toolStorm)
+
+    expect(
+      mergeKunRuntimeSettings(current, { runtimeTuning: { maxWallTimeMs: 0 } })
+        .runtimeTuning.maxWallTimeMs
+    ).toBe(86_400_000)
+    expect(
+      mergeKunRuntimeSettings(current, { runtimeTuning: { maxWallTimeMs: 999_999_999 } })
+        .runtimeTuning.maxWallTimeMs
+    ).toBe(86_400_000)
+  })
+
+  it('normalizes maximum concurrent turns to the supported range', () => {
+    const current = defaultKunRuntimeSettings()
+    expect(current.runtimeTuning.maxConcurrentTurns).toBe(256)
+
+    expect(
+      mergeKunRuntimeSettings(current, { runtimeTuning: { maxConcurrentTurns: 32 } })
+        .runtimeTuning.maxConcurrentTurns
+    ).toBe(32)
+    expect(
+      mergeKunRuntimeSettings(current, { runtimeTuning: { maxConcurrentTurns: 0 } })
+        .runtimeTuning.maxConcurrentTurns
+    ).toBe(256)
+    expect(
+      mergeKunRuntimeSettings(current, { runtimeTuning: { maxConcurrentTurns: 257 } })
+        .runtimeTuning.maxConcurrentTurns
+    ).toBe(256)
   })
 
   it('normalizes the stream idle timeout (0 disables, out-of-range clamps)', () => {
     const current = defaultKunRuntimeSettings()
-    expect(current.runtimeTuning.streamIdleTimeoutMs).toBe(45000)
+    expect(current.runtimeTuning.streamIdleTimeoutMs).toBe(450000)
 
     const set = mergeKunRuntimeSettings(current, {
       runtimeTuning: { streamIdleTimeoutMs: 300000 }
@@ -631,11 +1145,75 @@ describe('mergeKunRuntimeSettings', () => {
     expect(
       mergeKunRuntimeSettings(current, { runtimeTuning: { streamIdleTimeoutMs: -5 } })
         .runtimeTuning.streamIdleTimeoutMs
-    ).toBe(45000)
+    ).toBe(450000)
     expect(
       mergeKunRuntimeSettings(current, { runtimeTuning: { streamIdleTimeoutMs: 999_999_999 } })
         .runtimeTuning.streamIdleTimeoutMs
     ).toBe(3_600_000)
+  })
+
+  it('migrates the unversioned stream idle default exactly once', () => {
+    const current = settings()
+    const { defaultsVersion: _defaultsVersion, ...legacyRuntimeTuning } =
+      current.agents.kun.runtimeTuning
+    void _defaultsVersion
+
+    const migrated = normalizeAppSettings({
+      ...current,
+      agents: {
+        kun: {
+          ...current.agents.kun,
+          runtimeTuning: {
+            ...legacyRuntimeTuning,
+            streamIdleTimeoutMs: 45_000
+          }
+        }
+      }
+    } as AppSettingsV1)
+
+    expect(migrated.agents.kun.runtimeTuning).toMatchObject({
+      defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+      streamIdleTimeoutMs: DEFAULT_KUN_STREAM_IDLE_TIMEOUT_MS
+    })
+    expect(normalizeAppSettings(migrated).agents.kun.runtimeTuning).toEqual(
+      migrated.agents.kun.runtimeTuning
+    )
+  })
+
+  it('preserves custom, disabled, and already-versioned stream idle timeouts', () => {
+    const current = settings()
+    const { defaultsVersion: _defaultsVersion, ...legacyRuntimeTuning } =
+      current.agents.kun.runtimeTuning
+    void _defaultsVersion
+    const normalizeTimeout = (
+      streamIdleTimeoutMs: number,
+      defaultsVersion?: number
+    ) => normalizeAppSettings({
+      ...current,
+      agents: {
+        kun: {
+          ...current.agents.kun,
+          runtimeTuning: {
+            ...legacyRuntimeTuning,
+            ...(defaultsVersion !== undefined ? { defaultsVersion } : {}),
+            streamIdleTimeoutMs
+          }
+        }
+      }
+    } as AppSettingsV1).agents.kun.runtimeTuning
+
+    expect(normalizeTimeout(120_000)).toMatchObject({
+      defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+      streamIdleTimeoutMs: 120_000
+    })
+    expect(normalizeTimeout(0)).toMatchObject({
+      defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+      streamIdleTimeoutMs: 0
+    })
+    expect(normalizeTimeout(45_000, KUN_RUNTIME_TUNING_DEFAULTS_VERSION)).toMatchObject({
+      defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+      streamIdleTimeoutMs: 45_000
+    })
   })
 
   it('deep-merges image generation settings and normalizes invalid values', () => {
@@ -656,21 +1234,37 @@ describe('mergeKunRuntimeSettings', () => {
       baseUrl: 'https://api.siliconflow.cn/v1',
       apiKey: 'sk-image',
       model: 'Kwai-Kolors/Kolors',
+      defaultResolution: '1K',
       defaultSize: '',
+      quality: 'auto',
       timeoutMs: 180000
     })
 
     const sized = mergeKunRuntimeSettings(next, {
-      imageGeneration: { defaultSize: '1536x1024', timeoutMs: 240000 }
+      imageGeneration: {
+        defaultResolution: '2K',
+        defaultSize: '1536x1024',
+        quality: 'high',
+        timeoutMs: 240000
+      }
     })
+    expect(sized.imageGeneration.defaultResolution).toBe('2K')
     expect(sized.imageGeneration.defaultSize).toBe('1536x1024')
+    expect(sized.imageGeneration.quality).toBe('high')
     expect(sized.imageGeneration.timeoutMs).toBe(240000)
     expect(sized.imageGeneration.apiKey).toBe('sk-image')
 
     const invalidSize = mergeKunRuntimeSettings(sized, {
-      imageGeneration: { defaultSize: 'huge', timeoutMs: -5 }
+      imageGeneration: {
+        defaultResolution: '8K' as never,
+        defaultSize: 'huge',
+        quality: 'maximum' as never,
+        timeoutMs: -5
+      }
     })
+    expect(invalidSize.imageGeneration.defaultResolution).toBe('1K')
     expect(invalidSize.imageGeneration.defaultSize).toBe('')
+    expect(invalidSize.imageGeneration.quality).toBe('auto')
     expect(invalidSize.imageGeneration.timeoutMs).toBe(180000)
   })
 
@@ -839,7 +1433,8 @@ describe('legacy Kun defaults migration', () => {
       autoStart: false,
       runtimeToken: 'old-token',
       approvalPolicy: 'on-request',
-      sandboxMode: 'read-only'
+      sandboxMode: 'read-only',
+      approvalReviewer: 'user'
     }))
     expect(normalized.provider).toEqual(expect.objectContaining({
       apiKey: 'sk-old',
@@ -876,8 +1471,18 @@ describe('legacy Kun defaults migration', () => {
 
     expect(normalized.agents.kun).toEqual(expect.objectContaining({
       approvalPolicy: 'on-request',
-      sandboxMode: 'workspace-write'
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'user'
     }))
+  })
+
+  it('drops legacy top-level instructions during normalization', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      instructions: { enabled: true }
+    } as unknown as AppSettingsV1)
+
+    expect('instructions' in normalized).toBe(false)
   })
 
   it('moves the legacy local HTTP default port to the Kun default port', () => {
@@ -931,8 +1536,37 @@ describe('legacy Kun defaults migration', () => {
       baseUrl: '',
       apiKey: '',
       model: '',
+      defaultResolution: '1K',
       defaultSize: '',
+      quality: 'auto',
       timeoutMs: 180000
+    })
+  })
+
+  it('preserves the Codex responses image protocol during normalization', () => {
+    const normalized = normalizeAppSettings({
+      ...settings(),
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          imageGeneration: {
+            ...defaultKunRuntimeSettings().imageGeneration,
+            enabled: true,
+            providerId: 'custom',
+            protocol: 'codex-responses-image',
+            baseUrl: 'https://chatgpt.com/backend-api/codex',
+            apiKey: 'codex-access',
+            model: 'gpt-image-2'
+          }
+        }
+      }
+    })
+
+    expect(normalized.agents.kun.imageGeneration).toMatchObject({
+      protocol: 'codex-responses-image',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: 'codex-access',
+      model: 'gpt-image-2'
     })
   })
 
@@ -1145,7 +1779,9 @@ describe('claw runtime prompts', () => {
       baseUrl: 'https://images.example.test/v1',
       apiKey: 'sk-image',
       model: 'test-image-model',
+      defaultResolution: '1K',
       defaultSize: '1024x1024',
+      quality: 'auto',
       timeoutMs: 180000
     }
 
@@ -1296,6 +1932,23 @@ describe('write inline completion runtime config', () => {
 })
 
 describe('write selection assist settings', () => {
+  it('keeps write auto-save enabled by default and preserves explicit opt-out', () => {
+    expect(defaultWriteSettings().autoSaveEnabled).toBe(true)
+    expect(defaultWriteSettings().autoSaveDelayMs).toBe(180_000)
+    expect(normalizeWriteSettings({}).autoSaveEnabled).toBe(true)
+    expect(normalizeWriteSettings({ autoSaveEnabled: false }).autoSaveEnabled).toBe(false)
+    expect(normalizeWriteSettings({ autoSaveDelayMs: 30_000 }).autoSaveDelayMs).toBe(30_000)
+    expect(normalizeWriteSettings({ autoSaveDelayMs: 1 }).autoSaveDelayMs).toBe(5_000)
+    expect(normalizeWriteSettings({ autoSaveDelayMs: 3_600_000 }).autoSaveDelayMs).toBe(1_800_000)
+
+    const next = mergeWriteSettings(defaultWriteSettings(), {
+      autoSaveEnabled: false,
+      autoSaveDelayMs: 120_000
+    })
+    expect(next.autoSaveEnabled).toBe(false)
+    expect(next.autoSaveDelayMs).toBe(120_000)
+  })
+
   it('defaults to the built-in quick actions with empty overrides', () => {
     const write = defaultWriteSettings()
     expect(write.selectionAssist.infographicPrompt).toBe('')

@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClawImChannelV1 } from '@shared/app-settings'
-import type { ChatBlock } from '../agent/types'
 import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
-import { CLAW_MANAGED_INSTRUCTIONS_HEADING } from '@shared/app-settings'
+import { CLAW_MANAGED_INSTRUCTIONS_HEADING, MODEL_REASONING_EFFORTS } from '@shared/app-settings'
 import {
+  MAX_COMPOSER_REASONING_EFFORTS,
   MAX_TURN_MODEL_LABELS,
   MAX_THREAD_COMPOSER_SELECTIONS,
   MAX_CODE_WORKSPACE_ROOTS,
@@ -11,7 +11,6 @@ import {
   clawThreadIdsFromChannels,
   clawThreadTitleLooksManaged,
   compactCodeWorkspaceRoots,
-  conversationHasVisionAttachments,
   fallbackComposerModel,
   hydrateBlockModelLabels,
   isClawThread,
@@ -22,6 +21,10 @@ import {
   readThreadComposerSelection,
   reconcileCodeWorkspaceRoots,
   composerModeForThread,
+  composerReasoningEffortForSelection,
+  normalizeComposerReasoningEffortMap,
+  persistComposerReasoningEffort,
+  readStoredComposerReasoningEffort,
   rememberThreadComposerMode,
   readThreadComposerMode,
   rememberThreadComposerSelection,
@@ -31,6 +34,7 @@ import {
 
 const TURN_MODEL_STORAGE_KEY = 'kun.turnModelLabel'
 const THREAD_COMPOSER_SELECTION_STORAGE_KEY = 'kun.threadComposerSelection.v1'
+const COMPOSER_REASONING_EFFORT_STORAGE_KEY = 'kun.composerReasoningEffortByModel.v1'
 
 function createMemoryStorage(): Storage {
   const items = new Map<string, string>()
@@ -226,6 +230,20 @@ describe('chat-store Claw helpers', () => {
     expect(fallbackComposerModel([], '')).toBe('')
   })
 
+  it('prefers the configured runtime default over provider ordering', () => {
+    const groups: ModelProviderModelGroup[] = [{
+      providerId: 'minimax',
+      label: 'MiniMax',
+      modelIds: ['MiniMax-M3', 'MiniMax-M2']
+    }]
+
+    expect(fallbackComposerModel(
+      ['MiniMax-M3', 'MiniMax-M2', 'deepseek-v4-pro'],
+      'deepseek-v4-pro',
+      groups
+    )).toBe('deepseek-v4-pro')
+  })
+
   it('resolves context windows from the selected provider model profile', () => {
     const modelGroups: ModelProviderModelGroup[] = [
       {
@@ -261,7 +279,7 @@ describe('chat-store Claw helpers', () => {
     expect(resolveComposerContextWindowTokens(modelGroups, 'glm-4.5', 'zhipu')).toBe(200_000)
   })
 
-  it('falls back to 128k when the selected model lacks a configured window', () => {
+  it('falls back to 256k when the selected model lacks a configured window', () => {
     const modelGroups: ModelProviderModelGroup[] = [
       {
         providerId: 'custom',
@@ -339,7 +357,8 @@ describe('chat-store Claw helpers', () => {
     for (let index = 0; index < MAX_THREAD_COMPOSER_SELECTIONS + 5; index += 1) {
       raw[`thread-${index}`] = {
         model: ` model-${index} `,
-        providerId: ` provider-${index} `
+        providerId: ` provider-${index} `,
+        ...(index === 5 ? { source: 'default' } : {})
       }
     }
 
@@ -347,7 +366,11 @@ describe('chat-store Claw helpers', () => {
 
     expect(Object.keys(normalized)).toHaveLength(MAX_THREAD_COMPOSER_SELECTIONS)
     expect(normalized['thread-0']).toBeUndefined()
-    expect(normalized['thread-5']).toEqual({ model: 'model-5', providerId: 'provider-5' })
+    expect(normalized['thread-5']).toEqual({
+      model: 'model-5',
+      providerId: 'provider-5',
+      source: 'default'
+    })
     expect(normalized['bad-empty-model']).toBeUndefined()
     expect(normalized['bad-number']).toBeUndefined()
   })
@@ -358,6 +381,73 @@ describe('chat-store Claw helpers', () => {
 
     expect(readThreadComposerMode('thread-a')).toBe('plan')
     expect(readThreadComposerMode('thread-b')).toBe('agent')
+  })
+
+  it('persists every reasoning effort independently per provider and model', () => {
+    for (const effort of MODEL_REASONING_EFFORTS) {
+      persistComposerReasoningEffort(`model-${effort}`, 'provider-a', effort)
+    }
+    persistComposerReasoningEffort('shared-model', 'provider-a', 'off')
+    persistComposerReasoningEffort('shared-model', 'provider-b', 'high')
+
+    for (const effort of MODEL_REASONING_EFFORTS) {
+      expect(readStoredComposerReasoningEffort(`MODEL-${effort}`, 'PROVIDER-A')).toBe(effort)
+    }
+    expect(readStoredComposerReasoningEffort('shared-model', 'provider-a')).toBe('off')
+    expect(readStoredComposerReasoningEffort('shared-model', 'provider-b')).toBe('high')
+  })
+
+  it('falls back safely for missing, malformed, and unknown reasoning preferences', () => {
+    expect(readStoredComposerReasoningEffort('missing-model', 'provider-a')).toBe('max')
+
+    localStorage.setItem(COMPOSER_REASONING_EFFORT_STORAGE_KEY, '{not-json')
+    expect(readStoredComposerReasoningEffort('broken-model', 'provider-a')).toBe('max')
+
+    localStorage.setItem(COMPOSER_REASONING_EFFORT_STORAGE_KEY, JSON.stringify({
+      '["provider-a","unknown-model"]': 'turbo'
+    }))
+    expect(readStoredComposerReasoningEffort('unknown-model', 'provider-a')).toBe('max')
+    expect(normalizeComposerReasoningEffortMap({ valid: ' OFF ', invalid: 'turbo' })).toEqual({
+      valid: 'off'
+    })
+  })
+
+  it('normalizes unsupported stored reasoning to the model default and writes it back', () => {
+    persistComposerReasoningEffort('reasoning-model', 'provider-a', 'high')
+    const groups: ModelProviderModelGroup[] = [{
+      providerId: 'provider-a',
+      label: 'Provider A',
+      modelIds: ['reasoning-model'],
+      modelProfiles: {
+        'reasoning-model': {
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text'],
+          reasoning: {
+            supportedEfforts: ['off', 'medium'],
+            defaultEffort: 'medium',
+            requestProtocol: 'none'
+          }
+        }
+      }
+    }]
+
+    expect(composerReasoningEffortForSelection(groups, 'reasoning-model', 'provider-a')).toBe('medium')
+    expect(readStoredComposerReasoningEffort('reasoning-model', 'provider-a')).toBe('medium')
+  })
+
+  it('caps the stored reasoning preference registry', () => {
+    for (let index = 0; index < MAX_COMPOSER_REASONING_EFFORTS + 5; index += 1) {
+      persistComposerReasoningEffort(`model-${index}`, 'provider-a', 'off')
+    }
+
+    const stored = JSON.parse(
+      localStorage.getItem(COMPOSER_REASONING_EFFORT_STORAGE_KEY) ?? '{}'
+    ) as Record<string, string>
+    expect(Object.keys(stored)).toHaveLength(MAX_COMPOSER_REASONING_EFFORTS)
+    expect(readStoredComposerReasoningEffort('model-0', 'provider-a')).toBe('max')
+    expect(readStoredComposerReasoningEffort('model-504', 'provider-a')).toBe('off')
   })
 
   it('resolves composer mode from stored selection before thread metadata', () => {
@@ -376,46 +466,17 @@ describe('chat-store Claw helpers', () => {
 
     expect(readThreadComposerSelection('thread-a')).toEqual({
       model: 'deepseek-v4-pro',
-      providerId: 'deepseek'
+      providerId: 'deepseek',
+      source: 'user'
     })
     expect(readThreadComposerSelection('thread-b')).toEqual({
       model: 'MiniMax-M2',
-      providerId: 'minimax'
+      providerId: 'minimax',
+      source: 'user'
     })
     expect(JSON.parse(localStorage.getItem(THREAD_COMPOSER_SELECTION_STORAGE_KEY) ?? '{}')).toMatchObject({
-      'thread-a': { model: 'deepseek-v4-pro', providerId: 'deepseek' },
-      'thread-b': { model: 'MiniMax-M2', providerId: 'minimax' }
+      'thread-a': { model: 'deepseek-v4-pro', providerId: 'deepseek', source: 'user' },
+      'thread-b': { model: 'MiniMax-M2', providerId: 'minimax', source: 'user' }
     })
-  })
-})
-
-describe('conversationHasVisionAttachments', () => {
-  it('returns false for text-only conversations (issue #579)', () => {
-    const blocks: ChatBlock[] = [
-      { kind: 'user', id: 'u1', text: 'hello' },
-      { kind: 'assistant', id: 'a1', text: 'hi' }
-    ]
-    expect(conversationHasVisionAttachments(blocks)).toBe(false)
-  })
-
-  it('returns true when a user message carries an image attachment', () => {
-    const blocks: ChatBlock[] = [
-      { kind: 'user', id: 'u1', text: 'look', meta: { attachments: [{ id: 'img-1', kind: 'image' }] } }
-    ]
-    expect(conversationHasVisionAttachments(blocks)).toBe(true)
-  })
-
-  it('returns false when attachments are documents only', () => {
-    const blocks: ChatBlock[] = [
-      { kind: 'user', id: 'u1', text: 'read', meta: { attachments: [{ id: 'doc-1', kind: 'document' }] } }
-    ]
-    expect(conversationHasVisionAttachments(blocks)).toBe(false)
-  })
-
-  it('treats unresolved attachmentIds (restored sessions) as vision content', () => {
-    const blocks: ChatBlock[] = [
-      { kind: 'user', id: 'u1', text: 'check', meta: { attachmentIds: ['att-1'] } }
-    ]
-    expect(conversationHasVisionAttachments(blocks)).toBe(true)
   })
 })

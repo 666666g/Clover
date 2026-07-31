@@ -13,10 +13,11 @@ import {
   KUN_ATTACHMENT_DIAGNOSTICS_PATH,
   KUN_MEMORY_DIAGNOSTICS_PATH,
   KUN_MEMORY_PATH,
+  KUN_MCP_OAUTH_PATH,
+  KUN_MODEL_CONNECTIONS_PATH,
   KUN_RUNTIME_INFO_PATH,
   KUN_RUNTIME_TOOLS_PATH,
   KUN_SKILLS_PATH,
-  kunApprovalPath,
   kunThreadCompactPath,
   kunThreadEventsPath,
   kunThreadForkPath,
@@ -31,11 +32,16 @@ import {
   kunAttachmentContentPath,
   kunUserInputPath,
   kunMemoryRecordPath,
+  kunMcpOAuthServerPath,
   kunSessionResumePath,
   normalizeThreadMode,
   type KunThreadMode
 } from '@shared/kun-endpoints'
 import { parseRuntimeErrorBody, runtimeErrorToError, type RuntimeError } from '@shared/runtime-error'
+import {
+  workspaceDirectoryExists,
+  workspaceMissingError
+} from '../lib/workspace-availability'
 import type {
   CoreAttachmentDiagnosticsJson,
   CoreAttachmentContentResponseJson,
@@ -45,6 +51,10 @@ import type {
   CoreMemoryDiagnosticsJson,
   CoreMemoryListResponseJson,
   CoreMemoryRecordJson,
+  CoreMcpOAuthClearResponseJson,
+  CoreMcpOAuthAuthorizeResponseJson,
+  CoreMcpOAuthDiagnosticJson,
+  CoreMcpOAuthDiagnosticsResponseJson,
   CoreResumeSessionResponseJson,
   CoreRuntimeInfoJson,
   CoreRuntimeEventJson,
@@ -70,6 +80,9 @@ import {
   threadFromCore
 } from './kun-mapper'
 import { rendererRuntimeClient } from './runtime-client'
+import type { ComposerContextAttachment } from '@kun/extension-api'
+
+const MAX_PENDING_SSE_DISPATCH_BATCHES = 32
 
 function createSseStreamId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `sse-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -98,6 +111,62 @@ function readRuntimeJson<T>(body: string, fallback: string): T {
     return JSON.parse(body) as T
   } catch {
     throw runtimeErrorToError({ code: 'unknown', message: fallback })
+  }
+}
+
+async function sharedDefaultModelSelection(): Promise<{
+  registryAvailable: boolean
+  providerId?: string
+  accountId?: string
+  model?: string
+  providers?: Array<{
+    id: string
+    accountId?: string
+    configured: boolean
+    models: string[]
+  }>
+}> {
+  const response = await rendererRuntimeClient.runtimeRequest(KUN_MODEL_CONNECTIONS_PATH, 'GET')
+  if (!response.ok) return { registryAvailable: false }
+  try {
+    const value = JSON.parse(response.body) as {
+      defaultProviderId?: unknown
+      defaultAccountId?: unknown
+      defaultModel?: unknown
+      providers?: unknown
+    }
+    return {
+      registryAvailable: true,
+      ...(typeof value.defaultProviderId === 'string' && value.defaultProviderId.trim()
+        ? { providerId: value.defaultProviderId.trim() }
+        : {}),
+      ...(typeof value.defaultAccountId === 'string' && value.defaultAccountId.trim()
+        ? { accountId: value.defaultAccountId.trim() }
+        : {}),
+      ...(typeof value.defaultModel === 'string' && value.defaultModel.trim()
+        ? { model: value.defaultModel.trim() }
+        : {}),
+      providers: Array.isArray(value.providers)
+        ? value.providers.flatMap((entry) => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+            const profile = entry as Record<string, unknown>
+            if (typeof profile.id !== 'string' || !profile.id.trim()) return []
+            return [{
+              id: profile.id.trim(),
+              ...(typeof profile.accountId === 'string' && profile.accountId.trim()
+                ? { accountId: profile.accountId.trim() }
+                : {}),
+              configured: profile.configured === true,
+              models: Array.isArray(profile.models)
+                ? profile.models.filter((model): model is string =>
+                    typeof model === 'string' && Boolean(model.trim()))
+                : []
+            }]
+          })
+        : []
+    }
+  } catch {
+    return { registryAvailable: false }
   }
 }
 
@@ -135,7 +204,7 @@ export class KunRuntimeProvider implements AgentProvider {
 
   async listThreads(options: ThreadListOptions = {}): Promise<NormalizedThread[]> {
     const query = buildQuery({
-      limit: options.limit ?? 50,
+      limit: options.limit,
       search: options.search,
       include_archived: options.includeArchived,
       archived_only: options.archivedOnly
@@ -158,23 +227,53 @@ export class KunRuntimeProvider implements AgentProvider {
     mode?: KunThreadMode
     agentId?: string
     providerId?: string
+    accountId?: string
     model?: string
     systemPrompt?: string
   }): Promise<NormalizedThread> {
     const settings = await rendererRuntimeClient.getSettings()
     const runtime = getKunRuntimeSettings(settings)
+    const workspace = (input.workspace || settings.workspaceRoot || '').trim()
+    if (!workspace || !(await workspaceDirectoryExists(workspace))) {
+      throw new Error(workspaceMissingError())
+    }
+    const sharedDefault = await sharedDefaultModelSelection()
+    const requestedProviderId = input.providerId?.trim() || sharedDefault.providerId
+    const requestedModel = input.model?.trim() ||
+      (requestedProviderId === sharedDefault.providerId ? sharedDefault.model : undefined)
+    const requestedProfile = sharedDefault.providers?.find((profile) =>
+      profile.id === requestedProviderId
+    )
+    if (
+      sharedDefault.registryAvailable &&
+      (
+        !requestedProviderId ||
+        !requestedModel ||
+        !requestedProfile?.configured ||
+        (requestedProfile.models.length > 0 && !requestedProfile.models.includes(requestedModel))
+      )
+    ) {
+      throw new Error('No connected model is selected. Connect a provider or choose an available shared model first.')
+    }
     const response = await rendererRuntimeClient.runtimeRequest(
       '/v1/threads',
       'POST',
       JSON.stringify({
-        workspace: input.workspace || settings.workspaceRoot || '~',
+        workspace,
         title: input.title,
         ...(input.titleAuto !== undefined ? { titleAuto: input.titleAuto } : {}),
-        model: input.model?.trim() || runtime.model,
+        model: requestedModel || runtime.model,
         mode: normalizeThreadMode(input.mode),
         approvalPolicy: runtime.approvalPolicy,
         sandboxMode: runtime.sandboxMode,
-        ...(input.providerId?.trim() ? { providerId: input.providerId.trim() } : {}),
+        approvalReviewer: runtime.approvalReviewer,
+        modelRequestCaptureEnabled: runtime.llmDebug.defaultThreadCaptureEnabled,
+        ...(requestedProviderId
+          ? { providerId: requestedProviderId }
+          : {}),
+        ...(input.accountId?.trim() || requestedProfile?.accountId || sharedDefault.accountId
+          ? { accountId: input.accountId?.trim() || requestedProfile?.accountId || sharedDefault.accountId }
+          : {}),
         ...(input.agentId?.trim() ? { agentId: input.agentId.trim() } : {}),
         ...(input.systemPrompt?.trim() ? { systemPrompt: input.systemPrompt.trim() } : {})
       })
@@ -193,6 +292,7 @@ export class KunRuntimeProvider implements AgentProvider {
     latestSeq: number
     threadStatus?: string
     latestTurnId?: string
+    latestTurnOrchestration?: 'direct' | 'graph'
     latestUserMessageId?: string
     turnDurationByUserId?: Record<string, number>
     usage?: ThreadUsageSnapshot
@@ -216,7 +316,12 @@ export class KunRuntimeProvider implements AgentProvider {
         attachmentIds: turn.attachmentIds,
         activeSkillIds: turn.activeSkillIds,
         injectedMemoryIds: turn.injectedMemoryIds,
+        injectedMemorySummaries: turn.injectedMemorySummaries,
         skillInjectionBytes: turn.skillInjectionBytes,
+        injectedInstructionSources: turn.injectedInstructionSources,
+        instructionInjectionBytes: turn.instructionInjectionBytes,
+        guiDesignCanvas: turn.guiDesignCanvas,
+        guiDesignMode: turn.guiDesignMode,
         workspaceCheckpointId: item.workspaceCheckpointId ?? turn.workspaceCheckpointId
       }))
     )
@@ -245,6 +350,9 @@ export class KunRuntimeProvider implements AgentProvider {
       latestSeq: thread.latestSeq ?? 0,
       threadStatus: thread.status ?? latestTurn?.status,
       latestTurnId: latestTurn?.id,
+      latestTurnOrchestration: latestTurn
+        ? latestTurn.orchestration === 'graph' ? 'graph' : 'direct'
+        : undefined,
       latestUserMessageId,
       relation: thread.relation,
       ...(thread.parentThreadId ? { parentThreadId: thread.parentThreadId } : {}),
@@ -259,8 +367,12 @@ export class KunRuntimeProvider implements AgentProvider {
     text: string,
     options?: {
       mode?: KunThreadMode
+      orchestration?: 'direct' | 'graph'
       model?: string
+      providerId?: string
+      accountId?: string
       reasoningEffort?: string
+      serviceTier?: 'priority'
       displayText?: string
       guiPlan?: {
         operation: 'draft' | 'refine'
@@ -270,26 +382,50 @@ export class KunRuntimeProvider implements AgentProvider {
         sourceRequest?: string
         title?: string
       }
+      guiDesignCanvas?: boolean
+      guiDesignMode?: boolean
+      agentSurface?: 'code' | 'write' | 'design'
+      guiDesignArtifact?: {
+        kind: 'svg'
+        artifactId: string
+        relativePath: string
+      }
       attachmentIds?: string[]
       workspaceCheckpointId?: string
+      workspaceCheckpointRequestId?: string
       fileReferences?: Array<{ path: string; relativePath: string; name: string; kind?: 'file' | 'directory' }>
+      composerContexts?: ComposerContextAttachment[]
     }
   ): Promise<{ turnId: string; threadId: string; userMessageItemId?: string }> {
     const settings = await rendererRuntimeClient.getSettings()
     const runtime = getKunRuntimeSettings(settings)
+    const mode = options?.mode
+    const selectedModel = options?.model?.trim() ||
+      (mode === 'plan' ? runtime.planModel?.trim() : '')
+    const selectedProviderId = options?.providerId?.trim() ||
+      (mode === 'plan' ? runtime.planProviderId?.trim() : '')
+    const selectedAccountId = options?.accountId?.trim() ||
+      (mode === 'plan' ? runtime.planAccountId?.trim() : '')
     const body: Record<string, unknown> = {
       prompt: text,
-      model: options?.model,
+      ...(options?.orchestration === 'graph' ? { orchestration: 'graph' } : {}),
+      clientSurface: 'gui',
+      ...(selectedModel ? { model: selectedModel } : {}),
+      ...(selectedProviderId ? { providerId: selectedProviderId } : {}),
+      ...(selectedAccountId ? { accountId: selectedAccountId } : {}),
       approvalPolicy: runtime.approvalPolicy,
-      sandboxMode: runtime.sandboxMode
+      sandboxMode: runtime.sandboxMode,
+      approvalReviewer: runtime.approvalReviewer
     }
     if (options?.reasoningEffort?.trim()) {
       body.reasoningEffort = options.reasoningEffort.trim()
     }
+    if (options?.serviceTier === 'priority') {
+      body.serviceTier = 'priority'
+    }
     if (options?.displayText?.trim() && options.displayText.trim() !== text.trim()) {
       body.displayText = options.displayText.trim()
     }
-    const mode = options?.mode
     if (mode === 'agent' || mode === 'plan') {
       body.mode = mode
     }
@@ -303,14 +439,32 @@ export class KunRuntimeProvider implements AgentProvider {
         title: options.guiPlan.title
       }
     }
+    if (options?.guiDesignCanvas) {
+      body.guiDesignCanvas = true
+    }
+    if (options?.guiDesignMode) {
+      body.guiDesignMode = true
+    }
+    if (options?.agentSurface) {
+      body.agentSurface = options.agentSurface
+    }
+    if (options?.guiDesignArtifact) {
+      body.guiDesignArtifact = options.guiDesignArtifact
+    }
     if (options?.attachmentIds?.length) {
       body.attachmentIds = options.attachmentIds
     }
     if (options?.workspaceCheckpointId?.trim()) {
       body.workspaceCheckpointId = options.workspaceCheckpointId.trim()
     }
+    if (options?.workspaceCheckpointRequestId?.trim()) {
+      body.workspaceCheckpointRequestId = options.workspaceCheckpointRequestId.trim()
+    }
     if (options?.fileReferences?.length) {
       body.fileReferences = options.fileReferences
+    }
+    if (options?.composerContexts?.length) {
+      body.composerContexts = options.composerContexts
     }
     const response = await rendererRuntimeClient.runtimeRequest(
       kunThreadTurnsPath(threadId),
@@ -345,11 +499,17 @@ export class KunRuntimeProvider implements AgentProvider {
   async reviewThread(
     threadId: string,
     target: ReviewTarget,
-    options?: { model?: string }
+    options?: { model?: string; providerId?: string; accountId?: string }
   ): Promise<{ turnId: string; threadId: string; userMessageItemId?: string; reviewItemId?: string }> {
     const body: Record<string, unknown> = { target }
     if (options?.model?.trim()) {
       body.model = options.model.trim()
+    }
+    if (options?.providerId?.trim()) {
+      body.providerId = options.providerId.trim()
+    }
+    if (options?.accountId?.trim()) {
+      body.accountId = options.accountId.trim()
     }
     const response = await rendererRuntimeClient.runtimeRequest(
       kunThreadReviewPath(threadId),
@@ -371,11 +531,17 @@ export class KunRuntimeProvider implements AgentProvider {
     }
   }
 
-  async steerUserMessage(threadId: string, turnId: string, text: string): Promise<void> {
+  async steerUserMessage(
+    threadId: string,
+    turnId: string,
+    text: string,
+    options?: { displayText?: string }
+  ): Promise<void> {
+    const displayText = options?.displayText?.trim()
     const response = await rendererRuntimeClient.runtimeRequest(
       kunThreadSteerPath(threadId, turnId),
       'POST',
-      JSON.stringify({ text })
+      JSON.stringify({ text, ...(displayText ? { displayText } : {}) })
     )
     if (!response.ok) {
       throw runtimeErrorToError(readRuntimeError(response.body, 'failed to queue message'))
@@ -582,16 +748,22 @@ export class KunRuntimeProvider implements AgentProvider {
 
   async submitApprovalDecision(
     approvalId: string,
-    decision: 'allow' | 'deny'
-  ): Promise<void> {
-    const response = await rendererRuntimeClient.runtimeRequest(
-      kunApprovalPath(approvalId),
-      'POST',
-      JSON.stringify({ decision })
-    )
-    if (!response.ok) {
-      throw runtimeErrorToError(readRuntimeError(response.body, 'approval decision failed'))
+    decision: 'allow' | 'deny',
+    userInitiated = false
+  ): Promise<'submitted' | 'cancelled'> {
+    const protectedResult = await window.kunGui.resolveKunApproval({
+      approvalId,
+      decision,
+      source: userInitiated ? 'user' : 'policy'
+    })
+    if (!protectedResult.confirmed) return 'cancelled'
+    if (!protectedResult.response.ok) {
+      throw runtimeErrorToError(readRuntimeError(
+        protectedResult.response.body,
+        'approval decision failed'
+      ))
     }
+    return 'submitted'
   }
 
   async submitUserInputResponse(inputId: string, answers: UserInputAnswer[]): Promise<void> {
@@ -638,6 +810,42 @@ export class KunRuntimeProvider implements AgentProvider {
     )
   }
 
+  async getMcpOAuthDiagnostics(): Promise<CoreMcpOAuthDiagnosticJson[]> {
+    const response = await rendererRuntimeClient.runtimeRequest(KUN_MCP_OAUTH_PATH, 'GET')
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'failed to load MCP OAuth diagnostics'))
+    }
+    return readRuntimeJson<CoreMcpOAuthDiagnosticsResponseJson>(
+      response.body,
+      'runtime returned an invalid MCP OAuth diagnostics response'
+    ).servers
+  }
+
+  async clearMcpOAuthCredentials(serverId?: string): Promise<string[]> {
+    const response = await rendererRuntimeClient.runtimeRequest(
+      serverId ? kunMcpOAuthServerPath(serverId) : KUN_MCP_OAUTH_PATH,
+      'DELETE'
+    )
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'failed to clear MCP OAuth credentials'))
+    }
+    return readRuntimeJson<CoreMcpOAuthClearResponseJson>(
+      response.body,
+      'runtime returned an invalid MCP OAuth reset response'
+    ).cleared
+  }
+
+  async authorizeMcpOAuthCredentials(serverId: string): Promise<CoreMcpOAuthAuthorizeResponseJson> {
+    const response = await rendererRuntimeClient.runtimeRequest(kunMcpOAuthServerPath(serverId), 'POST')
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'failed to authorize MCP OAuth connector'))
+    }
+    return readRuntimeJson<CoreMcpOAuthAuthorizeResponseJson>(
+      response.body,
+      'runtime returned an invalid MCP OAuth authorize response'
+    )
+  }
+
   async listSkills(): Promise<CoreRuntimeSkillJson[]> {
     const response = await rendererRuntimeClient.runtimeRequest(KUN_SKILLS_PATH, 'GET')
     if (!response.ok) {
@@ -653,11 +861,31 @@ export class KunRuntimeProvider implements AgentProvider {
     name: string
     mimeType?: string
     dataBase64: string
+    documentText?: string
+    documentFormat?: 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'text' | 'csv' | 'json' | 'xml'
+    sourceSha256?: string
+    pageCount?: number
     localFilePath?: string
     textFallback?: CoreAttachmentTextFallbackJson
+    visualPreview?: CoreAttachmentTextFallbackJson
     threadId?: string
     workspace?: string
   }): Promise<CoreAttachmentMetadataJson> {
+    if (
+      input.mimeType?.startsWith('image/') &&
+      typeof window.kunGui?.uploadRuntimeImageAttachment === 'function'
+    ) {
+      const result = await window.kunGui.uploadRuntimeImageAttachment({
+        source: input.localFilePath
+          ? { kind: 'localPath', path: input.localFilePath }
+          : { kind: 'base64', dataBase64: input.dataBase64, mimeType: input.mimeType },
+        name: input.name,
+        ...(input.threadId ? { threadId: input.threadId } : {}),
+        ...(input.workspace ? { workspace: input.workspace } : {})
+      })
+      if (!result.ok) throw new Error(result.message)
+      return result.attachment
+    }
     const response = await rendererRuntimeClient.uploadRuntimeAttachment(input)
     if (!response.ok) {
       throw runtimeErrorToError(readRuntimeError(response.body, 'attachment upload failed'))
@@ -700,10 +928,11 @@ export class KunRuntimeProvider implements AgentProvider {
     )
   }
 
-  async listMemories(options: { workspace?: string; includeDeleted?: boolean } = {}): Promise<CoreMemoryRecordJson[]> {
+  async listMemories(options: { workspace?: string; includeDeleted?: boolean; all?: boolean } = {}): Promise<CoreMemoryRecordJson[]> {
     const query = buildQuery({
       workspace: options.workspace,
-      include_deleted: options.includeDeleted
+      include_deleted: options.includeDeleted,
+      all: options.all
     })
     const response = await rendererRuntimeClient.runtimeRequest(`${KUN_MEMORY_PATH}${query}`, 'GET')
     if (!response.ok) {
@@ -843,7 +1072,8 @@ export class KunRuntimeProvider implements AgentProvider {
     const streamId = createSseStreamId()
     await new Promise<void>(async (resolve) => {
       let settled = false
-      const pendingDispatches = new Set<Promise<void>>()
+      let dispatchTail: Promise<void> = Promise.resolve()
+      let queuedDispatchBatches = 0
       const finish = (): void => {
         if (settled) return
         settled = true
@@ -851,7 +1081,7 @@ export class KunRuntimeProvider implements AgentProvider {
         offEnd()
         offErr()
         signal.removeEventListener('abort', onAbort)
-        void Promise.allSettled([...pendingDispatches]).then(() => resolve())
+        void dispatchTail.finally(() => resolve())
       }
       const offData = rendererRuntimeClient.onSseEvent((payload) => {
         if (payload.streamId !== streamId) return
@@ -869,21 +1099,47 @@ export class KunRuntimeProvider implements AgentProvider {
           entry && typeof entry === 'object' ? (entry as CoreRuntimeEventJson) : {}
         )
         if (batch.length === 0) return
+        if (queuedDispatchBatches >= MAX_PENDING_SSE_DISPATCH_BATCHES) {
+          sink.onError(new Error('SSE renderer dispatch backlog exceeded its safety limit'))
+          void rendererRuntimeClient.stopSse(streamId)
+          finish()
+          return
+        }
         let maxSeq: number | null = null
         for (const event of batch) {
           if (typeof event.seq === 'number') {
             maxSeq = maxSeq === null ? event.seq : Math.max(maxSeq, event.seq)
           }
         }
-        if (maxSeq !== null) {
-          sink.onSeq(maxSeq)
-        }
-        const task = dispatchKunRuntimeEvents(batch, sink, (runtimeEvent, eventSink) =>
-          this.handleApprovalRequest(runtimeEvent, eventSink)
-        ).finally(() => {
-          pendingDispatches.delete(task)
+        // Keep batches strictly ordered. The main process reads no further SSE
+        // data until this batch is acknowledged, so dispatch must not fan out
+        // into an unbounded renderer-side promise set.
+        queuedDispatchBatches += 1
+        const task = dispatchTail.then(async () => {
+          if (signal.aborted || settled) return
+          await dispatchKunRuntimeEvents(batch, sink, (runtimeEvent, eventSink) =>
+            this.handleApprovalRequest(runtimeEvent, eventSink)
+          )
+          if (signal.aborted || settled) return
+          // Commit the renderer cursor only after the whole ordered batch has
+          // been projected. ACK is flow control for the main process and must
+          // never precede the renderer's durable in-memory projection.
+          if (maxSeq !== null) sink.onSeq(maxSeq)
+          if (signal.aborted || settled) return
+          if (payload.batchId) {
+            await rendererRuntimeClient.ackSse(streamId, payload.batchId)
+          }
+        }).catch((error) => {
+          if (!settled) {
+            sink.onError(error instanceof Error ? error : new Error(String(error)))
+            void rendererRuntimeClient.stopSse(streamId)
+            finish()
+          }
         })
-        pendingDispatches.add(task)
+        dispatchTail = task
+        void task.finally(() => {
+          queuedDispatchBatches = Math.max(0, queuedDispatchBatches - 1)
+        })
       })
       const offErr = rendererRuntimeClient.onSseError(({ streamId: sid, message, status }) => {
         if (sid !== streamId) return
@@ -904,7 +1160,8 @@ export class KunRuntimeProvider implements AgentProvider {
       }
       signal.addEventListener('abort', onAbort, { once: true })
       try {
-        await rendererRuntimeClient.startSse(threadId, sinceSeq, streamId)
+        await rendererRuntimeClient.startSse(threadId, sinceSeq, streamId, { acknowledgedBatches: true })
+        if (!settled && !signal.aborted) sink.onConnected?.()
       } catch (error) {
         sink.onError(error instanceof Error ? error : new Error(String(error)))
         finish()
@@ -916,27 +1173,15 @@ export class KunRuntimeProvider implements AgentProvider {
   private async handleApprovalRequest(event: CoreRuntimeEventJson, sink: ThreadEventSink): Promise<void> {
     const approvalId = event.approvalId ?? event.itemId ?? ''
     if (!approvalId) return
-    try {
-      const eventPolicy = normalizeApprovalPolicy(event.approvalPolicy)
-      const policy = eventPolicy ?? getKunRuntimeSettings(await rendererRuntimeClient.getSettings()).approvalPolicy
-      switch (policy) {
-        case 'auto':
-          await this.submitApprovalDecision(approvalId, 'allow')
-          return
-        case 'never':
-          await this.submitApprovalDecision(approvalId, 'deny')
-          return
-        case 'on-request':
-        case 'suggest':
-        case 'untrusted':
-        case 'always':
-          break
-      }
-    } catch {
-      /* Fall through and render the approval card. */
-    }
+    // Automatic review is owned by Kun and is deliberately not resolvable
+    // through the user approval surface. Missing reviewer identity is legacy
+    // manual review; never infer it from mutable global settings because the
+    // emitting thread owns an immutable authority snapshot.
+    if (event.approvalReviewer === 'agent') return
     sink.onApproval({
       approvalId,
+      turnId: event.turnId,
+      createdAt: event.timestamp,
       summary: event.summary ?? 'Approval required',
       toolName: event.toolName,
       ...(event.child ? { meta: { child: event.child } } : {})

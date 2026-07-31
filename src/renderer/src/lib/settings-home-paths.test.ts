@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -93,6 +94,8 @@ function settings(): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     cursorSpotlight: true,
     provider: defaultModelProviderSettings(),
     agents: {
@@ -109,7 +112,7 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '~/.kun/default_workspace',
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: true, retentionDays: 2 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -141,6 +144,7 @@ function settings(): AppSettingsV1 {
       tasks: [scheduledTask('~/schedule/task-1')]
     },
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',

@@ -1,5 +1,6 @@
 import {
   DEFAULT_KUN_MODEL,
+  DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
   DEFAULT_WRITE_INLINE_COMPLETION_DEBOUNCE_MS,
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_COMPLETION_MIN_ACCEPT_SCORE,
@@ -8,6 +9,8 @@ import {
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MIN_ACCEPT_SCORE,
   DEFAULT_WRITE_WORKSPACE_ROOT,
+  MAX_WRITE_AUTOSAVE_DELAY_MS,
+  MIN_WRITE_AUTOSAVE_DELAY_MS,
   normalizeWriteAgentPresets,
   normalizeWriteInlineCompletionModel,
   normalizeWriteSelectionAssistSettings,
@@ -100,6 +103,8 @@ export function normalizeWriteSettings(settings?: Partial<WriteSettingsV1> | nul
   defaultWorkspaceRoot: string
   activeWorkspaceRoot: string
   workspaces: string[]
+  autoSaveEnabled: boolean
+  autoSaveDelayMs: number
   inlineCompletion: WriteInlineCompletionSettingsV1
   selectionAssist: WriteSelectionAssistSettingsV1
   agentPresets: WriteAgentPresetV1[]
@@ -118,12 +123,17 @@ export function normalizeWriteSettings(settings?: Partial<WriteSettingsV1> | nul
   const longMinAcceptScore = Number(rawInlineCompletion.longMinAcceptScore)
   const maxTokens = Number(rawInlineCompletion.maxTokens)
   const longMaxTokens = Number(rawInlineCompletion.longMaxTokens)
+  const autoSaveDelayMs = Number(settings?.autoSaveDelayMs)
   const model = normalizeWriteInlineCompletionModel(rawInlineCompletion.model)
   const rawModel = typeof rawInlineCompletion.model === 'string' ? rawInlineCompletion.model.trim() : ''
   return {
     defaultWorkspaceRoot,
     activeWorkspaceRoot: workspaces.includes(activeWorkspaceRoot) ? activeWorkspaceRoot : defaultWorkspaceRoot,
     workspaces: workspaces.length > 0 ? workspaces : [defaultWorkspaceRoot],
+    autoSaveEnabled: settings?.autoSaveEnabled !== false,
+    autoSaveDelayMs: Number.isFinite(autoSaveDelayMs)
+      ? Math.max(MIN_WRITE_AUTOSAVE_DELAY_MS, Math.min(MAX_WRITE_AUTOSAVE_DELAY_MS, Math.round(autoSaveDelayMs)))
+      : DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
     inlineCompletion: {
       enabled: rawInlineCompletion.enabled !== false,
       retrievalEnabled: rawInlineCompletion.retrievalEnabled !== false,
@@ -167,6 +177,8 @@ export function withResolvedInlineCompletionSettings(
     defaultWorkspaceRoot: string
     activeWorkspaceRoot: string
     workspaces: string[]
+    autoSaveEnabled: boolean
+    autoSaveDelayMs: number
     inlineCompletion: WriteInlineCompletionSettingsV1
     selectionAssist: WriteSelectionAssistSettingsV1
     agentPresets: WriteAgentPresetV1[]
@@ -176,6 +188,8 @@ export function withResolvedInlineCompletionSettings(
   defaultWorkspaceRoot: string
   activeWorkspaceRoot: string
   workspaces: string[]
+  autoSaveEnabled: boolean
+  autoSaveDelayMs: number
   inlineCompletion: WriteInlineCompletionSettingsV1
   selectionAssist: WriteSelectionAssistSettingsV1
   agentPresets: WriteAgentPresetV1[]
@@ -288,6 +302,9 @@ export function initialState(): Pick<
   | 'fileError'
   | 'fileLoading'
   | 'saveStatus'
+  | 'documentEpoch'
+  | 'contentRevision'
+  | 'persistedContent'
   | 'pendingAgentReview'
   | 'reviewActive'
   | 'selection'
@@ -314,6 +331,9 @@ export function initialState(): Pick<
     fileError: null,
     fileLoading: false,
     saveStatus: 'saved',
+    documentEpoch: 0,
+    contentRevision: 0,
+    persistedContent: '',
     pendingAgentReview: null,
     reviewActive: false,
     selection: emptySelection(),

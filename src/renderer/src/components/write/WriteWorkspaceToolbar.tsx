@@ -8,8 +8,10 @@ import {
   FilePenLine,
   FileText,
   Loader2,
+  Presentation,
   Save,
-  Sparkles
+  Sparkles,
+  WandSparkles
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { WriteExportFormat } from '@shared/write-export'
@@ -33,6 +35,7 @@ type Props = {
   activeFileName: string
   activeFilePath: string
   documentStatsLabel: string | null
+  inlineCompletionEnabled: boolean
   assistantOpen: boolean
   exportInFlight: boolean
   exportMenuOpen: boolean
@@ -44,9 +47,13 @@ type Props = {
   modeMenuRef: RefObject<HTMLDivElement | null>
   onCopyRichText: () => void
   onExportFile: (format: WriteExportFormat) => void
+  onGeneratePresentation: () => void
   onSave: () => void
+  onToggleInlineCompletion: () => void
   onToggleLeftSidebar: () => void
   previewMode: WritePreviewMode
+  presentationEnabled: boolean
+  presentationInFlight: boolean
   readOnly: boolean
   saveLabel: string
   saveStatus: WriteSaveStatus
@@ -65,6 +72,7 @@ export function WriteWorkspaceToolbar({
   activeFileName,
   activeFilePath,
   documentStatsLabel,
+  inlineCompletionEnabled,
   assistantOpen,
   exportInFlight,
   exportMenuOpen,
@@ -76,9 +84,13 @@ export function WriteWorkspaceToolbar({
   modeMenuRef,
   onCopyRichText,
   onExportFile,
+  onGeneratePresentation,
   onSave,
+  onToggleInlineCompletion,
   onToggleLeftSidebar,
   previewMode,
+  presentationEnabled,
+  presentationInFlight,
   readOnly,
   saveLabel,
   saveStatus,
@@ -91,7 +103,7 @@ export function WriteWorkspaceToolbar({
   const { t } = useTranslation('common')
   if (activeFileIsPdf) {
     return (
-      <div className="ds-stage-inset -mx-3 shrink-0 sm:-mx-4 md:-mx-6 lg:-mx-8">
+      <div className={`ds-stage-inset shrink-0 -mr-3 sm:-mr-4 md:-mr-6 lg:-mr-8 ${leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : '-ml-3 sm:-ml-4 md:-ml-6 lg:-ml-8'}`}>
         <header className="ds-topbar-surface write-pdf-topbar relative z-10 mt-3 flex min-h-[52px] w-full items-stretch overflow-visible rounded-[18px]">
           <div className="write-pdf-topbar-grid grid w-full min-w-0 items-center gap-2 px-3 py-2 sm:px-4 md:pl-5 md:pr-3">
             <div
@@ -142,7 +154,7 @@ export function WriteWorkspaceToolbar({
   }
 
   return (
-    <div className="ds-stage-inset -mx-3 shrink-0 sm:-mx-4 md:-mx-6 lg:-mx-8">
+    <div className={`ds-stage-inset shrink-0 -mr-3 sm:-mr-4 md:-mr-6 lg:-mr-8 ${leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : '-ml-3 sm:-ml-4 md:-ml-6 lg:-ml-8'}`}>
       <header className="ds-topbar-surface relative z-10 mt-3 flex min-h-[56px] w-full items-stretch overflow-visible rounded-[18px]">
         <div className="write-workspace-toolbar-grid grid w-full min-w-0 items-center gap-2 px-3 py-2 sm:px-4 md:pl-5 md:pr-2 lg:gap-4">
           <div
@@ -241,6 +253,31 @@ export function WriteWorkspaceToolbar({
 
           <div className="write-workspace-toolbar-actions flex min-w-0 items-center justify-end gap-1.5">
             {activeFileIsText ? <WriteFontSizeControl /> : null}
+            <button
+              type="button"
+              onClick={onToggleInlineCompletion}
+              disabled={!activeFileIsText || readOnly}
+              className={`${toolbarIconButtonClass(inlineCompletionEnabled)} disabled:cursor-not-allowed disabled:opacity-40`}
+              title={`${t(inlineCompletionEnabled ? 'writeInlineCompletionOn' : 'writeInlineCompletionOff')} · ${t('writeInlineCompletionShortcut')}`}
+              aria-label={t(inlineCompletionEnabled ? 'writeInlineCompletionOn' : 'writeInlineCompletionOff')}
+              aria-pressed={inlineCompletionEnabled}
+            >
+              <WandSparkles className="h-4 w-4" strokeWidth={1.85} />
+            </button>
+            <button
+              type="button"
+              onClick={onGeneratePresentation}
+              disabled={!presentationEnabled || presentationInFlight}
+              className={`${toolbarIconButtonClass(presentationInFlight)} disabled:cursor-not-allowed disabled:opacity-40`}
+              title={presentationInFlight ? t('writePptPreparing') : presentationEnabled ? t('writePptGenerate') : t('writePptMarkdownOnly')}
+              aria-label={presentationInFlight ? t('writePptPreparing') : presentationEnabled ? t('writePptGenerate') : t('writePptMarkdownOnly')}
+            >
+              {presentationInFlight ? (
+                <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.85} />
+              ) : (
+                <Presentation className="h-4 w-4" strokeWidth={1.85} />
+              )}
+            </button>
             <button
               type="button"
               onClick={() => setAssistantOpen(!assistantOpen)}

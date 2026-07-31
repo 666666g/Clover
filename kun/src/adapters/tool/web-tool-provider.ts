@@ -1,16 +1,50 @@
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { request as httpRequest, type IncomingMessage } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { isIP, type LookupFunction } from 'node:net'
 import type { KunCapabilitiesConfig, WebCapabilityConfig } from '../../contracts/capabilities.js'
 import type { WebFetchResult, WebProvider, WebSearchResult } from '../../ports/web-provider.js'
 import { sourceIdFor, UnavailableWebProvider } from '../../ports/web-provider.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
 import { LocalToolHost } from './local-tool-host.js'
 
-const DEFAULT_WEB_TIMEOUT_MS = 15_000
+const WEB_REQUEST_TIMEOUT_MS = 60 * 60_000
 const DEFAULT_WEB_MAX_BYTES = 1_000_000
 // Models sometimes pass tiny max_bytes budgets (2000 was common in the
 // wild); below this floor the extracted text is too small to be useful.
 const MIN_WEB_FETCH_BYTES = 4_096
 const DEFAULT_SEARCH_LIMIT = 5
 const MAX_SEARCH_LIMIT = 10
+const MAX_WEB_REDIRECTS = 5
+
+export type ResolvedAddress = {
+  address: string
+  family: 4 | 6
+}
+
+export type FetchWebTransportRequest = {
+  url: URL
+  lookup: LookupFunction
+  signal: AbortSignal
+}
+
+export type FetchWebTransportResponse = {
+  status: number
+  contentType?: string
+  location?: string
+  body: AsyncIterable<Uint8Array>
+  cancel(): void
+}
+
+export type FetchWebProviderOptions = {
+  nowIso?: () => string
+  /**
+   * Injection point for deterministic tests. Production uses the OS resolver
+   * and pins the vetted answers into the outbound socket lookup callback.
+   */
+  resolveHost?: (hostname: string) => Promise<ResolvedAddress[]>
+  request?: (request: FetchWebTransportRequest) => Promise<FetchWebTransportResponse>
+}
 
 export type WebProviderDiagnostic = {
   id: string
@@ -49,7 +83,9 @@ export function buildWebToolProviders(
     }
   }
 
-  const provider: WebProvider = options.provider ?? (web.fetchEnabled ? new FetchWebProvider(options.nowIso) : new UnavailableWebProvider(web.provider))
+  const provider: WebProvider = options.provider ?? (web.fetchEnabled ? new FetchWebProvider(web, {
+    nowIso: options.nowIso
+  }) : new UnavailableWebProvider(web.provider))
   const tools = []
   if (web.fetchEnabled) {
     tools.push(createFetchTool(web, provider))
@@ -72,6 +108,12 @@ export function buildWebToolProviders(
           kind: 'web',
           enabled: true,
           available: true,
+          effects: {
+            network: true,
+            externalWrite: false,
+            processExecution: false,
+            guiAutomation: false
+          },
           ...(reason ? { reason } : {}),
           tools
         }]
@@ -99,8 +141,7 @@ function createFetchTool(config: WebCapabilityConfig, provider: WebProvider) {
       type: 'object',
       properties: {
         url: { type: 'string' },
-        max_bytes: { type: 'number' },
-        timeout_ms: { type: 'number' }
+        max_bytes: { type: 'number' }
       },
       required: ['url'],
       additionalProperties: false
@@ -120,12 +161,11 @@ function createFetchTool(config: WebCapabilityConfig, provider: WebProvider) {
         Math.min(MIN_WEB_FETCH_BYTES, maxBytesCap),
         maxBytesCap
       )
-      const timeoutMs = boundedInt(args.timeout_ms, DEFAULT_WEB_TIMEOUT_MS, 1, DEFAULT_WEB_TIMEOUT_MS)
       try {
         const result = await provider.fetch({
           url: policy.url.href,
           maxBytes,
-          timeoutMs,
+          timeoutMs: WEB_REQUEST_TIMEOUT_MS,
           signal: context.abortSignal
         })
         return {
@@ -138,6 +178,14 @@ function createFetchTool(config: WebCapabilityConfig, provider: WebProvider) {
           }))
         }
       } catch (error) {
+        if (error instanceof WebFetchPolicyError) {
+          return toolError('policy_blocked', error.message, telemetry({
+            startedAt,
+            policy: 'blocked',
+            url: policy.url.href,
+            provider: provider.id
+          }))
+        }
         return toolError('fetch_failed', errorMessage(error), telemetry({
           startedAt,
           policy: 'allowed',
@@ -157,8 +205,7 @@ function createSearchTool(config: WebCapabilityConfig, provider: WebProvider) {
       type: 'object',
       properties: {
         query: { type: 'string' },
-        limit: { type: 'number' },
-        timeout_ms: { type: 'number' }
+        limit: { type: 'number' }
       },
       required: ['query'],
       additionalProperties: false
@@ -170,12 +217,11 @@ function createSearchTool(config: WebCapabilityConfig, provider: WebProvider) {
       if (!query) return toolError('invalid_query', 'query is required')
       if (!provider.search) return toolError('provider_unavailable', 'web search provider is unavailable')
       const limit = boundedInt(args.limit, DEFAULT_SEARCH_LIMIT, 1, MAX_SEARCH_LIMIT)
-      const timeoutMs = boundedInt(args.timeout_ms, DEFAULT_WEB_TIMEOUT_MS, 1, DEFAULT_WEB_TIMEOUT_MS)
       try {
         const results = await provider.search({
           query,
           limit,
-          timeoutMs,
+          timeoutMs: WEB_REQUEST_TIMEOUT_MS,
           signal: context.abortSignal
         })
         return {
@@ -199,12 +245,18 @@ function createSearchTool(config: WebCapabilityConfig, provider: WebProvider) {
   })
 }
 
-class FetchWebProvider implements WebProvider {
+export class FetchWebProvider implements WebProvider {
   readonly id = 'fetch'
+  private readonly config: WebCapabilityConfig
   private readonly nowIso: () => string
+  private readonly resolveHost: (hostname: string) => Promise<ResolvedAddress[]>
+  private readonly request: (request: FetchWebTransportRequest) => Promise<FetchWebTransportResponse>
 
-  constructor(nowIso: (() => string) | undefined) {
-    this.nowIso = nowIso ?? (() => new Date().toISOString())
+  constructor(config: WebCapabilityConfig, options: FetchWebProviderOptions = {}) {
+    this.config = config
+    this.nowIso = options.nowIso ?? (() => new Date().toISOString())
+    this.resolveHost = options.resolveHost ?? resolveHostAddresses
+    this.request = options.request ?? requestWithPinnedLookup
   }
 
   async fetch(request: {
@@ -218,49 +270,48 @@ class FetchWebProvider implements WebProvider {
     const onAbort = () => controller.abort()
     request.signal.addEventListener('abort', onAbort, { once: true })
     try {
-      const response = await fetch(request.url, { signal: controller.signal })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      let currentUrl = new URL(request.url)
+      let redirectCount = 0
+      let response: FetchWebTransportResponse | undefined
+
+      while (true) {
+        const policy = validateUrlPolicy(currentUrl.href, this.config)
+        if (!policy.ok) throw new WebFetchPolicyError(policy.reason)
+        const resolved = await awaitWithAbort(this.resolveDestination(policy.url), controller.signal)
+        response = await this.request({
+          url: policy.url,
+          lookup: pinnedLookup(policy.url.hostname, resolved),
+          signal: controller.signal
+        })
+
+        if (!isRedirectStatus(response.status)) break
+        const location = response.location
+        response.cancel()
+        if (!location) throw new Error(`HTTP ${response.status} redirect is missing a Location header`)
+        if (redirectCount >= MAX_WEB_REDIRECTS) throw new Error(`redirect limit (${MAX_WEB_REDIRECTS}) exceeded`)
+        try {
+          currentUrl = new URL(location, policy.url)
+        } catch {
+          throw new WebFetchPolicyError('redirect Location must be a valid absolute or relative HTTP URL')
+        }
+        redirectCount += 1
+      }
+
+      if (!response) throw new Error('web response is unavailable')
+      if (response.status < 200 || response.status >= 300) {
+        response.cancel()
+        throw new Error(`HTTP ${response.status}`)
+      }
 
       // Oversized pages truncate at maxBytes via the streaming read below.
       // Hard-failing on the declared content-length made most real pages
       // unfetchable whenever the model passed a small byte budget.
-
-      // Stream response body with size limit
-      const reader = response.body?.getReader()
-      if (!reader) throw new Error('response body is not readable')
-
-      const chunks: Uint8Array[] = []
-      let totalBytes = 0
-      let truncated = false
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        const remaining = request.maxBytes - totalBytes
-        if (remaining <= 0) {
-          truncated = true
-          reader.cancel()
-          break
-        }
-
-        if (value.length > remaining) {
-          chunks.push(value.subarray(0, remaining))
-          totalBytes += remaining
-          truncated = true
-          reader.cancel()
-          break
-        }
-
-        chunks.push(value)
-        totalBytes += value.length
-      }
-
-      const buffer = Buffer.concat(chunks)
-      const contentType = response.headers.get('content-type') ?? undefined
+      const body = await readResponseBody(response, request.maxBytes)
+      const buffer = Buffer.concat(body.chunks)
+      const contentType = response.contentType
       const raw = buffer.toString('utf8')
       const extracted = extractReadableText(raw, contentType)
-      const finalUrl = response.url || request.url
+      const finalUrl = currentUrl.href
       return {
         sourceId: sourceIdFor('fetch', finalUrl),
         url: request.url,
@@ -269,14 +320,263 @@ class FetchWebProvider implements WebProvider {
         contentType,
         text: extracted.text,
         retrievedAt: this.nowIso(),
-        byteCount: totalBytes,
-        truncated
+        byteCount: body.totalBytes,
+        truncated: body.truncated
       }
     } finally {
       clearTimeout(timeout)
       request.signal.removeEventListener('abort', onAbort)
     }
   }
+
+  private async resolveDestination(url: URL): Promise<ResolvedAddress[]> {
+    const hostname = normalizedHostname(url.hostname)
+    const literalFamily = isIP(hostname)
+    if (literalFamily === 4 || literalFamily === 6) {
+      if (!isPublicAddress(hostname)) {
+        throw new WebFetchPolicyError('URL targets a non-public IP address')
+      }
+      return [{ address: hostname, family: literalFamily }]
+    }
+
+    let records: ResolvedAddress[]
+    try {
+      records = await this.resolveHost(hostname)
+    } catch {
+      throw new WebFetchPolicyError('hostname could not be resolved to a public address')
+    }
+    if (records.length === 0 || records.some((record) => !isResolvedPublicAddress(record))) {
+      throw new WebFetchPolicyError('hostname resolves to a non-public address')
+    }
+    return records
+  }
+}
+
+class WebFetchPolicyError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WebFetchPolicyError'
+  }
+}
+
+async function resolveHostAddresses(hostname: string): Promise<ResolvedAddress[]> {
+  const records = await dnsLookup(hostname, { all: true, verbatim: true })
+  return records.flatMap((record) => {
+    if (record.family !== 4 && record.family !== 6) return []
+    return [{ address: record.address, family: record.family }]
+  })
+}
+
+function requestWithPinnedLookup(request: FetchWebTransportRequest): Promise<FetchWebTransportResponse> {
+  const send = request.url.protocol === 'https:' ? httpsRequest : httpRequest
+  return new Promise((resolve, reject) => {
+    const outbound = send(request.url, {
+      method: 'GET',
+      signal: request.signal,
+      lookup: request.lookup,
+      headers: {
+        accept: 'text/html, text/plain, application/xhtml+xml;q=0.9, */*;q=0.1',
+        // Node's http client does not transparently decompress responses. Ask
+        // for the representation we can account for byte-for-byte instead.
+        'accept-encoding': 'identity'
+      }
+    }, (response) => resolve(transportResponse(response)))
+    outbound.once('error', reject)
+    outbound.end()
+  })
+}
+
+function transportResponse(response: IncomingMessage): FetchWebTransportResponse {
+  return {
+    status: response.statusCode ?? 0,
+    contentType: headerValue(response.headers['content-type']),
+    location: headerValue(response.headers.location),
+    body: response,
+    cancel: () => response.destroy()
+  }
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value
+}
+
+async function readResponseBody(response: FetchWebTransportResponse, maxBytes: number): Promise<{
+  chunks: Uint8Array[]
+  totalBytes: number
+  truncated: boolean
+}> {
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  for await (const value of response.body) {
+    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
+    const remaining = maxBytes - totalBytes
+    if (remaining <= 0) {
+      response.cancel()
+      return { chunks, totalBytes, truncated: true }
+    }
+    if (chunk.length > remaining) {
+      chunks.push(chunk.subarray(0, remaining))
+      response.cancel()
+      return { chunks, totalBytes: totalBytes + remaining, truncated: true }
+    }
+    chunks.push(chunk)
+    totalBytes += chunk.length
+  }
+  return { chunks, totalBytes, truncated: false }
+}
+
+async function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortError()
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    void operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
+function abortError(): Error {
+  const error = new Error('web fetch aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+function pinnedLookup(expectedHostname: string, addresses: ResolvedAddress[]): LookupFunction {
+  const expected = normalizedHostname(expectedHostname)
+  return (hostname, options, callback) => {
+    if (normalizedHostname(hostname) !== expected) {
+      callback(lookupError('outbound lookup hostname did not match the vetted destination'), '', 0)
+      return
+    }
+    const requestedFamily = lookupFamily(options.family)
+    const candidates = addresses.filter((address) => requestedFamily === 0 || address.family === requestedFamily)
+    if (candidates.length === 0) {
+      callback(lookupError('no vetted address matches the requested IP family'), '', 0)
+      return
+    }
+    if (options.all) {
+      callback(null, candidates)
+      return
+    }
+    const candidate = candidates[0]!
+    callback(null, candidate.address, candidate.family)
+  }
+}
+
+function lookupFamily(value: number | 'IPv4' | 'IPv6' | undefined): 0 | 4 | 6 {
+  if (value === 4 || value === 'IPv4') return 4
+  if (value === 6 || value === 'IPv6') return 6
+  return 0
+}
+
+function lookupError(message: string): NodeJS.ErrnoException {
+  return Object.assign(new Error(message), { code: 'EHOSTUNREACH' })
+}
+
+function isResolvedPublicAddress(record: ResolvedAddress): boolean {
+  const family = isIP(normalizedIpAddress(record.address))
+  return family === record.family && isPublicAddress(record.address)
+}
+
+function isPublicAddress(value: string): boolean {
+  const address = normalizedIpAddress(value)
+  const family = isIP(address)
+  if (family === 4) return isPublicIpv4(address)
+  if (family !== 6) return false
+  const bytes = ipv6Bytes(address)
+  if (!bytes) return false
+
+  // URL and DNS parsers can spell IPv4-mapped addresses in several ways.
+  // Map them back to IPv4 policy instead of trusting their IPv6 spelling.
+  if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+    return isPublicIpv4(bytes.slice(12).join('.'))
+  }
+  if (bytes.slice(0, 12).every((byte) => byte === 0)) {
+    return isPublicIpv4(bytes.slice(12).join('.'))
+  }
+
+  // Only global-unicast IPv6 is useful for a public web fetch. This rejects
+  // unspecified, loopback, unique-local, link-local, multicast, and other
+  // special-use ranges before any connection is opened.
+  if ((bytes[0]! & 0xe0) !== 0x20) return false
+  if (hasIpv6Prefix(bytes, [0x20, 0x01, 0x0d, 0xb8])) return false // documentation
+  if (hasIpv6Prefix(bytes, [0x20, 0x01, 0x00, 0x00])) return false // Teredo
+  if (hasIpv6Prefix(bytes, [0x20, 0x02])) return false // 6to4 embeds an IPv4 address
+
+  return true
+}
+
+function isPublicIpv4(address: string): boolean {
+  const octets = ipv4Bytes(address)
+  if (!octets) return false
+  const [first, second, third] = octets
+  if (
+    first === 0 ||
+    first === 10 ||
+    first === 127 ||
+    first >= 224 ||
+    (first === 100 && second! >= 64 && second! <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second! >= 16 && second! <= 31) ||
+    (first === 192 && second === 0 && third === 0) ||
+    (first === 192 && second === 0 && third === 2) ||
+    (first === 192 && second === 31 && third === 196) ||
+    (first === 192 && second === 52 && third === 193) ||
+    (first === 192 && second === 88 && third === 99) ||
+    (first === 192 && second === 168) ||
+    (first === 192 && second === 175 && third === 48) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    (first === 198 && second === 51 && third === 100) ||
+    (first === 203 && second === 0 && third === 113)
+  ) {
+    return false
+  }
+  return true
+}
+
+function ipv4Bytes(address: string): number[] | undefined {
+  const parts = address.split('.')
+  if (parts.length !== 4) return undefined
+  const bytes = parts.map((part) => {
+    if (!/^\d{1,3}$/.test(part)) return Number.NaN
+    return Number(part)
+  })
+  return bytes.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255) ? bytes : undefined
+}
+
+function ipv6Bytes(address: string): number[] | undefined {
+  let normalized = address.toLowerCase()
+  const tailStart = normalized.lastIndexOf(':')
+  const tail = normalized.slice(tailStart + 1)
+  if (tail.includes('.')) {
+    const ipv4 = ipv4Bytes(tail)
+    if (!ipv4) return undefined
+    normalized = `${normalized.slice(0, tailStart)}:${((ipv4[0]! << 8) | ipv4[1]!).toString(16)}:${((ipv4[2]! << 8) | ipv4[3]!).toString(16)}`
+  }
+  const pieces = normalized.split('::')
+  if (pieces.length > 2) return undefined
+  const left = pieces[0] ? pieces[0].split(':') : []
+  const right = pieces.length === 2 && pieces[1] ? pieces[1].split(':') : []
+  if (left.length + right.length > 8 || (pieces.length === 1 && left.length !== 8)) return undefined
+  const groups = [...left, ...Array(8 - left.length - right.length).fill('0'), ...right]
+  const bytes: number[] = []
+  for (const group of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(group)) return undefined
+    const value = Number.parseInt(group, 16)
+    bytes.push(value >> 8, value & 0xff)
+  }
+  return bytes
+}
+
+function hasIpv6Prefix(bytes: number[], prefix: number[]): boolean {
+  return prefix.every((value, index) => bytes[index] === value)
+}
+
+function normalizedIpAddress(value: string): string {
+  return value.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1')
 }
 
 function fetchOutput(result: WebFetchResult, toolTelemetry: Record<string, unknown>) {
@@ -334,7 +634,18 @@ function validateUrlPolicy(rawUrl: string, config: WebCapabilityConfig): { ok: t
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return { ok: false, reason: 'only http and https URLs are allowed' }
   }
-  const hostname = url.hostname.toLowerCase()
+  if (url.username || url.password) {
+    return { ok: false, reason: 'URLs with embedded credentials are not allowed' }
+  }
+  const hostname = normalizedHostname(url.hostname)
+  if (!hostname) return { ok: false, reason: 'URL host is required' }
+  if (isLocalOnlyHostname(hostname)) {
+    return { ok: false, reason: 'local and metadata hosts are not allowed' }
+  }
+  const literalFamily = isIP(hostname)
+  if ((literalFamily === 4 || literalFamily === 6) && !isPublicAddress(hostname)) {
+    return { ok: false, reason: 'URL targets a non-public IP address' }
+  }
   if (config.denyDomains.some((domain) => domainMatches(hostname, domain))) {
     return { ok: false, reason: `domain is denied: ${hostname}` }
   }
@@ -345,8 +656,30 @@ function validateUrlPolicy(rawUrl: string, config: WebCapabilityConfig): { ok: t
 }
 
 function domainMatches(hostname: string, domain: string): boolean {
-  const normalized = domain.toLowerCase().replace(/^\./, '')
+  const normalized = normalizedHostname(domain).replace(/^\./, '')
   return hostname === normalized || hostname.endsWith(`.${normalized}`)
+}
+
+function normalizedHostname(value: string): string {
+  let normalized = value.trim().toLowerCase()
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    normalized = normalized.slice(1, -1)
+  }
+  let end = normalized.length
+  while (end > 0 && normalized[end - 1] === '.') end -= 1
+  return normalized.slice(0, end)
+}
+
+function isLocalOnlyHostname(hostname: string): boolean {
+  return (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === 'metadata' ||
+    hostname === 'metadata.google.internal' ||
+    hostname === 'instance-data' ||
+    hostname === 'instance-data.ec2.internal' ||
+    hostname.endsWith('.local')
+  )
 }
 
 function extractReadableText(raw: string, contentType: string | undefined): { title?: string; text: string } {

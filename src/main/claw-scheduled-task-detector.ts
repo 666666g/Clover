@@ -8,13 +8,21 @@ import type {
 import {
   DEFAULT_SCHEDULE_MODEL,
   DEFAULT_SCHEDULE_REASONING_EFFORT,
+  getModelProviderProfile,
   isCustomModelEndpointFormat,
   modelEndpointPath,
+  modelProviderModelProfile,
   resolveKunRuntimeSettings,
   resolveModelEndpointFormat,
   resolveModelProviderProxyUrl
 } from '../shared/app-settings'
 import { fetchWithOptionalProxy } from './proxy-fetch'
+import {
+  codexResponsesLiteInput,
+  resolveCodexResponsesRequestAuth,
+  usesCodexResponsesLite,
+  withCodexResponsesLiteHeader
+} from './codex-responses-lite'
 
 const SCHEDULED_TASK_CANDIDATE_RE =
   /(?:提醒|定时|闹钟|通知|叫我|叫醒|稍后|之后|到点|分钟后|小时后|秒后|天后|明天|后天|今晚|later|remind|reminder|alarm|timer|schedule|scheduled|tomorrow|tonight|in\s+\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?))/iu
@@ -198,18 +206,38 @@ function buildDetectionRequest(input: {
   model: string
   systemPrompt: string
   sourceText: string
+  responsesMode?: 'lite'
 }): DetectionRequestPayload | null {
   const endpointFormat = resolveModelEndpointFormat(input.endpointFormat, input.baseUrl)
   if (!endpointFormat) return null
-  const headers: Record<string, string> = {
+  const auth = resolveCodexResponsesRequestAuth(input.baseUrl, input.apiKey)
+  const responsesLite = usesCodexResponsesLite(input.baseUrl, input.responsesMode)
+  const headers: Record<string, string> = withCodexResponsesLiteHeader({
     'Content-Type': 'application/json',
-    Authorization: `Bearer ${input.apiKey}`
-  }
+    Authorization: `Bearer ${auth.apiKey}`,
+    ...auth.headers
+  }, responsesLite)
   if (endpointFormat === 'messages') {
-    headers['x-api-key'] = input.apiKey
+    headers['x-api-key'] = auth.apiKey
     headers['anthropic-version'] = '2023-06-01'
   }
   if (endpointFormat === 'responses') {
+    if (responsesLite) {
+      return {
+        url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+        headers,
+        endpointFormat,
+        body: {
+          model: input.model,
+          input: codexResponsesLiteInput(input.systemPrompt, [{ role: 'user', content: input.sourceText }]),
+          store: false,
+          tool_choice: 'auto',
+          parallel_tool_calls: false,
+          reasoning: { context: 'all_turns' },
+          text: { format: { type: 'json_object' } }
+        }
+      }
+    }
     return {
       url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
       headers,
@@ -300,13 +328,18 @@ export async function detectClawScheduledTaskRequest(
   const runtime = resolveKunRuntimeSettings(settings)
   const apiKey = runtime.apiKey.trim()
   if (!apiKey) return null
+  const model = detectionModel(modelHint)
+  const provider = getModelProviderProfile(settings, runtime.providerId)
+  const responsesMode = modelProviderModelProfile(provider, model)?.responsesMode
+  if (!resolveCodexResponsesRequestAuth(runtime.baseUrl, apiKey).apiKey) return null
   const detectionRequest = buildDetectionRequest({
     baseUrl: runtime.baseUrl,
     apiKey,
     endpointFormat: runtime.endpointFormat,
-    model: detectionModel(modelHint),
+    model,
     systemPrompt: buildDetectionPrompt(now),
-    sourceText
+    sourceText,
+    responsesMode
   })
   if (!detectionRequest) return null
   const response = await fetchWithOptionalProxy(detectionRequest.url, {

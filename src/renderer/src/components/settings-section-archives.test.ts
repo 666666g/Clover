@@ -19,11 +19,18 @@ function thread(overrides: Partial<NormalizedThread> & Pick<NormalizedThread, 'i
 }
 
 const labels: Record<string, string> = {
+  title: 'Settings',
   back: 'Back',
+  settingsGroupCore: 'Basics',
+  settingsGroupWorkbench: 'Workbench',
+  settingsGroupIntelligence: 'Intelligence',
+  settingsGroupData: 'Data',
+  settingsGroupSystem: 'System',
   general: 'General',
   providers: 'Providers',
   write: 'Write',
   agents: 'AI assistant',
+  subagents: 'Subagents',
   archives: 'Archived chats',
   keyboardShortcuts: 'Keyboard shortcuts',
   claw: 'Connect phone',
@@ -99,7 +106,7 @@ describe('ArchivedThreadsSettingsSection', () => {
     expect(html).toContain('Delete archived chat')
   })
 
-  it('keeps archived chats after the AI assistant tab without a standalone permissions tab', () => {
+  it('keeps subagents between the AI assistant and archived chats without a standalone permissions tab', () => {
     const html = renderToStaticMarkup(createElement(SettingsSidebar, {
       category: 'archives',
       goBack: () => undefined,
@@ -108,15 +115,19 @@ describe('ArchivedThreadsSettingsSection', () => {
     }))
 
     const agentsIndex = html.indexOf('AI assistant')
+    const subagentsIndex = html.indexOf('Subagents')
     const archivesIndex = html.indexOf('Archived chats')
+    const migrationIndex = html.indexOf('dataMigration')
     const permissionsIndex = html.indexOf('permissions')
     expect(agentsIndex).toBeGreaterThanOrEqual(0)
+    expect(subagentsIndex).toBeGreaterThan(agentsIndex)
     expect(permissionsIndex).toBe(-1)
-    expect(archivesIndex).toBeGreaterThan(agentsIndex)
-    expect(html.match(/data-cursor-spotlight-target/g)?.length).toBe(16)
+    expect(archivesIndex).toBeGreaterThan(subagentsIndex)
+    expect(migrationIndex).toBeGreaterThan(archivesIndex)
+    expect(html.match(/data-cursor-spotlight-target/g)?.length).toBe(20)
   })
 
-  it('keeps settings tabs scrollable without pushing the footer away', () => {
+  it('groups compact settings navigation without pushing the footer away', () => {
     const html = renderToStaticMarkup(createElement(SettingsSidebar, {
       category: 'shortcuts',
       goBack: () => undefined,
@@ -124,9 +135,15 @@ describe('ArchivedThreadsSettingsSection', () => {
       t
     }))
 
-    expect(html).toContain('flex h-full min-h-0 w-[248px]')
-    expect(html).toContain('flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overscroll-contain')
-    expect(html).toContain('ds-no-drag shrink-0 border-t border-ds-border p-3')
+    expect(html).toContain('flex h-full min-h-0 w-[260px]')
+    expect(html).toContain('min-h-0 flex-1 overflow-y-auto overscroll-contain')
+    expect(html).toContain('ds-no-drag shrink-0 border-t border-ds-border px-5 py-3.5')
+    expect(html).toContain('group flex h-9 w-full')
+    expect(html).toContain('aria-current="page"')
+    expect(html.indexOf('Basics')).toBeLessThan(html.indexOf('Workbench'))
+    expect(html.indexOf('Workbench')).toBeLessThan(html.indexOf('Intelligence'))
+    expect(html.indexOf('Intelligence')).toBeLessThan(html.indexOf('Data'))
+    expect(html.indexOf('Data')).toBeLessThan(html.indexOf('System'))
     expect(html).toContain('Kun')
     expect(html).toContain('Settings')
   })

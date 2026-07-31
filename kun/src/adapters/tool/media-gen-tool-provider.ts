@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { dirname } from 'node:path'
 import type { KunCapabilitiesConfig } from '../../contracts/capabilities.js'
 import { detectImage } from '../../attachments/attachment-store.js'
 import type { ToolExecutionUpdate, ToolHostContext } from '../../ports/tool-host.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
 import { ImageGenHttpError, describeNetworkError } from './image-gen-tool-provider.js'
+import { resolveWorkspacePath } from './builtin-tool-utils.js'
 import { LocalToolHost } from './local-tool-host.js'
 
 const GENERATED_SPEECH_DIR = '.deepseekgui-audio'
@@ -15,6 +16,19 @@ const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
 const REFERENCE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const AUDIO_FORMATS = new Set(['mp3', 'wav', 'flac', 'pcm', 'pcm16'])
 const VIDEO_RESOLUTIONS = ['768P', '1080P'] as const
+const GROK_VIDEO_RESOLUTIONS = ['480P', '720P'] as const
+const GROK_VIDEO_DURATIONS = [6, 10] as const
+const GROK_VIDEO_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '3:2', '2:3'] as const
+const VOLCENGINE_VIDEO_RESOLUTIONS = ['480P', '720P', '1080P', '4K'] as const
+const VOLCENGINE_VIDEO_ASPECT_RATIOS = [
+  'adaptive',
+  '21:9',
+  '16:9',
+  '4:3',
+  '1:1',
+  '3:4',
+  '9:16'
+] as const
 
 export type GeneratedMedia = { data: Buffer; mimeType: string; extension: string }
 
@@ -45,6 +59,7 @@ export type VideoGenRequest = {
   model: string
   duration: number
   resolution: string
+  aspectRatio?: string
   firstFrameImage?: { mimeType: string; data: Buffer }
   lastFrameImage?: { mimeType: string; data: Buffer }
   timeoutMs: number
@@ -137,6 +152,7 @@ export function buildSpeechGenToolProviders(
 
   const tool = LocalToolHost.defineTool({
     name: 'generate_speech',
+    toolKind: 'file_change',
     description: [
       'Generate spoken audio from text using the configured text-to-speech provider.',
       `The generated audio is saved under ${GENERATED_SPEECH_DIR}/ in the workspace and returned as a generated file.`,
@@ -222,6 +238,7 @@ export function buildMusicGenToolProviders(
 
   const tool = LocalToolHost.defineTool({
     name: 'generate_music',
+    toolKind: 'file_change',
     description: [
       'Generate a song or instrumental audio using the configured music provider.',
       `The generated audio is saved under ${GENERATED_MUSIC_DIR}/ in the workspace and returned as a generated file.`,
@@ -309,22 +326,58 @@ export function buildVideoGenToolProviders(
 
   const client = options.videoClient ?? createVideoGenClient(config)
   const model = config.model!
+  const isGrokImagine = config.protocol === 'grok-imagine-video'
+  const isVolcengineArk = config.protocol === 'volcengine-ark-video'
 
   const tool = LocalToolHost.defineTool({
     name: 'generate_video',
+    toolKind: 'file_change',
     description: [
       'Generate a video from a text prompt using the configured video provider.',
-      'Optionally pass workspace-relative first_frame_image_path and last_frame_image_path for image-to-video guidance.',
+      isGrokImagine
+        ? 'Optionally pass a workspace-relative first_frame_image_path for Grok image-to-video guidance.'
+        : 'Optionally pass workspace-relative first_frame_image_path and last_frame_image_path for image-to-video guidance.',
       `The generated video is saved under ${GENERATED_VIDEO_DIR}/ in the workspace and returned as a generated file.`
     ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Detailed video generation prompt' },
-        duration: { type: 'integer', minimum: 1, maximum: 30 },
-        resolution: { type: 'string', enum: VIDEO_RESOLUTIONS },
+        duration: isGrokImagine
+          ? { type: 'integer', enum: [...GROK_VIDEO_DURATIONS] }
+          : isVolcengineArk
+            ? { type: 'integer', minimum: 4, maximum: 15 }
+            : { type: 'integer', minimum: 1, maximum: 30 },
+        resolution: {
+          type: 'string',
+          enum: isGrokImagine
+            ? [...GROK_VIDEO_RESOLUTIONS]
+            : isVolcengineArk
+              ? [...VOLCENGINE_VIDEO_RESOLUTIONS]
+              : VIDEO_RESOLUTIONS
+        },
+        ...(isGrokImagine || isVolcengineArk
+          ? {
+              aspect_ratio: {
+                type: 'string',
+                enum: isVolcengineArk
+                  ? [...VOLCENGINE_VIDEO_ASPECT_RATIOS]
+                  : [...GROK_VIDEO_ASPECT_RATIOS],
+                description: isVolcengineArk
+                  ? 'Optional Seedance output ratio; adaptive lets the model choose.'
+                  : 'Optional aspect ratio for Grok text-to-video generation.'
+              }
+            }
+          : {}),
         first_frame_image_path: { type: 'string', description: 'Workspace-relative png/jpeg/webp first frame' },
-        last_frame_image_path: { type: 'string', description: 'Workspace-relative png/jpeg/webp last frame' }
+        ...(!isGrokImagine
+          ? {
+              last_frame_image_path: {
+                type: 'string',
+                description: 'Workspace-relative png/jpeg/webp last frame'
+              }
+            }
+          : {})
       },
       required: ['prompt'],
       additionalProperties: false
@@ -338,14 +391,24 @@ export function buildVideoGenToolProviders(
       if ('error' in firstFrame) return firstFrame.error
       const lastFrame = await collectFrameImage(args.last_frame_image_path, context, 'last_frame_image_path')
       if ('error' in lastFrame) return lastFrame.error
-      const duration = normalizeDuration(args.duration, config.defaultDuration)
-      const resolution = pickString(args.resolution) || config.defaultResolution
+      const duration = isGrokImagine
+        ? normalizeGrokVideoDuration(args.duration, config.defaultDuration)
+        : isVolcengineArk
+          ? normalizeVolcengineVideoDuration(args.duration, config.defaultDuration)
+        : normalizeDuration(args.duration, config.defaultDuration)
+      const resolution = isGrokImagine
+        ? normalizeGrokVideoResolution(args.resolution, config.defaultResolution)
+        : isVolcengineArk
+          ? normalizeVolcengineVideoResolution(args.resolution, config.defaultResolution)
+        : pickString(args.resolution) || config.defaultResolution
+      const aspectRatio = pickString(args.aspect_ratio)
       try {
         const media = await client.generate({
           prompt,
           model,
           duration,
           resolution,
+          ...(aspectRatio ? { aspectRatio } : {}),
           ...(firstFrame.image ? { firstFrameImage: firstFrame.image } : {}),
           ...(lastFrame.image ? { lastFrameImage: lastFrame.image } : {}),
           timeoutMs: config.timeoutMs,
@@ -406,7 +469,14 @@ export function createVideoGenClient(config: {
   protocol?: string
   baseUrl?: string
   apiKey?: string
+  headers?: Record<string, string>
 }): VideoGenClient {
+  if (config.protocol === 'grok-imagine-video') {
+    return new GrokImagineVideoClient(config.baseUrl!, config.apiKey!, config.headers)
+  }
+  if (config.protocol === 'volcengine-ark-video') {
+    return new VolcengineArkVideoClient(config.baseUrl!, config.apiKey!)
+  }
   if (config.protocol === 'agnes-video') {
     return new AgnesVideoClient(config.baseUrl!, config.apiKey!)
   }
@@ -680,6 +750,121 @@ export class MiniMaxVideoClient implements VideoGenClient {
   }
 }
 
+export class VolcengineArkVideoClient implements VideoGenClient {
+  readonly id = 'volcengine-ark-video'
+  private readonly tasksUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string
+  ) {
+    this.tasksUrl = volcengineArkVideoTasksUrl(baseUrl)
+  }
+
+  async generate(request: VideoGenRequest): Promise<GeneratedMedia> {
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    const content: VolcengineArkVideoContent[] = [
+      { type: 'text', text: request.prompt }
+    ]
+    if (request.firstFrameImage) {
+      content.push({
+        type: 'image_url',
+        image_url: {
+          url: dataUri(request.firstFrameImage.mimeType, request.firstFrameImage.data)
+        },
+        role: 'first_frame'
+      })
+    }
+    if (request.lastFrameImage) {
+      content.push({
+        type: 'image_url',
+        image_url: {
+          url: dataUri(request.lastFrameImage.mimeType, request.lastFrameImage.data)
+        },
+        role: 'last_frame'
+      })
+    }
+
+    const createPayload = await requestJson<VolcengineArkVideoCreatePayload>(this.tasksUrl, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({
+        model: request.model,
+        content,
+        generate_audio: true,
+        ...(request.aspectRatio ? { ratio: request.aspectRatio } : {}),
+        duration: request.duration,
+        resolution: request.resolution.toLowerCase(),
+        watermark: false
+      }),
+      signal
+    }, request)
+    const taskId = createPayload.id?.trim()
+    if (!taskId) throw new Error('Volcano Ark video provider returned no task id')
+    await request.onUpdate?.({
+      output: { status: 'submitted', taskId, provider: this.id }
+    })
+
+    const deadline = Date.now() + request.timeoutMs
+    let lastStatus = 'submitted'
+    try {
+      while (Date.now() < deadline) {
+        await delay(request.pollIntervalMs, signal)
+        const pollPayload = await requestJson<VolcengineArkVideoTaskPayload>(
+          `${this.tasksUrl}/${encodeURIComponent(taskId)}`,
+          {
+            method: 'GET',
+            headers: this.headers(),
+            signal
+          },
+          request
+        )
+        lastStatus = pollPayload.status?.trim().toLowerCase() || lastStatus
+        await request.onUpdate?.({
+          output: { status: lastStatus, taskId, provider: this.id }
+        })
+        if (['failed', 'expired', 'cancelled', 'canceled'].includes(lastStatus)) {
+          const detail = pollPayload.error?.message?.trim() || pollPayload.error?.code?.trim()
+          throw new Error(
+            `Volcano Ark video generation ${lastStatus} (task_id=${taskId})${detail ? `: ${detail}` : ''}`
+          )
+        }
+        if (lastStatus !== 'succeeded') continue
+        const downloadUrl = pollPayload.content?.video_url?.trim()
+        if (!downloadUrl) {
+          throw new Error('Volcano Ark video provider finished without content.video_url')
+        }
+        const response = await requestResponse(downloadUrl, { method: 'GET', signal }, request)
+        if (!response.ok) throw new ImageGenHttpError(response.status, await response.text())
+        const mimeType = response.headers.get('content-type')?.split(';')[0] || 'video/mp4'
+        return {
+          data: Buffer.from(await response.arrayBuffer()),
+          mimeType,
+          extension: videoExtension(mimeType)
+        }
+      }
+    } catch (error) {
+      const signalReasonName = signal.reason instanceof Error ? signal.reason.name : ''
+      if (!request.signal.aborted && signal.aborted && signalReasonName === 'TimeoutError') {
+        throw new Error(
+          `Volcano Ark video generation timed out after ${request.timeoutMs}ms (last status: ${lastStatus})`
+        )
+      }
+      throw error
+    }
+    throw new Error(
+      `Volcano Ark video generation timed out after ${request.timeoutMs}ms (last status: ${lastStatus})`
+    )
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json'
+    }
+  }
+}
+
 export class AgnesVideoClient implements VideoGenClient {
   readonly id = 'agnes-video'
   private readonly rootUrl: string
@@ -836,6 +1021,86 @@ function extractAgnesVideoUrl(payload: AgnesVideoQueryPayload): string | undefin
   )
 }
 
+export class GrokImagineVideoClient implements VideoGenClient {
+  readonly id = 'grok-imagine-video'
+  private readonly rootUrl: string
+
+  constructor(
+    baseUrl: string,
+    private readonly apiKey: string,
+    private readonly extraHeaders: Record<string, string> = {}
+  ) {
+    this.rootUrl = trimTrailingSlashes(baseUrl)
+  }
+
+  async generate(request: VideoGenRequest): Promise<GeneratedMedia> {
+    if (request.lastFrameImage) {
+      throw new Error('Grok Imagine video does not support an explicit last frame')
+    }
+    const signal = withTimeout(request.signal, request.timeoutMs)
+    const createPayload = await requestJson<GrokVideoCreatePayload>(`${this.rootUrl}/videos/generations`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({
+        model: request.model,
+        prompt: request.prompt,
+        duration: request.duration,
+        resolution: request.resolution.toLowerCase(),
+        ...(request.firstFrameImage
+          ? { image: { url: dataUri(request.firstFrameImage.mimeType, request.firstFrameImage.data) } }
+          : request.aspectRatio
+            ? { aspect_ratio: request.aspectRatio }
+            : {}),
+        reference_images: []
+      }),
+      signal
+    }, request)
+    const requestId = createPayload.request_id?.trim()
+    if (!requestId) throw new Error('Grok Imagine video provider returned no request_id')
+    await request.onUpdate?.({
+      output: { status: 'submitted', taskId: requestId, provider: this.id }
+    })
+
+    const deadline = Date.now() + request.timeoutMs
+    let lastStatus = 'submitted'
+    while (Date.now() < deadline) {
+      await delay(request.pollIntervalMs, signal)
+      const pollPayload = await requestJson<GrokVideoPollPayload>(
+        `${this.rootUrl}/videos/${encodeURIComponent(requestId)}`,
+        { method: 'GET', headers: this.headers(), signal },
+        request
+      )
+      lastStatus = pollPayload.status?.trim().toLowerCase() || lastStatus
+      await request.onUpdate?.({
+        output: { status: lastStatus, taskId: requestId, provider: this.id }
+      })
+      if (lastStatus === 'failed' || lastStatus === 'expired') {
+        throw new Error(`Grok Imagine video generation ${lastStatus} (request_id=${requestId})`)
+      }
+      if (lastStatus !== 'done') continue
+      const downloadUrl = pollPayload.video?.url?.trim()
+      if (!downloadUrl) throw new Error('Grok Imagine video provider finished without a download URL')
+      const response = await requestResponse(downloadUrl, { method: 'GET', signal }, request)
+      if (!response.ok) throw new ImageGenHttpError(response.status, await response.text())
+      const mimeType = response.headers.get('content-type')?.split(';')[0] || 'video/mp4'
+      return {
+        data: Buffer.from(await response.arrayBuffer()),
+        mimeType,
+        extension: videoExtension(mimeType)
+      }
+    }
+    throw new Error(`Grok Imagine video generation timed out after ${request.timeoutMs}ms (last status: ${lastStatus})`)
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      ...this.extraHeaders,
+      Authorization: `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json'
+    }
+  }
+}
+
 type MiniMaxAudioPayload = {
   data?: { audio?: string }
   base_resp?: MiniMaxBaseResponse
@@ -860,6 +1125,33 @@ type MiniMaxFileRetrievePayload = {
 type MiniMaxBaseResponse = {
   status_code?: number
   status_msg?: string
+}
+
+type GrokVideoCreatePayload = {
+  request_id?: string
+}
+
+type GrokVideoPollPayload = {
+  status?: string
+  video?: { url?: string }
+}
+
+type VolcengineArkVideoContent =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image_url'
+      image_url: { url: string }
+      role: 'first_frame' | 'last_frame'
+    }
+
+type VolcengineArkVideoCreatePayload = {
+  id?: string
+}
+
+type VolcengineArkVideoTaskPayload = {
+  status?: string
+  content?: { video_url?: string }
+  error?: { code?: string; message?: string }
 }
 
 type MimoSpeechPayload = {
@@ -897,8 +1189,11 @@ async function writeGeneratedMediaFile(input: {
   const stamp = (input.nowIso?.() ?? new Date().toISOString()).replace(/\D/g, '').slice(0, 14)
   const fileName = `${input.prefix}-${stamp}-${randomBytes(2).toString('hex')}.${input.extension}`
   const relativePath = `${input.dir}/${fileName}`
-  const absolutePath = join(input.context.workspace, input.dir, fileName)
-  await mkdir(join(input.context.workspace, input.dir), { recursive: true })
+  const target = await resolveWorkspacePath(relativePath, input.context, { enforceWorkspaceBoundary: true })
+  await mkdir(dirname(target.absolutePath), { recursive: true })
+  const absolutePath = (await resolveWorkspacePath(relativePath, input.context, {
+    enforceWorkspaceBoundary: true
+  })).absolutePath
   await writeFile(absolutePath, input.data)
   return {
     relativePath,
@@ -918,9 +1213,10 @@ async function collectFrameImage(
 ): Promise<FrameImageResult | FrameImageError> {
   const rawPath = pickString(value)
   if (!rawPath) return {}
-  const resolved = resolve(context.workspace, rawPath)
-  const rel = relative(context.workspace, resolved)
-  if (rel.startsWith('..') || isAbsolute(rel)) {
+  let resolved: string
+  try {
+    resolved = (await resolveWorkspacePath(rawPath, context, { enforceWorkspaceBoundary: true })).absolutePath
+  } catch {
     return { error: toolError('invalid_reference_path', `${fieldName} must be inside the workspace: ${rawPath}`) }
   }
   let data: Buffer
@@ -1004,6 +1300,13 @@ function minimaxRootUrl(baseUrl: string): string {
   return normalized
 }
 
+export function volcengineArkVideoTasksUrl(baseUrl: string): string {
+  const normalized = trimTrailingSlashes(baseUrl.trim())
+  if (!normalized) return '/contents/generations/tasks'
+  if (normalized.toLowerCase().endsWith('/contents/generations/tasks')) return normalized
+  return `${normalized}/contents/generations/tasks`
+}
+
 function trimTrailingSlashes(value: string): string {
   let end = value.length
   while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1
@@ -1067,6 +1370,30 @@ function videoExtension(mimeType: string): string {
 function normalizeDuration(value: unknown, fallback: number): number {
   const candidate = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
   return Math.min(30, Math.max(1, candidate))
+}
+
+function normalizeGrokVideoDuration(value: unknown, fallback: number): number {
+  const candidate = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
+  return GROK_VIDEO_DURATIONS.includes(candidate as 6 | 10) ? candidate : 6
+}
+
+function normalizeGrokVideoResolution(value: unknown, fallback: string): string {
+  const candidate = (pickString(value) || fallback).toUpperCase()
+  return GROK_VIDEO_RESOLUTIONS.includes(candidate as '480P' | '720P') ? candidate : '480P'
+}
+
+function normalizeVolcengineVideoDuration(value: unknown, fallback: number): number {
+  const candidate = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : fallback
+  return Math.min(15, Math.max(4, candidate))
+}
+
+function normalizeVolcengineVideoResolution(value: unknown, fallback: string): string {
+  const candidate = (pickString(value) || fallback).toUpperCase()
+  return VOLCENGINE_VIDEO_RESOLUTIONS.includes(
+    candidate as (typeof VOLCENGINE_VIDEO_RESOLUTIONS)[number]
+  )
+    ? candidate
+    : '720P'
 }
 
 function isSuccessStatus(status: string): boolean {

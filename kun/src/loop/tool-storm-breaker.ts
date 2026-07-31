@@ -3,6 +3,7 @@ import type { ToolCallLike } from '../ports/tool-host.js'
 export type ToolStormBreakerOptions = {
   windowSize?: number
   threshold?: number
+  interactiveThreshold?: number
 }
 
 type RecentToolCall = {
@@ -13,8 +14,13 @@ type RecentToolCall = {
 
 const DEFAULT_WINDOW_SIZE = 8
 const DEFAULT_THRESHOLD = 3
+const DEFAULT_INTERACTIVE_THRESHOLD = 3
 const MUTATING_TOOL_NAMES = new Set(['write', 'edit', 'edit_diff', 'apply_patch', 'delete', 'move'])
-const STORM_EXEMPT_TOOL_NAMES = new Set(['request_user_input', 'user_input'])
+const GRAPH_MUTATING_TOOL_NAMES = new Set([
+  'graph_patch_run',
+  'graph_review_node'
+])
+const INTERACTIVE_TOOL_NAMES = new Set(['request_user_input', 'user_input'])
 
 /**
  * Prevents repeated identical tool calls from inflating dynamic history
@@ -24,15 +30,38 @@ const STORM_EXEMPT_TOOL_NAMES = new Set(['request_user_input', 'user_input'])
 export class ToolStormBreaker {
   private readonly windowSize: number
   private readonly threshold: number
+  private readonly interactiveThreshold: number
   private readonly recent: RecentToolCall[] = []
+  private interactiveCount = 0
 
   constructor(options: ToolStormBreakerOptions = {}) {
     this.windowSize = Math.max(1, Math.floor(options.windowSize ?? DEFAULT_WINDOW_SIZE))
     this.threshold = Math.max(2, Math.floor(options.threshold ?? DEFAULT_THRESHOLD))
+    this.interactiveThreshold = Math.max(
+      1,
+      Math.floor(options.interactiveThreshold ?? DEFAULT_INTERACTIVE_THRESHOLD)
+    )
   }
 
   inspect(call: ToolCallLike): { suppress: boolean; reason?: string } {
-    if (STORM_EXEMPT_TOOL_NAMES.has(call.toolName)) return { suppress: false }
+    if (call.toolName === 'graph_define_plan') {
+      // The planning draft owns candidate hashing and the single-repair
+      // policy. Let it return unchanged_invalid_plan on the second identical
+      // submission instead of converting it into a generic third-call storm.
+      return { suppress: false }
+    }
+    if (INTERACTIVE_TOOL_NAMES.has(call.toolName)) {
+      this.interactiveCount += 1
+      if (this.interactiveCount > this.interactiveThreshold) {
+        return {
+          suppress: true,
+          reason:
+            `${call.toolName} was called ${this.interactiveCount} times in this turn; ` +
+            'interactive prompt guard suppressed the repeated ask. Act on the latest answer, finish, or ask follow-up in normal text.'
+        }
+      }
+      return { suppress: false }
+    }
     const name = call.toolName
     const args = stableStringify(call.arguments)
     const readOnly = !isMutatingToolCall(call)
@@ -61,6 +90,7 @@ export class ToolStormBreaker {
 
   reset(): void {
     this.recent.length = 0
+    this.interactiveCount = 0
   }
 
   private clearReadOnlyEntries(): void {
@@ -72,7 +102,27 @@ export class ToolStormBreaker {
 
 function isMutatingToolCall(call: ToolCallLike): boolean {
   if (call.toolKind === 'file_change') return true
+  if (call.toolName === 'graph_control_run') {
+    return graphControlAction(call) !== 'inspect'
+  }
+  if (call.toolName === 'graph_supervise_node') {
+    return graphAction(call) === 'guide'
+  }
+  if (GRAPH_MUTATING_TOOL_NAMES.has(call.toolName)) return true
   return MUTATING_TOOL_NAMES.has(call.toolName)
+}
+
+function graphControlAction(call: ToolCallLike): string {
+  if (call.toolName !== 'graph_control_run') return ''
+  return graphAction(call)
+}
+
+function graphAction(call: ToolCallLike): string {
+  if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) {
+    return ''
+  }
+  const action = (call.arguments as Record<string, unknown>).action
+  return typeof action === 'string' ? action : ''
 }
 
 function stableStringify(value: unknown): string {

@@ -63,4 +63,24 @@ describe('UsageCounter.total cross-thread aggregate', () => {
     expect(total.cacheMissReasons).toBeUndefined()
     expect(total.cacheSuggestions).toBeUndefined()
   })
+
+  it('preserves reasoning, cache-write, and arbitrary currency usage', () => {
+    const counter = new UsageCounter()
+    counter.record('thread-a', snapshot({
+      reasoningTokens: 7,
+      cacheWriteTokens: 11,
+      costByCurrency: { EUR: 0.25 }
+    }))
+    counter.record('thread-a', snapshot({
+      reasoningTokens: 3,
+      cacheWriteTokens: 5,
+      costByCurrency: { EUR: 0.15 }
+    }))
+
+    expect(counter.forThread('thread-a')).toMatchObject({
+      reasoningTokens: 10,
+      cacheWriteTokens: 16,
+      costByCurrency: { EUR: 0.4 }
+    })
+  })
 })

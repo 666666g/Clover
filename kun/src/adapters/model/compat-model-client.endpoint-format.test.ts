@@ -3,12 +3,21 @@ import { CompatModelClient } from './compat-model-client.js'
 import type { ModelCapabilityMetadata } from '../../contracts/capabilities.js'
 import type { ModelEndpointFormat } from '../../contracts/model-endpoint-format.js'
 import type { ModelRequest, ModelStreamChunk } from '../../ports/model-client.js'
+import { makeCompactionItem } from '../../domain/item.js'
+import { GRAPH_DEFINE_PLAN_INPUT_JSON_SCHEMA } from '../tool/graph-mode-tool-provider.js'
+import { createCompatRequestCodecs, normalizeToolSpecs } from './compat-request-builder.js'
 
 // A single provider (OpenCode Go) routes some models over chat completions
 // and others over Anthropic Messages. The wire format is resolved per request
 // model from its capability metadata, falling back to the provider format.
 
 type CapturedCall = { url: string; body: Record<string, unknown> }
+
+const DEEPSEEK_REASONING: NonNullable<ModelCapabilityMetadata['reasoning']> = {
+  supportedEfforts: ['off', 'high', 'max'],
+  defaultEffort: 'max',
+  requestProtocol: 'deepseek-chat-completions'
+}
 
 function modelCapabilities(
   overrides: Record<string, ModelEndpointFormat>
@@ -57,6 +66,309 @@ async function drain(iterable: AsyncIterable<ModelStreamChunk>): Promise<ModelSt
 }
 
 describe('CompatModelClient per-model endpointFormat', () => {
+  it('uses Gemini-compatible reasoning controls on the Google OpenAI endpoint', () => {
+    const codecs = createCompatRequestCodecs()
+    const expected = new Map([
+      ['auto', undefined],
+      ['off', 'minimal'],
+      ['low', 'low'],
+      ['medium', 'medium'],
+      ['high', 'high'],
+      ['max', 'high']
+    ])
+
+    for (const [reasoningEffort, wireEffort] of expected) {
+      const body = codecs.build({
+        request: { ...request('gemini-3.6-flash'), reasoningEffort },
+        model: 'gemini-3.6-flash',
+        messages: [],
+        tools: [],
+        stream: true,
+        endpointFormat: 'chat_completions',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        isCodex: false,
+        isCodexLite: false,
+        codexNativeImageGeneration: false
+      })
+
+      expect(body).not.toHaveProperty('thinking')
+      if (wireEffort === undefined) {
+        expect(body).not.toHaveProperty('reasoning_effort')
+      } else {
+        expect(body.reasoning_effort).toBe(wireEffort)
+      }
+    }
+  })
+
+  it('keeps DeepSeek thinking controls scoped to the official DeepSeek host', () => {
+    const codecs = createCompatRequestCodecs()
+    const build = (baseUrl: string) => codecs.build({
+      request: { ...request('custom-model'), reasoningEffort: 'off' },
+      model: 'custom-model',
+      messages: [],
+      tools: [],
+      stream: true,
+      endpointFormat: 'chat_completions',
+      baseUrl,
+      isCodex: false,
+      isCodexLite: false,
+      codexNativeImageGeneration: false
+    })
+
+    expect(build('https://api.deepseek.com').thinking).toEqual({ type: 'disabled' })
+    expect(build('https://openrouter.ai/api/v1')).not.toHaveProperty('thinking')
+  })
+
+  it('disables DeepSeek thinking when a named tool choice is required', () => {
+    const codecs = createCompatRequestCodecs()
+    const tools = normalizeToolSpecs([{
+      name: 'graph_create_run',
+      description: 'Create a Graph run',
+      inputSchema: { type: 'object', additionalProperties: false }
+    }])
+    const build = (reasoningEffort?: string) => codecs.build({
+      request: {
+        ...request('deepseek-v4-pro'),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        requiredToolName: 'graph_create_run'
+      },
+      model: 'deepseek-v4-pro',
+      messages: [],
+      tools,
+      stream: true,
+      endpointFormat: 'chat_completions',
+      baseUrl: 'https://api.deepseek.com',
+      reasoning: DEEPSEEK_REASONING,
+      isCodex: false,
+      isCodexLite: false,
+      codexNativeImageGeneration: false
+    })
+
+    for (const body of [build('high'), build()]) {
+      expect(body.thinking).toEqual({ type: 'disabled' })
+      expect(body).not.toHaveProperty('reasoning_effort')
+      expect(body.tool_choice).toEqual({
+        type: 'function', function: { name: 'graph_create_run' }
+      })
+    }
+  })
+
+  it('keeps required-tool thinking fallback scoped to official DeepSeek requests', () => {
+    const codecs = createCompatRequestCodecs()
+    const tools = normalizeToolSpecs([{
+      name: 'graph_create_run',
+      description: 'Create a Graph run',
+      inputSchema: { type: 'object', additionalProperties: false }
+    }])
+    const build = (baseUrl: string, requiredToolName?: string) => codecs.build({
+      request: {
+        ...request('deepseek-v4-pro'),
+        reasoningEffort: 'high',
+        ...(requiredToolName ? { requiredToolName } : {})
+      },
+      model: 'deepseek-v4-pro',
+      messages: [],
+      tools,
+      stream: true,
+      endpointFormat: 'chat_completions',
+      baseUrl,
+      reasoning: DEEPSEEK_REASONING,
+      isCodex: false,
+      isCodexLite: false,
+      codexNativeImageGeneration: false
+    })
+
+    const ordinaryDeepSeek = build('https://api.deepseek.com')
+    expect(ordinaryDeepSeek.thinking).toEqual({ type: 'enabled' })
+    expect(ordinaryDeepSeek.reasoning_effort).toBe('high')
+    expect(ordinaryDeepSeek).not.toHaveProperty('tool_choice')
+
+    const compatibleProvider = build('https://provider.example/v1', 'graph_create_run')
+    expect(compatibleProvider).not.toHaveProperty('thinking')
+    expect(compatibleProvider.reasoning_effort).toBe('high')
+    expect(compatibleProvider.tool_choice).toEqual({
+      type: 'function', function: { name: 'graph_create_run' }
+    })
+  })
+
+  it('excludes local tool provenance from every supported wire format', () => {
+    const codecs = createCompatRequestCodecs()
+    const tools = normalizeToolSpecs([{
+      name: 'read_file',
+      description: 'Read a file',
+      inputSchema: { type: 'object', properties: {} },
+      providerKind: 'gui',
+      providerId: 'design-canvas'
+    }])
+
+    for (const endpointFormat of ['chat_completions', 'responses', 'messages'] as const) {
+      const body = codecs.build({
+        request: request('test-model'),
+        model: 'test-model',
+        messages: [],
+        tools,
+        stream: true,
+        endpointFormat,
+        baseUrl: 'https://provider.example/v1',
+        isCodex: false,
+        isCodexLite: false,
+        codexNativeImageGeneration: false
+      })
+      const serialized = JSON.stringify(body)
+      expect(serialized).toContain('read_file')
+      expect(serialized).not.toContain('providerKind')
+      expect(serialized).not.toContain('providerId')
+      expect(serialized).not.toContain('design-canvas')
+      if (endpointFormat === 'responses') {
+        expect(body).not.toHaveProperty('prompt_cache_key')
+      }
+    }
+  })
+
+  it('uses protocol-native named tool choice for every compatible endpoint', () => {
+    const codecs = createCompatRequestCodecs()
+    const tools = normalizeToolSpecs([{
+      name: 'graph_create_run',
+      description: 'Create a Graph run',
+      inputSchema: { type: 'object', additionalProperties: false }
+    }])
+    const build = (endpointFormat: 'chat_completions' | 'responses' | 'messages', isCodexLite = false) =>
+      codecs.build({
+        request: { ...request('test-model'), requiredToolName: 'graph_create_run' },
+        model: 'test-model',
+        messages: [],
+        tools,
+        stream: true,
+        endpointFormat,
+        baseUrl: 'https://provider.example/v1',
+        isCodex: isCodexLite,
+        isCodexLite,
+        codexNativeImageGeneration: false
+      })
+
+    expect(build('chat_completions').tool_choice).toEqual({
+      type: 'function', function: { name: 'graph_create_run' }
+    })
+    expect(build('responses').tool_choice).toEqual({ type: 'function', name: 'graph_create_run' })
+    expect(build('responses').parallel_tool_calls).toBe(false)
+    expect(build('messages').tool_choice).toEqual({ type: 'tool', name: 'graph_create_run' })
+    expect(build('responses', true).tool_choice).toEqual({ type: 'function', name: 'graph_create_run' })
+
+    expect(() => codecs.build({
+      request: { ...request('test-model'), requiredToolName: 'missing_tool' },
+      model: 'test-model',
+      messages: [],
+      tools,
+      stream: true,
+      endpointFormat: 'responses',
+      baseUrl: 'https://provider.example/v1',
+      isCodex: false,
+      isCodexLite: false,
+      codexNativeImageGeneration: false
+    })).toThrow(/required_tool_unsupported/)
+  })
+
+  it('preserves the minimal graph_define_plan schema in OpenAI and Anthropic wire formats', () => {
+    const codecs = createCompatRequestCodecs()
+    const tools = normalizeToolSpecs([{
+      name: 'graph_define_plan',
+      description: 'Define a Graph plan',
+      inputSchema: GRAPH_DEFINE_PLAN_INPUT_JSON_SCHEMA
+    }])
+
+    for (const endpointFormat of ['chat_completions', 'responses', 'messages'] as const) {
+      const body = codecs.build({
+        request: request('test-model'),
+        model: 'test-model',
+        messages: [],
+        tools,
+        stream: true,
+        endpointFormat,
+        baseUrl: 'https://provider.example/v1',
+        isCodex: false,
+        isCodexLite: false,
+        codexNativeImageGeneration: false
+      })
+      const wireTools = body.tools as Array<Record<string, unknown>>
+      const wireSchema = endpointFormat === 'chat_completions'
+        ? (wireTools[0]?.function as Record<string, unknown>)?.parameters
+        : endpointFormat === 'messages'
+          ? wireTools[0]?.input_schema
+          : wireTools[0]?.parameters
+      const schema = wireSchema as {
+        properties: {
+          plan: {
+            properties: Record<string, unknown> & {
+              tasks: {
+                items: {
+                  oneOf: Array<{
+                    properties: Record<string, unknown>
+                    required: string[]
+                  }>
+                }
+              }
+            }
+          }
+        }
+      }
+
+      expect(schema.properties.plan.properties).toHaveProperty('tasks')
+      expect(schema.properties.plan.properties).toHaveProperty('completionTaskKeys')
+      const branches = schema.properties.plan.properties.tasks.items.oneOf
+      const ordinary = branches.find((branch) => !branch.required.includes('loop'))
+      expect(ordinary?.properties).not.toHaveProperty('loop')
+      const encoded = JSON.stringify(wireSchema)
+      for (const forbidden of [
+        'budget',
+        'model',
+        'providerId',
+        'reasoningEffort',
+        'timeout',
+        'maxAttempts',
+        'priority',
+        'phase',
+        'revision',
+        'workspaceRoot',
+        'runId',
+        'timestamp'
+      ]) {
+        expect(encoded).not.toContain(`"${forbidden}"`)
+      }
+    }
+  })
+
+  it('uses stable thread-scoped prompt cache keys only for Codex Responses', () => {
+    const codecs = createCompatRequestCodecs()
+    const buildResponses = (threadId: string, isCodex: boolean, isCodexLite = false) =>
+      codecs.build({
+        request: { ...request('gpt-5.6-sol'), threadId },
+        model: 'gpt-5.6-sol',
+        messages: [],
+        tools: [],
+        stream: true,
+        endpointFormat: 'responses',
+        baseUrl: isCodex
+          ? 'https://chatgpt.com/backend-api/codex'
+          : 'https://provider.example/v1',
+        isCodex,
+        isCodexLite,
+        codexNativeImageGeneration: false
+      })
+
+    const first = buildResponses('thread-a', true)
+    const repeated = buildResponses('thread-a', true)
+    const isolated = buildResponses('thread-b', true)
+    const lite = buildResponses('thread-a', true, true)
+    const compatible = buildResponses('thread-a', false)
+
+    expect(first.prompt_cache_key).toBe('thread-a')
+    expect(repeated.prompt_cache_key).toBe(first.prompt_cache_key)
+    expect(isolated.prompt_cache_key).toBe('thread-b')
+    expect(isolated.prompt_cache_key).not.toBe(first.prompt_cache_key)
+    expect(lite.prompt_cache_key).toBe('thread-a')
+    expect(compatible).not.toHaveProperty('prompt_cache_key')
+  })
+
   it('routes an override model to the Anthropic Messages endpoint while others use chat completions', async () => {
     const calls: CapturedCall[] = []
     const client = new CompatModelClient({
@@ -145,5 +457,170 @@ describe('CompatModelClient per-model endpointFormat', () => {
       'https://api.z.ai/api/coding/paas/v4/chat/completions'
     ])
     expect(calls.every((call) => call.body.messages)).toBe(true)
+  })
+
+  it('keeps compacted Codex history in Responses input while preserving stable instructions', async () => {
+    const calls: CapturedCall[] = []
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      apiKey: 'oauth-access-token',
+      model: 'gpt-5.3-codex-spark',
+      endpointFormat: 'custom_endpoint',
+      nonStreaming: true,
+      fetchImpl: (async (url: string, init: { body: string }) => {
+        calls.push({ url: String(url), body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(JSON.stringify({ output_text: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }) as unknown as typeof fetch,
+      modelCapabilities: modelCapabilities({})
+    })
+
+    await drain(client.stream({
+      ...request('gpt-5.3-codex-spark'),
+      history: [makeCompactionItem({
+        id: 'compaction_1',
+        threadId: 't1',
+        turnId: 'u1',
+        summary: 'Preserve the repository findings.',
+        replacedTokens: 80_000,
+        pinnedConstraints: []
+      })]
+    }))
+
+    expect(calls[0].body.instructions).toBe('You are a helpful assistant.')
+    expect(calls[0].body.input).toEqual([{
+      role: 'system',
+      content: 'Conversation summary from earlier turns:\nPreserve the repository findings.'
+    }])
+    expect(JSON.stringify(calls[0].body)).not.toContain('compat-history-context')
+  })
+
+  it('moves system-only Codex context into Responses input without duplicating it', async () => {
+    const calls: CapturedCall[] = []
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      apiKey: 'oauth-access-token',
+      model: 'gpt-5.3-codex-spark',
+      endpointFormat: 'custom_endpoint',
+      nonStreaming: true,
+      fetchImpl: (async (url: string, init: { body: string }) => {
+        calls.push({ url: String(url), body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(JSON.stringify({ output_text: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }) as unknown as typeof fetch,
+      modelCapabilities: modelCapabilities({})
+    })
+
+    await drain(client.stream(request('gpt-5.3-codex-spark')))
+
+    expect(calls[0].body.instructions).toBe(' ')
+    expect(calls[0].body.input).toEqual([{
+      role: 'system',
+      content: 'You are a helpful assistant.'
+    }])
+    expect(JSON.stringify(calls[0].body).match(/You are a helpful assistant\./g)).toHaveLength(1)
+  })
+
+  it('uses the Codex Responses Lite shape for GPT-5.6 models', async () => {
+    const calls: Array<{ headers: Record<string, string>; body: Record<string, unknown> }> = []
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: 'oauth-access-token',
+      model: 'gpt-5.6-sol',
+      endpointFormat: 'responses',
+      nonStreaming: true,
+      fetchImpl: (async (_url: string, init: { headers: Record<string, string>; body: string }) => {
+        calls.push({ headers: init.headers, body: JSON.parse(init.body) as Record<string, unknown> })
+        return new Response(JSON.stringify({ output_text: 'ok' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }) as unknown as typeof fetch,
+      modelCapabilities: (model) => ({
+        id: model,
+        endpointFormat: 'responses',
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        messageParts: ['text', 'image_url'],
+        serviceTiers: model === 'gpt-5.6-sol' ? ['priority'] : undefined,
+        responsesMode: model === 'gpt-5.6-sol' ? 'lite' : undefined
+      })
+    })
+
+    await drain(client.stream({
+      ...request('gpt-5.6-sol'),
+      reasoningEffort: 'max',
+      serviceTier: 'priority',
+      tools: [{
+        name: 'read_file',
+        description: 'Read a file',
+        inputSchema: { type: 'object', properties: {} }
+      }]
+    }))
+
+    expect(calls[0].headers['x-openai-internal-codex-responses-lite']).toBe('true')
+    expect(calls[0].body).toMatchObject({
+      model: 'gpt-5.6-sol',
+      store: false,
+      parallel_tool_calls: false,
+      prompt_cache_key: 't1',
+      service_tier: 'priority',
+      reasoning: { effort: 'xhigh', context: 'all_turns' }
+    })
+    expect(calls[0].body).not.toHaveProperty('instructions')
+    expect(calls[0].body).not.toHaveProperty('tools')
+    const input = calls[0].body.input as Array<Record<string, unknown>>
+    expect(input[0]).toMatchObject({
+      type: 'additional_tools',
+      role: 'developer',
+      tools: [{ type: 'function', name: 'read_file' }]
+    })
+    expect(input[0].tools).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'image_generation' })
+    ]))
+    expect(input[1]).toMatchObject({ type: 'message', role: 'developer' })
+  })
+
+  it('omits the priority service tier for unsupported Codex models', async () => {
+    const calls: CapturedCall[] = []
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      apiKey: 'oauth-access-token',
+      model: 'gpt-5.4-mini',
+      endpointFormat: 'responses',
+      nonStreaming: true,
+      fetchImpl: fakeFetch(calls),
+      modelCapabilities: modelCapabilities({})
+    })
+
+    await drain(client.stream({
+      ...request('gpt-5.4-mini'),
+      serviceTier: 'priority'
+    }))
+
+    expect(calls[0].body).not.toHaveProperty('service_tier')
+  })
+
+  it('never forwards the priority service tier to non-Codex Responses endpoints', () => {
+    const body = createCompatRequestCodecs().build({
+      request: { ...request('gpt-5.4'), serviceTier: 'priority' },
+      model: 'gpt-5.4',
+      messages: [],
+      tools: [],
+      stream: true,
+      endpointFormat: 'responses',
+      baseUrl: 'https://api.openai.com/v1',
+      isCodex: false,
+      isCodexLite: false,
+      serviceTiers: ['priority'],
+      codexNativeImageGeneration: false
+    })
+
+    expect(body).not.toHaveProperty('service_tier')
   })
 })

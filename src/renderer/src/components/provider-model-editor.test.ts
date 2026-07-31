@@ -36,6 +36,10 @@ function chatForm(
 }
 
 describe('provider-model-editor', () => {
+  it('defaults new chat models to a 256k context window', () => {
+    expect(newProviderModelForm('chat', provider()).contextWindowTokens).toBe(256_000)
+  })
+
   it('derives the reasoning protocol from the provider connection', () => {
     expect(defaultReasoningProtocolForProvider(provider())).toBe('deepseek-chat-completions')
     expect(

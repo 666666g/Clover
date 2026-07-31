@@ -25,23 +25,25 @@ function renderHero(options: {
   )
 }
 
-describe('MessageTimeline initial heatmap empty hero routing', () => {
+describe('MessageTimeline empty hero routing', () => {
   beforeEach(async () => {
     await i18n.changeLanguage('en')
   })
 
-  it('shows the collapsed Kun calendar for eligible initial chat states', () => {
+  it('shows the approved text-only welcome for an eligible initial chat state', () => {
     const html = renderHero()
 
-    expect(html).toContain('Expand calendar')
-    expect(html).not.toContain('Daily Kun usage calendar')
-    expect(html).not.toContain('Start a new conversation')
+    expect(html).toContain('What would you like to do with Kun today?')
+    expect(html).toContain('Describe your idea, or start a new task')
+    expect(html).not.toContain('ds-initial-usage-heatmap')
+    expect(html).not.toContain('Expand calendar')
   })
 
-  it('keeps offline, missing-workspace, and Claw empty states gated away from the heatmap', () => {
+  it('routes offline, missing-workspace, and Claw states to their dedicated heroes', () => {
     const offlineHtml = renderHero({ ready: false })
     expect(offlineHtml).toContain('Kun is waking the local agent')
-    expect(offlineHtml).toContain('ds-kun-state-sleep')
+    expect(offlineHtml).toContain('ds-runtime-wake-hero')
+    expect(offlineHtml).not.toContain('ds-kun-state-')
     const workspaceHtml = renderHero({ hasWorkspace: false })
     expect(workspaceHtml).toContain('Choose working directory')
     expect(workspaceHtml).toContain('ds-kun-state-sit')

@@ -1,3 +1,13 @@
+!macro customInit
+  ${if} ${isUpdated}
+    # electron-updater always passes --updated, including older Kun versions
+    # that launched the assisted installer without /S. Force only that path
+    # into silent mode so retry/cancel dialogs use their safe default while a
+    # manually launched installer remains interactive.
+    SetSilent silent
+  ${endif}
+!macroend
+
 !macro customCheckAppRunning
   Var /GLOBAL KunInstallerCurrentPid
   Var /GLOBAL KunInstallerStopAttempt
@@ -70,4 +80,18 @@
 
 !macro customUnInstallCheckCurrentUser
   !insertmacro kunContinueAfterOldUninstallerFailure
+!macroend
+
+!macro customInstall
+  DetailPrint "Adding $INSTDIR\bin to PATH for the kun terminal command."
+  System::Call 'kernel32::SetEnvironmentVariable(t, t)i ("KUN_CLI_BIN", "$INSTDIR\bin").r0'
+  nsExec::ExecToLog `"$PowerShellPath" -NoProfile -ExecutionPolicy Bypass -Command "$$p=[Environment]::GetEnvironmentVariable('Path','User');$$parts=@($$p -split ';' | ? { $$_.Trim() -ne '' });if(-not ($$parts | ? { $$_.TrimEnd('\').Equals($$env:KUN_CLI_BIN.TrimEnd('\'),'OrdinalIgnoreCase') })){[Environment]::SetEnvironmentVariable('Path',(($$parts + $$env:KUN_CLI_BIN) -join ';'),'User')}"`
+  System::Call 'user32::SendMessageTimeout(i 0xffff, i 0x001A, i 0, t "Environment", i 2, i 5000, *i .r0)'
+!macroend
+
+!macro customUnInstall
+  DetailPrint "Removing $INSTDIR\bin from PATH."
+  System::Call 'kernel32::SetEnvironmentVariable(t, t)i ("KUN_CLI_BIN", "$INSTDIR\bin").r0'
+  nsExec::ExecToLog `"$PowerShellPath" -NoProfile -ExecutionPolicy Bypass -Command "$$p=[Environment]::GetEnvironmentVariable('Path','User');$$parts=@($$p -split ';' | ? { $$_.Trim() -ne '' -and -not $$_.TrimEnd('\').Equals($$env:KUN_CLI_BIN.TrimEnd('\'),'OrdinalIgnoreCase') });[Environment]::SetEnvironmentVariable('Path',($$parts -join ';'),'User')"`
+  System::Call 'user32::SendMessageTimeout(i 0xffff, i 0x001A, i 0, t "Environment", i 2, i 5000, *i .r0)'
 !macroend

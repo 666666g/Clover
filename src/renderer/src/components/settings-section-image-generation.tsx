@@ -1,8 +1,11 @@
 import { useState, useEffect, type ReactElement } from 'react'
 import {
   CUSTOM_IMAGE_GENERATION_PROVIDER_ID,
+  DEFAULT_IMAGE_GENERATION_RESOLUTION,
   DEFAULT_IMAGE_GENERATION_PROTOCOL,
+  IMAGE_GENERATION_QUALITIES,
   IMAGE_GENERATION_PROTOCOLS,
+  IMAGE_GENERATION_RESOLUTIONS,
   resolveKunImageGenerationSettings,
   type ImageGenerationProtocol
 } from '@shared/app-settings'
@@ -15,8 +18,24 @@ const DEFAULT_IMAGE_GENERATION = {
   baseUrl: '',
   apiKey: '',
   model: '',
+  defaultResolution: DEFAULT_IMAGE_GENERATION_RESOLUTION,
   defaultSize: '',
+  quality: 'auto',
   timeoutMs: 180000
+}
+
+function imageGenerationProtocolLabelKey(protocol: string): string {
+  if (protocol === 'minimax-image') return 'imageGenProtocolMiniMax'
+  if (protocol === 'codex-responses-image') return 'imageGenProtocolCodex'
+  if (protocol === 'grok-imagine-image') return 'imageGenProtocolGrok'
+  if (protocol === 'volcengine-ark-image') return 'imageGenProtocolVolcengineArk'
+  if (protocol === 'agnes-image') return 'imageGenProtocolAgnes'
+  return 'imageGenProtocolOpenAi'
+}
+
+function preferredImageGenerationModel(image: { protocol?: string; models?: string[] } | undefined): string {
+  if (image?.protocol === 'codex-responses-image' && image.models?.includes('gpt-image-2')) return 'gpt-image-2'
+  return image?.models?.[0] ?? ''
 }
 
 export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, any> }): ReactElement {
@@ -42,6 +61,18 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
   const selectedImageProvider = imageProviders.find((item: { id: string }) => item.id === selectedProviderId)
   const usingCustomProvider = selectedProviderId === CUSTOM_IMAGE_GENERATION_PROVIDER_ID || !selectedImageProvider
   const selectedProviderImage = selectedImageProvider?.image
+  const effectiveImageProtocol = selectedProviderImage?.protocol ?? imageGeneration.protocol
+  const isVolcengineArkImage = effectiveImageProtocol === 'volcengine-ark-image'
+  const imageResolutionOptions = isVolcengineArkImage
+    ? IMAGE_GENERATION_RESOLUTIONS.filter((resolution) => (
+        resolution === '2K' || resolution === '3K' || resolution === '4K'
+      ))
+    : IMAGE_GENERATION_RESOLUTIONS.filter((resolution) => (
+        resolution === 'auto' || resolution === '1K' || resolution === '2K'
+      ))
+  const effectiveImageResolution = imageResolutionOptions.includes(imageGeneration.defaultResolution)
+    ? imageGeneration.defaultResolution
+    : imageResolutionOptions[0]
   const imageModelOptions = usingCustomProvider
     ? []
     : selectedProviderImage?.models ?? []
@@ -95,7 +126,7 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                         : nextProvider?.image?.protocol ?? DEFAULT_IMAGE_GENERATION_PROTOCOL,
                       model: providerId === CUSTOM_IMAGE_GENERATION_PROVIDER_ID
                         ? imageGeneration.model
-                        : nextProvider?.image?.models?.[0] ?? ''
+                        : preferredImageGenerationModel(nextProvider?.image)
                     })
                   }}
                 >
@@ -123,18 +154,11 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                     value={imageGeneration.protocol}
                     onChange={(e) => updateImageGeneration({ protocol: e.target.value })}
                   >
-                    {IMAGE_GENERATION_PROTOCOLS.map((protocol) => {
-                      const labelKey: Record<ImageGenerationProtocol, string> = {
-                        'openai-images': 'imageGenProtocolOpenAi',
-                        'minimax-image': 'imageGenProtocolMiniMax',
-                        'agnes-image': 'imageGenProtocolAgnes'
-                      }
-                      return (
-                        <option key={protocol} value={protocol}>
-                          {t(labelKey[protocol])}
-                        </option>
-                      )
-                    })}
+                    {IMAGE_GENERATION_PROTOCOLS.map((protocol) => (
+                      <option key={protocol} value={protocol}>
+                        {t(imageGenerationProtocolLabelKey(protocol))}
+                      </option>
+                    ))}
                   </select>
                 }
               />
@@ -185,7 +209,7 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                     value={imageModelOptions.includes(imageGeneration.model) ? imageGeneration.model : ''}
                     options={imageModelOptions}
                     defaultLabel={t('modelSelectDefaultOption', {
-                      model: imageModelOptions[0] ?? ''
+                      model: preferredImageGenerationModel(selectedProviderImage)
                     })}
                     selectClassName={selectControlClass}
                     onChange={(model) => updateImageGeneration({ model })}
@@ -197,6 +221,40 @@ export function ImageGenerationSettingsSection({ ctx }: { ctx: Record<string, an
           <div className="px-3 py-3">
             <InlineNoticeView notice={{ tone: 'info', message: t('imageGenModelQualityHint') }} />
           </div>
+          <SettingRow
+            title={t('imageGenQuality')}
+            description={t('imageGenQualityDesc')}
+            control={
+              <select
+                className={selectControlClass}
+                value={imageGeneration.quality}
+                onChange={(e) => updateImageGeneration({ quality: e.target.value })}
+              >
+                {IMAGE_GENERATION_QUALITIES.map((quality) => (
+                  <option key={quality} value={quality}>
+                    {t(`imageGenQuality_${quality}`)}
+                  </option>
+                ))}
+              </select>
+            }
+          />
+          <SettingRow
+            title={t('imageGenDefaultResolution')}
+            description={t('imageGenDefaultResolutionDesc')}
+            control={
+              <select
+                className={selectControlClass}
+                value={effectiveImageResolution}
+                onChange={(e) => updateImageGeneration({ defaultResolution: e.target.value })}
+              >
+                {imageResolutionOptions.map((resolution) => (
+                  <option key={resolution} value={resolution}>
+                    {t(`imageGenDefaultResolution_${resolution}`)}
+                  </option>
+                ))}
+              </select>
+            }
+          />
           <SettingRow
             title={t('imageGenDefaultSize')}
             description={t('imageGenDefaultSizeDesc')}

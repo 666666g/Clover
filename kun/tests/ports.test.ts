@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { InMemoryEventBus } from '../src/adapters/in-memory-event-bus.js'
 import { InMemoryApprovalGate } from '../src/adapters/in-memory-approval-gate.js'
+import { InMemoryUserInputGate } from '../src/adapters/in-memory-user-input-gate.js'
 import { InMemoryThreadStore } from '../src/adapters/in-memory-thread-store.js'
 import { InMemorySessionStore } from '../src/adapters/in-memory-session-store.js'
 import { LocalToolHost, defaultLocalTools } from '../src/adapters/tool/local-tool-host.js'
@@ -27,6 +28,20 @@ describe('InMemoryEventBus', () => {
     bus.publish({ kind: 'heartbeat', seq: 2, timestamp: 't', threadId: 'a' })
     expect(received).toEqual([1])
   })
+
+  it('clears retained state for only the deleted thread', () => {
+    const bus = new InMemoryEventBus()
+    bus.publish({ kind: 'heartbeat', seq: 1, timestamp: 't', threadId: 'a' })
+    bus.publish({ kind: 'heartbeat', seq: 1, timestamp: 't', threadId: 'b' })
+
+    bus.clearThread('a')
+
+    expect(bus.snapshotSince('a', 0)).toEqual([])
+    expect(bus.highestSeq('a')).toBe(0)
+    expect(bus.allocateSeq('a')).toBe(1)
+    expect(bus.snapshotSince('b', 0)).toHaveLength(1)
+    expect(bus.highestSeq('b')).toBe(1)
+  })
 })
 
 describe('InMemoryApprovalGate', () => {
@@ -51,6 +66,33 @@ describe('InMemoryApprovalGate', () => {
     expect(gate.decide('missing', 'deny')).toBe(false)
   })
 
+  it('expires a pending approval and settles its waiter', async () => {
+    const gate = new InMemoryApprovalGate()
+    const approval = createApprovalRequest({
+      id: 'a', threadId: 't', turnId: 'tu', toolName: 'echo', summary: 's'
+    })
+    const pending = gate.request(approval)
+
+    expect(gate.expire('a', 'turn aborted')).toBe(true)
+    await expect(pending).resolves.toBe('deny')
+    expect(gate.get('a')).toMatchObject({ status: 'expired', reason: 'turn aborted' })
+  })
+
+  it('bounds resolved approval retention without evicting pending requests', async () => {
+    const gate = new InMemoryApprovalGate({ resolvedCapacity: 1 })
+    for (const id of ['a', 'b']) {
+      const approval = createApprovalRequest({ id, threadId: 't', turnId: 'u', toolName: 'x', summary: 's' })
+      void gate.request(approval)
+      gate.decide(id, 'deny')
+    }
+    const pending = createApprovalRequest({ id: 'pending', threadId: 't', turnId: 'u', toolName: 'x', summary: 's' })
+    void gate.request(pending)
+
+    expect(gate.get('a')).toBeUndefined()
+    expect(gate.get('b')?.status).toBe('denied')
+    expect(gate.pending()).toEqual([pending])
+  })
+
   it('filters pending by thread', () => {
     const gate = new InMemoryApprovalGate()
     gate.request(
@@ -60,6 +102,81 @@ describe('InMemoryApprovalGate', () => {
       createApprovalRequest({ id: 'b', threadId: 'th2', turnId: 't', toolName: 'x', summary: 's' })
     )
     expect(gate.pending('th1')).toHaveLength(1)
+  })
+
+  it('rejects duplicate ids instead of overwriting a pending waiter', async () => {
+    const gate = new InMemoryApprovalGate()
+    const approval = createApprovalRequest({
+      id: 'duplicate',
+      threadId: 't',
+      turnId: 'tu',
+      toolName: 'echo',
+      summary: 's'
+    })
+    const first = gate.request(approval)
+
+    expect(() => gate.request(approval)).toThrow('duplicate approval id: duplicate')
+    expect(gate.decide('duplicate', 'allow')).toBe(true)
+    await expect(first).resolves.toBe('allow')
+  })
+
+  it('commits a reserved decision after a concurrent expiration request', async () => {
+    const gate = new InMemoryApprovalGate()
+    const pending = gate.request(createApprovalRequest({
+      id: 'reserved',
+      threadId: 't',
+      turnId: 'tu',
+      toolName: 'echo',
+      summary: 's'
+    }))
+
+    expect(gate.reserveDecision('reserved', 'allow')).toBe(true)
+    expect(gate.expire('reserved', 'turn aborted')).toBe(true)
+    expect(gate.get('reserved')?.status).toBe('pending')
+    expect(gate.commitDecision('reserved')).toBe(true)
+    await expect(pending).resolves.toBe('allow')
+    expect(gate.get('reserved')?.status).toBe('allowed')
+  })
+
+  it('applies deferred expiration when an audited decision rolls back', async () => {
+    const gate = new InMemoryApprovalGate()
+    const pending = gate.request(createApprovalRequest({
+      id: 'rolled_back',
+      threadId: 't',
+      turnId: 'tu',
+      toolName: 'echo',
+      summary: 's'
+    }))
+
+    expect(gate.reserveDecision('rolled_back', 'allow')).toBe(true)
+    expect(gate.expire('rolled_back', 'turn aborted')).toBe(true)
+    expect(gate.rollbackDecision('rolled_back')).toBe(true)
+    await expect(pending).resolves.toBe('deny')
+    expect(gate.get('rolled_back')).toMatchObject({
+      status: 'expired',
+      reason: 'turn aborted'
+    })
+  })
+})
+
+describe('InMemoryUserInputGate', () => {
+  it('reserves a resolution while its durable event is being recorded', async () => {
+    const gate = new InMemoryUserInputGate()
+    const pending = gate.request({
+      id: 'input_1',
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      itemId: 'item_1',
+      prompt: 'Continue?',
+      questions: []
+    })
+    const claim = gate.claimResolution('input_1')
+
+    expect(claim?.request.id).toBe('input_1')
+    expect(gate.pending('thread_1')).toEqual([])
+    expect(gate.resolve('input_1', { status: 'cancelled' })).toBe(false)
+    expect(claim?.resolve({ status: 'submitted', answers: [] })).toBe(true)
+    await expect(pending).resolves.toEqual({ status: 'submitted', answers: [] })
   })
 })
 
@@ -169,21 +286,25 @@ describe('LocalToolHost', () => {
     ).rejects.toThrow(/aborted/)
   })
 
-  it('rejects user_input as unadvertised when no GUI gate is available', async () => {
+  it('returns an error when user_input has no GUI gate', async () => {
     const host = new LocalToolHost({ tools: defaultLocalTools })
-    await expect(
-      host.execute(
-        { callId: 'c1', toolName: 'user_input', arguments: { prompt: '?' } },
-        {
-          threadId: 'th',
-          turnId: 'tu',
-          workspace: '/tmp',
-          approvalPolicy: 'on-request',
-          abortSignal: new AbortController().signal,
-          awaitApproval: async () => 'allow'
-        }
-      )
-    ).rejects.toThrow(/user_input is not advertised/)
+    const result = await host.execute(
+      { callId: 'c1', toolName: 'user_input', arguments: { prompt: '?' } },
+      {
+        threadId: 'th',
+        turnId: 'tu',
+        workspace: '/tmp',
+        approvalPolicy: 'on-request',
+        abortSignal: new AbortController().signal,
+        awaitApproval: async () => 'allow'
+      }
+    )
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      toolName: 'user_input',
+      isError: true,
+      output: { error: 'structured user input is not available in this client context' }
+    })
   })
 
   it('updates in-memory session items in place', async () => {

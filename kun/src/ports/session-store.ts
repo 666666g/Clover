@@ -18,6 +18,22 @@ export type SessionLatestUsageSnapshot = {
 }
 
 /**
+ * A point-in-time view of the canonical item history. `revision` is opaque to
+ * callers and is valid for the lifetime of the active SessionStore instance.
+ * It lets a read-compute-rewrite flow detect an item append or update that
+ * landed after it loaded the history.
+ */
+export type ItemHistorySnapshot = {
+  revision: number
+  items: TurnItem[]
+}
+
+/** Result of a conditional full-history replacement. */
+export type ItemHistoryCommit =
+  | { applied: true; revision: number }
+  | { applied: false; reason: 'conflict' | 'closed'; revision?: number }
+
+/**
  * Port for persisted per-thread activity.
  *
  * The store keeps three streams: the ordered runtime event log
@@ -34,8 +50,28 @@ export interface SessionStore {
    * and explicit discard flows.
    */
   rewriteItems(threadId: string, items: TurnItem[]): Promise<void>
+  /** Load item history and its opaque revision as one consistent snapshot. */
+  loadItemSnapshot(threadId: string): Promise<ItemHistorySnapshot>
+  /**
+   * Replace item history only if no item mutation has occurred since the
+   * caller loaded `expectedRevision`.
+   */
+  rewriteItemsIfRevision(
+    threadId: string,
+    expectedRevision: number,
+    items: TurnItem[]
+  ): Promise<ItemHistoryCommit>
   updateItem(threadId: string, itemId: string, patch: Partial<TurnItem>): Promise<TurnItem | null>
   loadEventsSince(threadId: string, sinceSeq: number): Promise<RuntimeEvent[]>
+  /**
+   * Optional bounded, forward-only event replay. Serve uses this when present
+   * so a long JSONL backlog is never materialized as one giant array.
+   */
+  iterateEventsSince?(
+    threadId: string,
+    sinceSeq: number,
+    options?: { maxRecordBytes?: number }
+  ): AsyncIterable<RuntimeEvent>
   loadItems(threadId: string): Promise<TurnItem[]>
   loadSession(threadId: string): Promise<AgentSession | null>
   upsertSession(session: AgentSession): Promise<void>
@@ -50,4 +86,6 @@ export interface SessionStore {
   loadLatestUsageSnapshots?(options?: { threadIds?: string[] }): Promise<SessionLatestUsageSnapshot[]>
   /** Forget the per-thread in-memory state without touching disk. */
   resetMemory(): Promise<void>
+  /** Forget cached state for a deleted thread without recreating its files. */
+  clearThreadMemory(threadId: string): void
 }

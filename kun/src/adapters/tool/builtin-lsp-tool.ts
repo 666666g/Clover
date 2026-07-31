@@ -6,7 +6,9 @@
  * tool returns a helpful error instead of crashing.
  *
  * Operations: goToDefinition, findReferences, hover, documentSymbol,
- * workspaceSymbol, goToImplementation. All queries are read-only.
+ * workspaceSymbol, goToImplementation. Their protocol queries are read-only,
+ * but each call starts a language-server process and is therefore treated as
+ * command execution by the tool host.
  *
  * Positions use 1-based line/character (as editors display them); the tool
  * converts to 0-based before sending to the LSP server.
@@ -98,8 +100,9 @@ export function createLspLocalTool(): LocalTool {
       required: ['operation', 'filePath'],
       additionalProperties: false
     },
-    policy: 'auto',
-    toolKind: 'tool_call',
+    policy: 'on-request',
+    toolKind: 'command_execution',
+    sideEffect: 'read-only',
     execute: async (args, context) =>
       withToolBoundary(async () => {
         const operation = String(args.operation ?? '') as LspOperation

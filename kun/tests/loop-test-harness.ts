@@ -17,6 +17,7 @@ import { createThreadRecord } from '../src/domain/thread.js'
 import { createImmutablePrefix } from '../src/cache/immutable-prefix.js'
 import type { ModelClient, ModelRequest, ModelStreamChunk } from '../src/ports/model-client.js'
 import type { SkillRuntime } from '../src/skills/skill-runtime.js'
+import type { InstructionRuntime } from '../src/instructions/instruction-runtime.js'
 import type { AttachmentStore } from '../src/attachments/attachment-store.js'
 import type { ModelCapabilityMetadata } from '../src/contracts/capabilities.js'
 import type { MemoryStore } from '../src/memory/memory-store.js'
@@ -24,6 +25,8 @@ import type { TokenEconomyConfig } from '../src/loop/token-economy.js'
 import type { ToolStormBreakerOptions } from '../src/loop/tool-storm-breaker.js'
 import type { ContextCompactionConfig } from '../src/loop/model-context-profile.js'
 import type { ResolvedHook } from '../src/hooks/hook-engine.js'
+import type { AgentSdkRuntime } from '../src/runtime/agent-sdk/agent-sdk-runtime.js'
+import type { ApprovalReviewPort } from '../src/ports/approval-review.js'
 
 export type Harness = {
   threadId: string
@@ -77,6 +80,7 @@ export function makeHarness(
     /** Pre-built tool host (e.g. with a delegation-kind provider). Overrides `tools`. */
     toolHost?: LocalToolHost
     skillRuntime?: SkillRuntime
+    instructionRuntime?: InstructionRuntime
     attachmentStore?: AttachmentStore
     memoryStore?: MemoryStore
     modelCapabilities?: (model: string) => ModelCapabilityMetadata
@@ -88,6 +92,8 @@ export function makeHarness(
       maxStringBytes?: number
     }
     hooks?: readonly ResolvedHook[]
+    sdkRuntime?: AgentSdkRuntime
+    approvalReview?: ApprovalReviewPort
     goalResume?: NonNullable<ConstructorParameters<typeof AgentLoop>[0]['goalResume']>
   } = {}
 ): Harness {
@@ -118,7 +124,10 @@ export function makeHarness(
     steering,
     compactor,
     ids,
-    nowIso
+    nowIso,
+    ...(options.attachmentStore
+      ? { attachmentStore: () => options.attachmentStore }
+      : {})
   })
   const threads = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
   const loop = new AgentLoop({
@@ -139,6 +148,7 @@ export function makeHarness(
     nowIso,
     nowMs,
     ...(options.skillRuntime ? { skillRuntime: options.skillRuntime } : {}),
+    ...(options.instructionRuntime ? { instructionRuntime: options.instructionRuntime } : {}),
     ...(options.attachmentStore ? { attachmentStore: options.attachmentStore } : {}),
     ...(options.memoryStore ? { memoryStore: options.memoryStore } : {}),
     ...(options.modelCapabilities ? { modelCapabilities: options.modelCapabilities } : {}),
@@ -147,6 +157,8 @@ export function makeHarness(
     ...(options.toolStorm ? { toolStorm: options.toolStorm } : {}),
     ...(options.toolArgumentRepair ? { toolArgumentRepair: options.toolArgumentRepair } : {}),
     ...(options.hooks ? { hooks: options.hooks } : {}),
+    ...(options.sdkRuntime ? { sdkRuntime: options.sdkRuntime } : {}),
+    ...(options.approvalReview ? { approvalReview: options.approvalReview } : {}),
     ...(options.goalResume ? { goalResume: options.goalResume } : {})
   })
 

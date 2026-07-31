@@ -13,7 +13,11 @@ import type { ReviewTarget } from '../contracts/review.js'
 import { AgentLoop } from '../loop/agent-loop.js'
 import { ContextCompactor } from '../loop/context-compactor.js'
 import { InflightTracker } from '../loop/inflight-tracker.js'
-import type { ContextCompactionConfig, ModelConfig } from '../loop/model-context-profile.js'
+import type {
+  ContextCompactionConfig,
+  ModelConfig,
+  ModelContextProfile
+} from '../loop/model-context-profile.js'
 import { modelCapabilitiesForModel } from '../loop/model-context-profile.js'
 import { SteeringQueue } from '../loop/steering-queue.js'
 import type { TokenEconomyConfig } from '../loop/token-economy.js'
@@ -39,16 +43,31 @@ export type ReviewServiceDeps = {
   contextCompaction?: ContextCompactionConfig
   tokenEconomy?: TokenEconomyConfig
   runtime?: RuntimeTuningConfig
-  modelCapabilities?: (model: string) => ModelCapabilityMetadata
+  modelCapabilities?: (model: string, providerId?: string) => ModelCapabilityMetadata
+  profilesForProvider?: (
+    providerId: string | undefined
+  ) => readonly ModelContextProfile[]
   /** Reasoning depth for the code-review model call. Invalid/missing => 'off'. */
   reasoningEffort?: string
+  roleModel?: string
+  roleProviderId?: string
+  roleAccountId?: string
 }
 
 export class ReviewService {
-  private readonly deps: ReviewServiceDeps
+  private deps: ReviewServiceDeps
 
   constructor(deps: ReviewServiceDeps) {
     this.deps = deps
+  }
+
+  updateRuntimeConfig(
+    patch: Partial<Pick<ReviewServiceDeps, 'defaultModel' | 'models' | 'contextCompaction' | 'tokenEconomy' | 'runtime' | 'reasoningEffort' | 'roleModel' | 'roleProviderId' | 'roleAccountId'>>
+  ): void {
+    this.deps = {
+      ...this.deps,
+      ...patch
+    }
   }
 
   async runReview(input: {
@@ -57,6 +76,8 @@ export class ReviewService {
     reviewItemId: string
     target: ReviewTarget
     model?: string
+    providerId?: string
+    accountId?: string
   }): Promise<'completed' | 'failed' | 'aborted'> {
     const signal = this.deps.turns.getAbortController(input.turnId)
     if (!signal) {
@@ -81,7 +102,9 @@ export class ReviewService {
       const rawReviewText = await this.runIsolatedReviewer({
         prompt: resolved.prompt,
         workspace: thread.workspace ?? '',
-        model: input.model?.trim() || thread.model || this.deps.defaultModel,
+        model: input.model?.trim() || this.deps.roleModel?.trim() || thread.model || this.deps.defaultModel,
+        providerId: input.providerId?.trim() || this.deps.roleProviderId?.trim() || thread.providerId?.trim(),
+        accountId: input.accountId?.trim() || this.deps.roleAccountId?.trim() || thread.accountId?.trim(),
         signal
       })
       if (signal.aborted) {
@@ -118,6 +141,8 @@ export class ReviewService {
     prompt: string
     workspace: string
     model: string
+    providerId?: string
+    accountId?: string
     signal: AbortSignal
   }): Promise<string> {
     const nowIso = this.deps.nowIso
@@ -130,7 +155,8 @@ export class ReviewService {
     const steering = new SteeringQueue()
     const compactor = new ContextCompactor({
       contextCompaction: this.deps.contextCompaction,
-      models: this.deps.models
+      models: this.deps.models,
+      profilesForProvider: this.deps.profilesForProvider
     })
     const events = new RuntimeEventRecorder({
       eventBus,
@@ -178,7 +204,7 @@ export class ReviewService {
       ids,
       nowIso,
       modelCapabilities: (model) =>
-        this.deps.modelCapabilities?.(model) ?? modelCapabilitiesForModel(model),
+        this.deps.modelCapabilities?.(model, input.providerId) ?? modelCapabilitiesForModel(model),
       ...(this.deps.contextCompaction ? { contextCompaction: this.deps.contextCompaction } : {}),
       ...(this.deps.tokenEconomy ? { tokenEconomy: this.deps.tokenEconomy } : {}),
       ...(this.deps.runtime?.toolStorm ? { toolStorm: this.deps.runtime.toolStorm } : {}),
@@ -189,14 +215,22 @@ export class ReviewService {
       title: 'Review',
       workspace: input.workspace || '~',
       model: input.model,
+      ...(input.providerId?.trim() ? { providerId: input.providerId.trim() } : {}),
+      ...(input.accountId?.trim() ? { accountId: input.accountId.trim() } : {}),
       mode: 'agent',
-      approvalPolicy: 'auto'
+      approvalPolicy: 'auto',
+      // The reviewer receives untrusted diff and workspace content in its
+      // prompt. Its deliberately read-only tool set must be paired with the
+      // read-only sandbox, otherwise its child thread defaults to full access
+      // and can read files outside the reviewed workspace.
+      sandboxMode: 'read-only'
     })
     const started = await turns.startTurn({
       threadId: childThread.id,
       request: {
         prompt: input.prompt,
         model: input.model,
+        ...(input.providerId?.trim() ? { providerId: input.providerId.trim() } : {}),
         mode: 'agent',
         reasoningEffort: normalizeRoleReasoningEffort(this.deps.reasoningEffort)
       }

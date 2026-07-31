@@ -28,6 +28,27 @@ function processingSections(input: {
 }
 
 describe('deriveTurnSections', () => {
+  it('does not render internal Graph supervision prompts as user or process content', () => {
+    const result = sections([
+      {
+        kind: 'user',
+        id: 'graph_runtime_1',
+        text: 'Graph Lead supervision for durable run run_1.',
+        meta: { messageSource: 'graph_runtime' }
+      },
+      {
+        kind: 'assistant',
+        id: 'milestone_1',
+        text: 'The first node passed review.'
+      }
+    ])
+
+    expect(result.processBlocks).toEqual([])
+    expect(result.assistantContentBlocks.map((block) => block.id)).toEqual([
+      'milestone_1'
+    ])
+  })
+
   it('renders the final assistant answer as content even when reasoning was persisted after it', () => {
     const result = sections([
       { kind: 'assistant', id: 'answer', text: '你好！' },
@@ -58,7 +79,7 @@ describe('deriveTurnSections', () => {
     expect(result.processBlocks.map((block) => block.kind)).toEqual(['tool'])
   })
 
-  it('keeps intermediate assistant text inside the process timeline and surfaces only the final answer', () => {
+  it('keeps intermediate assistant text in chronological work and surfaces only the final answer', () => {
     const result = sections([
       { kind: 'assistant', id: 'intro', text: 'I found the likely cause.' },
       {
@@ -92,12 +113,7 @@ describe('deriveTurnSections', () => {
       { kind: 'assistant', id: 'next', text: 'The issue link above should still be visible.' }
     ])
 
-    // Only the trailing answer renders as the visible message body; the earlier
-    // "我先看看…"-style narration belongs inside the collapsed work timeline,
-    // not spilled out as standalone bubbles (regression from b9d4efb0a).
     expect(result.assistantContentBlocks.map((block) => block.id)).toEqual(['next'])
-    // The intermediate segments are preserved (not dropped) — just kept in the
-    // process trace, in chronological order with the tool calls.
     expect(result.processBlocks.map((block) => block.id)).toEqual([
       'intro',
       'tool_read',
@@ -112,11 +128,7 @@ describe('deriveTurnSections', () => {
     ).toContain('command output line 2')
   })
 
-  it('keeps every consecutive trailing segment but the last inside the timeline', () => {
-    // Reproduces the reported case: a single command followed by several
-    // consecutive assistant segments. Only the final segment is the visible
-    // answer; the preface + intermediate analysis stay inside 已处理 even
-    // though no tool separates them.
+  it('keeps every consecutive trailing segment except the final one inside work', () => {
     const result = sections([
       {
         kind: 'tool',
@@ -148,6 +160,42 @@ describe('deriveTurnSections', () => {
 
     expect(result.assistantContentBlocks).toEqual([])
     expect(result.processBlocks.map((block) => block.kind)).toEqual(['tool'])
+  })
+
+  it('surfaces runtime errors outside collapsed process work after partial assistant output', () => {
+    const result = sections([
+      { kind: 'reasoning', id: 'reasoning_1', text: 'Checking the provider.' },
+      { kind: 'assistant', id: 'partial_1', text: 'I found part of the answer.' },
+      {
+        kind: 'system',
+        id: 'error_1',
+        text: 'model request was rate limited (HTTP 429)',
+        code: 'http_429',
+        severity: 'error',
+        runtimeError: true
+      }
+    ])
+
+    expect(result.assistantContentBlocks.map((block) => block.id)).toEqual(['partial_1'])
+    expect(result.processBlocks.map((block) => block.id)).toEqual(['reasoning_1'])
+    expect(result.runtimeErrorBlocks).toEqual([
+      expect.objectContaining({
+        id: 'error_1',
+        text: 'model request was rate limited (HTTP 429)',
+        runtimeError: true
+      })
+    ])
+  })
+
+  it('keeps ordinary system statuses in process work', () => {
+    const result = sections([{
+      kind: 'system',
+      id: 'retry_status',
+      text: 'Retrying model request 1/3'
+    }])
+
+    expect(result.runtimeErrorBlocks).toEqual([])
+    expect(result.processBlocks.map((block) => block.id)).toEqual(['retry_status'])
   })
 
   it('surfaces generated media blocks outside the collapsed process work', () => {
@@ -206,6 +254,31 @@ describe('deriveTurnSections', () => {
 
     expect(result.generatedFileBlocks.map((block) => block.id)).toEqual(['tool_img'])
     expect(result.processBlocks.map((block) => block.id)).toEqual(['tool_img', 'tool_next'])
+  })
+
+  it('surfaces component prototypes outside work while retaining the tool in process history', () => {
+    const block: ChatBlock = {
+      kind: 'tool',
+      id: 'tool_component',
+      summary: 'design_component',
+      status: 'success',
+      toolKind: 'file_change',
+      meta: {
+        toolName: 'design_component',
+        componentPrototype: {
+          version: 1,
+          status: 'completed',
+          artifactId: 'component_abc',
+          title: 'Date range picker',
+          relativePath: '.kun-design/component-prototypes/date-picker/prototype.html',
+          viewport: { width: 720, height: 460 },
+          profile: 'component-designer'
+        }
+      }
+    }
+    const result = sections([block])
+    expect(result.componentPrototypeBlocks).toEqual([block])
+    expect(result.processBlocks).toEqual([block])
   })
 
   it('extracts file changes from JSON-wrapped tool output diffs', () => {
@@ -285,13 +358,7 @@ describe('deriveTurnSections', () => {
     expect(result.turnFileChanges[0]?.detail).toContain('+new detail')
   })
 
-  it('keeps live reasoning in the process timeline; live assistant is rendered separately by MessageTimeline', () => {
-    // The streaming assistant text is rendered as a dedicated MessageBubble
-    // by MessageTimeline (`<MessageBubble block={{ kind: 'assistant',
-    // id: 'live-assistant', text: liveContent }} />`). It must NOT also
-    // appear in processBlocks, otherwise the user sees the same text twice
-    // during streaming (once in the WorkMetaRow process area, once in
-    // the regular message flow).
+  it('appends live reasoning and assistant output to the active process timeline', () => {
     const result = processingSections({
       liveProcessText: 'private reasoning',
       liveContent: '这里是正在生成的回答。'
@@ -299,11 +366,20 @@ describe('deriveTurnSections', () => {
 
     expect(result.assistantContentBlocks).toEqual([])
     expect(result.processBlocks).toEqual([
-      { kind: 'reasoning', id: 'live-reasoning', text: 'private reasoning' }
+      {
+        kind: 'reasoning',
+        id: 'live-reasoning',
+        text: 'private reasoning'
+      },
+      {
+        kind: 'assistant',
+        id: 'live-assistant',
+        text: '这里是正在生成的回答。'
+      }
     ])
   })
 
-  it('keeps assistant content in chronological process order while a later tool is still running', () => {
+  it('keeps assistant content in chronological work while a later tool is still running', () => {
     const result = processingSections({
       blocks: [
         { kind: 'assistant', id: 'answer', text: '先给你一部分结果。' },

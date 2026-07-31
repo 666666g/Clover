@@ -1,11 +1,5 @@
 import type { AgentProvider, NormalizedThread, ThreadEventSink } from '../agent/types'
-import { getProvider } from '../agent/registry'
-import { rendererRuntimeClient } from '../agent/runtime-client'
-import {
-  DEFAULT_MODEL_PROVIDER_ID,
-  getKunRuntimeSettings
-} from '@shared/app-settings'
-import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
+import type { ChatState, ChatStoreGet } from './chat-store-types'
 import {
   composerModelSelectable,
   providerIdForComposerModel,
@@ -20,47 +14,43 @@ export function fallbackComposerProviderIdForSend(state: ChatState): string {
 export async function ensureRuntimeProviderForSend(input: {
   providerId?: string
   model?: string
-  set: ChatStoreSet
-  get: ChatStoreGet
 }): Promise<void> {
   const providerId = input.providerId?.trim()
   const model = input.model?.trim()
   if (!providerId || !model || model.toLowerCase() === 'auto') return
-  const settings = await rendererRuntimeClient.getSettings({ forceRefresh: true })
-  const runtime = getKunRuntimeSettings(settings)
-  const activeProviderId = runtime.providerId?.trim() || DEFAULT_MODEL_PROVIDER_ID
-  if (activeProviderId === providerId) return
-  input.set({ runtimeConnection: 'checking', error: null, runtimeErrorDetail: null })
-  try {
-    await window.kunGui.saveSettingsSilent({ agents: { kun: { providerId, model } } })
-    rendererRuntimeClient.invalidateSettings()
-    await rendererRuntimeClient.restartRuntime()
-    await getProvider().connect()
-    input.set({ runtimeConnection: 'ready', error: null, runtimeErrorDetail: null })
-    void input.get().loadComposerModels()
-  } catch (error) {
-    input.set({ runtimeConnection: 'offline' })
-    throw error
-  }
 }
 
 export function composerSelectionForThread(
   state: ChatState,
-  thread: Pick<NormalizedThread, 'id' | 'model'> | null | undefined
+  thread: Pick<NormalizedThread, 'id' | 'model'> | null | undefined,
+  options: {
+    hasUserMessages?: boolean
+    runtimeModel?: string
+  } = {}
 ): { model: string; providerId: string } | null {
   if (!thread) return null
   const pickList = state.composerPickList
   const stored = readThreadComposerSelection(thread.id)
   const storedModel = stored?.model.trim() ?? ''
-  const threadModel = thread.model.trim()
-  const model = composerModelSelectable(pickList, state.composerModelGroups, storedModel)
+  const threadModel = options.runtimeModel?.trim() || thread.model.trim()
+  const storedSelectable = composerModelSelectable(pickList, state.composerModelGroups, storedModel)
+  const storedShouldWin = storedSelectable && (
+    options.hasUserMessages !== false ||
+    stored?.source === 'user' ||
+    stored?.source === 'default'
+  )
+  const model = storedShouldWin
     ? storedModel
     : composerModelSelectable(pickList, state.composerModelGroups, threadModel)
       ? threadModel
-      : ''
+      : storedSelectable
+        ? storedModel
+        : ''
   if (!model) return null
+  const usesStoredModel = storedModel.toLowerCase() === model.toLowerCase()
   const storedProviderId =
-    stored && providerIdMatchesComposerModel(state.composerModelGroups, stored.providerId, model)
+    stored && usesStoredModel &&
+      providerIdMatchesComposerModel(state.composerModelGroups, stored.providerId, model)
       ? stored.providerId
       : ''
   return {

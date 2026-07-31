@@ -8,21 +8,32 @@ const LazyStreamdownAssistant = lazy(() =>
 export function AssistantMarkdown({
   text,
   streaming,
-  className
+  className,
+  hideHtmlComments = false
 }: {
   text: string
   streaming: boolean
   className?: string
+  hideHtmlComments?: boolean
 }): ReactElement {
+  const fallbackText = hideHtmlComments
+    ? text.replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+    : text
+
   return (
     <Suspense
       fallback={
         <div className={className}>
-          {text}
+          {fallbackText}
         </div>
       }
     >
-      <LazyStreamdownAssistant text={text} streaming={streaming} className={className} />
+      <LazyStreamdownAssistant
+        text={text}
+        streaming={streaming}
+        className={className}
+        hideHtmlComments={hideHtmlComments}
+      />
     </Suspense>
   )
 }

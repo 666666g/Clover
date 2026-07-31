@@ -1,10 +1,12 @@
 import type {
   ToolHostContext,
+  ToolEffects,
   ToolProviderKind,
   ToolProviderPolicy
 } from '../../ports/tool-host.js'
 import type { LocalTool } from './local-tool-host.js'
 import { isToolAdvertisedInSandbox } from './sandbox-policy.js'
+import { isToolAllowedInOrchestration } from '../../graph/graph-tool-boundary.js'
 
 export type CapabilityToolRecord = {
   provider: ToolProviderPolicy
@@ -20,19 +22,31 @@ export type CapabilityToolSpec = {
   description: string
   inputSchema: Record<string, unknown>
   toolKind?: 'tool_call' | 'command_execution' | 'file_change'
+  sideEffect?: 'read-only' | 'unknown'
   providerId: string
   providerKind: ToolProviderKind
+  effects?: ToolEffects
 }
 
 const PLAN_MODE_ALLOWED_TOOL_NAMES = new Set([
   'read',
   'grep',
+  'glob',
   'find',
   'ls',
+  'repo_map',
+  'git_inspect',
+  'lsp',
+  'write',
+  'edit',
   'create_plan',
   'user_input',
   'request_user_input'
 ])
+
+const MANAGED_SKILL_BLOCKED_TOOL_NAMES: Readonly<Record<string, ReadonlySet<string>>> = {
+  'ppt-master': new Set(['bash', 'background_shell'])
+}
 
 export class CapabilityRegistry {
   private readonly providers = new Map<string, CapabilityToolProvider>()
@@ -51,12 +65,10 @@ export class CapabilityRegistry {
   }
 
   constructor(providers: readonly CapabilityToolProvider[] = []) {
-    for (const provider of providers) {
-      this.registerProvider(provider)
-    }
+    this.replaceProviders(providers)
   }
 
-  registerProvider(provider: CapabilityToolProvider): void {
+  registerProvider(provider: CapabilityToolProvider): () => void {
     if (this.providers.has(provider.id)) {
       throw new Error(`duplicate tool provider: ${provider.id}`)
     }
@@ -67,13 +79,52 @@ export class CapabilityRegistry {
       }
       this.tools.set(tool.name, { provider: providerPolicy(provider), tool })
     }
+    return () => this.unregisterProvider(provider.id)
+  }
+
+  replaceProvider(provider: CapabilityToolProvider): void {
+    const providers = [...this.providers.values()].filter((candidate) => candidate.id !== provider.id)
+    this.replaceProviders([...providers, provider])
+  }
+
+  unregisterProvider(providerId: string): boolean {
+    if (!this.providers.has(providerId)) return false
+    this.replaceProviders([...this.providers.values()].filter((provider) => provider.id !== providerId))
+    return true
+  }
+
+  replaceProviders(providers: readonly CapabilityToolProvider[]): void {
+    const nextProviders = new Map<string, CapabilityToolProvider>()
+    const nextTools = new Map<string, CapabilityToolRecord>()
+    for (const provider of providers) {
+      if (nextProviders.has(provider.id)) {
+        throw new Error(`duplicate tool provider: ${provider.id}`)
+      }
+      nextProviders.set(provider.id, provider)
+      for (const tool of provider.tools) {
+        if (nextTools.has(tool.name)) {
+          throw new Error(`duplicate tool name: ${tool.name}`)
+        }
+        nextTools.set(tool.name, { provider: providerPolicy(provider), tool })
+      }
+    }
+    this.providers.clear()
+    this.tools.clear()
+    for (const [id, provider] of nextProviders) this.providers.set(id, provider)
+    for (const [name, record] of nextTools) this.tools.set(name, record)
   }
 
   listTools(context?: ToolHostContext): CapabilityToolSpec[] {
     const specs: CapabilityToolSpec[] = []
     for (const record of this.tools.values()) {
       if (!this.canUseProvider(record.provider, context)) continue
-      if (!this.canUseTool(record.tool.name, context)) continue
+      if (!isToolAllowedInOrchestration({
+        toolName: record.tool.name,
+        providerId: record.provider.id,
+        providerKind: record.provider.kind
+      }, context)) continue
+      if (!this.canUseTool(record.tool, context)) continue
+      if (record.tool.modelAdvertised === false) continue
       if (!isToolAdvertisedInSandbox(record.tool, context)) continue
       if (record.tool.shouldAdvertise) {
         if (!context || !record.tool.shouldAdvertise(context)) continue
@@ -83,8 +134,12 @@ export class CapabilityRegistry {
         description: record.tool.description,
         inputSchema: record.tool.inputSchema,
         toolKind: record.tool.toolKind,
+        ...(record.tool.sideEffect ? { sideEffect: record.tool.sideEffect } : {}),
         providerId: record.provider.id,
-        providerKind: record.provider.kind
+        providerKind: record.provider.kind,
+        ...(record.tool.effects || record.provider.effects
+          ? { effects: record.tool.effects ?? record.provider.effects }
+          : {})
       })
     }
     return specs
@@ -101,7 +156,14 @@ export class CapabilityRegistry {
     if (!this.canUseProvider(record.provider, context)) {
       throw new Error(`tool ${toolName} is not advertised by provider ${record.provider.id}`)
     }
-    if (!this.canUseTool(toolName, context)) {
+    if (!isToolAllowedInOrchestration({
+      toolName: record.tool.name,
+      providerId: record.provider.id,
+      providerKind: record.provider.kind
+    }, context)) {
+      throw new Error(`tool ${toolName} is unavailable in the Graph capability plane`)
+    }
+    if (!this.canUseTool(record.tool, context)) {
       throw new Error(`tool ${toolName} is not advertised by active tool policy`)
     }
     if (record.tool.shouldAdvertise && !record.tool.shouldAdvertise(context)) {
@@ -116,22 +178,46 @@ export class CapabilityRegistry {
 
   private canUseProvider(provider: ToolProviderPolicy, context?: ToolHostContext): boolean {
     if (!provider.enabled || !provider.available) return false
-    const blocked = context?.blockedProviderIds
-    if (blocked && blocked.includes(provider.id)) return false
+    // `gui` 专属于需要实时桌面工作台或控制本地桌面的能力；无 context 的诊断可以列出所有 provider，
+    // 但具体的非 GUI 会话绝不能看到或执行这些工具。
+    if (context && provider.kind === 'gui' && effectiveClientSurface(context) !== 'gui') {
+      return false
+    }
+    if (context?.blockedProviderIds?.includes(provider.id)) return false
     const allowed = context?.allowedProviderIds
     if (allowed && !allowed.includes(provider.id)) return false
     return true
   }
 
-  private canUseTool(toolName: string, context?: ToolHostContext): boolean {
-    if (isPlanModeContext(context) && !PLAN_MODE_ALLOWED_TOOL_NAMES.has(toolName)) {
+  private canUseTool(tool: LocalTool, context?: ToolHostContext): boolean {
+    const toolName = tool.name
+    if (
+      isPlanModeContext(context) &&
+      !PLAN_MODE_ALLOWED_TOOL_NAMES.has(toolName) &&
+      tool.sideEffect !== 'read-only'
+    ) {
       return false
     }
-    const blocked = context?.blockedToolNames
-    if (blocked && blocked.includes(toolName)) return false
+    if (context?.blockedToolNames?.includes(toolName)) return false
+    for (const skillId of context?.activeSkillIds ?? []) {
+      if (MANAGED_SKILL_BLOCKED_TOOL_NAMES[skillId]?.has(toolName)) return false
+    }
     const allowed = context?.allowedToolNames
     return !allowed || allowed.includes(toolName)
   }
+}
+
+function effectiveClientSurface(context: ToolHostContext): NonNullable<ToolHostContext['clientSurface']> {
+  if (context.clientSurface) return context.clientSurface
+  if (
+    context.guiPlan ||
+    context.guiDesignCanvas ||
+    context.guiDesignMode ||
+    context.guiDesignArtifact ||
+    context.agentSurface
+  ) return 'gui'
+  if (context.imContext) return 'im'
+  return 'api'
 }
 
 function isPlanModeContext(context: ToolHostContext | undefined): boolean {
@@ -144,6 +230,7 @@ function providerPolicy(provider: ToolProviderPolicy): ToolProviderPolicy {
     kind: provider.kind,
     enabled: provider.enabled,
     available: provider.available,
-    ...(provider.reason ? { reason: provider.reason } : {})
+    ...(provider.reason ? { reason: provider.reason } : {}),
+    ...(provider.effects ? { effects: provider.effects } : {})
   }
 }

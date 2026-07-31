@@ -2,6 +2,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NormalizedThread } from '../agent/types'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
+import type { BrowserStorageLike } from '../lib/browser-storage'
+import {
+  emptyDesignThreadRegistry,
+  markDesignThread,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
+import {
+  activeWriteThreadForWorkspace,
+  emptyWriteThreadRegistry,
+  markWriteThread,
+  readWriteThreadRegistry,
+  saveWriteThreadRegistry
+} from '../write/write-thread-registry'
+import { useWriteWorkspaceStore } from '../write/write-workspace-store'
+import {
+  isSddAssistantThread,
+  markSddAssistantThread,
+  readSddThreadRegistry,
+  releaseSddAssistantThread,
+  showSddAssistantThreadInSidebar
+} from '../sdd/sdd-thread-registry'
+import type { SddDraft } from '../sdd/sdd-draft-store'
 
 const registryMock = vi.hoisted(() => ({
   getProvider: vi.fn()
@@ -16,12 +38,15 @@ const applyThemeLibMock = vi.hoisted(() => ({
   applyCursorSpotlightColor: vi.fn(),
   applyTheme: vi.fn(),
   applyUiFontScale: vi.fn(),
+  applyChatContentMaxWidth: vi.fn(),
   applyDocumentLocale: vi.fn()
 }))
 
 vi.mock('../lib/apply-theme', () => applyThemeLibMock)
 
-import { createNavigationActions } from './chat-store-navigation-actions'
+import {
+  createNavigationActions
+} from './chat-store-navigation-actions'
 
 function thread(overrides: Partial<NormalizedThread> & Pick<NormalizedThread, 'id' | 'workspace'>): NormalizedThread {
   return {
@@ -35,6 +60,49 @@ function thread(overrides: Partial<NormalizedThread> & Pick<NormalizedThread, 'i
     ...(overrides.archived !== undefined ? { archived: overrides.archived } : {})
   }
 }
+
+class MemoryStorage implements BrowserStorageLike {
+  private readonly values = new Map<string, string>()
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value)
+  }
+}
+
+describe('requirement session lifecycle', () => {
+  const draft: SddDraft = {
+    id: 'draft-1',
+    workspaceRoot: '/tmp/app',
+    relativePath: '.kunsdd/requirements/draft-1/requirement.md',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z'
+  }
+  const requirementThread = thread({
+    id: 'thread-sdd-1',
+    title: 'Requirement draft',
+    workspace: '/tmp/app'
+  })
+
+  it('stays bound to its draft until released into Code', () => {
+    const storage = new MemoryStorage()
+    markSddAssistantThread(draft, requirementThread.id, storage)
+
+    let registry = readSddThreadRegistry(storage)
+    expect(isSddAssistantThread(requirementThread, registry)).toBe(true)
+
+    showSddAssistantThreadInSidebar(requirementThread.id, storage)
+    registry = readSddThreadRegistry(storage)
+    expect(isSddAssistantThread(requirementThread, registry)).toBe(true)
+
+    releaseSddAssistantThread(requirementThread.id, storage)
+    registry = readSddThreadRegistry(storage)
+    expect(isSddAssistantThread(requirementThread, registry)).toBe(false)
+  })
+})
 
 function buildHarness(overrides?: {
   subscribeThreadEventsLive?: ReturnType<typeof vi.fn>
@@ -186,6 +254,389 @@ describe('chat-store navigation workspace selection', () => {
     expect(setSettings).not.toHaveBeenCalled()
     expect(harness.state.activeThreadId).toBe('thr_default')
   })
+
+  it('selectWorkspaceRoot does not warn before the user sends a message', async () => {
+    const setSettings = vi.fn(async () => ({ workspaceRoot: '/Volumes/missing/project' }))
+    const alertDialog = vi.fn(async () => undefined)
+    const workspaceDirectoryExists = vi.fn(async () => false)
+    vi.stubGlobal('window', {
+      kunGui: {
+        setSettings,
+        workspaceDirectoryExists,
+        alertDialog
+      }
+    })
+    const harness = buildHarness()
+
+    await expect(harness.actions.selectWorkspaceRoot('/Volumes/missing/project'))
+      .resolves.toBe('/Volumes/missing/project')
+
+    expect(setSettings).toHaveBeenCalledOnce()
+    expect(workspaceDirectoryExists).not.toHaveBeenCalled()
+    expect(alertDialog).not.toHaveBeenCalled()
+    expect(harness.state.workspaceRoot).toBe('/Volumes/missing/project')
+  })
+
+  it('keeps a missing current workspace without warning during boot', async () => {
+    const alertDialog = vi.fn(async () => undefined)
+    const workspaceDirectoryExists = vi.fn(async () => false)
+    const setSettings = vi.fn()
+    vi.stubGlobal('window', {
+      kunGui: {
+        getSettings: vi.fn(async () => ({
+          workspaceRoot: 'E:\\missing-project',
+          write: {
+            defaultWorkspaceRoot: '~/.kun/write_workspace',
+            activeWorkspaceRoot: '~/.kun/write_workspace',
+            workspaces: []
+          },
+          claw: { channels: [] },
+          theme: 'dark',
+          uiFontScale: 1,
+          chatContentMaxWidthPx: 896,
+          composerSendKey: 'enter',
+          locale: 'en',
+          agents: { kun: { apiKey: 'test-key', model: 'deepseek-v4-pro', baseUrl: '' } },
+          disabledSkillIds: []
+        })),
+        setSettings,
+        workspaceDirectoryExists,
+        alertDialog
+      }
+    })
+    const harness = buildHarness()
+
+    await harness.actions.boot()
+
+    expect(harness.state.workspaceRoot).toBe('E:\\missing-project')
+    expect(setSettings).not.toHaveBeenCalled()
+    expect(workspaceDirectoryExists).not.toHaveBeenCalled()
+    expect(alertDialog).not.toHaveBeenCalled()
+    expect(harness.state.error).toBeNull()
+  })
+
+  it('starts Kun without reopening completed onboarding when the active provider has no API key', async () => {
+    vi.useFakeTimers()
+    try {
+      const probeRuntime = vi.fn(async () => undefined)
+      vi.stubGlobal('window', {
+        kunGui: {
+          getSettings: vi.fn(async () => ({
+            version: 1,
+            initialSetupCompleted: true,
+            workspaceRoot: '~/.kun/default_workspace',
+            conversationWorkspaceRoot: '~/Documents/Kun',
+            write: {
+              defaultWorkspaceRoot: '~/.kun/write_workspace',
+              activeWorkspaceRoot: '~/.kun/write_workspace',
+              workspaces: []
+            },
+            claw: { channels: [] },
+            theme: 'dark',
+            uiFontScale: 1,
+            chatContentMaxWidthPx: 896,
+            locale: 'en',
+            agents: {
+              kun: {
+                apiKey: '',
+                providerId: 'gemini-subscription',
+                model: 'auto',
+                baseUrl: ''
+              }
+            },
+            disabledSkillIds: []
+          }))
+        }
+      })
+      const harness = buildHarness({ probeRuntime })
+
+      await harness.actions.boot()
+      expect(harness.state.initialSetupOpen).not.toBe(true)
+
+      await vi.advanceTimersByTimeAsync(900)
+      expect(probeRuntime).toHaveBeenCalledWith('user')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('hydrates Graph availability during boot but starts the composer in Direct mode', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('window', {
+        kunGui: {
+          getSettings: vi.fn(async () => ({
+            version: 1,
+            initialSetupCompleted: true,
+            workspaceRoot: '~/.kun/default_workspace',
+            conversationWorkspaceRoot: '~/Documents/Kun',
+            write: {
+              defaultWorkspaceRoot: '~/.kun/write_workspace',
+              activeWorkspaceRoot: '~/.kun/write_workspace',
+              workspaces: []
+            },
+            claw: { channels: [] },
+            theme: 'dark',
+            uiFontScale: 1,
+            chatContentMaxWidthPx: 896,
+            locale: 'en',
+            agents: {
+              kun: {
+                apiKey: 'test-key',
+                model: 'deepseek-v4-pro',
+                baseUrl: '',
+                graph: {
+                  enabled: true,
+                  defaultStrategy: 'graph'
+                }
+              }
+            },
+            disabledSkillIds: []
+          }))
+        }
+      })
+      const harness = buildHarness()
+      harness.state.composerOrchestration = 'graph'
+
+      await harness.actions.boot()
+
+      expect(harness.state.graphEnabled).toBe(true)
+      expect(harness.state.composerOrchestration).toBe('direct')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('warns when creating Write or Design threads for a missing workspace', async () => {
+    const alertDialog = vi.fn(async () => undefined)
+    vi.stubGlobal('window', {
+      kunGui: {
+        workspaceDirectoryExists: vi.fn(async () => false),
+        alertDialog
+      }
+    })
+    const harness = buildHarness()
+
+    await expect(harness.actions.createWriteThread('/Volumes/missing/project')).resolves.toBeNull()
+    await expect(harness.actions.createDesignThread('/Volumes/missing/project', 'screen-1')).resolves.toBeNull()
+
+    expect(alertDialog).toHaveBeenCalledTimes(2)
+    expect(harness.state.error).toBeTruthy()
+  })
+
+  it('openCode does not keep a registered design thread active in Code mode', async () => {
+    const storage = new MemoryStorage()
+    saveDesignThreadRegistry(
+      markDesignThread(
+        '/Users/zxy/project',
+        'login',
+        'thr_design',
+        emptyDesignThreadRegistry()
+      ),
+      storage
+    )
+    vi.stubGlobal('window', { localStorage: storage })
+    const harness = buildHarness()
+    harness.state.activeThreadId = 'thr_design'
+    harness.state.workspaceRoot = '/Users/zxy/project'
+    harness.state.threads = [
+      thread({
+        id: 'thr_design',
+        title: 'Design Assistant',
+        workspace: '/Users/zxy/project',
+        updatedAt: '2026-06-12T10:00:00.000Z'
+      }),
+      thread({
+        id: 'thr_code',
+        title: 'Code task',
+        workspace: '/Users/zxy/project',
+        updatedAt: '2026-06-12T09:00:00.000Z'
+      })
+    ]
+
+    await harness.actions.openCode()
+
+    expect(harness.state.route).toBe('chat')
+    expect(harness.selectThread).toHaveBeenCalledWith('thr_code')
+  })
+
+  it('openCode does not keep a legacy design assistant thread active in Code mode', async () => {
+    const storage = new MemoryStorage()
+    storage.setItem(
+      'kun.design-assistant.threadRegistry.v1',
+      JSON.stringify({ '/Users/zxy/project': 'thr_legacy_design' })
+    )
+    vi.stubGlobal('window', { localStorage: storage })
+    const harness = buildHarness()
+    harness.state.activeThreadId = 'thr_legacy_design'
+    harness.state.workspaceRoot = '/Users/zxy/project'
+    harness.state.threads = [
+      thread({
+        id: 'thr_legacy_design',
+        title: 'Design Assistant',
+        workspace: '/Users/zxy/project',
+        updatedAt: '2026-06-12T10:00:00.000Z'
+      }),
+      thread({
+        id: 'thr_code',
+        title: 'Code task',
+        workspace: '/Users/zxy/project',
+        updatedAt: '2026-06-12T09:00:00.000Z'
+      })
+    ]
+
+    await harness.actions.openCode()
+
+    expect(harness.state.route).toBe('chat')
+    expect(harness.selectThread).toHaveBeenCalledWith('thr_code')
+  })
+
+  it('openCode clears an internal design workspace thread when no Code thread is available', async () => {
+    const harness = buildHarness()
+    harness.state.activeThreadId = 'thr_design'
+    harness.state.workspaceRoot = '/Users/zxy/project'
+    harness.state.blocks = [
+      { kind: 'user', id: 'u1', text: 'design this' },
+      { kind: 'assistant', id: 'a1', text: 'Done' }
+    ]
+    harness.state.threads = [
+      thread({
+        id: 'thr_design',
+        title: 'Design Assistant',
+        workspace: '/Users/zxy/.kun/design-workspace',
+        updatedAt: '2026-06-12T10:00:00.000Z'
+      })
+    ]
+
+    await harness.actions.openCode()
+
+    expect(harness.state.route).toBe('chat')
+    expect(harness.state.activeThreadId).toBeNull()
+    expect(harness.state.blocks).toEqual([])
+    expect(harness.selectThread).not.toHaveBeenCalled()
+  })
+
+  it('openDesign does not keep a code thread active in Design mode', () => {
+    const harness = buildHarness()
+    harness.state.activeThreadId = 'thr_code'
+    harness.state.route = 'chat'
+    harness.state.busy = true
+    harness.state.blocks = [
+      { kind: 'user', id: 'u1', text: 'hello' },
+      { kind: 'assistant', id: 'a1', text: 'How can I help?' }
+    ]
+    harness.state.threads = [
+      thread({
+        id: 'thr_code',
+        title: 'Code task',
+        workspace: '/Users/zxy/project'
+      })
+    ]
+
+    harness.actions.openDesign()
+
+    expect(harness.state.route).toBe('design')
+    expect(harness.state.activeThreadId).toBeNull()
+    expect(harness.state.blocks).toEqual([])
+    expect(harness.state.busy).toBe(false)
+    expect(harness.state.watchTurnCompletion).toEqual({ thr_code: true })
+    expect(harness.selectThread).not.toHaveBeenCalled()
+  })
+
+  it('clearActiveThreadSelection clears stale blocks and watches a running thread', () => {
+    const harness = buildHarness()
+    harness.state.activeThreadId = 'thr_old_design'
+    harness.state.busy = true
+    harness.state.blocks = [
+      { kind: 'user', id: 'u1', text: 'old design request' },
+      { kind: 'assistant', id: 'a1', text: 'old design answer' }
+    ]
+
+    harness.actions.clearActiveThreadSelection()
+
+    expect(harness.state.activeThreadId).toBeNull()
+    expect(harness.state.blocks).toEqual([])
+    expect(harness.state.busy).toBe(false)
+    expect(harness.state.watchTurnCompletion).toEqual({ thr_old_design: true })
+  })
+})
+
+describe('write assistant file conversation selection', () => {
+  beforeEach(() => {
+    rendererRuntimeClient.invalidateSettings()
+    registryMock.getProvider.mockReset()
+  })
+
+  afterEach(() => {
+    useWriteWorkspaceStore.getState().resetWorkspace()
+    rendererRuntimeClient.invalidateSettings()
+    vi.unstubAllGlobals()
+  })
+
+  it('selects the conversation mapped to the active file', async () => {
+    const storage = new MemoryStorage()
+    const workspace = '/Users/zxy/write'
+    const registry = markWriteThread(
+      workspace,
+      'thr_b',
+      markWriteThread(workspace, 'thr_a', emptyWriteThreadRegistry(), `${workspace}/a.md`),
+      `${workspace}/b.md`
+    )
+    saveWriteThreadRegistry(registry, storage)
+    vi.stubGlobal('window', { localStorage: storage })
+    useWriteWorkspaceStore.setState({
+      workspaceRoot: workspace,
+      activeFilePath: `${workspace}/b.md`,
+      activeFileKind: 'text'
+    })
+    const harness = buildHarness()
+    Object.assign(harness.state, harness.actions)
+    harness.state.activeThreadId = 'thr_a'
+    harness.state.workspaceRoot = workspace
+    harness.state.threads = [
+      thread({ id: 'thr_a', workspace }),
+      thread({ id: 'thr_b', workspace })
+    ]
+
+    await expect(harness.actions.ensureWriteThreadForWorkspace(workspace)).resolves.toBe('thr_b')
+    expect(harness.selectThread).toHaveBeenCalledWith('thr_b')
+  })
+
+  it('creates and records a fresh conversation for an unmapped file', async () => {
+    const storage = new MemoryStorage()
+    const workspace = '/Users/zxy/write'
+    const activeFilePath = `${workspace}/new.md`
+    vi.stubGlobal('window', { localStorage: storage })
+    useWriteWorkspaceStore.setState({
+      workspaceRoot: workspace,
+      activeFilePath,
+      activeFileKind: 'text'
+    })
+    const created = thread({ id: 'thr_new', workspace, title: 'Write Assistant' })
+    const createThread = vi.fn(async () => created)
+    registryMock.getProvider.mockReturnValue({ createThread })
+    const harness = buildHarness()
+    Object.assign(harness.state, harness.actions)
+    harness.state.activeThreadId = null
+    harness.state.workspaceRoot = workspace
+    harness.state.threads = []
+
+    await expect(harness.actions.ensureWriteThreadForWorkspace(workspace)).resolves.toBe('thr_new')
+
+    const registry = readWriteThreadRegistry(storage)
+    expect(createThread).toHaveBeenCalledWith({
+      workspace,
+      title: 'Write Assistant',
+      mode: 'agent'
+    })
+    expect(activeWriteThreadForWorkspace(
+      workspace,
+      [created],
+      registry,
+      activeFilePath
+    )?.id).toBe('thr_new')
+    expect(harness.selectThread).toHaveBeenCalledWith('thr_new')
+  })
 })
 
 describe('onClawChannelActivity routes through subscribeThreadEventsLive (not selectThread)', () => {
@@ -230,6 +681,8 @@ describe('onClawChannelActivity routes through subscribeThreadEventsLive (not se
       },
       theme: 'dark',
       uiFontScale: 1,
+      chatContentMaxWidthPx: 896,
+      composerSendKey: 'enter',
       locale: 'en',
       agents: { kun: { apiKey: 'test-key', model: 'deepseek-v4-pro', baseUrl: '' } },
       disabledSkillIds: []

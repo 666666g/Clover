@@ -11,6 +11,8 @@ type RuntimeErrorPayload = {
 
 export type RuntimeErrorView = {
   summary: string
+  /** Sanitized provider/runtime text suitable for direct conversation display. */
+  message: string
   detail?: string
   code?: string
   settingsAction?: 'agents'
@@ -161,6 +163,7 @@ export function describeRuntimeError(error: unknown): RuntimeErrorView {
   }
   return {
     summary,
+    message: redactedText || summary,
     ...(details.length > 0 ? { detail: details.join('\n\n') } : {}),
     ...(errorCode ? { code: errorCode } : {}),
     ...(shouldOpenAgentsSettings(errorCode) ? { settingsAction: 'agents' as const } : {})

@@ -1,10 +1,13 @@
-import type { ReactElement } from 'react'
+import { useState, type ReactElement } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_COMPLETION_MODEL,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
+  DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
   DEFAULT_MODEL_PROVIDER_ID,
+  MAX_WRITE_AUTOSAVE_DELAY_MS,
+  MIN_WRITE_AUTOSAVE_DELAY_MS,
   WRITE_EDITOR_FONT_SIZE_MAX,
   WRITE_EDITOR_FONT_SIZE_MIN,
   WRITE_EDITOR_LINE_HEIGHT_MAX,
@@ -24,12 +27,24 @@ import {
 } from '@shared/app-settings'
 import { WRITE_DESIGN_DRAFT_DEFAULT_PROMPT, WRITE_INFOGRAPHIC_DEFAULT_PROMPT } from '@shared/write-infographic'
 import { WRITE_PROTOTYPE_DEFAULT_PROMPT } from '@shared/write-prototype'
-import { PencilLine, Plus, RotateCcw, Trash2 } from 'lucide-react'
+import {
+  Bot,
+  FolderOpen,
+  PencilLine,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  TextCursorInput,
+  Trash2,
+  Type
+} from 'lucide-react'
 import { builtinWriteQuickActionDefaults } from '../write/quick-actions'
 import {
   AdvancedSettingsDisclosure,
   ModelSelect,
   SettingsCard,
+  SettingsTabPanel,
+  SettingsTabs,
   SettingRow,
   Toggle
 } from './settings-controls'
@@ -81,6 +96,9 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
   const selectionAssist = form.write.selectionAssist ?? defaultWriteSelectionAssistSettings()
   const typography = form.write.typography ?? defaultWriteTypography()
   const agentPresets: WriteAgentPresetV1[] = form.write.agentPresets ?? defaultWriteAgentPresets()
+  const autoSaveDelaySeconds = Math.round(
+    (form.write.autoSaveDelayMs ?? DEFAULT_WRITE_AUTOSAVE_DELAY_MS) / 1000
+  )
   const updateAgentPresets = (next: WriteAgentPresetV1[]): void => {
     update({ write: { agentPresets: next } })
   }
@@ -102,9 +120,26 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
       ? writeInlineProviderModels[0]
       : undefined)
     || (kun?.model?.trim() || DEFAULT_WRITE_INLINE_COMPLETION_MODEL)
+  const [activeTab, setActiveTab] = useState<
+    'workspace' | 'typography' | 'suggestions' | 'selection' | 'agents'
+  >('workspace')
 
   return (
             <>
+              <SettingsTabs
+                baseId="write-settings"
+                ariaLabel={t('write')}
+                value={activeTab}
+                onChange={setActiveTab}
+                items={[
+                  { id: 'workspace', label: t('sectionWrite'), icon: FolderOpen },
+                  { id: 'typography', label: t('writeTypography'), icon: Type },
+                  { id: 'suggestions', label: t('writeInlineCompletion'), icon: Sparkles },
+                  { id: 'selection', label: t('writeSelectionAssistTitle'), icon: TextCursorInput },
+                  { id: 'agents', label: t('writeAgentPresets'), icon: Bot }
+                ]}
+              />
+              <SettingsTabPanel baseId="write-settings" tabId="workspace" active={activeTab === 'workspace'}>
               <SettingsCard title={t('sectionWrite')}>
                 <SettingRow
                   title={t('writeWorkspaceRoot')}
@@ -150,8 +185,41 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
                     </div>
                   }
                 />
+                <SettingRow
+                  title={t('writeAutoSave')}
+                  description={t('writeAutoSaveDesc')}
+                  control={
+                    <Toggle
+                      checked={form.write.autoSaveEnabled !== false}
+                      onChange={(autoSaveEnabled) => update({ write: { autoSaveEnabled } })}
+                    />
+                  }
+                />
+                <SettingRow
+                  title={t('writeAutoSaveDelay')}
+                  description={t('writeAutoSaveDelayDesc', {
+                    min: MIN_WRITE_AUTOSAVE_DELAY_MS / 1000,
+                    max: MAX_WRITE_AUTOSAVE_DELAY_MS / 60_000
+                  })}
+                  control={
+                    <input
+                      type="number"
+                      min={MIN_WRITE_AUTOSAVE_DELAY_MS / 1000}
+                      max={MAX_WRITE_AUTOSAVE_DELAY_MS / 1000}
+                      step={5}
+                      className="w-32 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-60"
+                      value={autoSaveDelaySeconds}
+                      disabled={form.write.autoSaveEnabled === false}
+                      onChange={(e) => update({
+                        write: { autoSaveDelayMs: Number(e.target.value) * 1000 }
+                      })}
+                    />
+                  }
+                />
               </SettingsCard>
+              </SettingsTabPanel>
 
+              <SettingsTabPanel baseId="write-settings" tabId="typography" active={activeTab === 'typography'}>
               <SettingsCard title={t('writeTypography')} className="mt-5">
                 <SettingRow
                   title={t('writeFontPreset')}
@@ -248,7 +316,9 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
                   }
                 />
               </SettingsCard>
+              </SettingsTabPanel>
 
+              <SettingsTabPanel baseId="write-settings" tabId="suggestions" active={activeTab === 'suggestions'}>
               <SettingsCard title={t('writeInlineCompletion')} className="mt-5">
                 <SettingRow
                   title={t('writeInlineCompletionEnabled')}
@@ -424,7 +494,9 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
                   </AdvancedSettingsDisclosure>
                 </div>
               </SettingsCard>
+              </SettingsTabPanel>
 
+              <SettingsTabPanel baseId="write-settings" tabId="selection" active={activeTab === 'selection'}>
               <SettingsCard title={t('writeSelectionAssistTitle')} className="mt-5">
                 <div className="px-3 py-4">
                   <AdvancedSettingsDisclosure
@@ -452,10 +524,10 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
 
                       <div>
                         <div className="text-[13px] font-semibold text-ds-ink">
-                          {t('writeDesignDraftPromptLabel')}
+                          {tCommon('writeDesignDraftPromptLabel')}
                         </div>
                         <p className="mt-1 text-[12.5px] leading-5 text-ds-faint">
-                          {t('writeDesignDraftPromptDesc')}
+                          {tCommon('writeDesignDraftPromptDesc')}
                         </p>
                         <textarea
                           className={`${textInputClass} mt-2 min-h-[72px] resize-y leading-5`}
@@ -470,10 +542,10 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
 
                       <div>
                         <div className="text-[13px] font-semibold text-ds-ink">
-                          {t('writePrototypePromptLabel')}
+                          {tCommon('writePrototypePromptLabel')}
                         </div>
                         <p className="mt-1 text-[12.5px] leading-5 text-ds-faint">
-                          {t('writePrototypePromptDesc')}
+                          {tCommon('writePrototypePromptDesc')}
                         </p>
                         <textarea
                           className={`${textInputClass} mt-2 min-h-[72px] resize-y leading-5`}
@@ -594,8 +666,15 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
                   </AdvancedSettingsDisclosure>
                 </div>
               </SettingsCard>
+              </SettingsTabPanel>
 
-              <SettingsCard title={t('writeAgentPresets')} className="mt-5">
+              <SettingsTabPanel baseId="write-settings" tabId="agents" active={activeTab === 'agents'}>
+              <SettingsCard
+                title={t('writeAgentPresets')}
+                description={t('writeAgentPresetsDesc')}
+                className="mt-5"
+                collapsible
+              >
                 <div className="px-3 py-4">
                   <p className="text-[12.5px] leading-5 text-ds-faint">
                     {t('writeAgentPresetsDesc')}
@@ -699,6 +778,7 @@ export function WriteSettingsSection({ ctx }: { ctx: Record<string, any> }): Rea
                   }
                 />
               </SettingsCard>
+              </SettingsTabPanel>
             </>
   )
 }

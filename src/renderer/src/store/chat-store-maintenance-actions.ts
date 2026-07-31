@@ -6,6 +6,12 @@ import { applyTheme, applyUiFontScale } from '../lib/apply-theme'
 import { confirmDialog } from '../lib/confirm-dialog'
 import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
 import { formatRuntimeError, getRuntimeErrorCode } from '../lib/format-runtime-error'
+import { requestCodeCanvasPanelOpen } from '../lib/code-canvas-panel-event'
+import {
+  prepareCodeCanvasResend,
+  type PrepareCodeCanvasResendOptions,
+  type PreparedCodeCanvasResend
+} from '../design/canvas/code-canvas-resend'
 import {
   deriveThreadTitleFromPrompt,
   getDefaultThreadTitle,
@@ -25,6 +31,10 @@ import {
   readThreadWorktreeRegistry,
   saveThreadWorktreeRegistry
 } from '../lib/thread-worktree-registry'
+import {
+  forgetQueuedMessagesForThread,
+  saveQueuedMessagesForThread
+} from './queued-message-persistence'
 
 /**
  * Release the worktree pool slot owned by a thread when the task completes
@@ -84,6 +94,10 @@ import {
   writeThreadBelongsToWorkspace,
   writeWorkspaceForThreadId
 } from '../write/write-thread-registry'
+import {
+  forgetDesignThread,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
 import {
   clearBusyWatchdog,
   resetBusyRecoveryAttempts,
@@ -167,6 +181,7 @@ function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
       ...finalizeTurnTiming(s),
       busy: false,
       currentTurnId: null,
+      currentTurnOrchestration: null,
       currentTurnUserId: null,
       error: null
     })
@@ -180,9 +195,35 @@ function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
   }
 }
 
+export type MaintenanceActionDependencies = {
+  prepareCodeCanvasResend?: (
+    options: PrepareCodeCanvasResendOptions
+  ) => Promise<PreparedCodeCanvasResend | null>
+  requestCodeCanvasPanelOpen?: () => void
+}
+
+/**
+ * Checkpoint create/restore identity must follow the thread workspace, not the
+ * currently selected global workspace picker. Multi-project sidebars can keep
+ * one thread open under DeepSeek-GUI while `workspaceRoot` still points at
+ * another project (e.g. KunUIExtend).
+ */
+function resolveCheckpointExpectedWorkspaceRoot(state: {
+  activeThreadId: string | null
+  threads: Array<{ id: string; workspace?: string | null }>
+  workspaceRoot: string
+}): string {
+  const threadWorkspace = state.threads.find((thread) => thread.id === state.activeThreadId)?.workspace
+  return normalizeWorkspaceRoot(threadWorkspace) || normalizeWorkspaceRoot(state.workspaceRoot)
+}
+
 export function createMaintenanceActions(
-  { set, get, sseAbortRef }: StoreActionContext
+  { set, get, sseAbortRef }: StoreActionContext,
+  dependencies: MaintenanceActionDependencies = {}
 ): Pick<ChatState, 'renameActiveThread' | 'renameThread' | 'pinThread' | 'archiveThread' | 'compactActiveThread' | 'forkActiveThread' | 'forkThreadFromTurn' | 'setActiveThreadGoal' | 'setActiveThreadGoalStatus' | 'clearActiveThreadGoal' | 'setActiveThreadTodoStatus' | 'clearActiveThreadTodos' | 'syncPlanTodosFromMarkdown' | 'resumeSessionIntoThread' | 'deleteThread' | 'rewindAndResend' | 'rollbackWorkspaceToCheckpoint' | 'resolveApproval' | 'resolveUserInput' | 'interrupt'> {
+  const prepareCanvasResend = dependencies.prepareCodeCanvasResend ?? prepareCodeCanvasResend
+  const openCodeCanvasPanel =
+    dependencies.requestCodeCanvasPanelOpen ?? requestCodeCanvasPanelOpen
   const forkActiveThreadWithOptions = async (options: { turnId?: string } = {}): Promise<void> => {
     const { activeThreadId, busy, blocks } = get()
     if (!activeThreadId) return
@@ -370,23 +411,8 @@ export function createMaintenanceActions(
       const result = await p.compactThread(activeThreadId, reason)
       await get().refreshThreads()
       await get().selectThread(activeThreadId)
-      // Manual compaction may use a model request for the summary, but the
-      // chat context gauge is still based on the main turn's measured prompt.
-      // Drop the last turn's total by the folded amount so the UI reflects the
-      // compacted model-visible history immediately. The next real turn
-      // replaces this with a precise provider count.
       const replacedTokens = result && typeof result.replacedTokens === 'number' ? result.replacedTokens : 0
-      if (replacedTokens > 0) {
-        set((s) => {
-          const prev = s.lastTurnUsage
-          if (!prev || prev.threadId !== activeThreadId) return {}
-          const inputTokens = Math.max(0, prev.snapshot.inputTokens - replacedTokens)
-          return {
-            usageRefreshKey: s.usageRefreshKey + 1,
-            lastTurnUsage: { threadId: prev.threadId, snapshot: { ...prev.snapshot, inputTokens } }
-          }
-        })
-      } else {
+      if (replacedTokens <= 0) {
         // Nothing was folded (e.g. a near-empty thread). The compaction emits no
         // timeline row in that case, so surface a transient notice instead of
         // leaving the command silently doing nothing.
@@ -664,7 +690,9 @@ export function createMaintenanceActions(
     }
     try {
       await p.deleteThread(targetId)
+      forgetQueuedMessagesForThread(targetId)
       saveWriteThreadRegistry(forgetWriteThread(targetId))
+      saveDesignThreadRegistry(forgetDesignThread(targetId))
       saveThreadForkRegistry(forgetThreadFork(targetId))
       if (wtRecord) saveThreadWorktreeRegistry(forgetThreadWorktree(targetId))
       if (deletingActive) {
@@ -721,7 +749,12 @@ export function createMaintenanceActions(
     }
     const checkpointId = targetBlock.meta?.workspaceCheckpointId
     if (checkpointId) {
-      const restored = await window.kunGui.restoreGitCheckpoint({ checkpointId }).catch((error) => ({
+      const expectedWorkspaceRoot = resolveCheckpointExpectedWorkspaceRoot(state)
+      const restored = await window.kunGui.restoreGitCheckpoint({
+        checkpointId,
+        ...(state.activeThreadId ? { expectedThreadId: state.activeThreadId } : {}),
+        ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+      }).catch((error) => ({
         ok: false as const,
         reason: 'error' as const,
         message: error instanceof Error ? error.message : String(error)
@@ -754,21 +787,39 @@ export function createMaintenanceActions(
     clearBusyWatchdog()
 
     try {
+      const canvasResend = await prepareCanvasResend({
+        route: state.route,
+        text: trimmed,
+        previousCanvasTurn: targetBlock.meta?.guiDesignCanvas === true,
+        fallbackWorkspaceRoot: state.workspaceRoot,
+        threadWorkspaceRoot: state.threads.find(
+          (thread) => thread.id === state.activeThreadId
+        )?.workspace,
+        threadId: state.activeThreadId
+      })
+      if (canvasResend) openCodeCanvasPanel()
       await p.rewindThread(state.activeThreadId, turnId)
       set({
         blocks: trimmedBlocks,
         liveReasoning: '',
         liveAssistant: '',
         currentTurnId: null,
+        currentTurnOrchestration: null,
         currentTurnUserId: null,
         turnStartedAtByUserId,
         turnDurationByUserId,
         turnReasoningFirstAtByUserId,
         turnReasoningLastAtByUserId,
-        queuedMessages: [],
         error: null
       })
-      await get().sendMessage(trimmed)
+      if (canvasResend) {
+        await get().sendMessage(canvasResend.text, 'agent', {
+          displayText: canvasResend.displayText,
+          guiDesignCanvas: true
+        })
+      } else {
+        await get().sendMessage(trimmed)
+      }
     } catch (e) {
       set({ error: formatRuntimeError(e) })
     }
@@ -796,12 +847,52 @@ export function createMaintenanceActions(
       set({ error: i18n.t('common:rollbackWorkspaceBusyError') })
       return
     }
-    const { activeThreadId, workspaceRoot } = get()
-    const restored = await window.kunGui.restoreGitCheckpoint({ checkpointId: targetCheckpointId }).catch((error) => ({
+    const state = get()
+    const { activeThreadId } = state
+    const expectedWorkspaceRoot = resolveCheckpointExpectedWorkspaceRoot(state)
+    let restored = await window.kunGui.restoreGitCheckpoint({
+      checkpointId: targetCheckpointId,
+      ...(activeThreadId ? { expectedThreadId: activeThreadId } : {}),
+      ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+    }).catch((error) => ({
       ok: false as const,
       reason: 'error' as const,
       message: error instanceof Error ? error.message : String(error)
     }))
+    // A partial checkpoint skipped some untracked files (too large to capture).
+    // Restoring would delete them, so the main process refuses unless the user
+    // opts in. Surface the at-risk files and, on confirmation, retry with the
+    // opt-in (the main process then takes a full rescue checkpoint first).
+    if (!restored.ok && restored.reason === 'partial') {
+      const skipped = 'skippedUntracked' in restored && Array.isArray(restored.skippedUntracked)
+        ? restored.skippedUntracked
+        : []
+      const preview = skipped.slice(0, 10).join(', ') + (skipped.length > 10 ? ` … (+${skipped.length - 10})` : '')
+      const proceed = await confirmDialog(
+        i18n.t('common:rollbackWorkspacePartialConfirm'),
+        i18n.t('common:rollbackWorkspacePartialConfirmDetail', { files: preview })
+      )
+      if (!proceed) {
+        set({ error: null })
+        return
+      }
+      if (get().busy) {
+        set({ error: i18n.t('common:rollbackWorkspaceBusyError') })
+        return
+      }
+      restored = await window.kunGui
+        .restoreGitCheckpoint({
+          checkpointId: targetCheckpointId,
+          allowPartialRestore: true,
+          ...(activeThreadId ? { expectedThreadId: activeThreadId } : {}),
+          ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+        })
+        .catch((error) => ({
+          ok: false as const,
+          reason: 'error' as const,
+          message: error instanceof Error ? error.message : String(error)
+        }))
+    }
     if (!restored.ok) {
       set({ error: restored.message })
       return
@@ -817,7 +908,7 @@ export function createMaintenanceActions(
       '[rollback] rescue checkpoint:',
       rescueId,
       'workspace:',
-      workspaceRoot,
+      expectedWorkspaceRoot,
       'thread:',
       activeThreadId
     )
@@ -841,19 +932,33 @@ export function createMaintenanceActions(
       )
     }))
     try {
-      await p.submitApprovalDecision(
+      const outcome = await p.submitApprovalDecision(
         block.approvalId,
         decision === 'allow' ? 'allow' : 'deny',
-        false
+        true
       )
+      if (outcome === 'cancelled') {
+        set((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
+              ? { ...b, status: 'pending' as const, errorMessage: undefined }
+              : b
+          )
+        }))
+        return
+      }
       set((s) => ({
         blocks: s.blocks.map((b) =>
-          b.id === blockId && b.kind === 'approval'
+          b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
             ? { ...b, status: decision === 'allow' ? ('allowed' as const) : ('denied' as const) }
             : b
         )
       }))
     } catch (e) {
+      const stillSubmitting = get().blocks.some((b) =>
+        b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
+      )
+      if (!stillSubmitting) return
       const msg = formatRuntimeError(e)
       void window.kunGui.logError('approval', 'Failed to submit approval decision', {
         message: msg,
@@ -865,7 +970,7 @@ export function createMaintenanceActions(
           ? { route: 'settings' as const, settingsSection: 'agents' as const }
           : {}),
         blocks: s.blocks.map((b) =>
-          b.id === blockId && b.kind === 'approval'
+          b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
             ? { ...b, status: 'error' as const, errorMessage: msg }
             : b
         )
@@ -901,7 +1006,8 @@ export function createMaintenanceActions(
                 ...s.queuedMessages,
                 {
                   id: `q-${Date.now()}-${s.queuedMessages.length}`,
-                  text: followupText
+                  text: followupText,
+                  deliveryState: 'pending' as const
                 }
               ],
               blocks: s.blocks.map((b) =>
@@ -910,6 +1016,7 @@ export function createMaintenanceActions(
                   : b
               )
             }))
+            saveQueuedMessagesForThread(activeThreadId, get().queuedMessages)
             await p.interruptTurn(activeThreadId, currentTurnId)
             settleInterruptedTurn(set, get)
             void get().refreshThreads()

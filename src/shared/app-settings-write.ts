@@ -4,6 +4,7 @@ import {
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_COMPLETION_MIN_ACCEPT_SCORE,
   DEFAULT_WRITE_INLINE_COMPLETION_MODEL,
+  DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_DEBOUNCE_MS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MIN_ACCEPT_SCORE,
@@ -18,6 +19,8 @@ import {
   WRITE_AGENT_PERSONA_MAX_CHARS,
   WRITE_AGENT_PRESET_MAX_COUNT,
   WRITE_AGENT_PRESET_NAME_MAX_CHARS,
+  MAX_WRITE_AUTOSAVE_DELAY_MS,
+  MIN_WRITE_AUTOSAVE_DELAY_MS,
   DEFAULT_MODEL_ENDPOINT_FORMAT,
   DEFAULT_MODEL_PROVIDER_ID,
   type AppSettingsV1,
@@ -46,6 +49,9 @@ export const WRITE_QUICK_ACTION_BUILTIN_IDS = [
   'quieter',
   'critique'
 ] as const
+
+/** Managed seed file created in Kun's default writing space. */
+export const DEFAULT_WRITE_WELCOME_FILE_NAME = 'welcome.md'
 
 // Retired built-ins: pristine stored rows (label and prompt empty, i.e. "use
 // the built-in defaults") are dropped on normalization since the defaults no
@@ -282,6 +288,8 @@ export function defaultWriteSettings(): WriteSettingsV1 {
     defaultWorkspaceRoot: DEFAULT_WRITE_WORKSPACE_ROOT,
     activeWorkspaceRoot: DEFAULT_WRITE_WORKSPACE_ROOT,
     workspaces: [DEFAULT_WRITE_WORKSPACE_ROOT],
+    autoSaveEnabled: true,
+    autoSaveDelayMs: DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
     inlineCompletion: {
       enabled: true,
       retrievalEnabled: true,
@@ -449,10 +457,15 @@ export function normalizeWriteSettings(input: WriteSettingsPatchV1 | undefined):
     activeWorkspaceRoot,
     ...(Array.isArray(source.workspaces) ? source.workspaces : [])
   ])
+  const autoSaveDelayMs = Number(source.autoSaveDelayMs)
   return {
     defaultWorkspaceRoot,
     activeWorkspaceRoot,
     workspaces: workspaces.length > 0 ? workspaces : [defaultWorkspaceRoot],
+    autoSaveEnabled: source.autoSaveEnabled !== false,
+    autoSaveDelayMs: Number.isFinite(autoSaveDelayMs)
+      ? Math.max(MIN_WRITE_AUTOSAVE_DELAY_MS, Math.min(MAX_WRITE_AUTOSAVE_DELAY_MS, Math.round(autoSaveDelayMs)))
+      : defaults.autoSaveDelayMs,
     inlineCompletion: normalizeWriteInlineCompletionSettings(source.inlineCompletion),
     selectionAssist: normalizeWriteSelectionAssistSettings(source.selectionAssist),
     typography: normalizeWriteTypography(source.typography),

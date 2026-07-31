@@ -11,6 +11,8 @@ export type WriteActiveFileKind = 'text' | 'image' | 'pdf'
 export type WriteWorkspaceState = {
   defaultWorkspaceRoot: string
   workspaceRoots: string[]
+  autoSaveEnabled: boolean
+  autoSaveDelayMs: number
   inlineCompletion: WriteInlineCompletionSettingsV1
   inlineCompletionApiReady: boolean
   /** Selection toolbar AI assists: quick action prompts + infographic prompt. */
@@ -42,8 +44,19 @@ export type WriteWorkspaceState = {
   fileError: string | null
   fileLoading: boolean
   saveStatus: WriteSaveStatus
+  /** Advances whenever the active document lifecycle changes, including reopening the same path. */
+  documentEpoch: number
+  /** Advances for each local content mutation within the active document epoch. */
+  contentRevision: number
+  /** Last content confirmed on disk for the active document epoch. */
+  persistedContent: string
   /** Set when an agent edited the active file and the change awaits red/green review. */
-  pendingAgentReview: { nextContent: string } | null
+  pendingAgentReview: {
+    workspaceRoot: string
+    filePath: string
+    documentEpoch: number
+    nextContent: string
+  } | null
   /** True while an inline diff review (agent edit or AI rewrite) is in progress. */
   reviewActive: boolean
   previewMode: WritePreviewMode
@@ -59,6 +72,7 @@ export type WriteWorkspaceState = {
   selectWriteWorkspace: (workspaceRoot: string) => Promise<void>
   addWriteWorkspace: (workspaceRoot: string) => Promise<void>
   removeWriteWorkspace: (workspaceRoot: string) => Promise<void>
+  setInlineCompletionEnabled: (enabled: boolean) => Promise<void>
   initializeWorkspace: (workspaceRoot: string) => Promise<void>
   loadDirectory: (workspaceRoot: string, path?: string) => Promise<string | null>
   toggleDirectory: (workspaceRoot: string, path: string) => Promise<void>
@@ -80,7 +94,10 @@ export type WriteWorkspaceState = {
     }
   ) => Promise<boolean>
   syncActiveImageFromDisk: (workspaceRoot: string, path?: string) => Promise<boolean>
-  flushSave: (workspaceRoot: string) => Promise<boolean>
+  flushSave: (
+    workspaceRoot: string,
+    options?: { resolveExternalConflict?: 'keep-local' }
+  ) => Promise<boolean>
   createFile: (workspaceRoot: string, path: string, content?: string) => Promise<string | null>
   createDirectory: (workspaceRoot: string, path: string) => Promise<string | null>
   renameEntry: (workspaceRoot: string, path: string, newName: string) => Promise<string | null>

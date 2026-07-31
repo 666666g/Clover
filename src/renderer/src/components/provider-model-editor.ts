@@ -31,6 +31,9 @@ export const PROVIDER_MODEL_REASONING_PROTOCOLS: ModelReasoningRequestProtocol[]
   'deepseek-chat-completions',
   'glm-chat-completions',
   'mimo-chat-completions',
+  'openai-chat-completions',
+  'qwen-chat-completions',
+  'thinking-toggle-chat-completions',
   'openai-responses',
   'anthropic-thinking',
   'none'
@@ -54,6 +57,8 @@ export type ProviderModelForm = {
   reasoningProtocol: ModelReasoningRequestProtocol
   /** Per-model wire-format override; null means "inherit the provider's format". */
   endpointFormat: ModelEndpointFormat | null
+  /** Internal preset transport metadata; intentionally not exposed in the form UI. */
+  responsesMode: 'lite' | null
   aliases: string[]
 }
 
@@ -98,7 +103,7 @@ export function newProviderModelForm(
     kind,
     originalModelId: '',
     modelId: '',
-    contextWindowTokens: kind === 'chat' ? 128_000 : null,
+    contextWindowTokens: kind === 'chat' ? 256_000 : null,
     maxOutputTokens: null,
     visionInput: false,
     supportsToolCalling: true,
@@ -107,6 +112,7 @@ export function newProviderModelForm(
     reasoningDefaultEffort: 'medium',
     reasoningProtocol: defaultReasoningProtocolForProvider(provider),
     endpointFormat: null,
+    responsesMode: null,
     aliases: []
   }
 }
@@ -137,6 +143,7 @@ export function providerModelFormForExisting(
     reasoningDefaultEffort: profile.reasoning?.defaultEffort ?? base.reasoningDefaultEffort,
     reasoningProtocol: profile.reasoning?.requestProtocol ?? base.reasoningProtocol,
     endpointFormat: profile.endpointFormat ?? null,
+    responsesMode: profile.responsesMode ?? null,
     aliases: [...(profile.aliases ?? [])]
   }
 }
@@ -427,7 +434,8 @@ function chatProfileFromForm(form: ProviderModelForm): ModelProviderModelProfile
     ...(form.reasoningEnabled && form.reasoningEfforts.length > 0
       ? { reasoning: reasoningCapabilityFromForm(form) }
       : {}),
-    ...(form.endpointFormat ? { endpointFormat: form.endpointFormat } : {})
+    ...(form.endpointFormat ? { endpointFormat: form.endpointFormat } : {}),
+    ...(form.responsesMode ? { responsesMode: form.responsesMode } : {})
   }
 }
 

@@ -1,8 +1,14 @@
-import { useMemo, useState, type FormEvent, type ReactElement } from 'react'
+import {
+  useMemo,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type FormEvent,
+  type ReactElement
+} from 'react'
 import { useTranslation } from 'react-i18next'
 import { ChevronDown, ChevronRight, MessageCirclePlus, Plus, Search } from 'lucide-react'
 import type { NormalizedThread } from '../../agent/types'
-import { isConversationWorkspacePath } from '../../lib/workspace-path'
+import { defaultConversationWorkspaceRoot, isConversationWorkspacePath } from '../../lib/workspace-path'
 import {
   SidebarIconButton,
   SidebarSearchField
@@ -14,6 +20,18 @@ import {
   sortSidebarThreads
 } from './SidebarProjectsSection'
 import { useChatStore } from '../../store/chat-store'
+import {
+  SIDEBAR_THREAD_DRAG_DATA_KEY,
+  readSidebarOrderRegistry,
+  reconcileSidebarThreadOrder,
+  reorderSidebarThreadIds,
+  saveSidebarOrderRegistry,
+  setSidebarThreadOrder,
+  sidebarDropPosition,
+  sidebarThreadOrderScope,
+  type SidebarDropPosition,
+  type SidebarOrderRegistry
+} from './sidebar-order'
 
 type Props = {
   threads: NormalizedThread[]
@@ -51,17 +69,29 @@ export function SidebarConversationsSection({
   const watchTurnCompletion = useChatStore((s) => s.watchTurnCompletion)
   const unreadThreadIds = useChatStore((s) => s.unreadThreadIds)
 
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(true)
   const [searchOpen, setSearchOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [deletingThreadIds, setDeletingThreadIds] = useState<Record<string, boolean>>({})
   const [renameState, setRenameState] = useState<LocalRenameState | null>(null)
+  const [sidebarOrder, setSidebarOrder] = useState<SidebarOrderRegistry>(() => readSidebarOrderRegistry())
+  const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null)
+  const [dropTarget, setDropTarget] = useState<{ threadId: string; position: SidebarDropPosition } | null>(null)
+
+  const conversationOrderScopePath = conversationRoot.trim() || defaultConversationWorkspaceRoot()
+  const conversationOrderScope = sidebarThreadOrderScope(conversationOrderScopePath)
+
+  const allConversationThreads = useMemo(() => sortSidebarThreads(threads.filter((thread) =>
+    isConversationWorkspacePath(thread.workspace, conversationRoot) && thread.archived !== true
+  )), [conversationRoot, threads])
 
   const conversationThreads = useMemo(() => {
     const query = search.trim().toLowerCase()
-    const filtered = threads.filter((thread) => {
-      if (!isConversationWorkspacePath(thread.workspace, conversationRoot)) return false
-      if (thread.archived === true) return false
+    const ordered = reconcileSidebarThreadOrder(
+      allConversationThreads,
+      sidebarOrder.threadIdsByScope[conversationOrderScope] ?? []
+    )
+    return ordered.filter((thread) => {
       if (!query) return true
       const haystack = [thread.title, thread.preview, thread.workspace]
         .filter(Boolean)
@@ -69,8 +99,7 @@ export function SidebarConversationsSection({
         .toLowerCase()
       return haystack.includes(query)
     })
-    return sortSidebarThreads(filtered)
-  }, [threads, conversationRoot, search])
+  }, [allConversationThreads, conversationOrderScope, search, sidebarOrder.threadIdsByScope])
 
   const handlePin = (threadId: string, pinned: boolean): void => {
     void onPinThread(threadId, pinned)
@@ -112,6 +141,84 @@ export function SidebarConversationsSection({
   }
 
   const noOp = (): void => {}
+
+  const persistSidebarOrder = (
+    update: (current: SidebarOrderRegistry) => SidebarOrderRegistry
+  ): void => {
+    const next = update(readSidebarOrderRegistry())
+    saveSidebarOrderRegistry(next)
+    setSidebarOrder(next)
+  }
+
+  const handleDragStart = (
+    event: ReactDragEvent<HTMLDivElement>,
+    threadId: string
+  ): void => {
+    if (!threadId.trim() || deletingThreadIds[threadId] === true) {
+      event.preventDefault()
+      return
+    }
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData(SIDEBAR_THREAD_DRAG_DATA_KEY, threadId)
+    setDraggingThreadId(threadId)
+    setDropTarget(null)
+  }
+
+  const handleDragEnd = (): void => {
+    setDraggingThreadId(null)
+    setDropTarget(null)
+  }
+
+  const handleDragOver = (
+    event: ReactDragEvent<HTMLDivElement>,
+    targetThreadId: string
+  ): void => {
+    const sourceId = draggingThreadId || event.dataTransfer.getData(SIDEBAR_THREAD_DRAG_DATA_KEY)
+    if (!sourceId || sourceId === targetThreadId) return
+    if (!allConversationThreads.some((thread) => thread.id === sourceId)) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+    const rect = event.currentTarget.getBoundingClientRect()
+    setDropTarget({
+      threadId: targetThreadId,
+      position: sidebarDropPosition(event.clientY, rect.top, rect.height)
+    })
+  }
+
+  const handleDragLeave = (
+    event: ReactDragEvent<HTMLDivElement>,
+    threadId: string
+  ): void => {
+    if (
+      event.relatedTarget instanceof Node
+      && event.currentTarget.contains(event.relatedTarget)
+    ) return
+    setDropTarget((current) => current?.threadId === threadId ? null : current)
+  }
+
+  const handleDrop = (
+    event: ReactDragEvent<HTMLDivElement>,
+    targetThreadId: string
+  ): void => {
+    const sourceId = draggingThreadId || event.dataTransfer.getData(SIDEBAR_THREAD_DRAG_DATA_KEY)
+    if (!sourceId || sourceId === targetThreadId) return
+    if (!allConversationThreads.some((thread) => thread.id === sourceId)) return
+    event.preventDefault()
+    const orderedIds = reconcileSidebarThreadOrder(
+      allConversationThreads,
+      sidebarOrder.threadIdsByScope[conversationOrderScope] ?? []
+    ).map((thread) => thread.id)
+    const rect = event.currentTarget.getBoundingClientRect()
+    const nextIds = reorderSidebarThreadIds({
+      threadIds: orderedIds,
+      sourceId,
+      targetId: targetThreadId,
+      position: sidebarDropPosition(event.clientY, rect.top, rect.height)
+    })
+    persistSidebarOrder((current) => setSidebarThreadOrder(current, conversationOrderScopePath, nextIds))
+    setDraggingThreadId(null)
+    setDropTarget(null)
+  }
 
   return (
     <div className="ds-no-drag flex shrink-0 flex-col">
@@ -190,6 +297,14 @@ export function SidebarConversationsSection({
               onContextMenu={noOp}
               onPreviewOpen={noOp}
               onPreviewClose={noOp}
+              draggable={deletingThreadIds[thread.id] !== true}
+              dragging={draggingThreadId === thread.id}
+              dropPosition={dropTarget?.threadId === thread.id ? dropTarget.position : null}
+              onDragStart={(event) => handleDragStart(event, thread.id)}
+              onDragEnd={handleDragEnd}
+              onDragOver={(event) => handleDragOver(event, thread.id)}
+              onDragLeave={(event) => handleDragLeave(event, thread.id)}
+              onDrop={(event) => handleDrop(event, thread.id)}
               onPin={() => handlePin(thread.id, thread.pinned !== true)}
               onRename={() => openRename(thread)}
               onArchive={() => handleArchive(thread.id)}

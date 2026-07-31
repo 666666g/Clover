@@ -15,30 +15,71 @@ import type { ModelClient, ModelRequest, ModelStreamChunk } from '../../ports/mo
  */
 export class MultiProviderModelClient implements ModelClient {
   readonly provider = 'compat-multi'
-  readonly model: string
+  model: string
 
-  private readonly default_: ModelClient
-  private readonly providers: Map<string, ModelClient>
+  private default_: ModelClient
+  private providers: Map<string, ModelClient>
+  private readonly turnPins = new Map<string, {
+    client: ModelClient
+    providerId: string
+    touchedAt: number
+  }>()
 
   constructor(input: { default: ModelClient; providers?: Map<string, ModelClient> }) {
     this.default_ = input.default
-    this.providers = input.providers ?? new Map()
+    this.providers = canonicalProviders(input.providers)
     this.model = input.default.model
   }
 
+  replace(input: { default: ModelClient; providers?: Map<string, ModelClient> }): void {
+    this.default_ = input.default
+    this.providers = canonicalProviders(input.providers)
+    this.model = input.default.model
+  }
+
+  register(providerId: string, client: ModelClient): () => void {
+    const id = providerId.trim().toLowerCase()
+    if (!id) throw new Error('model provider id is required')
+    if (this.providers.has(id)) throw new Error(`model provider already registered: ${providerId}`)
+    this.providers.set(id, client)
+    return () => {
+      if (this.providers.get(id) === client) this.providers.delete(id)
+    }
+  }
+
+  unregister(providerId: string): boolean {
+    return this.providers.delete(providerId.trim().toLowerCase())
+  }
+
+  registeredProviderIds(): string[] {
+    return [...this.providers.keys()].sort()
+  }
+
   /**
-   * Pick the client for this request's `providerId` (case-insensitive,
-   * trimmed); fall back to the default client when the id is missing or
-   * unknown.
+   * Pick the client for this request's `providerId`. Omitted ids use the
+   * default client; an explicit unknown id is an error so private request
+   * content can never silently fall back to different provider credentials.
    */
   resolve(providerId?: string): ModelClient {
-    const trimmed = providerId?.trim()
-    if (!trimmed) return this.default_
-    return this.providers.get(trimmed) ?? this.default_
+    const trimmed = providerId?.trim().toLowerCase()
+    if (!trimmed || trimmed === 'default') return this.default_
+    const client = this.providers.get(trimmed)
+    if (!client) throw new Error(`unknown model provider: ${providerId}`)
+    return client
   }
 
   stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
-    return this.resolve(request.providerId).stream(request)
+    const providerId = request.providerId?.trim().toLowerCase() || 'default'
+    const pinned = this.turnPins.get(request.turnId)
+    if (pinned && pinned.providerId !== providerId) {
+      throw new Error(
+        `model provider changed within turn ${request.turnId}: ${pinned.providerId} -> ${providerId}`
+      )
+    }
+    const client = pinned?.client ?? this.resolve(request.providerId)
+    this.turnPins.set(request.turnId, { client, providerId, touchedAt: Date.now() })
+    this.pruneTurnPins()
+    return client.stream(request)
   }
 
   /**
@@ -59,4 +100,22 @@ export class MultiProviderModelClient implements ModelClient {
   configFor(providerId?: string): unknown {
     return (this.resolve(providerId) as { config?: unknown }).config
   }
+
+  private pruneTurnPins(): void {
+    if (this.turnPins.size <= 2_000) return
+    const cutoff = Date.now() - 6 * 60 * 60 * 1_000
+    for (const [turnId, pin] of this.turnPins) {
+      if (pin.touchedAt < cutoff || this.turnPins.size > 4_000) {
+        this.turnPins.delete(turnId)
+      }
+    }
+  }
+}
+
+function canonicalProviders(providers?: Map<string, ModelClient>): Map<string, ModelClient> {
+  return new Map(
+    [...(providers ?? new Map())]
+      .map(([id, client]) => [id.trim().toLowerCase(), client] as const)
+      .filter(([id]) => Boolean(id))
+  )
 }

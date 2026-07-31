@@ -3,12 +3,13 @@ export type GitCheckpointCreateResult =
       ok: true
       checkpointId: string
       repositoryRoot: string
-      head: string
+      /** `null` when the repository had no initial commit yet. */
+      head: string | null
       currentBranch: string | null
     }
   | {
       ok: false
-      reason: 'no_workspace' | 'not_git_repo' | 'git_unavailable' | 'conflict' | 'error'
+      reason: 'no_workspace' | 'not_git_repo' | 'git_unavailable' | 'conflict' | 'disabled' | 'error'
       message: string
     }
 
@@ -17,7 +18,8 @@ export type GitCheckpointRestoreResult =
       ok: true
       checkpointId: string
       repositoryRoot: string
-      head: string
+      /** `null` when the restored checkpoint predates the first commit. */
+      head: string | null
       currentBranch: string | null
       rescueCheckpointId: string | null
     }
@@ -29,6 +31,16 @@ export type GitCheckpointRestoreResult =
         | 'git_unavailable'
         | 'not_found'
         | 'conflict'
+        // Rescue-snapshot failures reuse the create-checkpoint reasons, which include 'disabled'.
+        | 'disabled'
+        | 'partial'
         | 'error'
       message: string
+      /**
+       * Present when `reason === 'partial'`: untracked files that existed at
+       * checkpoint time but were NOT snapshotted (over the size budget).
+       * Restoring would `git clean` them with no way to bring them back, so the
+       * restore is refused unless the caller opts in with `allowPartialRestore`.
+       */
+      skippedUntracked?: string[]
     }

@@ -14,6 +14,7 @@ import {
   ServeExitCode
 } from './serve.js'
 import type { ServeOptions } from './cli-options.js'
+import { runTuiCommand } from '../tui/index.js'
 
 type WritableLike = {
   write(chunk: string): unknown
@@ -30,19 +31,29 @@ export type CliIo = {
 
 export const KUN_CLI_USAGE = `kun <command> [options]
 
+Run \`kun\` without a command to open the inline terminal UI.
+
 Commands:
   serve [options]            Start the local HTTP/SSE runtime
   run [options] <prompt>     Run one agent turn without the GUI
   chat [options]             Start a line-oriented terminal chat
+  tui [options]              Open the inline terminal UI (same as bare kun)
+  runtime <command>          Inspect, stop, or restart the shared runtime
+  update [--check|--yes]     Check or update a stable standalone TUI archive
   exec [options] <tool>      List or invoke tools directly
+  extension <command>        Create, validate, pack, install, and manage extensions
 
 Common options:
   --config <path>            JSON config file
   --data-dir <path>          Root directory for Kun data
   --workspace <path>         Workspace root for run/chat/exec
   --model <model>            Model id
+  --provider-id <id>         Route through a configured or extension model provider
+  --account-id <id>          Bind an opaque core-managed provider account
   --approval-policy <p>      on-request | untrusted | never | auto | suggest
+  --approval-reviewer <r>    user | agent
   --json                     Emit machine-readable JSON where supported
+  --jsonl                    Stream one machine-readable event per line for kun run
 
 Exec options:
   --list-tools               Print available tools
@@ -63,8 +74,11 @@ const VALUE_FLAGS = new Set([
   'base-url',
   'baseUrl',
   'model',
+  'provider-id',
+  'account-id',
   'approval-policy',
   'sandbox-mode',
+  'approval-reviewer',
   'workspace',
   'prompt',
   'p',
@@ -72,7 +86,7 @@ const VALUE_FLAGS = new Set([
   'title'
 ])
 
-export type KunCliCommand = 'serve' | 'run' | 'chat' | 'exec' | 'help'
+export type KunCliCommand = 'serve' | 'run' | 'chat' | 'tui' | 'exec' | 'runtime' | 'update' | 'version' | 'help'
 
 export function splitKunCliCommand(argv: readonly string[]): {
   command: KunCliCommand
@@ -80,20 +94,32 @@ export function splitKunCliCommand(argv: readonly string[]): {
   error?: string
 } {
   const first = argv[0]
-  if (!first || first === '--help' || first === '-h' || first === 'help') {
+  if (!first) return { command: 'tui', args: [] }
+  if (first === '--help' || first === '-h' || first === 'help') {
     return { command: 'help', args: [] }
   }
-  if (first === 'serve' || first === 'run' || first === 'chat' || first === 'exec') {
+  if (first === '--version' || first === '-V' || first === 'version') {
+    return { command: 'version', args: [] }
+  }
+  if (
+    first === 'serve' ||
+    first === 'run' ||
+    first === 'chat' ||
+    first === 'tui' ||
+    first === 'exec' ||
+    first === 'runtime' ||
+    first === 'update'
+  ) {
     return { command: first, args: [...argv.slice(1)] }
   }
-  if (first.startsWith('--')) {
-    return { command: 'serve', args: [...argv] }
+  if (first.startsWith('-')) {
+    return { command: 'tui', args: [...argv] }
   }
   return { command: 'help', args: [], error: `unknown command: ${first}` }
 }
 
 export async function runAgentCommand(
-  command: Exclude<KunCliCommand, 'serve' | 'help'>,
+  command: Exclude<KunCliCommand, 'serve' | 'runtime' | 'update' | 'version' | 'help'>,
   argv: readonly string[],
   io: CliIo
 ): Promise<number> {
@@ -102,6 +128,8 @@ export async function runAgentCommand(
       return runOneShot(argv, io)
     case 'chat':
       return runChat(argv, io)
+    case 'tui':
+      return runTuiCommand(argv, io)
     case 'exec':
       return runExec(argv, io)
   }
@@ -110,6 +138,11 @@ export async function runAgentCommand(
 async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
   const parsed = parseSharedOptions(argv, io)
   if (!parsed.ok) return writeParseError(parsed, io, 'kun run')
+  const jsonl = hasFlag(argv, 'jsonl')
+  if (parsed.json && jsonl) {
+    io.stderr.write('kun run: --json and --jsonl are mutually exclusive\n')
+    return ServeExitCode.usage
+  }
   const prompt = stringFlag(argv, ['prompt', 'p']) ?? positionals(argv).join(' ').trim()
   if (!prompt) {
     io.stderr.write('kun run: missing prompt\n')
@@ -122,17 +155,29 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
       title: stringFlag(argv, ['title']) ?? prompt.slice(0, 80),
       workspace: parsed.workspace,
       model: parsed.options.model,
+      ...(parsed.providerId ? { providerId: parsed.providerId } : {}),
+      ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
       mode: 'agent',
       approvalPolicy: parsed.options.approvalPolicy,
-      sandboxMode: parsed.options.sandboxMode
+      sandboxMode: parsed.options.sandboxMode,
+      approvalReviewer: parsed.options.approvalReviewer
     })
+    if (jsonl) writeJsonLine(io.stdout, { type: 'run_started', threadId: thread.id })
     const turn = await runtime.turnService.startTurn({
       threadId: thread.id,
-      request: { prompt, model: parsed.options.model, mode: 'agent' }
+      request: {
+        prompt,
+        model: parsed.options.model,
+        mode: 'agent',
+        clientSurface: 'cli',
+        disableUserInput: true
+      }
     })
     let streamed = false
-    const unsubscribe = parsed.json ? undefined : runtime.eventBus.subscribe(thread.id, (event) => {
-      if (event.kind === 'assistant_text_delta' && event.item.kind === 'assistant_text') {
+    const unsubscribe = runtime.eventBus.subscribe(thread.id, (event) => {
+      if (jsonl) {
+        writeJsonLine(io.stdout, { type: 'runtime_event', event })
+      } else if (!parsed.json && event.kind === 'assistant_text_delta' && event.item.kind === 'assistant_text') {
         streamed = true
         io.stdout.write(event.item.text)
       }
@@ -140,7 +185,9 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
     const status = await runtime.runTurn(thread.id, turn.turnId)
     unsubscribe?.()
     const items = await runtime.sessionStore.loadItems(thread.id)
-    if (parsed.json) {
+    if (jsonl) {
+      writeJsonLine(io.stdout, { type: 'run_finished', threadId: thread.id, turnId: turn.turnId, status })
+    } else if (parsed.json) {
       io.stdout.write(JSON.stringify({ threadId: thread.id, turnId: turn.turnId, status, items }) + '\n')
     } else {
       if (!streamed) {
@@ -158,6 +205,10 @@ async function runOneShot(argv: readonly string[], io: CliIo): Promise<number> {
   }
 }
 
+function writeJsonLine(output: WritableLike, value: unknown): void {
+  output.write(`${JSON.stringify(value)}\n`)
+}
+
 async function runChat(argv: readonly string[], io: CliIo): Promise<number> {
   const parsed = parseSharedOptions(argv, io)
   if (!parsed.ok) return writeParseError(parsed, io, 'kun chat')
@@ -168,9 +219,12 @@ async function runChat(argv: readonly string[], io: CliIo): Promise<number> {
       title: stringFlag(argv, ['title']) ?? 'CLI chat',
       workspace: parsed.workspace,
       model: parsed.options.model,
+      ...(parsed.providerId ? { providerId: parsed.providerId } : {}),
+      ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
       mode: 'agent',
       approvalPolicy: parsed.options.approvalPolicy,
-      sandboxMode: parsed.options.sandboxMode
+      sandboxMode: parsed.options.sandboxMode,
+      approvalReviewer: parsed.options.approvalReviewer
     })
     const input = io.stdin ?? processStdin
     const terminal = isTtyInput(input)
@@ -223,7 +277,13 @@ async function runChatTurn(input: {
   if (!prompt || prompt === '/exit' || prompt === '/quit') return false
   const turn = await input.runtime.turnService.startTurn({
     threadId: input.threadId,
-    request: { prompt, model: input.model, mode: 'agent' }
+    request: {
+      prompt,
+      model: input.model,
+      mode: 'agent',
+      clientSurface: 'cli',
+      disableUserInput: true
+    }
   })
   let streamed = false
   const unsubscribe = input.runtime.eventBus.subscribe(input.threadId, (event) => {
@@ -294,7 +354,14 @@ async function runExec(argv: readonly string[], io: CliIo): Promise<number> {
 }
 
 type SharedOptionsResult =
-  | { ok: true; options: ServeOptions; workspace: string; json: boolean }
+  | {
+      ok: true
+      options: ServeOptions
+      workspace: string
+      providerId?: string
+      accountId?: string
+      json: boolean
+    }
   | { ok: false; exitCode: number; message: string; issues?: unknown }
 
 function parseSharedOptions(argv: readonly string[], io: CliIo): SharedOptionsResult {
@@ -304,6 +371,12 @@ function parseSharedOptions(argv: readonly string[], io: CliIo): SharedOptionsRe
     ok: true,
     options: parsed.options,
     workspace: stringFlag(argv, ['workspace']) ?? io.env?.KUN_WORKSPACE ?? io.cwd?.() ?? process.cwd(),
+    ...(stringFlag(argv, ['provider-id'])?.trim()
+      ? { providerId: stringFlag(argv, ['provider-id'])!.trim() }
+      : {}),
+    ...(stringFlag(argv, ['account-id'])?.trim()
+      ? { accountId: stringFlag(argv, ['account-id'])!.trim() }
+      : {}),
     json: hasFlag(argv, 'json')
   }
 }
@@ -334,12 +407,14 @@ function buildExecContext(options: ServeOptions, workspace: string): ToolHostCon
     threadId: 'cli_exec',
     turnId: 'cli_exec',
     workspace,
+    clientSurface: 'cli',
     threadMode: 'agent',
     model: modelCapabilitiesForModel(options.model, modelProfiles),
     memoryPolicy: { enabled: false },
     delegationPolicy: { enabled: false },
     approvalPolicy: options.approvalPolicy,
     sandboxMode: options.sandboxMode,
+    approvalReviewer: options.approvalReviewer,
     abortSignal: new AbortController().signal,
     awaitApproval: async () => (options.approvalPolicy === 'auto' ? 'allow' : 'deny')
   }

@@ -1,0 +1,43 @@
+{
+  "name": "@kun/extension-api",
+  "version": "1.2.0",
+  "description": "Stable framework-neutral API for Kun extensions",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./manifest.schema.json": "./schema/kun-extension.schema.json"
+  },
+  "files": [
+    "dist",
+    "schema",
+    "fixtures",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run --root .",
+    "schema:generate": "npm run build && node ./scripts/generate-manifest-schema.mjs",
+    "schema:check": "npm run build && node ./scripts/generate-manifest-schema.mjs --check",
+    "prepack": "npm run schema:check"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "vitest": "^4.1.7"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

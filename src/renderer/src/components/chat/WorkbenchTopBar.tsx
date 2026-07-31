@@ -1,12 +1,12 @@
 import type { ReactElement } from 'react'
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { EditorInfo } from '@shared/editor'
 import type { GuiUpdateState } from '@shared/gui-update'
 import {
   ArrowUpCircle,
+  Blocks,
   Bot,
   Check,
-  ChevronDown,
   Code2,
   ClipboardList,
   Download,
@@ -15,67 +15,84 @@ import {
   Folders,
   FolderOpen,
   Globe2,
-  ListTodo,
+  Gauge,
+  GitBranch,
+  LockKeyhole,
   Loader2,
   MessageCircleMore,
+  PanelRight,
+  Puzzle,
   RefreshCw,
+  ScanSearch,
+  Shapes,
   Terminal
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { readPreferredEditorId, writePreferredEditorId } from '../../lib/editor-preferences'
+import {
+  extensionHostIconUrl,
+  type ExtensionRightRailViewEntry
+} from '../../extensions/contribution-registry'
+import {
+  type ExtensionRightContainerTarget
+} from '../../extensions/ExtensionWorkbenchSurfaces'
+import {
+  BUILTIN_RIGHT_PANEL_IDS,
+  type RightPanelMode
+} from '../../extensions/contribution-ids'
+import { boundedPlainText } from '../../extensions/safe-text'
 
-export type RightPanelMode =
-  | 'todo'
-  | 'changes'
-  | 'browser'
-  | 'file'
-  | 'plan'
-  | 'sdd-ai'
-  | 'subagents'
-  | null
+export type { RightPanelMode } from '../../extensions/contribution-ids'
 
 type Props = {
   rightPanelMode: RightPanelMode
   onToggleRightPanelMode: (mode: Exclude<RightPanelMode, null>) => void
   planPanelEnabled?: boolean
-  terminalOpen?: boolean
-  onToggleTerminal?: () => void
-  sideChatCount?: number
+  canvasEnabled?: boolean
+  graphEnabled?: boolean
   sideChatRunningCount?: number
   sideChatOpen?: boolean
   sideChatEnabled?: boolean
+  agentPerspectiveEnabled?: boolean
   fileTreeOpen?: boolean
   fileTreeEnabled?: boolean
   onToggleFileTree?: () => void
   onOpenSideChat?: () => void
+  extensionItems?: readonly ExtensionRightRailViewEntry[]
+  extensionContainers?: readonly ExtensionRightContainerTarget[]
+  onSelectExtension?: (entry: ExtensionRightRailViewEntry) => void
 }
 
-const TOPBAR_ICON_CLASS = 'h-[17px] w-[17px]'
-const TOPBAR_BUTTON_BASE =
-  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border p-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]'
-const TOPBAR_BUTTON_ACTIVE = 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-const TOPBAR_BUTTON_IDLE =
-  'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-
-function topbarIconButtonClass(active: boolean): string {
-  return `${TOPBAR_BUTTON_BASE} ${active ? TOPBAR_BUTTON_ACTIVE : TOPBAR_BUTTON_IDLE}`
+type WorkbenchTopActionsProps = {
+  terminalOpen?: boolean
+  onToggleTerminal?: () => void
+  rightWorkspaceExpanded?: boolean
+  onToggleRightWorkspace?: () => void
 }
 
-export function WorkbenchTopBar({
-  rightPanelMode,
-  onToggleRightPanelMode,
-  planPanelEnabled = false,
+const TOPBAR_ICON_CLASS = 'h-4 w-4'
+const SIDE_RAIL_BUTTON_BASE =
+  'ds-side-rail-button inline-flex h-8 w-8 items-center justify-center rounded-[var(--ds-radius-control)] border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30'
+const SIDE_RAIL_BUTTON_ACTIVE = 'border-ds-border-strong bg-ds-card text-ds-ink'
+const SIDE_RAIL_BUTTON_IDLE =
+  'border-transparent bg-transparent text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-ds-hover hover:text-ds-ink hover:opacity-100'
+const TOPBAR_ACTION_BUTTON_BASE =
+  'ds-topbar-action-button inline-flex h-8 w-8 items-center justify-center rounded-[var(--ds-radius-control)] border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30'
+
+function sideRailButtonClass(active: boolean, extra?: string): string {
+  return `${SIDE_RAIL_BUTTON_BASE} ${active ? SIDE_RAIL_BUTTON_ACTIVE : SIDE_RAIL_BUTTON_IDLE}${extra ? ` ${extra}` : ''}`
+}
+
+function topbarActionButtonClass(active: boolean, extra?: string): string {
+  return `${TOPBAR_ACTION_BUTTON_BASE} ${active ? SIDE_RAIL_BUTTON_ACTIVE : SIDE_RAIL_BUTTON_IDLE}${extra ? ` ${extra}` : ''}`
+}
+
+export function WorkbenchTopActions({
   terminalOpen = false,
   onToggleTerminal,
-  sideChatCount = 0,
-  sideChatRunningCount = 0,
-  sideChatOpen = false,
-  sideChatEnabled = true,
-  fileTreeOpen = false,
-  fileTreeEnabled = true,
-  onToggleFileTree,
-  onOpenSideChat
-}: Props): ReactElement {
+  rightWorkspaceExpanded = false,
+  onToggleRightWorkspace
+}: WorkbenchTopActionsProps): ReactElement {
   const { t } = useTranslation(['common', 'settings'])
   const [editors, setEditors] = useState<EditorInfo[]>([])
   const [selectedEditorId, setSelectedEditorId] = useState(() => readPreferredEditorId() ?? '')
@@ -84,17 +101,13 @@ export function WorkbenchTopBar({
   const [guiUpdateState, setGuiUpdateState] = useState<GuiUpdateState>({ status: 'idle' })
   const [applyingGuiUpdate, setApplyingGuiUpdate] = useState(false)
   const editorMenuRef = useRef<HTMLDivElement>(null)
-  const items = [
-    { mode: 'todo' as const, label: t('rightPanelTodo'), icon: ListTodo },
-    ...(planPanelEnabled ? [{ mode: 'plan' as const, label: t('rightPanelPlan'), icon: ClipboardList }] : []),
-    { mode: 'changes' as const, label: t('rightPanelChanges'), icon: FileEdit },
-    { mode: 'browser' as const, label: t('rightPanelBrowser'), icon: Globe2 },
-    { mode: 'subagents' as const, label: t('rightPanelSubagents'), icon: Bot }
-  ]
   const selectedEditor = useMemo(
     () => editors.find((editor) => editor.id === selectedEditorId) ?? editors[0],
     [editors, selectedEditorId]
   )
+  const editorButtonTitle = selectedEditor
+    ? t('editorPickerTitleWithEditor', { editor: selectedEditor.label })
+    : t('editorPickerTitle')
 
   useEffect(() => {
     let cancelled = false
@@ -279,18 +292,20 @@ export function WorkbenchTopBar({
   }
 
   return (
-    <div className="chat-workbench-topbar ds-no-drag flex min-w-0 shrink-0 flex-nowrap items-center justify-end gap-1">
+    <div className="ds-workbench-top-actions ds-no-drag relative flex shrink-0 items-center gap-1.5">
       {guiUpdateAction ? (
         <button
           type="button"
           onClick={() => void runGuiUpdateAction()}
           disabled={guiUpdateBusy}
-          className="chat-gui-update-button inline-flex items-center gap-1.5 rounded-full border border-amber-300/75 bg-amber-50/92 px-3 py-1.5 text-[12.5px] font-semibold text-amber-950 shadow-[inset_0_1px_0_rgba(255,255,255,0.55)] transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-700/70 dark:bg-amber-950/35 dark:text-amber-100 dark:hover:bg-amber-900/45"
-          aria-label={guiUpdateTitle}
-          title={guiUpdateTitle}
+          className="ds-topbar-action-button relative inline-flex h-8 w-8 items-center justify-center rounded-[0.9rem] border border-amber-300/75 bg-amber-50/92 text-amber-950 shadow-[inset_0_1px_0_rgba(255,255,255,0.55)] transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-700/70 dark:bg-amber-950/35 dark:text-amber-100 dark:hover:bg-amber-900/45"
+          data-tooltip={guiUpdateBusy ? guiUpdateLabel : guiUpdateTitle}
+          aria-label={guiUpdateBusy ? guiUpdateLabel : guiUpdateTitle}
         >
           {renderGuiUpdateIcon()}
-          <span className="chat-gui-update-label max-w-[11rem] truncate">{guiUpdateLabel}</span>
+          {!guiUpdateBusy ? (
+            <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+          ) : null}
         </button>
       ) : null}
 
@@ -298,21 +313,16 @@ export function WorkbenchTopBar({
         <button
           type="button"
           onClick={() => setEditorMenuOpen((value) => !value)}
-          className="inline-flex h-7 items-center gap-1 rounded-full border border-transparent bg-white/38 px-2.5 text-ds-faint opacity-90 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] dark:hover:bg-white/8"
+          className={topbarActionButtonClass(false)}
+          data-tooltip={editorButtonTitle}
           aria-label={t('editorPickerTitle')}
           aria-expanded={editorMenuOpen}
-          title={
-            selectedEditor
-              ? t('editorPickerTitleWithEditor', { editor: selectedEditor.label })
-              : t('editorPickerTitle')
-          }
         >
-          {renderEditorIcon(selectedEditor, TOPBAR_ICON_CLASS)}
-          <ChevronDown className="h-3.5 w-3.5 opacity-60" strokeWidth={1.9} />
+          {renderEditorIcon(selectedEditor, 'h-4 w-4')}
         </button>
 
         {editorMenuOpen ? (
-          <div className="ds-card-strong absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-[18px] border border-ds-border py-1.5 shadow-[0_18px_52px_rgba(20,47,95,0.18)] backdrop-blur-xl dark:shadow-[0_22px_58px_rgba(0,0,0,0.38)]">
+          <div className="ds-card-strong absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-[var(--ds-radius-card)] border border-ds-border py-1.5 shadow-[var(--ds-shadow-overlay)]">
             <div className="border-b border-ds-border-muted px-3 pb-2 pt-1.5 text-[11px] font-semibold text-ds-faint">
               {t('editorPickerMenuTitle')}
             </div>
@@ -344,24 +354,94 @@ export function WorkbenchTopBar({
         ) : null}
       </div>
 
+      {onToggleTerminal ? (
+        <button
+          type="button"
+          onClick={onToggleTerminal}
+          className={topbarActionButtonClass(terminalOpen)}
+          data-tooltip={t('rightPanelTerminal')}
+          aria-label={t('rightPanelTerminal')}
+          aria-pressed={terminalOpen}
+        >
+          <Terminal className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
+        </button>
+      ) : null}
+
+      {onToggleRightWorkspace ? (
+        <button
+          type="button"
+          onClick={onToggleRightWorkspace}
+          className={topbarActionButtonClass(rightWorkspaceExpanded)}
+          data-tooltip={t('rightPanelWorkspaceToggle')}
+          aria-label={t('rightPanelWorkspaceToggle')}
+          aria-pressed={rightWorkspaceExpanded}
+        >
+          <PanelRight className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
+export function WorkbenchSideRail({
+  rightPanelMode,
+  onToggleRightPanelMode,
+  planPanelEnabled = false,
+  canvasEnabled = false,
+  graphEnabled = false,
+  sideChatRunningCount = 0,
+  sideChatOpen = false,
+  sideChatEnabled = true,
+  agentPerspectiveEnabled = true,
+  fileTreeOpen = false,
+  fileTreeEnabled = true,
+  onToggleFileTree,
+  onOpenSideChat,
+  extensionItems = [],
+  extensionContainers = [],
+  onSelectExtension
+}: Props): ReactElement {
+  const { t } = useTranslation(['common', 'settings'])
+  const items = [
+    {
+      mode: BUILTIN_RIGHT_PANEL_IDS.agentPerspective,
+      label: t('rightPanelAgentPerspective'),
+      icon: ScanSearch,
+      disabled: !agentPerspectiveEnabled
+    },
+    ...(planPanelEnabled ? [{ mode: BUILTIN_RIGHT_PANEL_IDS.plan, label: t('rightPanelPlan'), icon: ClipboardList }] : []),
+    { mode: BUILTIN_RIGHT_PANEL_IDS.changes, label: t('rightPanelChanges'), icon: FileEdit },
+    { mode: BUILTIN_RIGHT_PANEL_IDS.browser, label: t('rightPanelBrowser'), icon: Globe2 },
+    ...(canvasEnabled ? [{ mode: BUILTIN_RIGHT_PANEL_IDS.canvas, label: t('rightPanelWhiteboard'), icon: Shapes }] : []),
+    ...(graphEnabled ? [{
+      mode: BUILTIN_RIGHT_PANEL_IDS.graph,
+      label: t('rightPanelGraph', { defaultValue: 'Graph' }),
+      icon: GitBranch
+    }] : []),
+    { mode: BUILTIN_RIGHT_PANEL_IDS.subagents, label: t('rightPanelSubagents'), icon: Bot },
+    { mode: BUILTIN_RIGHT_PANEL_IDS.mcpSkills, label: t('rightPanelMcpSkills'), icon: Blocks },
+    {
+      mode: BUILTIN_RIGHT_PANEL_IDS.providerQuotas,
+      label: t('rightPanelProviderQuotas'),
+      icon: Gauge
+    }
+  ]
+
+  return (
+    <div className="ds-workbench-side-rail ds-sidebar-surface ds-no-drag flex h-full w-12 shrink-0 flex-col items-center gap-1.5 border-l border-ds-border-muted py-3">
       {onOpenSideChat ? (
         <button
           type="button"
           onClick={onOpenSideChat}
           disabled={!sideChatEnabled}
-          className={`relative ${topbarIconButtonClass(sideChatOpen)} disabled:cursor-not-allowed disabled:opacity-45`}
+          className={sideRailButtonClass(sideChatOpen, 'relative disabled:cursor-not-allowed disabled:opacity-45')}
+          data-tooltip={t('sidePanelOpen')}
           aria-label={t('sidePanelOpen')}
           aria-pressed={sideChatOpen}
-          title={t('sidePanelOpen')}
         >
           <MessageCircleMore className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
-          {sideChatCount > 0 ? (
-            <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-semibold leading-none text-white">
-              {Math.min(sideChatCount, 9)}
-            </span>
-          ) : null}
           {sideChatRunningCount > 0 ? (
-            <span className="absolute -bottom-0.5 -right-0.5 h-2 w-2 animate-pulse rounded-full bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.18)]" />
+            <span className="absolute -bottom-0.5 -left-0.5 h-2 w-2 animate-pulse rounded-full bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.18)]" />
           ) : null}
         </button>
       ) : null}
@@ -369,32 +449,19 @@ export function WorkbenchTopBar({
       {items.map((item) => {
         const active = rightPanelMode === item.mode
         const Icon = item.icon
-        const isChanges = item.mode === 'changes'
         return (
-          <Fragment key={item.mode}>
-            <button
-              type="button"
-              onClick={() => onToggleRightPanelMode(item.mode)}
-              className={topbarIconButtonClass(active)}
-              aria-label={item.label}
-              aria-pressed={active}
-              title={item.label}
-            >
-              <Icon className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
-            </button>
-            {isChanges && onToggleTerminal ? (
-              <button
-                type="button"
-                onClick={onToggleTerminal}
-                className={topbarIconButtonClass(terminalOpen)}
-                aria-label={t('rightPanelTerminal')}
-                aria-pressed={terminalOpen}
-                title={t('rightPanelTerminal')}
-              >
-                <Terminal className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
-              </button>
-            ) : null}
-          </Fragment>
+          <button
+            key={item.mode}
+            type="button"
+            onClick={() => onToggleRightPanelMode(item.mode)}
+            disabled={'disabled' in item && item.disabled === true}
+            className={sideRailButtonClass(active, 'disabled:cursor-not-allowed disabled:opacity-45')}
+            data-tooltip={item.label}
+            aria-label={item.label}
+            aria-pressed={active}
+          >
+            <Icon className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
+          </button>
         )
       })}
 
@@ -403,14 +470,102 @@ export function WorkbenchTopBar({
           type="button"
           onClick={onToggleFileTree}
           disabled={!fileTreeEnabled}
-          className={`${topbarIconButtonClass(fileTreeOpen)} disabled:cursor-not-allowed disabled:opacity-45`}
+          className={sideRailButtonClass(fileTreeOpen, 'disabled:cursor-not-allowed disabled:opacity-45')}
+          data-tooltip={t('rightPanelFiles')}
           aria-label={t('rightPanelFiles')}
           aria-pressed={fileTreeOpen}
-          title={t('rightPanelFiles')}
         >
           <Folders className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
         </button>
       ) : null}
+
+      {extensionContainers.length > 0 || extensionItems.length > 0 ? (
+        <div className="ds-extension-side-rail-group mt-auto flex shrink-0 flex-col items-center gap-1.5 border-t border-ds-border-muted pt-2">
+          {extensionContainers.map(({ container, target }) => {
+            if (container.owner.kind !== 'extension') return null
+            const active = rightPanelMode === target.id
+            const icon = container.payload.icon
+            const title = boundedPlainText(container.payload.title, 128)
+            const label = target.workspaceTrusted
+              ? title
+              : t('extensionRailAuthorize', { title })
+            return (
+              <button
+                key={container.id}
+                type="button"
+                onClick={() => onSelectExtension
+                  ? onSelectExtension(target)
+                  : onToggleRightPanelMode(target.id as Exclude<RightPanelMode, null>)}
+                className={sideRailButtonClass(active, 'relative')}
+                data-tooltip={label}
+                aria-label={label}
+                aria-pressed={active}
+                data-contribution-id={container.id}
+                data-extension-trusted={String(target.workspaceTrusted)}
+              >
+                {icon ? (
+                  <img
+                    src={extensionHostIconUrl(container.owner.extensionId, icon)}
+                    alt=""
+                    aria-hidden="true"
+                    className={TOPBAR_ICON_CLASS}
+                  />
+                ) : (
+                  <Puzzle className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
+                )}
+                {!target.workspaceTrusted ? (
+                  <span className="absolute -bottom-1 -left-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-amber-500 text-white shadow-sm" aria-hidden>
+                    <LockKeyhole className="h-2.5 w-2.5" strokeWidth={2.25} />
+                  </span>
+                ) : null}
+              </button>
+            )
+          })}
+
+          {extensionItems.map((item) => {
+            if (item.owner.kind !== 'extension') return null
+            if (extensionContainers.some(({ target }) => target.id === item.id)) return null
+            const active = rightPanelMode === item.id
+            const icon = item.payload.icon
+            const title = boundedPlainText(item.payload.title, 128)
+            const label = item.workspaceTrusted
+              ? title
+              : t('extensionRailAuthorize', { title })
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onSelectExtension
+                  ? onSelectExtension(item)
+                  : onToggleRightPanelMode(item.id as Exclude<RightPanelMode, null>)}
+                className={sideRailButtonClass(active, 'relative')}
+                data-tooltip={label}
+                aria-label={label}
+                aria-pressed={active}
+                data-contribution-id={item.id}
+                data-extension-trusted={String(item.workspaceTrusted)}
+              >
+                {icon ? (
+                  <img
+                    src={extensionHostIconUrl(item.owner.extensionId, icon)}
+                    alt=""
+                    aria-hidden="true"
+                    className={TOPBAR_ICON_CLASS}
+                  />
+                ) : (
+                  <Puzzle className={TOPBAR_ICON_CLASS} strokeWidth={1.75} />
+                )}
+                {!item.workspaceTrusted ? (
+                  <span className="absolute -bottom-1 -left-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-amber-500 text-white shadow-sm" aria-hidden>
+                    <LockKeyhole className="h-2.5 w-2.5" strokeWidth={2.25} />
+                  </span>
+                ) : null}
+              </button>
+            )
+          })}
+        </div>
+      ) : null}
+
     </div>
   )
 }

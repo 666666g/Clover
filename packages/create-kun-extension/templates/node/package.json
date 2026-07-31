@@ -1,0 +1,22 @@
+{
+  "name": "{{EXTENSION_ID}}",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test dist/extension.test.js",
+    "validate": "kun extension validate .",
+    "pack": "npm run build && kun extension pack ."
+  },
+  "dependencies": {
+    "@kun/extension-api": "^1.0.0"
+  },
+  "devDependencies": {
+    "@kun/extension-test": "^1.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.2"
+  }
+}

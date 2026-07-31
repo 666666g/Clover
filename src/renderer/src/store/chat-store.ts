@@ -4,6 +4,7 @@ import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
 import {
+  applyChatContentMaxWidth,
   applyCursorSpotlight,
   applyCursorSpotlightColor,
   applyDocumentLocale,
@@ -55,6 +56,8 @@ import {
   optimisticUserModelLabel,
   persistComposerMode,
   persistComposerModel,
+  persistComposerFastMode,
+  persistComposerReasoningEffort,
   rememberThreadComposerMode,
   readCodeWorkspaceRoots,
   readStoredComposerModel,
@@ -112,6 +115,7 @@ import { createNavigationActions } from './chat-store-navigation-actions'
 import { createThreadActions } from './chat-store-thread-actions'
 import { createMaintenanceActions } from './chat-store-maintenance-actions'
 import { createInitialChatStoreState } from './chat-store-initial-state'
+import { createComposerContextActions } from './chat-store-composer-context-actions'
 
 export type { AppRoute, SettingsRouteSection } from './chat-store-types'
 export { CLAW_COMPOSER_MODEL_IDS } from './chat-store-helpers'
@@ -129,6 +133,10 @@ let composerModelLoadPromise: Promise<void> | null = null
 
 export const useChatStore = create<ChatState>((set, get) => ({
   ...createInitialChatStoreState(i18n.t('common:workingDirectory')),
+  // Shared high-water mark de-duplicating delta replays across concurrent SSE
+  // sinks on long turns (design-rail duplicate-text fix). Not part of develop's
+  // split initial-state helper, so it's appended here.
+  liveDeltaSeqFloor: 0,
 
   ...createClawActions({
     set,
@@ -152,6 +160,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     i18n,
     persistComposerModel,
     persistComposerMode,
+    persistComposerFastMode,
+    persistComposerReasoningEffort,
     rememberThreadComposerMode,
     readStoredComposerModel,
     mergeComposerPickList,
@@ -162,6 +172,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     },
     applyTheme,
     applyUiFontScale,
+    applyChatContentMaxWidth,
     applyCursorSpotlight,
     applyCursorSpotlightColor,
     applyWriteTypography,
@@ -180,6 +191,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   }),
 
   ...createNavigationActions({ set, get, sseAbortRef }),
+
+  ...createComposerContextActions({ set, get }),
 
   ...createThreadActions({ set, get, sseAbortRef }),
 

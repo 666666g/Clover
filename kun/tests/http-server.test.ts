@@ -8,6 +8,10 @@ import { makeAssistantTextItem, makeToolCallItem, makeToolResultItem } from '../
 import { encodeSseEvent } from '../src/server/sse.js'
 import { buildHarness, readJson, readSseEvents, usageSnapshot } from './http-server-test-harness.js'
 import type { TurnItem } from '../src/contracts/items.js'
+import {
+  createApprovalConsentToken,
+  KUN_APPROVAL_CONSENT_HEADER
+} from '../src/server/approval-consent.js'
 
 describe('HTTP server', () => {
   let dataDir = ''
@@ -18,6 +22,14 @@ describe('HTTP server', () => {
     await rm(dataDir, { recursive: true, force: true })
   })
 
+  const approvalConsent = (approvalId: string, decision: 'allow' | 'deny') =>
+    createApprovalConsentToken({
+      runtimeToken: 'tok-1',
+      approvalId,
+      decision,
+      expiresAt: Date.now() + 30_000
+    })
+
   it('returns 200 on /health without auth', async () => {
     const h = buildHarness()
     const response = await dispatchRequest(h.router, new Request('http://localhost/health'))
@@ -26,7 +38,7 @@ describe('HTTP server', () => {
     expect(body).toEqual({ status: 'ok', service: 'kun', mode: 'serve' })
   })
 
-  it('returns runtime info with disabled capability defaults', async () => {
+  it('returns runtime info with accurate CLI and disabled provider capability defaults', async () => {
     const h = buildHarness()
     const response = await dispatchRequest(
       h.router,
@@ -43,7 +55,12 @@ describe('HTTP server', () => {
         mcp?: { available?: boolean; reason?: string }
         web?: { available?: boolean; fetch?: { available?: boolean } }
         attachments?: { available?: boolean; allowedMimeTypes?: string[] }
-        cli?: { serve?: { available?: boolean }; run?: { available?: boolean; reason?: string } }
+        cli?: {
+          serve?: { available?: boolean }
+          run?: { available?: boolean; reason?: string }
+          chat?: { available?: boolean; reason?: string }
+          exec?: { available?: boolean; reason?: string }
+        }
         model?: { inputModalities?: string[]; supportsToolCalling?: boolean; contextWindowTokens?: number }
       }
     }
@@ -57,7 +74,9 @@ describe('HTTP server', () => {
     expect(body.capabilities?.web?.fetch?.available).toBe(false)
     expect(body.capabilities?.attachments?.allowedMimeTypes).toContain('image/png')
     expect(body.capabilities?.cli?.serve?.available).toBe(true)
-    expect(body.capabilities?.cli?.run?.available).toBe(false)
+    expect(body.capabilities?.cli?.run?.available).toBe(true)
+    expect(body.capabilities?.cli?.chat?.available).toBe(true)
+    expect(body.capabilities?.cli?.exec?.available).toBe(true)
   })
 
   it('requires auth for runtime info', async () => {
@@ -70,13 +89,96 @@ describe('HTTP server', () => {
     expect(response.status).toBe(401)
   })
 
+  it('applies runtime config through the authenticated hot apply route', async () => {
+    const h = buildHarness()
+    const applyConfig = vi.fn(async () => ({ ok: true as const }))
+    h.runtime.applyConfig = applyConfig
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/runtime/config/apply', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          serve: {
+            model: 'deepseek-reasoner',
+            approvalPolicy: 'never',
+            providers: {
+              minimax: {
+                apiKey: 'sk-minimax',
+                baseUrl: 'https://api.minimax.example/v1'
+              }
+            }
+          }
+        })
+      })
+    )
+
+    expect(response.status).toBe(200)
+    expect(await readJson(response)).toEqual({ ok: true })
+    expect(applyConfig).toHaveBeenCalledWith(expect.objectContaining({
+      serve: expect.objectContaining({
+        model: 'deepseek-reasoner',
+        approvalPolicy: 'never',
+        providers: expect.objectContaining({
+          minimax: expect.objectContaining({
+            apiKey: 'sk-minimax',
+            baseUrl: 'https://api.minimax.example/v1'
+          })
+        })
+      })
+    }))
+  })
+
+  it('requires auth for runtime config hot apply', async () => {
+    const h = buildHarness()
+    h.runtime.applyConfig = vi.fn(async () => ({ ok: true as const }))
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/runtime/config/apply', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ serve: { model: 'deepseek-reasoner' } })
+      })
+    )
+
+    expect(response.status).toBe(401)
+    expect(h.runtime.applyConfig).not.toHaveBeenCalled()
+  })
+
+  it('rejects process-level runtime fields on the hot apply route', async () => {
+    const h = buildHarness()
+    h.runtime.applyConfig = vi.fn(async () => ({ ok: true as const }))
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/runtime/config/apply', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({ serve: { port: 18899 } })
+      })
+    )
+
+    expect(response.status).toBe(400)
+    const body = await readJson(response) as { ok?: boolean; code?: string }
+    expect(body).toMatchObject({ ok: false, code: 'invalid_config' })
+    expect(h.runtime.applyConfig).not.toHaveBeenCalled()
+  })
+
   it('returns structured validation errors for invalid JSON bodies', async () => {
     const h = buildHarness()
     const response = await dispatchRequest(
       h.router,
       new Request('http://localhost/v1/threads', {
         method: 'POST',
-        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json'
+        },
         body: '{'
       })
     )
@@ -170,6 +272,87 @@ describe('HTTP server', () => {
     expect(response.status).toBe(401)
   })
 
+  it('reports and clears MCP OAuth diagnostics through the HTTP layer', async () => {
+    const h = buildHarness()
+    h.runtime.mcpOAuth = () => [
+      {
+        serverId: 'google_drive',
+        enabled: true,
+        configured: true,
+        transport: 'streamable-http',
+        url: 'https://drivemcp.googleapis.com/mcp/v1',
+        status: 'authorized',
+        hasClientInformation: true,
+        hasTokens: true,
+        hasRefreshToken: true,
+        hasCodeVerifier: false,
+        hasDiscoveryState: true
+      }
+    ]
+    h.runtime.clearMcpOAuth = async (serverId?: string) => ({ cleared: serverId ? [serverId] : ['google_drive'] })
+
+    const listed = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/mcp/oauth', {
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+    expect(listed.status).toBe(200)
+    await expect(readJson(listed)).resolves.toMatchObject({
+      servers: [{ serverId: 'google_drive', status: 'authorized', hasTokens: true }]
+    })
+
+    const cleared = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/mcp/oauth/google_drive', {
+        method: 'DELETE',
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+    expect(cleared.status).toBe(200)
+    await expect(readJson(cleared)).resolves.toEqual({ cleared: ['google_drive'] })
+  })
+
+  it('runs MCP OAuth authorization through the HTTP layer', async () => {
+    const h = buildHarness()
+    const authorized: string[] = []
+    h.runtime.authorizeMcpOAuth = async (serverId: string) => {
+      authorized.push(serverId)
+      return { serverId, status: 'authorized', authorized: true }
+    }
+
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/mcp/oauth/google_drive', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+
+    expect(response.status).toBe(200)
+    await expect(readJson(response)).resolves.toEqual({
+      serverId: 'google_drive',
+      status: 'authorized',
+      authorized: true
+    })
+    expect(authorized).toEqual(['google_drive'])
+  })
+
+  it('reports MCP OAuth authorization as unavailable when the runtime lacks it', async () => {
+    const h = buildHarness()
+    h.runtime.authorizeMcpOAuth = undefined
+
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/mcp/oauth/google_drive', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+
+    expect(response.status).toBe(503)
+  })
+
   it('lists discovered skills through the HTTP layer', async () => {
     const h = buildHarness()
     h.runtime.skills = () => ({
@@ -222,7 +405,10 @@ describe('HTTP server', () => {
       h.router,
       new Request('http://localhost/v1/threads/thr_1/turns', {
         method: 'POST',
-        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json'
+        },
         body: JSON.stringify({ prompt: 'hello' })
       })
     )
@@ -421,6 +607,27 @@ describe('HTTP server', () => {
     )
     const limitedBody = (await readJson(limited)) as { threads: Array<{ id: string }> }
     expect(limitedBody.threads).toHaveLength(1)
+  })
+
+  it('returns the complete history when the caller omits a limit', async () => {
+    const h = buildHarness()
+    await Promise.all(Array.from({ length: 501 }, (_, index) =>
+      h.threadService.create(
+        { workspace: `/tmp/history-${index}`, model: 'deepseek-chat', mode: 'agent' },
+        { id: `thr_history_${index}`, title: `History ${index}` }
+      )
+    ))
+
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/threads?include_archived=true', {
+        headers: { authorization: 'Bearer tok-1' }
+      })
+    )
+    expect(response.status).toBe(200)
+    const body = (await readJson(response)) as { threads: Array<{ id: string }> }
+    expect(body.threads).toHaveLength(501)
+    expect(new Set(body.threads.map((thread) => thread.id)).size).toBe(501)
   })
 
   it('deletes threads through the HTTP layer', async () => {
@@ -848,11 +1055,30 @@ describe('HTTP server', () => {
       summary: 'run echo'
     })
     const pending = h.approvalGate.request(approval)
-    const decide = await dispatchRequest(
+    const consent = (decision: 'allow' | 'deny') => createApprovalConsentToken({
+      runtimeToken: 'tok-1',
+      approvalId: 'appr_1',
+      decision,
+      expiresAt: Date.now() + 30_000
+    })
+    const missingConsent = await dispatchRequest(
       h.router,
       new Request('http://localhost/v1/approvals/appr_1', {
         method: 'POST',
         headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'allow' })
+      })
+    )
+    expect(missingConsent.status).toBe(403)
+    const decide = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_1', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: consent('allow')
+        },
         body: JSON.stringify({ decision: 'allow' })
       })
     )
@@ -865,7 +1091,11 @@ describe('HTTP server', () => {
       h.router,
       new Request('http://localhost/v1/approvals/appr_1', {
         method: 'POST',
-        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: consent('allow')
+        },
         body: JSON.stringify({ decision: 'allow' })
       })
     )
@@ -879,11 +1109,199 @@ describe('HTTP server', () => {
       h.router,
       new Request('http://localhost/v1/approvals/appr_1', {
         method: 'POST',
-        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: consent('deny')
+        },
         body: JSON.stringify({ decision: 'deny' })
       })
     )
     expect(conflict.status).toBe(409)
+  })
+
+  it('persists approval audit data before releasing an allowed tool waiter', async () => {
+    const h = buildHarness()
+    const approval = createApprovalRequest({
+      id: 'appr_audited',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      toolName: 'echo',
+      summary: 'run echo'
+    })
+    const pending = h.approvalGate.request(approval)
+    const originalAppend = h.sessionStore.appendEvent.bind(h.sessionStore)
+    let releaseAudit!: () => void
+    const auditBlocked = new Promise<void>((resolve) => { releaseAudit = resolve })
+    let auditStarted = false
+    vi.spyOn(h.sessionStore, 'appendEvent').mockImplementation(async (threadId, event) => {
+      if (event.kind === 'approval_resolved') {
+        auditStarted = true
+        await auditBlocked
+      }
+      await originalAppend(threadId, event)
+    })
+
+    let waiterReleased = false
+    void pending.then(() => { waiterReleased = true })
+    const request = dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_audited', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: approvalConsent('appr_audited', 'allow')
+        },
+        body: JSON.stringify({ decision: 'allow' })
+      })
+    )
+    await vi.waitFor(() => expect(auditStarted).toBe(true))
+    expect(waiterReleased).toBe(false)
+    expect(h.approvalGate.get('appr_audited')?.status).toBe('pending')
+
+    releaseAudit()
+    expect((await request).status).toBe(200)
+    await expect(pending).resolves.toBe('allow')
+  })
+
+  it('rolls back a reserved decision when audit persistence fails', async () => {
+    const h = buildHarness()
+    const pending = h.approvalGate.request(createApprovalRequest({
+      id: 'appr_audit_failure',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      toolName: 'echo',
+      summary: 'run echo'
+    }))
+    vi.spyOn(h.sessionStore, 'appendEvent').mockImplementation(async (_threadId, event) => {
+      if (event.kind === 'approval_resolved') throw new Error('audit write failed')
+    })
+
+    await expect(dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_audit_failure', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: approvalConsent('appr_audit_failure', 'allow')
+        },
+        body: JSON.stringify({ decision: 'allow' })
+      })
+    )).rejects.toThrow('audit write failed')
+    expect(h.approvalGate.get('appr_audit_failure')?.status).toBe('pending')
+    expect(h.approvalGate.decide('appr_audit_failure', 'deny')).toBe(true)
+    await expect(pending).resolves.toBe('deny')
+  })
+
+  it('coalesces concurrent identical approval decisions into one audit event', async () => {
+    const h = buildHarness()
+    void h.approvalGate.request(createApprovalRequest({
+      id: 'appr_same_decision',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      toolName: 'echo',
+      summary: 'run echo'
+    }))
+    const originalAppend = h.sessionStore.appendEvent.bind(h.sessionStore)
+    let releaseAudit!: () => void
+    const auditBlocked = new Promise<void>((resolve) => { releaseAudit = resolve })
+    let auditStarted = false
+    vi.spyOn(h.sessionStore, 'appendEvent').mockImplementation(async (threadId, event) => {
+      if (event.kind === 'approval_resolved') {
+        auditStarted = true
+        await auditBlocked
+      }
+      await originalAppend(threadId, event)
+    })
+    const makeRequest = () => dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_same_decision', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: approvalConsent('appr_same_decision', 'allow')
+        },
+        body: JSON.stringify({ decision: 'allow' })
+      })
+    )
+
+    const first = makeRequest()
+    await vi.waitFor(() => expect(auditStarted).toBe(true))
+    const second = makeRequest()
+    releaseAudit()
+    const responses = await Promise.all([first, second])
+    expect(responses.map((response) => response.status)).toEqual([200, 200])
+    const events = await h.sessionStore.loadEventsSince('thr_1', 0)
+    expect(events.filter((event) => event.kind === 'approval_resolved')).toHaveLength(1)
+  })
+
+  it('returns conflict for the losing concurrent opposite decision', async () => {
+    const h = buildHarness()
+    void h.approvalGate.request(createApprovalRequest({
+      id: 'appr_opposite_decision',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      toolName: 'echo',
+      summary: 'run echo'
+    }))
+    const originalAppend = h.sessionStore.appendEvent.bind(h.sessionStore)
+    let releaseAudit!: () => void
+    const auditBlocked = new Promise<void>((resolve) => { releaseAudit = resolve })
+    let auditStarted = false
+    vi.spyOn(h.sessionStore, 'appendEvent').mockImplementation(async (threadId, event) => {
+      if (event.kind === 'approval_resolved') {
+        auditStarted = true
+        await auditBlocked
+      }
+      await originalAppend(threadId, event)
+    })
+    const request = (decision: 'allow' | 'deny') => dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_opposite_decision', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer tok-1',
+          'content-type': 'application/json',
+          [KUN_APPROVAL_CONSENT_HEADER]: approvalConsent('appr_opposite_decision', decision)
+        },
+        body: JSON.stringify({ decision })
+      })
+    )
+
+    const allow = request('allow')
+    await vi.waitFor(() => expect(auditStarted).toBe(true))
+    const deny = request('deny')
+    releaseAudit()
+    const [allowResponse, denyResponse] = await Promise.all([allow, deny])
+    expect(allowResponse.status).toBe(200)
+    expect(denyResponse.status).toBe(409)
+    expect(h.approvalGate.get('appr_opposite_decision')?.status).toBe('allowed')
+  })
+
+  it('rejects oversized approval reasons without resolving the request', async () => {
+    const h = buildHarness()
+    void h.approvalGate.request(createApprovalRequest({
+      id: 'appr_reason_limit',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      toolName: 'echo',
+      summary: 'run echo'
+    }))
+
+    const response = await dispatchRequest(
+      h.router,
+      new Request('http://localhost/v1/approvals/appr_reason_limit', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'deny', reason: 'x'.repeat(4097) })
+      })
+    )
+
+    expect(response.status).toBe(400)
+    expect(h.approvalGate.get('appr_reason_limit')?.status).toBe('pending')
   })
 
   it('resolves GUI user input through both HTTP compatibility endpoints', async () => {
@@ -932,6 +1350,42 @@ describe('HTTP server', () => {
     await expect(cancelPending).resolves.toEqual({ status: 'cancelled' })
     const events = await h.sessionStore.loadEventsSince('thr_1', 0)
     expect(events.filter((event) => event.kind === 'user_input_resolved')).toHaveLength(2)
+  })
+
+  it('serializes concurrent resolutions for the same GUI user input', async () => {
+    const h = buildHarness()
+    const pending = h.userInputGate.request({
+      id: 'in_race', threadId: 'thr_1', turnId: 'turn_1', itemId: 'item_in_race', prompt: 'Pick one', questions: []
+    })
+    const request = () => dispatchRequest(h.router, new Request('http://localhost/v1/user-inputs/in_race', {
+      method: 'POST',
+      headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: 'choice', label: 'Yes', value: 'yes' }] })
+    }))
+
+    const [first, second] = await Promise.all([request(), request()])
+    expect([first.status, second.status].sort()).toEqual([200, 404])
+    await expect(pending).resolves.toEqual({
+      status: 'submitted', answers: [{ id: 'choice', label: 'Yes', value: 'yes' }]
+    })
+    const events = await h.sessionStore.loadEventsSince('thr_1', 0)
+    expect(events.filter((event) => event.kind === 'user_input_resolved')).toHaveLength(1)
+  })
+
+  it('rejects answers that do not match pending user input questions', async () => {
+    const h = buildHarness()
+    const pending = h.userInputGate.request({
+      id: 'in_validate', threadId: 'thr_1', turnId: 'turn_1', itemId: 'item_in_validate', prompt: 'Pick',
+      questions: [{ header: 'Pick', id: 'choice', question: 'Choose', options: [{ label: 'Yes', description: '' }], selectionMode: 'single' }]
+    })
+    const invalid = await dispatchRequest(h.router, new Request('http://localhost/v1/user-inputs/in_validate', {
+      method: 'POST', headers: { authorization: 'Bearer tok-1', 'content-type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: 'choice', label: 'No', value: 'no' }] })
+    }))
+    expect(invalid.status).toBe(400)
+    expect(h.userInputGate.get('in_validate')).toBeDefined()
+    h.userInputGate.resolve('in_validate', { status: 'cancelled' })
+    await expect(pending).resolves.toEqual({ status: 'cancelled' })
   })
 
   it('forks a thread with copied history and lineage metadata', async () => {

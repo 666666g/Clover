@@ -1,11 +1,20 @@
-import { app, dialog, ipcMain, shell, type BrowserWindow, type WebContents } from 'electron'
+import {
+  app,
+  dialog,
+  ipcMain,
+  shell,
+  type BrowserWindow,
+  type IpcMainInvokeEvent,
+  type WebContents
+} from 'electron'
 import { watch, type FSWatcher } from 'node:fs'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, dirname, extname, join, resolve } from 'node:path'
-import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path'
+import { access, copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { z } from 'zod'
 import {
+  getKunRuntimeSettings,
   type AppSettingsPatch,
   type AppSettingsV1,
   type ClawRunResult,
@@ -23,8 +32,10 @@ import {
 import type {
   ClawImInstallPollResult,
   ClawImInstallQrResult,
+  CredentialRecoveryResetResult,
   ConversationWorkspaceCreateResult,
   DesktopCommand,
+  KunRuntimeSettingsSyncStatusPayload,
   RuntimeRequestResult,
   SystemNotificationResult,
   TurnCompleteNotificationPayload,
@@ -37,9 +48,12 @@ import {
   clawMirrorPayloadSchema,
   clawImInstallPollPayloadSchema,
   clawImTelegramTokenPayloadSchema,
+  alertDialogPayloadSchema,
   confirmDialogPayloadSchema,
   clawTaskFromTextPayloadSchema,
   computerUsePermissionKindSchema,
+  conversationExportPayloadSchema,
+  cursorSubscriptionDiscoveryPayloadSchema,
   deepseekConfigContentSchema,
   desktopCommandSchema,
   defaultPathSchema,
@@ -49,10 +63,14 @@ import {
   gitWorktreeRemoveSchema,
   guiUpdateChannelSchema,
   localPdfTextTargetPayloadSchema,
+  localOfficeDocumentTargetPayloadSchema,
   logErrorPayloadSchema,
   notificationPayloadSchema,
   openEditorPathPayloadSchema,
+  modelsDevCatalogPayloadSchema,
   providerProbePayloadSchema,
+  projectDesignMdLintPayloadSchema,
+  promptOptimizationPayloadSchema,
   rootPathSchema,
   worktreeCommitSchema,
   worktreeContinueMergeSchema,
@@ -62,8 +80,13 @@ import {
   worktreeProjectPathSchema,
   worktreeOptionalRootSchema,
   worktreePathSchema,
+  runtimeImageAttachmentUploadPayloadSchema,
   runtimeRequestPayloadSchema,
   runtimeUploadAttachmentPayloadSchema,
+  kunProtectedApprovalPayloadSchema,
+  kunProjectConfigTrustPayloadSchema,
+  kunProjectConfigWorkspacePayloadSchema,
+  kunProjectConfigWritePayloadSchema,
   scheduleTaskFromTextPayloadSchema,
   shellOpenExternalUrlSchema,
   skillGithubImportPayloadSchema,
@@ -78,6 +101,8 @@ import {
   uiPluginIdPayloadSchema,
   workspaceDirectoryCreatePayloadSchema,
   workspaceClipboardImageSavePayloadSchema,
+  workspaceImageBytesSavePayloadSchema,
+  workspaceImagePickPayloadSchema,
   workspaceDirectoryTargetPayloadSchema,
   workspaceEntryDeletePayloadSchema,
   workspaceEntryRenamePayloadSchema,
@@ -86,11 +111,15 @@ import {
   workspaceFileTargetPayloadSchema,
   workspaceFileWatchPayloadSchema,
   workspaceFileWritePayloadSchema,
+  workspacePreviewLeaseReleasePayloadSchema,
+  workspacePreviewLeaseTargetPayloadSchema,
   localWhisperDownloadPayloadSchema,
   localWhisperModelIdPayloadSchema,
   localWhisperSourceStatusPayloadSchema,
   speechTranscribePayloadSchema,
   writeExportPayloadSchema,
+  memoryMarkdownExportPayloadSchema,
+  designExportPayloadSchema,
   writeRichClipboardPayloadSchema,
   writeInfographicPayloadSchema,
   imageEditPayloadSchema,
@@ -100,10 +129,26 @@ import {
   workspaceRootSchema,
   legacySessionImportPayloadSchema
 } from './app-ipc-schemas'
+import { uploadRuntimeImageAttachment } from '../services/runtime-image-attachment-service'
+import {
+  createApprovalConsentToken,
+  KUN_APPROVAL_CONSENT_HEADER
+} from '../approval-consent'
+import {
+  KunExecutionSettingsConsentService,
+  executionSettingsEqual,
+  kunExecutionSettingsChange,
+  type KunExecutionSettingsConsentAction
+} from '../execution-settings-consent'
 import { DEFAULT_KUN_DATA_DIR, resolveKunRuntimeSettings } from '../../shared/app-settings'
 import { KUN_ATTACHMENTS_PATH } from '../../shared/kun-endpoints'
 import { detectLegacySessions, importLegacySessions } from '../services/legacy-session-import-service'
-import { claudeSubscriptionStatus, runClaudeSetupToken } from '../claude-subscription-auth'
+import { lintProjectDesignMd } from '../services/project-design-md-lint'
+import {
+  claudeSubscriptionStatus,
+  probeClaudeSubscription,
+  runClaudeSubscriptionLogin
+} from '../claude-subscription-auth'
 import { fetchSdkModels } from '../claude-subscription-models'
 import {
   agentSdkDownloadState,
@@ -113,9 +158,29 @@ import {
 } from '../agent-sdk-installer'
 import type { JsonSettingsStore } from '../settings-store'
 import { probeModelProvider } from '../provider-connection'
+import { listProviderQuotas } from '../provider-quota'
+import { fetchModelsDevCatalog } from '../models-dev-catalog'
 import type { ClawRuntime } from '../claw-runtime'
 import type { ScheduleRuntime } from '../schedule-runtime'
+import { reloadRenderer } from '../dev-renderer-cache'
 import { verifyTelegramBotToken } from '../telegram-runtime'
+import { startCodexDeviceAuth, pollCodexDeviceAuth, startCodexBrowserAuth } from '../codex-auth'
+import {
+  startGrokBrowserAuth,
+  submitGrokBrowserAuthCode,
+  cancelGrokBrowserAuth
+} from '../grok-auth'
+import {
+  antigravityCliDownloadState,
+  fetchAntigravityModels,
+  resolveAntigravityCliBinary,
+  startAntigravityCliInstall
+} from '../antigravity-cli'
+import { discoverCursorSubscription } from '../cursor-subscription-models'
+import {
+  geminiCliSubscriptionModels,
+  geminiCliSubscriptionStatus
+} from '../gemini-cli-subscription'
 import type { WorkflowRuntime } from '../workflow-runtime'
 import { checkWorkflowCode } from '../workflow-runtime'
 import {
@@ -127,7 +192,12 @@ import {
   removeGitBranchWorktree,
   switchGitBranch
 } from '../services/git-service'
-import { createGitCheckpoint, restoreGitCheckpoint } from '../services/git-checkpoint-service'
+import {
+  createGitCheckpoint,
+  failGitCheckpointGate,
+  restoreGitCheckpoint,
+  type GitCheckpointStorageOptions
+} from '../services/git-checkpoint-service'
 import {
   abortMerge,
   abortRebase,
@@ -149,7 +219,15 @@ import {
   loadUiPluginFigures,
   removeUiPlugin
 } from '../services/ui-plugin-service'
+import { UiPluginCdpThemeController } from '../services/ui-plugin-cdp-theme-controller'
+import {
+  buildUiPluginBackgroundCss,
+  buildUiPluginPresentationCss,
+  buildUiPluginSceneCss,
+  buildUiPluginTokenCss
+} from '../../shared/ui-plugin'
 import { ensureBundledUiPlugins } from '../ui-plugin-bundled'
+import { ensureBundledSkills } from '../skill-bundled'
 import {
   createWorkspaceDirectory,
   createWorkspaceFile,
@@ -167,7 +245,9 @@ import {
   renameWorkspaceEntry,
   resolveOpenTargetPath,
   resolveWorkspaceFile,
+  pickAndSaveWorkspaceImage,
   saveWorkspaceClipboardImage,
+  saveWorkspaceImageBytes,
   writeWorkspaceFile
 } from '../services/workspace-service'
 import {
@@ -180,6 +260,7 @@ import { requestWriteInfographic } from '../services/write-infographic-service'
 import { requestImageEdit } from '../services/image-edit-service'
 import { authorizePrototypePath } from '../services/prototype-embed-registry'
 import { requestSpeechTranscription } from '../services/speech-to-text-service'
+import { optimizePrompt } from '../services/prompt-optimization-service'
 import {
   cancelLocalWhisperModel,
   deleteLocalWhisperModel,
@@ -192,13 +273,50 @@ import {
   getComputerUsePermissions,
   requestComputerUsePermission
 } from '../services/computer-use-permissions'
-import { copyWriteDocumentAsRichText, exportWriteDocument } from '../services/write-export-service'
+import {
+  copyWriteDocumentAsRichText,
+  exportDesignPrototype,
+  exportWriteDocument
+} from '../services/write-export-service'
+import { exportConversation } from '../services/conversation-export-service'
+import { exportMemoryMarkdown } from '../services/memory-export-service'
 import { importGithubSkillsToRoot } from '../services/github-skill-import-service'
 import { readLocalPdfText } from '../services/write-pdf-text-service'
+import { readLocalOfficeDocument } from '../services/office-document-service'
+import type { WorkspacePreviewProtocolRegistry } from '../services/workspace-preview-protocol'
+import { resolveOfficeCliBinary } from '../officecli-resources'
+import { ensurePptMaster } from '../services/ppt-master-service'
 import { saveGuiSkillPackage } from '../services/skill-save-service'
-import { listGuiSkillRoots, listGuiSkills } from '../services/skill-service'
+import {
+  comparableSkillRootPath,
+  listGuiSkillRoots,
+  listGuiSkills,
+  normalizeSkillRootPath
+} from '../services/skill-service'
+import {
+  ensureKunProjectConfigDirectory,
+  loadKunProjectConfig,
+  readKunProjectConfigSource,
+  writeKunProjectConfig
+} from '../../../kun/src/config/project-config.js'
+import { readProjectConfigState } from '../services/project-config-service'
 
 type GuiUpdaterModule = typeof import('../gui-updater')
+
+const extensionArtifactActionSchema = z.strictObject({
+  artifactId: z.string().min(16).max(512).regex(/^[A-Za-z0-9_-]+$/),
+  ownerExtensionId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}\.[a-z0-9][a-z0-9-]{0,63}$/),
+  ownerExtensionVersion: z.string().min(1).max(64),
+  workspaceId: z.string().regex(/^[a-f0-9]{64}$/),
+  workspaceRoot: z.string().min(1).max(16_384).refine(isAbsolute),
+  action: z.enum(['open', 'reveal'])
+})
+const extensionArtifactResolutionSchema = z.strictObject({
+  artifactId: z.string().min(16).max(512),
+  absolutePath: z.string().min(1).max(16_384).refine(isAbsolute),
+  displayName: z.string().min(1).max(256),
+  mimeType: z.string().min(3).max(128)
+})
 
 type WorkspaceFileWatchRecord = {
   watcher: FSWatcher
@@ -208,16 +326,24 @@ type WorkspaceFileWatchRecord = {
   timer: ReturnType<typeof setTimeout> | null
 }
 
+type WorkspaceFileWatchSenderRecord = {
+  sender: WebContents
+  onDestroyed: () => void
+}
+
 type RegisterAppIpcHandlersOptions = {
   store: JsonSettingsStore
   getMainWindow: () => BrowserWindow | null
   applySettingsPatch: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   saveSettingsPatch: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
+  resetUnreadableCredentials: () => Promise<CredentialRecoveryResetResult>
   runtimeRequest: (
     path: string,
     method?: string,
-    body?: string
+    body?: string,
+    headers?: Record<string, string>
   ) => Promise<RuntimeRequestResult>
+  getRuntimeSettingsSyncStatus: () => KunRuntimeSettingsSyncStatusPayload
   restartRuntime: () => Promise<void>
   fetchUpstreamModels: () => Promise<UpstreamModelsResult>
   getClawRuntime: () => ClawRuntime | null
@@ -229,6 +355,7 @@ type RegisterAppIpcHandlersOptions = {
   pollWeixinInstall: (deviceCode: string, weixinBridgeUrl?: string) => Promise<ClawImInstallPollResult>
   resolveKunConfigPath: () => string
   onKunMcpConfigWritten?: (path: string, content: string) => Promise<void> | void
+  onKunProjectConfigChanged?: (path: string, content: string) => Promise<void> | void
   showTurnCompleteNotification: (
     payload: TurnCompleteNotificationPayload
   ) => Promise<SystemNotificationResult>
@@ -237,6 +364,7 @@ type RegisterAppIpcHandlersOptions = {
   loadGuiUpdaterModule: () => Promise<GuiUpdaterModule>
   resolveLogDirectory: () => string
   logError: (category: string, message: string, detail?: unknown) => void
+  workspacePreviewProtocols: WorkspacePreviewProtocolRegistry
 }
 
 function parseIpcPayload<T>(channel: string, schema: z.ZodType<T>, payload: unknown): T {
@@ -244,6 +372,40 @@ function parseIpcPayload<T>(channel: string, schema: z.ZodType<T>, payload: unkn
   if (parsed.success) return parsed.data
   const issue = parsed.error.issues[0]
   throw new Error(`Invalid payload for ${channel}: ${issue?.message ?? 'Bad request.'}`)
+}
+
+function withoutRendererProjectConfigGrants(partial: AppSettingsPatch): AppSettingsPatch {
+  const kun = partial.agents?.kun
+  if (!kun || kun.projectConfig === undefined) return partial
+  const { projectConfig: _projectConfig, ...safeKun } = kun
+  void _projectConfig
+  return {
+    ...partial,
+    agents: {
+      ...partial.agents,
+      kun: safeKun
+    }
+  }
+}
+
+function assertTrustedWorkbenchSender(
+  event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>,
+  getMainWindow: () => BrowserWindow | null
+): void {
+  const window = getMainWindow()
+  const senderFrame = event.senderFrame
+  const mainFrame = window?.webContents.mainFrame
+  if (
+    !window ||
+    window.isDestroyed() ||
+    event.sender.id !== window.webContents.id ||
+    !senderFrame ||
+    !mainFrame ||
+    senderFrame.processId !== mainFrame.processId ||
+    senderFrame.routingId !== mainFrame.routingId
+  ) {
+    throw new Error('IPC sender is not the trusted workbench frame.')
+  }
 }
 
 // node:fs/promises 没有内置 pathExists;用 access 实现。
@@ -336,6 +498,14 @@ function validateMcpConfigContent(content: string): void {
   }
 }
 
+function sameProjectWorkspace(left: string, right: string): boolean {
+  const normalize = (value: string): string => {
+    const path = resolve(value).replaceAll('\\', '/').replace(/\/+$/g, '')
+    return process.platform === 'win32' ? path.toLowerCase() : path
+  }
+  return normalize(left) === normalize(right)
+}
+
 function runDesktopCommand(
   command: DesktopCommand,
   sender: WebContents,
@@ -364,7 +534,7 @@ function runDesktopCommand(
       contents.selectAll()
       return
     case 'reload':
-      contents.reload()
+      reloadRenderer(contents)
       return
     case 'zoomIn':
       contents.setZoomLevel(contents.getZoomLevel() + 1)
@@ -399,12 +569,16 @@ function runDesktopCommand(
 }
 
 export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): void {
+  // Seed the built-in "design system & craft" skill into ~/.kun/skills/ once.
+  void ensureBundledSkills(join(homedir(), '.kun'))
   const {
     store,
     getMainWindow,
     applySettingsPatch,
     saveSettingsPatch,
+    resetUnreadableCredentials,
     runtimeRequest,
+    getRuntimeSettingsSyncStatus,
     restartRuntime,
     fetchUpstreamModels,
     getClawRuntime,
@@ -416,6 +590,7 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     pollWeixinInstall,
     resolveKunConfigPath,
     onKunMcpConfigWritten,
+    onKunProjectConfigChanged,
     showTurnCompleteNotification,
     getAppVersion,
     readGuiUpdateState,
@@ -427,6 +602,110 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     getMainWindow()?.webContents.send('speech:local-whisper:progress', payload)
   })
   const workspaceFileWatchers = new Map<string, WorkspaceFileWatchRecord>()
+  const workspaceFileWatchSenders = new Map<number, WorkspaceFileWatchSenderRecord>()
+  const executionSettingsConsents = new KunExecutionSettingsConsentService()
+  const uiPluginThemeController = new UiPluginCdpThemeController({
+    getWebContents: () => {
+      const window = getMainWindow()
+      return window && !window.isDestroyed() ? window.webContents : null
+    },
+    onBackgroundError: (scope, error) => {
+      logError('ui-plugin-cdp', `UI plugin CDP theme ${scope} failed`, {
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
+  })
+  let uiPluginOperationQueue: Promise<void> = Promise.resolve()
+  const enqueueUiPluginOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = uiPluginOperationQueue.then(operation, operation)
+    uiPluginOperationQueue = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
+  }
+
+  const applyProtectedSettingsPatch = async (
+    event: Pick<IpcMainInvokeEvent, 'sender' | 'senderFrame'>,
+    partial: AppSettingsPatch,
+    persist: (patch: AppSettingsPatch) => Promise<AppSettingsV1>
+  ): Promise<AppSettingsV1> => {
+    const current = await store.load()
+    const change = kunExecutionSettingsChange(current, partial)
+    if (!change) return persist(partial)
+
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const parent = getMainWindow()
+    const senderFrame = event.senderFrame
+    if (!parent || parent.isDestroyed() || !senderFrame) {
+      throw new Error('Protected execution-settings window is unavailable.')
+    }
+    const confirmation = await dialog.showMessageBox(parent, {
+      type: 'warning',
+      title: 'Change Kun execution permissions',
+      message: 'Apply this tool approval and sandbox configuration?',
+      detail: [
+        `Current approval policy: ${change.current.approvalPolicy}`,
+        `Current sandbox: ${change.current.sandboxMode}`,
+        `Current approval reviewer: ${change.current.approvalReviewer}`,
+        `New approval policy: ${change.next.approvalPolicy}`,
+        `New sandbox: ${change.next.sandboxMode}`,
+        `New approval reviewer: ${change.next.approvalReviewer}`,
+        ...(change.next.approvalPolicy === 'auto' &&
+          change.next.sandboxMode === 'danger-full-access' &&
+          change.next.approvalReviewer === 'user'
+          ? [
+              '',
+              'Full access lets Kun access any local file, execute host commands, and use network-capable tools without Kun approval.'
+            ]
+          : []),
+        '',
+        'This protected native prompt cannot be confirmed by extension Webviews or Direct DOM content scripts.'
+      ].join('\n'),
+      buttons: ['Apply change', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      normalizeAccessKeys: true
+    })
+    if (confirmation.response !== 0) return current
+
+    // Fail closed if another settings write raced the native decision. The
+    // consent is for one exact transition, not whichever values are current
+    // when the dialog eventually closes.
+    const latest = await store.load()
+    const latestExecution = {
+      approvalPolicy: latest.agents.kun.approvalPolicy,
+      sandboxMode: latest.agents.kun.sandboxMode,
+      approvalReviewer: latest.agents.kun.approvalReviewer
+    }
+    if (!executionSettingsEqual(latestExecution, change.current)) {
+      throw new Error('Kun execution settings changed while confirmation was open; retry the change.')
+    }
+
+    const action: KunExecutionSettingsConsentAction = {
+      ...change,
+      senderId: event.sender.id,
+      senderProcessId: senderFrame.processId,
+      senderRoutingId: senderFrame.routingId
+    }
+    const consent = executionSettingsConsents.issue(action)
+    if (!executionSettingsConsents.consume(consent, action)) {
+      throw new Error('Protected execution-settings consent is invalid or expired.')
+    }
+    return persist(partial)
+  }
+
+  const releaseWorkspaceFileWatchSender = (sender: WebContents): void => {
+    const stillUsed = Array.from(workspaceFileWatchers.values()).some(
+      (record) => record.sender.id === sender.id
+    )
+    if (stillUsed) return
+    const record = workspaceFileWatchSenders.get(sender.id)
+    if (!record) return
+    record.sender.removeListener('destroyed', record.onDestroyed)
+    workspaceFileWatchSenders.delete(sender.id)
+  }
 
   const disposeWorkspaceFileWatch = (watchId: string): boolean => {
     const record = workspaceFileWatchers.get(watchId)
@@ -441,6 +720,7 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       })
     }
     workspaceFileWatchers.delete(watchId)
+    releaseWorkspaceFileWatchSender(record.sender)
     return true
   }
 
@@ -450,6 +730,16 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         disposeWorkspaceFileWatch(watchId)
       }
     }
+  }
+
+  const retainWorkspaceFileWatchSender = (sender: WebContents): void => {
+    if (workspaceFileWatchSenders.has(sender.id)) return
+    const onDestroyed = (): void => {
+      workspaceFileWatchSenders.delete(sender.id)
+      disposeWorkspaceFileWatchesForSender(sender)
+    }
+    workspaceFileWatchSenders.set(sender.id, { sender, onDestroyed })
+    sender.once('destroyed', onDestroyed)
   }
 
   const emitWorkspaceFileChange = async (watchId: string): Promise<void> => {
@@ -511,9 +801,30 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
   }
 
   ipcMain.handle('settings:get', async () => store.load())
-  // Claude Pro/Max subscription login (compliant path: official CLI does the
-  // OAuth; we only detect it / capture the setup-token).
-  ipcMain.handle('claude-subscription:status', async () => claudeSubscriptionStatus())
+  ipcMain.handle('credentials:reset-unreadable', async (event): Promise<CredentialRecoveryResetResult> => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const parent = getMainWindow()
+    if (!parent || parent.isDestroyed()) {
+      throw new Error('Credential recovery window is unavailable.')
+    }
+    const confirmation = await dialog.showMessageBox(parent, {
+      type: 'warning',
+      title: 'Reset encrypted credentials',
+      message: 'Reset the credentials that Windows can no longer decrypt?',
+      detail: [
+        'Kun will back up the unreadable encrypted data before resetting it.',
+        'Saved API keys and OAuth sessions must be entered or authorized again.',
+        'Conversations, workspaces, and ordinary settings are not removed.'
+      ].join('\n'),
+      buttons: ['Back up and reset', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      normalizeAccessKeys: true
+    })
+    if (confirmation.response !== 0) return { reset: false }
+    return resetUnreadableCredentials()
+  })
   // The Claude Code binary (~222MB) is NOT bundled — it's downloaded on demand
   // into userData/agent-sdk and resolved from there (or kun/node_modules in dev).
   const claudeSubKunDirs = (): string[] =>
@@ -523,6 +834,11 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     ].map((root) => join(root, 'kun'))
   const claudeSubBinary = (): string | undefined =>
     resolveClaudeBinary(app.getPath('userData'), claudeSubKunDirs())
+  // Claude Pro/Max subscription login. The official CLI owns browser OAuth and
+  // platform credential storage; Kun observes only structured, redacted state.
+  ipcMain.handle('claude-subscription:status', async () =>
+    claudeSubscriptionStatus({ binaryPath: claudeSubBinary() })
+  )
   ipcMain.handle('claude-subscription:sdk-status', async () => ({
     ...agentSdkStatus(app.getPath('userData'), claudeSubKunDirs()),
     download: agentSdkDownloadState()
@@ -534,7 +850,13 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     )
   )
   ipcMain.handle('claude-subscription:login', async () =>
-    runClaudeSetupToken({ binaryPath: claudeSubBinary() })
+    runClaudeSubscriptionLogin({ binaryPath: claudeSubBinary() })
+  )
+  ipcMain.handle('claude-subscription:probe', async (_event, token: unknown) =>
+    probeClaudeSubscription({
+      token: typeof token === 'string' ? token : undefined,
+      binaryPath: claudeSubBinary()
+    })
   )
   ipcMain.handle('claude-subscription:models', async (_event, token: unknown) =>
     fetchSdkModels({
@@ -543,16 +865,59 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       binaryPath: claudeSubBinary()
     })
   )
-  ipcMain.handle('settings:set', async (_, partial: unknown) =>
-    applySettingsPatch(
-      parseIpcPayload('settings:set', settingsPatchSchema, partial) as AppSettingsPatch
+  const antigravityBinary = (): string | undefined =>
+    resolveAntigravityCliBinary(app.getPath('userData'))
+  ipcMain.handle('gemini-subscription:cli-status', async () => ({
+    installed: Boolean(antigravityBinary()),
+    ...(antigravityBinary() ? { path: antigravityBinary() } : {}),
+    download: antigravityCliDownloadState()
+  }))
+  ipcMain.handle('gemini-subscription:cli-install', async () =>
+    startAntigravityCliInstall(
+      { userDataDir: app.getPath('userData'), proxyUrl: resolveModelProviderProxyUrl(await store.load()) },
+      (state) => getMainWindow()?.webContents.send('gemini-subscription:cli-progress', state)
     )
   )
-  ipcMain.handle('settings:save-silent', async (_, partial: unknown) =>
-    saveSettingsPatch(
-      parseIpcPayload('settings:save-silent', settingsPatchSchema, partial) as AppSettingsPatch
-    )
+  ipcMain.handle('gemini-subscription:models', async () => {
+    const binaryPath = antigravityBinary()
+    if (!binaryPath) {
+      throw new Error('Antigravity CLI is not installed. Install it from the Gemini subscription settings first.')
+    }
+    return fetchAntigravityModels({ binaryPath })
+  })
+  ipcMain.handle('gemini-cli-subscription:status', async () =>
+    geminiCliSubscriptionStatus()
   )
+  ipcMain.handle('gemini-cli-subscription:models', async () =>
+    geminiCliSubscriptionModels()
+  )
+  ipcMain.handle('cursor-subscription:discover', async (_event, payload: unknown) => {
+    const { apiKey } = parseIpcPayload(
+      'cursor-subscription:discover',
+      cursorSubscriptionDiscoveryPayloadSchema,
+      payload
+    )
+    return discoverCursorSubscription({
+      apiKey,
+      kunRoots: claudeSubKunDirs()
+    })
+  })
+  ipcMain.handle('settings:set', async (event, partial: unknown) =>
+    applyProtectedSettingsPatch(
+      event,
+      withoutRendererProjectConfigGrants(
+        parseIpcPayload('settings:set', settingsPatchSchema, partial) as AppSettingsPatch
+      ),
+      applySettingsPatch
+    ))
+  ipcMain.handle('settings:save-silent', async (event, partial: unknown) =>
+    applyProtectedSettingsPatch(
+      event,
+      withoutRendererProjectConfigGrants(
+        parseIpcPayload('settings:save-silent', settingsPatchSchema, partial) as AppSettingsPatch
+      ),
+      saveSettingsPatch
+    ))
 
   ipcMain.handle('runtime:request', async (_, payload: unknown) => {
     const request = parseIpcPayload('runtime:request', runtimeRequestPayloadSchema, payload)
@@ -567,13 +932,87 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     return runtimeRequest(KUN_ATTACHMENTS_PATH, 'POST', JSON.stringify(request))
   })
 
+  ipcMain.handle('runtime:attachment:upload-image', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const request = parseIpcPayload(
+      'runtime:attachment:upload-image',
+      runtimeImageAttachmentUploadPayloadSchema,
+      payload
+    )
+    return uploadRuntimeImageAttachment(request, { runtimeRequest })
+  })
+
+  ipcMain.handle('approval:decide', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const request = parseIpcPayload(
+      'approval:decide',
+      kunProtectedApprovalPayloadSchema,
+      payload
+    )
+    if (request.source === 'user') {
+      const parent = getMainWindow()
+      if (!parent || parent.isDestroyed()) throw new Error('Protected approval window is unavailable.')
+      const allow = request.decision === 'allow'
+      const confirmation = await dialog.showMessageBox(parent, {
+        type: 'warning',
+        title: allow ? 'Approve tool action' : 'Deny tool action',
+        message: allow
+          ? 'Allow this pending Kun tool action once?'
+          : 'Deny this pending Kun tool action?',
+        detail: `Approval: ${request.approvalId}\n\nThis protected native prompt cannot be controlled by extension Webviews or Direct DOM content scripts.`,
+        buttons: [allow ? 'Allow once' : 'Deny', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+        normalizeAccessKeys: true
+      })
+      if (confirmation.response !== 0) return { confirmed: false as const }
+    }
+
+    const settings = await store.load()
+    const runtimeToken = getKunRuntimeSettings(settings).runtimeToken.trim()
+    const consentToken = createApprovalConsentToken({
+      runtimeToken,
+      approvalId: request.approvalId,
+      decision: request.decision,
+      expiresAt: Date.now() + 30_000
+    })
+    const response = await runtimeRequest(
+      `/v1/approvals/${encodeURIComponent(request.approvalId)}`,
+      'POST',
+      JSON.stringify({ decision: request.decision }),
+      { [KUN_APPROVAL_CONSENT_HEADER]: consentToken }
+    )
+    return { confirmed: true as const, response }
+  })
+
   ipcMain.handle('runtime:restart', async () => restartRuntime())
+  ipcMain.handle('runtime:settings-sync-status:get', () => getRuntimeSettingsSyncStatus())
 
   ipcMain.handle('upstream:models', async () => fetchUpstreamModels())
 
   ipcMain.handle('provider:probe', async (_, payload: unknown) => {
     const request = parseIpcPayload('provider:probe', providerProbePayloadSchema, payload)
     return probeModelProvider(request, await store.load())
+  })
+
+  ipcMain.handle('provider:quota:list', async (event) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    return listProviderQuotas(await store.load())
+  })
+
+  ipcMain.handle('provider:models-dev-catalog', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'provider:models-dev-catalog',
+      modelsDevCatalogPayloadSchema,
+      payload
+    )
+    return fetchModelsDevCatalog(request, await store.load())
+  })
+
+  ipcMain.handle('prompt:optimize', async (_, payload: unknown) => {
+    const request = parseIpcPayload('prompt:optimize', promptOptimizationPayloadSchema, payload)
+    return optimizePrompt(await store.load(), request.text)
   })
 
   ipcMain.handle('claw:status', async (): Promise<ClawRuntimeStatus> =>
@@ -771,6 +1210,45 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   )
 
+  ipcMain.handle('codex:auth:start', async () => {
+    return startCodexDeviceAuth()
+  })
+
+  ipcMain.handle('codex:auth:poll', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'codex:auth:poll',
+      z.object({ deviceCode: z.string().min(1), userCode: z.string().min(1) }).strict(),
+      payload
+    )
+    return pollCodexDeviceAuth(request.deviceCode, request.userCode)
+  })
+
+  ipcMain.handle('codex:auth:browser', async () => {
+    return startCodexBrowserAuth(async (url: string) => {
+      await shell.openExternal(url)
+    })
+  })
+
+  ipcMain.handle('grok:auth:browser', async () => {
+    return startGrokBrowserAuth(async (url: string) => {
+      await shell.openExternal(url)
+    })
+  })
+
+  ipcMain.handle('grok:auth:browser:paste', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'grok:auth:browser:paste',
+      z.object({ code: z.string().min(1) }).strict(),
+      payload
+    )
+    return submitGrokBrowserAuthCode(request.code)
+  })
+
+  ipcMain.handle('grok:auth:browser:cancel', async () => {
+    cancelGrokBrowserAuth()
+    return { ok: true as const }
+  })
+
   ipcMain.handle('workspace:pick-directory', async (_, defaultPath: unknown): Promise<WorkspacePickResult> => {
     const normalizedDefaultPath = parseIpcPayload(
       'workspace:pick-directory',
@@ -789,6 +1267,19 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     return {
       canceled: result.canceled,
       path: result.canceled ? null : (result.filePaths[0] ?? null)
+    }
+  })
+
+  ipcMain.handle('workspace:directory-exists', async (_, workspaceRoot: unknown): Promise<boolean> => {
+    const normalizedWorkspaceRoot = parseIpcPayload(
+      'workspace:directory-exists',
+      workspaceRootSchema,
+      workspaceRoot
+    )
+    try {
+      return (await stat(expandHomePath(normalizedWorkspaceRoot))).isDirectory()
+    } catch {
+      return false
     }
   })
 
@@ -834,8 +1325,7 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         const base =
           `${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}` +
           `-${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}`
-        // 同秒内连建两个对话会得到相同时间戳目录;mkdir(recursive) 对已存在目录
-        // 不报错,会导致两个会话静默共用目录。冲突时追加随机后缀保证唯一。
+        // 同秒内连建两个对话会得到相同时间戳目录。冲突时追加随机后缀保证唯一。
         let workspacePath = join(root, base)
         let suffixAttempt = 0
         while (await pathExists(workspacePath)) {
@@ -846,7 +1336,10 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
             : `${stamp.getMilliseconds()}${randomBytes(1).toString('hex')}`
           workspacePath = join(root, `${base}-${suffix}`)
         }
-        await mkdir(workspacePath, { recursive: true })
+        // 用户显式创建对话时，补建其配置的根目录。不要在设置加载期间创建自定义
+        // 路径，避免应用启动时意外恢复不可用的网络盘或已删除的目录。
+        await mkdir(root, { recursive: true })
+        await mkdir(workspacePath)
         return { ok: true, path: workspacePath }
       } catch (error) {
         return {
@@ -857,6 +1350,25 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       }
     }
   )
+
+  ipcMain.handle('dialog:alert', async (_, payload: unknown): Promise<void> => {
+    const request = parseIpcPayload('dialog:alert', alertDialogPayloadSchema, payload)
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      buttons: [request.buttonLabel ?? 'OK'],
+      defaultId: 0,
+      cancelId: 0,
+      message: request.message,
+      detail: request.detail,
+      noLink: true
+    }
+    const mainWindow = getMainWindow()
+    if (mainWindow) {
+      await dialog.showMessageBox(mainWindow, options)
+      return
+    }
+    await dialog.showMessageBox(options)
+  })
 
   // Replaces window.confirm in the renderer: the synchronous native confirm
   // leaves the WebContents unable to focus inputs after it closes
@@ -900,6 +1412,33 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     return importGithubSkillsToRoot(request)
   })
 
+  ipcMain.handle('ppt-master:ensure', async () => {
+    const settings = await store.load()
+    if (isManagedPptMasterSkillRootDisabled(settings)) {
+      return {
+        ok: false as const,
+        message: 'PPT Master uses ~/.kun/skills, which is disabled in Settings → Agents → Skills. Enable that skill directory, then try again.'
+      }
+    }
+    const result = await ensurePptMaster({
+      kunHomeDir: join(homedir(), '.kun'),
+      proxyUrl: resolveModelProviderProxyUrl(settings)
+    })
+    if (!result.ok) return result
+    try {
+      // SkillRuntime discovers both skill entries and local tools only at
+      // construction time. Reload even after a repair-only ensure: a prior
+      // dependency install may have failed after the venv was created.
+      await restartRuntime()
+      return result
+    } catch (error) {
+      return {
+        ok: false as const,
+        message: `PPT Master installed, but Kun could not restart: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+  })
+
   ipcMain.handle('skill:list', async (_, payload: unknown) => {
     const request = parseIpcPayload('skill:list', skillListPayloadSchema, payload)
     const settings = await store.load()
@@ -929,13 +1468,15 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   })
 
-  ipcMain.handle('ui-plugin:list', async () => {
+  ipcMain.handle('ui-plugin:list', async (event) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
     const kunHomeDir = join(homedir(), '.kun')
     await ensureBundledUiPlugins(kunHomeDir)
     return { plugins: await listUiPlugins(kunHomeDir) }
   })
 
-  ipcMain.handle('ui-plugin:install', async () => {
+  ipcMain.handle('ui-plugin:install', async (event) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
     const mainWindow = getMainWindow()
     const options: Electron.OpenDialogOptions = {
       title: 'Select a UI plugin folder',
@@ -948,23 +1489,96 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     if (picked.canceled || !sourceDir) {
       return { canceled: true as const }
     }
-    const result = await installUiPluginFromDirectory(join(homedir(), '.kun'), sourceDir)
+    const result = await enqueueUiPluginOperation(() =>
+      installUiPluginFromDirectory(join(homedir(), '.kun'), sourceDir)
+    )
     if (!result.ok) {
       return { canceled: false as const, ok: false as const, errors: result.errors }
     }
     return { canceled: false as const, ok: true as const, plugin: result.plugin }
   })
 
-  ipcMain.handle('ui-plugin:remove', async (_, payload: unknown) => {
+  ipcMain.handle('ui-plugin:remove', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
     const request = parseIpcPayload('ui-plugin:remove', uiPluginIdPayloadSchema, payload)
-    return { ok: await removeUiPlugin(join(homedir(), '.kun'), request.id) }
+    return enqueueUiPluginOperation(async () => {
+      if (uiPluginThemeController.activePluginId === request.id) {
+        try {
+          await uiPluginThemeController.deactivate()
+        } catch (error) {
+          logError('ui-plugin-cdp', 'Could not deactivate the UI plugin before removal', {
+            pluginId: request.id,
+            message: error instanceof Error ? error.message : String(error)
+          })
+          return { ok: false }
+        }
+      }
+      return { ok: await removeUiPlugin(join(homedir(), '.kun'), request.id) }
+    })
   })
 
-  ipcMain.handle('ui-plugin:load', async (_, payload: unknown) => {
+  ipcMain.handle('ui-plugin:load', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
     const request = parseIpcPayload('ui-plugin:load', uiPluginIdPayloadSchema, payload)
     const kunHomeDir = join(homedir(), '.kun')
     await ensureBundledUiPlugins(kunHomeDir)
     return loadUiPluginFigures(kunHomeDir, request.id)
+  })
+
+  ipcMain.handle('ui-plugin:theme:activate', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const request = parseIpcPayload(
+      'ui-plugin:theme:activate',
+      uiPluginIdPayloadSchema,
+      payload
+    )
+    return enqueueUiPluginOperation(async () => {
+      const kunHomeDir = join(homedir(), '.kun')
+      await ensureBundledUiPlugins(kunHomeDir)
+      const loaded = await loadUiPluginFigures(kunHomeDir, request.id)
+      if (!loaded.ok) return { ok: false as const, error: loaded.error }
+
+      // Only normalized manifest fields and main-validated image data reach the
+      // CSS builders. The renderer cannot supply CSS or executable payloads.
+      const css = [
+        buildUiPluginTokenCss(loaded.manifest),
+        buildUiPluginPresentationCss(loaded.manifest),
+        buildUiPluginSceneCss(loaded.manifest),
+        buildUiPluginBackgroundCss(loaded.manifest, loaded.backgrounds)
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+      try {
+        await uiPluginThemeController.activate(loaded.manifest.id, css)
+        return {
+          ok: true as const,
+          manifest: loaded.manifest,
+          figures: loaded.figures,
+          sceneAssets: loaded.sceneAssets
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logError('ui-plugin-cdp', 'Could not activate a UI plugin theme', {
+          pluginId: loaded.manifest.id,
+          message
+        })
+        return { ok: false as const, error: message }
+      }
+    })
+  })
+
+  ipcMain.handle('ui-plugin:theme:deactivate', async (event) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    return enqueueUiPluginOperation(async () => {
+      try {
+        await uiPluginThemeController.deactivate()
+        return { ok: true as const }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logError('ui-plugin-cdp', 'Could not deactivate the UI plugin theme', { message })
+        return { ok: false as const, error: message }
+      }
+    })
   })
 
   ipcMain.handle('kun:config:read', async () => {
@@ -1015,11 +1629,162 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   })
 
+  const projectConfigFileResult = async (
+    workspaceRoot: string,
+    settingsOverride?: AppSettingsV1
+  ) => {
+    const settings = settingsOverride ?? await store.load()
+    const state = await readProjectConfigState(settings, workspaceRoot)
+    const source = await readKunProjectConfigSource(workspaceRoot).catch(() => null)
+    return {
+      ...state,
+      content: source?.content ?? '',
+      exists: source?.exists ?? false
+    }
+  }
+
+  ipcMain.handle('kun:project-config:read', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'kun:project-config:read',
+      kunProjectConfigWorkspacePayloadSchema,
+      payload
+    )
+    return projectConfigFileResult(request.workspaceRoot)
+  })
+
+  ipcMain.handle('kun:project-config:write', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'kun:project-config:write',
+      kunProjectConfigWritePayloadSchema,
+      payload
+    )
+    const written = await writeKunProjectConfig(request.workspaceRoot, request.content)
+    try {
+      await onKunProjectConfigChanged?.(written.path, request.content)
+    } catch (error) {
+      logError('project-config', 'Failed to apply project config change after write', {
+        path: written.path,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
+    return projectConfigFileResult(written.workspaceRoot)
+  })
+
+  ipcMain.handle('kun:project-config:trust', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'kun:project-config:trust',
+      kunProjectConfigTrustPayloadSchema,
+      payload
+    )
+    const current = await store.load()
+    const loaded = await loadKunProjectConfig(request.workspaceRoot)
+    if (request.trusted && loaded.status !== 'valid') {
+      throw new Error(
+        loaded.status === 'invalid'
+          ? loaded.message
+          : 'Project config must exist and be valid before it can be approved.'
+      )
+    }
+    if (request.trusted && loaded.status === 'valid' &&
+      loaded.digest !== request.expectedDigest.toLowerCase()) {
+      throw new Error('Project config changed after confirmation. Refresh, review, and approve it again.')
+    }
+    const canonicalRoot = loaded.workspaceRoot
+    const currentState = await readProjectConfigState(current, canonicalRoot)
+    const enabledServers = currentState.serverSummaries.filter((server) => server.enabled)
+    const isChinese = current.locale.toLowerCase().startsWith('zh')
+    const detail = request.trusted
+      ? [
+          isChinese ? `工作区：${canonicalRoot}` : `Workspace: ${canonicalRoot}`,
+          isChinese ? '将启用的 MCP：' : 'Enabled MCP servers:',
+          enabledServers.length > 0
+            ? enabledServers.map((server) => `${server.id}: ${server.target}`).join('\n')
+            : isChinese ? '（无）' : '(none)',
+          loaded.status === 'valid' ? `SHA-256: ${loaded.digest}` : '',
+          isChinese
+            ? '仅批准你已审查且信任的项目配置。批准后，Kun 可以启动其中声明的命令。'
+            : 'Approve only a project configuration you reviewed and trust. Kun may start its declared commands.'
+        ].filter(Boolean).join('\n\n')
+      : isChinese
+        ? `工作区：${canonicalRoot}\n\n撤销后，项目 MCP 将在下一次配置应用时被移除。`
+        : `Workspace: ${canonicalRoot}\n\nProject MCP will be removed on the next configuration apply.`
+    const confirmationOptions: Electron.MessageBoxOptions = {
+      type: 'warning',
+      title: request.trusted
+        ? isChinese ? '批准项目 MCP' : 'Approve project MCP'
+        : isChinese ? '撤销项目 MCP' : 'Revoke project MCP',
+      message: request.trusted
+        ? isChinese ? '批准当前项目 MCP 配置？' : 'Approve the current project MCP configuration?'
+        : isChinese ? '撤销当前项目 MCP 授权？' : 'Revoke the current project MCP grant?',
+      detail,
+      buttons: request.trusted
+        ? [isChinese ? '批准' : 'Approve', isChinese ? '取消' : 'Cancel']
+        : [isChinese ? '撤销' : 'Revoke', isChinese ? '取消' : 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true
+    }
+    const mainWindow = getMainWindow()
+    const confirmation = mainWindow
+      ? await dialog.showMessageBox(mainWindow, confirmationOptions)
+      : await dialog.showMessageBox(confirmationOptions)
+    if (confirmation.response !== 0) {
+      return projectConfigFileResult(canonicalRoot, current)
+    }
+    let confirmedDigest: string | undefined
+    if (request.trusted) {
+      const confirmed = await loadKunProjectConfig(canonicalRoot)
+      if (confirmed.status !== 'valid' ||
+        !sameProjectWorkspace(confirmed.workspaceRoot, canonicalRoot) ||
+        confirmed.digest !== request.expectedDigest.toLowerCase()) {
+        throw new Error('Project config changed during confirmation. Refresh, review, and approve it again.')
+      }
+      confirmedDigest = confirmed.digest
+    }
+    const grants = getKunRuntimeSettings(current).projectConfig.grants.filter((grant) =>
+      !sameProjectWorkspace(grant.workspaceRoot, canonicalRoot)
+    )
+    if (request.trusted && confirmedDigest) {
+      grants.push({ workspaceRoot: canonicalRoot, configDigest: confirmedDigest })
+    }
+    const saved = await applySettingsPatch({
+      agents: { kun: { projectConfig: { grants } } }
+    })
+    return projectConfigFileResult(canonicalRoot, saved)
+  })
+
+  ipcMain.handle('kun:project-config:open-dir', async (_, payload: unknown) => {
+    const request = parseIpcPayload(
+      'kun:project-config:open-dir',
+      kunProjectConfigWorkspacePayloadSchema,
+      payload
+    )
+    try {
+      const directory = await ensureKunProjectConfigDirectory(request.workspaceRoot)
+      return openPathWithShell(directory)
+    } catch (error) {
+      return {
+        ok: false as const,
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+
   const resolveKunThreadsDataDir = async (): Promise<string> => {
     const settings = await store.load()
     const runtime = resolveKunRuntimeSettings(settings)
     return expandHomePath(runtime.dataDir?.trim() || DEFAULT_KUN_DATA_DIR)
   }
+
+  // Map the user's checkpoint settings (issue #651) to the service storage
+  // options: an optional directory override (e.g. another drive) and the
+  // per-thread retention cap. Home-relative paths are expanded.
+  const resolveCheckpointStorageOptions = (
+    cfg: { directory?: string; maxPerThread?: number }
+  ): GitCheckpointStorageOptions => ({
+    ...(cfg.directory?.trim() ? { checkpointsRoot: expandHomePath(cfg.directory.trim()) } : {}),
+    ...(cfg.maxPerThread !== undefined ? { maxPerThread: cfg.maxPerThread } : {})
+  })
 
   ipcMain.handle('kun:sessions:detect-legacy', async () =>
     detectLegacySessions({ homeDir: homedir(), destDataDir: await resolveKunThreadsDataDir() })
@@ -1081,17 +1846,41 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
   )
   ipcMain.handle('git:checkpoint:create', async (_, payload: unknown) => {
     const request = parseIpcPayload('git:checkpoint:create', gitCheckpointCreatePayloadSchema, payload)
+    const settings = await store.load()
+    if (!settings.checkpointCleanup.createEnabled) {
+      if (request.checkpointId) {
+        await failGitCheckpointGate(
+          await resolveKunThreadsDataDir(),
+          request.checkpointId,
+          'disabled',
+          'Git checkpoint creation is disabled in settings.'
+        ).catch(() => undefined)
+      }
+      return {
+        ok: false as const,
+        reason: 'disabled' as const,
+        message: 'Git checkpoint creation is disabled in settings.'
+      }
+    }
     return createGitCheckpoint({
       dataDir: await resolveKunThreadsDataDir(),
       workspaceRoot: request.workspaceRoot,
-      threadId: request.threadId
+      threadId: request.threadId,
+      ...(request.checkpointId ? { checkpointId: request.checkpointId } : {}),
+      deferRetention: true,
+      storage: resolveCheckpointStorageOptions(settings.checkpointCleanup)
     })
   })
   ipcMain.handle('git:checkpoint:restore', async (_, payload: unknown) => {
     const request = parseIpcPayload('git:checkpoint:restore', gitCheckpointRestorePayloadSchema, payload)
+    const settings = await store.load()
     return restoreGitCheckpoint({
       dataDir: await resolveKunThreadsDataDir(),
       checkpointId: request.checkpointId,
+      ...(request.allowPartialRestore ? { allowPartialRestore: true } : {}),
+      ...(request.expectedThreadId ? { expectedThreadId: request.expectedThreadId } : {}),
+      ...(request.expectedWorkspaceRoot ? { expectedWorkspaceRoot: request.expectedWorkspaceRoot } : {}),
+      storage: resolveCheckpointStorageOptions(settings.checkpointCleanup),
       // Bridge the main-process runtimeRequest into the shape restoreGitCheckpoint
       // expects ((path, {method, body}) => {ok,status,body}). On a transport-level
       // failure (runtime not up, connection refused) we return a non-ok result so
@@ -1211,6 +2000,15 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       parseIpcPayload('file:resolve-workspace', workspaceFileTargetPayloadSchema, payload)
     )
   )
+  ipcMain.handle('file:open-workspace-system', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, options.getMainWindow)
+    const resolved = await resolveWorkspaceFile(
+      parseIpcPayload('file:open-workspace-system', workspaceFileTargetPayloadSchema, payload)
+    )
+    if (!resolved.ok) return resolved
+    const message = await shell.openPath(resolved.path)
+    return message ? { ok: false as const, message } : { ok: true as const }
+  })
   ipcMain.handle('file:list-workspace-directory', async (_, payload: unknown) =>
     listWorkspaceDirectory(
       parseIpcPayload('file:list-workspace-directory', workspaceDirectoryTargetPayloadSchema, payload)
@@ -1236,6 +2034,26 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       parseIpcPayload('file:read-workspace-pdf', workspaceFileTargetPayloadSchema, payload)
     )
   )
+  ipcMain.handle('file:open-workspace-preview', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, options.getMainWindow)
+    return options.workspacePreviewProtocols.createLease(
+      event.sender,
+      parseIpcPayload(
+        'file:open-workspace-preview',
+        workspacePreviewLeaseTargetPayloadSchema,
+        payload
+      )
+    )
+  })
+  ipcMain.handle('file:release-workspace-preview', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, options.getMainWindow)
+    const request = parseIpcPayload(
+      'file:release-workspace-preview',
+      workspacePreviewLeaseReleasePayloadSchema,
+      payload
+    )
+    return options.workspacePreviewProtocols.release(event.sender.id, request.leaseId)
+  })
   ipcMain.handle('file:read-local-pdf-text', async (_, payload: unknown) => {
     const result = await readLocalPdfText(
       parseIpcPayload('file:read-local-pdf-text', localPdfTextTargetPayloadSchema, payload)
@@ -1249,12 +2067,86 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       pageCount: result.pageCount,
       text: result.pages.map((page) => page.text).join('\n\n'),
       hasText: result.hasText,
+      ocrApplied: result.ocrApplied,
+      ocrPageCount: result.ocrPageCount,
       truncated: result.truncated
+    }
+  })
+  ipcMain.handle('file:read-local-office-document', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const target = parseIpcPayload(
+      'file:read-local-office-document',
+      localOfficeDocumentTargetPayloadSchema,
+      payload
+    )
+    const binaryPath = resolveOfficeCliBinary({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appRoot: app.getAppPath(),
+      explicitPath: process.env.KUN_OFFICECLI_BINARY
+    })
+    if (!binaryPath) {
+      return {
+        ok: false as const,
+        code: 'officecli_unavailable',
+        message: 'Office document support is unavailable because the bundled OfficeCLI binary was not found.'
+      }
+    }
+    const abortController = new AbortController()
+    const cancelWhenRendererCloses = (): void => abortController.abort()
+    event.sender.once('destroyed', cancelWhenRendererCloses)
+    try {
+      return await readLocalOfficeDocument(target, {
+        binaryPath,
+        signal: abortController.signal
+      })
+    } finally {
+      event.sender.removeListener('destroyed', cancelWhenRendererCloses)
     }
   })
   ipcMain.handle('file:save-as', async (_, payload: unknown) =>
     saveWorkspaceFileAs(payload, getMainWindow)
   )
+  ipcMain.handle('extension:artifact:open', async (event, payload: unknown) => {
+    assertTrustedWorkbenchSender(event, getMainWindow)
+    const input = parseIpcPayload(
+      'extension:artifact:open',
+      extensionArtifactActionSchema,
+      payload
+    )
+    const result = await options.runtimeRequest(
+      '/v1/extensions/media/artifacts/resolve',
+      'POST',
+      JSON.stringify({
+        artifactId: input.artifactId,
+        ownerExtensionId: input.ownerExtensionId,
+        ownerExtensionVersion: input.ownerExtensionVersion,
+        workspaceId: input.workspaceId,
+        workspaceRoot: input.workspaceRoot
+      })
+    )
+    if (!result.ok) {
+      return { ok: false, message: 'Generated artifact is unavailable.' }
+    }
+    let decoded: unknown
+    try {
+      decoded = JSON.parse(result.body)
+    } catch {
+      return { ok: false, message: 'Generated artifact metadata is invalid.' }
+    }
+    const resolved = extensionArtifactResolutionSchema.safeParse(decoded)
+    if (!resolved.success || resolved.data.artifactId !== input.artifactId) {
+      return { ok: false, message: 'Generated artifact metadata is invalid.' }
+    }
+    if (input.action === 'reveal') {
+      shell.showItemInFolder(resolved.data.absolutePath)
+      return { ok: true }
+    }
+    const error = await shell.openPath(resolved.data.absolutePath)
+    return error
+      ? { ok: false, message: 'The generated artifact could not be opened.' }
+      : { ok: true }
+  })
   ipcMain.handle('file:write-workspace', async (_, payload: unknown) =>
     writeWorkspaceFile(
       parseIpcPayload('file:write-workspace', workspaceFileWritePayloadSchema, payload)
@@ -1277,6 +2169,17 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         workspaceClipboardImageSavePayloadSchema,
         payload
       )
+    )
+  )
+  ipcMain.handle('file:pick-workspace-image', async (_, payload: unknown) =>
+    pickAndSaveWorkspaceImage(
+      parseIpcPayload('file:pick-workspace-image', workspaceImagePickPayloadSchema, payload),
+      { parentWindow: getMainWindow() }
+    )
+  )
+  ipcMain.handle('file:save-workspace-image-bytes', async (_, payload: unknown) =>
+    saveWorkspaceImageBytes(
+      parseIpcPayload('file:save-workspace-image-bytes', workspaceImageBytesSavePayloadSchema, payload)
     )
   )
   ipcMain.handle('clipboard:read-image', async () => readClipboardImage())
@@ -1313,7 +2216,14 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
 
     const watchId = randomUUID()
     try {
-      const watcher = watch(watchedPath, { persistent: false }, () => {
+      const watchedDirectory = dirname(watchedPath)
+      const watchedName = basename(watchedPath)
+      // Watch the containing directory rather than the file inode. Workspace
+      // writes are atomic (`rename(temp, target)`), which replaces the inode and
+      // permanently detaches a file-level watcher after its first update on
+      // macOS/Linux. The directory remains stable across every replacement.
+      const watcher = watch(watchedDirectory, { persistent: false }, (_eventType, filename) => {
+        if (filename && basename(filename.toString()) !== watchedName) return
         scheduleWorkspaceFileChange(watchId)
       })
       workspaceFileWatchers.set(watchId, {
@@ -1323,7 +2233,28 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         workspaceRoot: request.workspaceRoot,
         timer: null
       })
-      event.sender.once('destroyed', () => disposeWorkspaceFileWatchesForSender(event.sender))
+      retainWorkspaceFileWatchSender(event.sender)
+      // Close the read → watch race: a file can be atomically replaced after
+      // the first read but before the directory watch starts. Re-read only
+      // after the watch is live, so callers never bootstrap a stale SVG and a
+      // later write is still delivered by the watcher.
+      if (initial.ok) {
+        const refreshed = await readWorkspaceFile(request)
+        if (!refreshed.ok) {
+          disposeWorkspaceFileWatch(watchId)
+          return refreshed
+        }
+        initialContent = refreshed.content
+        initialSize = refreshed.size
+        initialTruncated = refreshed.truncated
+      } else {
+        const refreshed = await readWorkspaceImage(request)
+        if (!refreshed.ok) {
+          disposeWorkspaceFileWatch(watchId)
+          return refreshed
+        }
+        initialSize = refreshed.size
+      }
       return {
         ok: true as const,
         watchId,
@@ -1349,6 +2280,28 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       { parentWindow: getMainWindow() }
     )
   )
+  ipcMain.handle('conversation:export', async (_, payload: unknown) =>
+    exportConversation(
+      parseIpcPayload('conversation:export', conversationExportPayloadSchema, payload),
+      { parentWindow: getMainWindow() }
+    )
+  )
+  ipcMain.handle('memory:export-markdown', async (_, payload: unknown) =>
+    exportMemoryMarkdown(
+      parseIpcPayload('memory:export-markdown', memoryMarkdownExportPayloadSchema, payload),
+      { parentWindow: getMainWindow() }
+    )
+  )
+  ipcMain.handle('design:export-prototype', async (_, payload: unknown) =>
+    exportDesignPrototype(
+      parseIpcPayload('design:export-prototype', designExportPayloadSchema, payload),
+      { parentWindow: getMainWindow() }
+    )
+  )
+  ipcMain.handle('design:lint-project-design-md', async (_, payload: unknown) => {
+    const request = parseIpcPayload('design:lint-project-design-md', projectDesignMdLintPayloadSchema, payload)
+    return lintProjectDesignMd(request.content)
+  })
   ipcMain.handle('write:copy-rich-text', async (_, payload: unknown) =>
     copyWriteDocumentAsRichText(
       parseIpcPayload('write:copy-rich-text', writeRichClipboardPayloadSchema, payload)
@@ -1496,4 +2449,16 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     if (error) return { ok: false, message: error }
     return { ok: true }
   })
+}
+
+function isManagedPptMasterSkillRootDisabled(settings: AppSettingsV1): boolean {
+  const target = comparableSkillRootPath(join(homedir(), '.kun', 'skills'))
+  const disabledDirectories = [
+    ...settings.claw.skills.disabledDirs,
+    ...settings.schedule.skills.disabledDirs
+  ]
+  return disabledDirectories.some((entry) =>
+    entry.trim().toLowerCase() === 'global-deepseek' ||
+    comparableSkillRootPath(normalizeSkillRootPath(entry)) === target
+  )
 }

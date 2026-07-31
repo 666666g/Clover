@@ -11,12 +11,14 @@ import {
   modelProviderTokenPlanProfile,
   normalizeAppSettings,
   tokenPlanProviderId,
+  type AppSettingsPatch,
   type AppSettingsV1,
   type KunToolPermissionMode,
   type KunRuntimeSettingsPatchV1,
   type ModelProviderPreset,
   type ModelProviderProfileV1
 } from '@shared/app-settings'
+import { diffSettingsPatch } from './settings-utils'
 
 export type InitialSetupAccessMode = 'api' | 'token-plan'
 
@@ -32,6 +34,8 @@ export type InitialSetupSelection = {
   presetId: string
   mode: InitialSetupAccessMode
   permissionMode: KunToolPermissionMode
+  /** True only after the user deliberately chooses a permission card. */
+  permissionTouched: boolean
 }
 
 const INITIAL_SETUP_PROVIDER_PRESET_IDS = new Set(['agnes', 'xiaomi', 'minimax'])
@@ -79,14 +83,26 @@ export function initialSetupSelection(settings: AppSettingsV1): InitialSetupSele
   const activeId = runtime.providerId.trim()
   const permissionMode = kunToolPermissionModeFromSettings(runtime)
   for (const preset of INITIAL_SETUP_PROVIDER_PRESETS) {
-    if (activeId === preset.id) return { presetId: preset.id, mode: 'api', permissionMode }
+    if (activeId === preset.id) {
+      return { presetId: preset.id, mode: 'api', permissionMode, permissionTouched: false }
+    }
     if (preset.tokenPlan && activeId === tokenPlanProviderId(preset.id)) {
-      return { presetId: preset.id, mode: 'token-plan', permissionMode }
+      return {
+        presetId: preset.id,
+        mode: 'token-plan',
+        permissionMode,
+        permissionTouched: false
+      }
     }
   }
   // On first run the active provider is still the app-wide default (DeepSeek);
   // default the onboarding selection to Agnes so users see it first.
-  return { presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID, mode: 'api', permissionMode }
+  return {
+    presetId: INITIAL_SETUP_DEFAULT_PROVIDER_ID,
+    mode: 'api',
+    permissionMode,
+    permissionTouched: false
+  }
 }
 
 export type InitialSetupAutoWirePlan = {
@@ -139,7 +155,8 @@ export function initialSetupAutoWirePlan(
 export function buildInitialSetupSettings(
   settings: AppSettingsV1,
   drafts: InitialSetupDrafts,
-  selection: Pick<InitialSetupSelection, 'presetId' | 'mode'> & Partial<Pick<InitialSetupSelection, 'permissionMode'>>
+  selection: Pick<InitialSetupSelection, 'presetId' | 'mode'> &
+    Partial<Pick<InitialSetupSelection, 'permissionMode' | 'permissionTouched'>>
 ): AppSettingsV1 {
   const provider = getModelProviderSettings(settings)
   const profiles = new Map(provider.providers.map((profile) => [profile.id, profile]))
@@ -169,6 +186,7 @@ export function buildInitialSetupSettings(
 
   const next = normalizeAppSettings({
     ...settings,
+    initialSetupCompleted: true,
     provider: {
       apiKey: nextApiKey,
       baseUrl: nextBaseUrl,
@@ -183,18 +201,17 @@ export function buildInitialSetupSettings(
   )
   const switchingProvider = (runtime.providerId.trim() || DEFAULT_MODEL_PROVIDER_ID) !== selectedId
   const wire = initialSetupAutoWirePlan(settings, drafts)
-  // Only rewrite approvalPolicy/sandboxMode when the user actually moved the
-  // permission selector. The mode<->settings mapping is lossy (only 5 of the
-  // policy/sandbox combos are representable), so emitting the pair when the
-  // selection still matches the persisted policy would silently weaken values
-  // the UI cannot represent — e.g. demote approvalPolicy 'never'/'suggest' or
-  // escalate an 'external-sandbox' sandbox. When unchanged we omit the spread
-  // so applyKunRuntimePatch leaves the existing pair untouched.
+  // Only rewrite the complete authority snapshot when the user actually moved
+  // the permission selector. The three-mode projection is intentionally lossy,
+  // so emitting it while the selector is untouched would silently broaden or
+  // otherwise rewrite a valid legacy approval/sandbox combination.
   const currentPermissionMode = kunToolPermissionModeFromSettings(runtime)
   const selectedPermissionMode = selection.permissionMode && KUN_TOOL_PERMISSION_MODES.includes(selection.permissionMode)
     ? selection.permissionMode
     : currentPermissionMode
-  const permissionChanged = selectedPermissionMode !== currentPermissionMode
+  const permissionChanged =
+    selection.permissionTouched === true ||
+    selectedPermissionMode !== currentPermissionMode
   const kunPatch: KunRuntimeSettingsPatchV1 = {
     providerId: selectedId,
     apiKey: '',
@@ -209,6 +226,15 @@ export function buildInitialSetupSettings(
       : {})
   }
   return applyKunRuntimePatch(next, kunPatch)
+}
+
+export function buildInitialSetupSettingsPatch(
+  settings: AppSettingsV1,
+  drafts: InitialSetupDrafts,
+  selection: Pick<InitialSetupSelection, 'presetId' | 'mode'> &
+    Partial<Pick<InitialSetupSelection, 'permissionMode' | 'permissionTouched'>>
+): AppSettingsPatch {
+  return diffSettingsPatch(settings, buildInitialSetupSettings(settings, drafts, selection))
 }
 
 function upsertPresetProfile(

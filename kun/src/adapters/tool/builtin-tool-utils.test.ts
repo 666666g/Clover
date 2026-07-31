@@ -1,14 +1,19 @@
 import { statSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  createShellCommandRunner,
+  globToRegExp,
   makeListEntry,
   normalizeToolPath,
   resolveExecutable,
+  ShellSpawnError,
   shellConfig,
   shellCommandArgs,
   shellDisplayName,
   shellRuntimeInfo,
   shellRuntimeInstruction,
+  shellRuntimePlan,
   shellSpawnEnv,
   terminateSpawnTree
 } from './builtin-tool-utils.js'
@@ -24,31 +29,50 @@ function lookup(results: Record<string, string>) {
   }) as never
 }
 
+function powerShellRuntime(shell: string) {
+  return shellRuntimeInfo({
+    shell,
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command']
+  })
+}
+
+function spawnFailure(code: string, errno: number): NodeJS.ErrnoException {
+  return Object.assign(new Error('spawn failed'), {
+    code,
+    errno,
+    syscall: 'spawn'
+  })
+}
+
 describe('shellConfig', () => {
-  it('prefers PowerShell on Windows even when Git Bash is available', () => {
+  it('prefers Git Bash on Windows when Git for Windows is installed', () => {
+    const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe'
     expect(shellConfig('win32', lookup({
       'where pwsh.exe': 'C:\\Program Files\\PowerShell\\7\\pwsh.exe\r\n',
-      'where bash.exe': 'C:\\Program Files\\Git\\bin\\bash.exe\r\n'
-    }))).toEqual({
-      shell: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
-      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+      'where git.exe': 'C:\\Program Files\\Git\\cmd\\git.exe\r\n',
+      'where bash.exe': `${gitBash}\r\n`
+    }), (path) => path === gitBash, {})).toEqual({
+      shell: gitBash,
+      args: ['-lc']
     })
   })
 
   it('falls back to Windows PowerShell when pwsh is unavailable', () => {
     expect(shellConfig('win32', lookup({
       'where powershell.exe': 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\r\n'
-    }))).toEqual({
+    }), () => false, {})).toEqual({
       shell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
-      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command']
     })
   })
 
   it('falls back to Git Bash on Windows when PowerShell is unavailable', () => {
+    const gitBash = 'C:\\Program Files\\Git\\bin\\bash.exe'
     expect(shellConfig('win32', lookup({
-      'where bash.exe': 'C:\\Program Files\\Git\\bin\\bash.exe\r\n'
-    }))).toEqual({
-      shell: 'C:\\Program Files\\Git\\bin\\bash.exe',
+      'where git.exe': 'C:\\Program Files\\Git\\cmd\\git.exe\r\n',
+      'where bash.exe': `${gitBash}\r\n`
+    }), (path) => path === gitBash, {})).toEqual({
+      shell: gitBash,
       args: ['-lc']
     })
   })
@@ -61,8 +85,33 @@ describe('shellConfig', () => {
       shellConfig('win32', lookup({}), (path) => path === winPwsh, { SystemRoot: 'C:\\Windows' })
     ).toEqual({
       shell: winPwsh,
-      args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+      args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command']
     })
+  })
+
+  it('skips WindowsApps aliases and keeps PowerShell fallbacks in one syntax family', () => {
+    const winPowerShell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+    const plan = shellRuntimePlan({
+      platform: 'win32',
+      lookup: lookup({
+        'where pwsh.exe': [
+          'C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe',
+          'D:\\Tools\\PowerShell\\pwsh.exe'
+        ].join('\r\n'),
+        'where powershell.exe': winPowerShell
+      }),
+      fileExists: (path) => path === winPowerShell,
+      env: { SystemRoot: 'C:\\Windows' }
+    })
+
+    expect(plan.candidates
+      .filter((candidate) => candidate.syntax === 'PowerShell')
+      .map((candidate) => candidate.shell)).toEqual([
+      'D:\\Tools\\PowerShell\\pwsh.exe',
+      winPowerShell
+    ])
+    expect(plan.candidates.at(-1)?.syntax).toBe('cmd.exe batch')
+    expect(plan.candidates.some((candidate) => /WindowsApps/i.test(candidate.shell))).toBe(false)
   })
 
   it('falls back to an absolute cmd.exe (never a bare name) when nothing else resolves', () => {
@@ -90,9 +139,22 @@ describe('shellConfig', () => {
 })
 
 describe('shellSpawnEnv', () => {
-  it('returns the env unchanged on non-Windows platforms', () => {
-    const env = { PATH: '/usr/bin:/bin' }
-    expect(shellSpawnEnv(env, 'darwin')).toBe(env)
+  it('keeps only the shell allow-list on non-Windows platforms', () => {
+    const env = {
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/test',
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'en_US.UTF-8',
+      KUN_RUNTIME_TOKEN: 'runtime-secret',
+      DEEPSEEK_API_KEY: 'model-secret',
+      AWS_SECRET_ACCESS_KEY: 'cloud-secret'
+    }
+    expect(shellSpawnEnv(env, 'darwin')).toEqual({
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/test',
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'en_US.UTF-8'
+    })
   })
 
   it('appends the core Windows system dirs when PATH is missing them', () => {
@@ -117,6 +179,20 @@ describe('shellSpawnEnv', () => {
     ].join(';')
     const result = shellSpawnEnv({ Path: path, SystemRoot: 'C:\\Windows' }, 'win32')
     expect(result.Path).toBe(path)
+  })
+
+  it('does not inherit runtime or provider credentials on Windows', () => {
+    const result = shellSpawnEnv({
+      Path: 'C:\\Tools',
+      SystemRoot: 'C:\\Windows',
+      KUN_RUNTIME_TOKEN: 'runtime-secret',
+      DEEPSEEK_API_KEY: 'model-secret',
+      GITHUB_TOKEN: 'github-secret'
+    }, 'win32')
+    expect(result).not.toHaveProperty('KUN_RUNTIME_TOKEN')
+    expect(result).not.toHaveProperty('DEEPSEEK_API_KEY')
+    expect(result).not.toHaveProperty('GITHUB_TOKEN')
+    expect(result).toMatchObject({ SystemRoot: 'C:\\Windows' })
   })
 })
 
@@ -175,11 +251,11 @@ describe('shell runtime metadata', () => {
     expect(instruction).not.toMatch(/Do not assume|Write shell commands/)
   })
 
-  it('runs PowerShell commands through a UTF-8 output preamble', () => {
+  it('runs PowerShell commands through a plain UTF-8 command argument', () => {
     const args = shellCommandArgs(
       {
         shell: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
-        args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+        args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command']
       },
       'Write-Output "测试"'
     )
@@ -187,17 +263,171 @@ describe('shell runtime metadata', () => {
     expect(args.slice(0, -1)).toEqual([
       '-NoLogo',
       '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-EncodedCommand'
+      '-NonInteractive',
+      '-Command'
     ])
-    const script = Buffer.from(args.at(-1) ?? '', 'base64').toString('utf16le')
+    expect(args).not.toContain('-ExecutionPolicy')
+    expect(args).not.toContain('Bypass')
+    expect(args).not.toContain('-EncodedCommand')
+    const script = args.at(-1) ?? ''
     expect(script).toContain('[Console]::OutputEncoding = $OutputEncoding')
     expect(script).toContain('Write-Output "测试"')
   })
 
   it('keeps non-PowerShell command arguments unchanged', () => {
     expect(shellCommandArgs({ shell: '/bin/bash', args: ['-lc'] }, 'echo hi')).toEqual(['-lc', 'echo hi'])
+  })
+})
+
+describe('shell command runner', () => {
+  it('keeps the requested cwd when Windows Git Bash loads its profile', async () => {
+    const bash = shellRuntimeInfo({
+      shell: 'C:\\Program Files\\Git\\bin\\bash.exe',
+      args: ['-lc']
+    })
+    const child = new EventEmitter()
+    const spawnImpl = vi.fn(() => {
+      queueMicrotask(() => child.emit('spawn'))
+      return child as never
+    })
+    const runner = createShellCommandRunner({
+      platform: 'win32',
+      env: { Path: 'C:\\Tools', SystemRoot: 'C:\\Windows' },
+      plan: { primary: bash, candidates: [bash] },
+      spawnImpl: spawnImpl as never
+    })
+
+    await runner.spawn('pwd', { cwd: 'C:\\Workspace' })
+
+    expect(spawnImpl).toHaveBeenCalledWith(
+      bash.shell,
+      ['-lc', 'pwd'],
+      expect.objectContaining({
+        cwd: 'C:\\Workspace',
+        env: expect.objectContaining({ CHERE_INVOKING: '1' })
+      })
+    )
+  })
+
+  it('retries a same-syntax candidate when error arrives before spawn', async () => {
+    const primary = powerShellRuntime('C:\\Blocked\\pwsh.exe')
+    const fallback = powerShellRuntime('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+    const calls: Array<{ shell: string; args: string[]; options: Record<string, unknown> }> = []
+    const spawnImpl = vi.fn((shell: string, args: string[], options: Record<string, unknown>) => {
+      const child = new EventEmitter()
+      const callIndex = calls.length
+      calls.push({ shell, args, options })
+      queueMicrotask(() => {
+        if (callIndex === 0) child.emit('error', spawnFailure('EPERM', -4048))
+        else child.emit('spawn')
+      })
+      return child as never
+    })
+    const runner = createShellCommandRunner({
+      platform: 'win32',
+      env: { Path: 'C:\\Tools', SystemRoot: 'C:\\Windows' },
+      plan: { primary, candidates: [primary, fallback] },
+      spawnImpl: spawnImpl as never
+    })
+
+    const result = await runner.spawn('Write-Output "中文"', {
+      cwd: 'C:\\Workspace With Spaces',
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+
+    expect(result.runtime.shell).toBe(fallback.shell)
+    expect(calls.map((call) => call.shell)).toEqual([primary.shell, fallback.shell])
+    expect(calls[0]?.args).toEqual(calls[1]?.args)
+    expect(calls[1]?.args.at(-1)).toContain('Write-Output "中文"')
+    expect(calls[1]?.options).toMatchObject({
+      cwd: 'C:\\Workspace With Spaces',
+      windowsHide: true,
+      shell: false
+    })
+    expect((calls[1]?.options.env as NodeJS.ProcessEnv).Path).toContain('C:\\Windows\\System32')
+  })
+
+  it('does not fall back after the child emits spawn', async () => {
+    const primary = powerShellRuntime('C:\\PowerShell\\pwsh.exe')
+    const fallback = powerShellRuntime('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+    const child = new EventEmitter()
+    const spawnImpl = vi.fn(() => {
+      queueMicrotask(() => child.emit('spawn'))
+      return child as never
+    })
+    const runner = createShellCommandRunner({
+      platform: 'win32',
+      plan: { primary, candidates: [primary, fallback] },
+      spawnImpl: spawnImpl as never
+    })
+
+    const result = await runner.spawn('Write-Output ok', { cwd: 'C:\\Workspace' })
+    const observedError = vi.fn()
+    child.once('error', observedError)
+    child.emit('error', spawnFailure('EIO', -5))
+
+    expect(result.runtime.shell).toBe(primary.shell)
+    expect(spawnImpl).toHaveBeenCalledTimes(1)
+    expect(observedError).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns a structured error without command arguments when every candidate fails', async () => {
+    const primary = powerShellRuntime('C:\\Blocked\\pwsh.exe')
+    const fallback = powerShellRuntime('C:\\Blocked\\powershell.exe')
+    const differentSyntax = shellRuntimeInfo({
+      shell: 'C:\\Windows\\System32\\cmd.exe',
+      args: ['/d', '/s', '/c']
+    })
+    let callIndex = 0
+    const spawnImpl = vi.fn(() => {
+      const child = new EventEmitter()
+      const current = callIndex
+      callIndex += 1
+      queueMicrotask(() => {
+        child.emit('error', current === 0
+          ? spawnFailure('EPERM', -4048)
+          : spawnFailure('ENOENT', -4058))
+      })
+      return child as never
+    })
+    const runner = createShellCommandRunner({
+      platform: 'win32',
+      plan: { primary, candidates: [primary, fallback, differentSyntax] },
+      spawnImpl: spawnImpl as never
+    })
+    const command = 'Write-Output "do-not-leak-this-command"'
+
+    let caught: unknown
+    try {
+      await runner.spawn(command, { cwd: 'C:\\Workspace' })
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(ShellSpawnError)
+    const shellError = caught as ShellSpawnError
+    expect(shellError.attempts).toEqual([
+      {
+        shell: primary.shell,
+        name: 'pwsh',
+        code: 'EPERM',
+        errno: -4048,
+        syscall: 'spawn'
+      },
+      {
+        shell: fallback.shell,
+        name: 'powershell',
+        code: 'ENOENT',
+        errno: -4058,
+        syscall: 'spawn'
+      }
+    ])
+    expect(shellError.code).toBe('ENOENT')
+    expect(spawnImpl).toHaveBeenCalledTimes(2)
+    const serialized = JSON.stringify(shellError)
+    expect(serialized).not.toContain(command)
+    expect(serialized).not.toContain('do-not-leak-this-command')
+    expect(serialized).not.toContain('EncodedCommand')
   })
 })
 
@@ -246,5 +476,29 @@ describe('tool path normalization', () => {
     const entry = makeListEntry('/workspace/src/index.ts', '/workspace', fileStat)
 
     expect(entry.relative_path).toBe('src/index.ts')
+  })
+})
+
+describe('globToRegExp', () => {
+  it('matches ? as exactly one non-separator character', () => {
+    const matcher = globToRegExp('src/?.ts')
+
+    expect(matcher.test('src/a.ts')).toBe(true)
+    expect(matcher.test('src/A.ts')).toBe(true)
+    expect(matcher.test('src/😀.ts')).toBe(true)
+    expect(matcher.test('src/ab.ts')).toBe(false)
+    expect(matcher.test('src/😀😀.ts')).toBe(false)
+    expect(matcher.test('src/.ts')).toBe(false)
+    expect(matcher.test('src/a/b.ts')).toBe(false)
+  })
+
+  it('keeps the optional **/ prefix without allowing ? to cross directories', () => {
+    const matcher = globToRegExp('**/a?.tsx')
+
+    expect(matcher.test('ab.tsx')).toBe(true)
+    expect(matcher.test('src/ab.tsx')).toBe(true)
+    expect(matcher.test('src/nested/ab.tsx')).toBe(true)
+    expect(matcher.test('src/nested/abc.tsx')).toBe(false)
+    expect(matcher.test('src/nested/a/b.tsx')).toBe(false)
   })
 })

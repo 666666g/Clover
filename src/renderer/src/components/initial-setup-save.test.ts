@@ -3,17 +3,20 @@ import {
   getActiveAgentApiKey,
   getKunRuntimeSettings,
   getModelProviderSettings,
+  defaultKunRuntimeSettings,
   normalizeAppSettings,
   type AppSettingsV1
 } from '@shared/app-settings'
 import {
   buildInitialSetupSettings,
+  buildInitialSetupSettingsPatch,
   INITIAL_SETUP_PROVIDER_PRESETS,
   initialSetupAutoWirePlan,
   initialSetupDrafts,
   initialSetupProfileId,
   initialSetupSelection
 } from './initial-setup-save'
+import { settingsPatchSchema } from '../../../main/ipc/app-ipc-schemas'
 
 function settings(patch: Record<string, unknown> = {}): AppSettingsV1 {
   return normalizeAppSettings(patch as AppSettingsV1)
@@ -35,7 +38,12 @@ function settingsWithActiveXiaomiWithoutKey(): AppSettingsV1 {
 describe('initialSetupSelection', () => {
   it('preselects the active provider card when it is a known preset', () => {
     const selection = initialSetupSelection(settingsWithActiveXiaomiWithoutKey())
-    expect(selection).toEqual({ presetId: 'xiaomi', mode: 'api', permissionMode: 'bypass' })
+    expect(selection).toEqual({
+      presetId: 'xiaomi',
+      mode: 'api',
+      permissionMode: 'ask-for-approval',
+      permissionTouched: false
+    })
   })
 
   it('preselects the token plan mode for token plan profiles', () => {
@@ -43,16 +51,61 @@ describe('initialSetupSelection', () => {
     expect(initialSetupSelection(current)).toEqual({
       presetId: 'minimax',
       mode: 'token-plan',
-      permissionMode: 'bypass'
+      permissionMode: 'ask-for-approval',
+      permissionTouched: false
     })
   })
 
   it('falls back to agnes for unknown or empty active providers', () => {
-    expect(initialSetupSelection(settings())).toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
+    expect(initialSetupSelection(settings())).toEqual({
+      presetId: 'agnes',
+      mode: 'api',
+      permissionMode: 'bypass',
+      permissionTouched: false
+    })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'custom-provider-2' } } })))
-      .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
+      .toEqual({
+        presetId: 'agnes',
+        mode: 'api',
+        permissionMode: 'bypass',
+        permissionTouched: false
+      })
     expect(initialSetupSelection(settings({ agents: { kun: { providerId: 'litellm' } } })))
-      .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
+      .toEqual({
+        presetId: 'agnes',
+        mode: 'api',
+        permissionMode: 'bypass',
+        permissionTouched: false
+      })
+  })
+
+  it('preselects the saved permission mode', () => {
+    const current = settings({
+      agents: {
+        kun: {
+          approvalPolicy: 'on-request',
+          sandboxMode: 'workspace-write',
+          approvalReviewer: 'user'
+        }
+      }
+    })
+    expect(initialSetupSelection(current).permissionMode).toBe('ask-for-approval')
+
+    const delegated = settings({
+      agents: {
+        kun: {
+          approvalPolicy: 'on-request',
+          sandboxMode: 'workspace-write',
+          approvalReviewer: 'agent'
+        }
+      }
+    })
+    expect(initialSetupSelection(delegated).permissionMode).toBe('approve-for-me')
+
+    const nonCanonical = settings({
+      agents: { kun: { approvalPolicy: 'auto', sandboxMode: 'workspace-write' } }
+    })
+    expect(initialSetupSelection(nonCanonical).permissionMode).toBe('ask-for-approval')
   })
 })
 
@@ -87,7 +140,12 @@ describe('initialSetupDrafts', () => {
     for (const id of excludedIds) {
       expect(drafts[id]).toBeUndefined()
       expect(initialSetupSelection(settings({ agents: { kun: { providerId: id } } })))
-        .toEqual({ presetId: 'agnes', mode: 'api', permissionMode: 'bypass' })
+        .toEqual({
+          presetId: 'agnes',
+          mode: 'api',
+          permissionMode: 'bypass',
+          permissionTouched: false
+        })
     }
   })
 })
@@ -98,6 +156,7 @@ describe('buildInitialSetupSettings', () => {
     const drafts = initialSetupDrafts(current)
     const next = buildInitialSetupSettings(current, drafts, { presetId: 'deepseek', mode: 'api' })
 
+    expect(next.initialSetupCompleted).toBe(true)
     expect(getKunRuntimeSettings(next).providerId).toBe('deepseek')
     expect(getActiveAgentApiKey(next)).toBe('sk-deepseek-key')
   })
@@ -108,20 +167,21 @@ describe('buildInitialSetupSettings', () => {
     const next = buildInitialSetupSettings(current, drafts, {
       presetId: 'deepseek',
       mode: 'api',
-      permissionMode: 'workspace-write'
+      permissionMode: 'approve-for-me',
+      permissionTouched: true
     })
 
     const runtime = getKunRuntimeSettings(next)
     expect(runtime.approvalPolicy).toBe('on-request')
     expect(runtime.sandboxMode).toBe('workspace-write')
+    expect(runtime.approvalReviewer).toBe('agent')
   })
 
   it('preserves a non-UI permission policy when the selector is untouched', () => {
-    // A persisted policy the 5-mode UI cannot represent: stricter approval gate
+    // A persisted policy the 3-mode UI cannot represent: stricter approval gate
     // plus a sandboxed filesystem. Reopening onboarding seeds the selector from
-    // the lossy fromSettings mapping (-> 'read-only'); when the user does not
-    // move it, the save must leave the strict pair intact rather than rewrite it
-    // to 'on-request'/'danger-full-access'.
+    // the lossy projection (-> Ask for approval); when the user does not move
+    // it, the save must leave the strict snapshot intact.
     const current = settings({
       provider: { apiKey: 'sk-deepseek-key' },
       agents: {
@@ -129,12 +189,13 @@ describe('buildInitialSetupSettings', () => {
       }
     })
     const seededMode = initialSetupSelection(current).permissionMode
-    expect(seededMode).toBe('read-only')
+    expect(seededMode).toBe('ask-for-approval')
 
     const next = buildInitialSetupSettings(current, initialSetupDrafts(current), {
       presetId: 'deepseek',
       mode: 'api',
-      permissionMode: seededMode
+      permissionMode: seededMode,
+      permissionTouched: false
     })
 
     const runtime = getKunRuntimeSettings(next)
@@ -144,9 +205,9 @@ describe('buildInitialSetupSettings', () => {
     expect(runtime.sandboxMode).not.toBe('danger-full-access')
   })
 
-  it('writes the permission pair only when the user picks a different mode', () => {
-    // Same strict starting policy, but this time the user explicitly chooses a
-    // representable mode, so the concrete pair for that mode must be written.
+  it('canonicalizes a projected legacy mode only after the user selects it', () => {
+    // The visible Ask card is already selected by projection. The explicit
+    // touched flag distinguishes a real click from an untouched lossy view.
     const current = settings({
       provider: { apiKey: 'sk-deepseek-key' },
       agents: {
@@ -156,12 +217,14 @@ describe('buildInitialSetupSettings', () => {
     const next = buildInitialSetupSettings(current, initialSetupDrafts(current), {
       presetId: 'deepseek',
       mode: 'api',
-      permissionMode: 'workspace-write'
+      permissionMode: 'ask-for-approval',
+      permissionTouched: true
     })
 
     const runtime = getKunRuntimeSettings(next)
     expect(runtime.approvalPolicy).toBe('on-request')
     expect(runtime.sandboxMode).toBe('workspace-write')
+    expect(runtime.approvalReviewer).toBe('user')
   })
 
   it('syncs the deepseek draft into the provider profile used by settings', () => {
@@ -312,6 +375,30 @@ describe('buildInitialSetupSettings', () => {
     })
     const zenmux = getModelProviderSettings(next).providers.find((p) => p.id === 'custom-provider-2')
     expect(zenmux?.apiKey).toBe('z-key')
+  })
+})
+
+describe('buildInitialSetupSettingsPatch', () => {
+  it('omits legacy top-level instructions from the settings:set payload', () => {
+    const current = settings({
+      instructions: { enabled: true },
+      provider: { apiKey: '' },
+      agents: { kun: { providerId: 'deepseek' } }
+    })
+    const drafts = initialSetupDrafts(current)
+    drafts.deepseek = {
+      ...drafts.deepseek,
+      apiKey: 'sk-deepseek-key',
+      baseUrl: 'https://api.deepseek.com'
+    }
+
+    const patch = buildInitialSetupSettingsPatch(current, drafts, {
+      presetId: 'deepseek',
+      mode: 'api'
+    })
+
+    expect('instructions' in patch).toBe(false)
+    expect(settingsPatchSchema.parse(patch)).toEqual(patch)
   })
 })
 

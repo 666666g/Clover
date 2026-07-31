@@ -96,8 +96,10 @@ describe('createVerifyChangesLocalTool', () => {
   it('runs selected checks and returns structured evidence', async () => {
     const root = await fixture()
     const executed: string[] = []
+    const timeouts: number[] = []
     const tool = createVerifyChangesLocalTool({
-      runCommand: async (command) => {
+      runCommand: async (command, options) => {
+        timeouts.push(options.timeoutSeconds)
         if (command.label === 'unstaged changes') return check(command, 0, 'src/sample.ts')
         if (command.label === 'staged changes' || command.label === 'untracked files') {
           return check(command)
@@ -107,10 +109,13 @@ describe('createVerifyChangesLocalTool', () => {
       }
     })
 
-    const result = await tool.execute({}, context(root))
+    const properties = tool.inputSchema.properties as Record<string, unknown>
+    const result = await tool.execute({ timeout: 1 }, context(root))
 
+    expect(properties).not.toHaveProperty('timeout')
     expect(result.isError).not.toBe(true)
     expect(executed).toEqual(['focused tests', 'typecheck'])
+    expect(timeouts).toEqual(Array(5).fill(3_600))
     expect(result.output).toMatchObject({ status: 'passed', changed_files: ['src/sample.ts'] })
   })
 

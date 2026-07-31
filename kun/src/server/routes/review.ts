@@ -5,7 +5,7 @@ import {
   type StartReviewResponse
 } from '../../contracts/review.js'
 import { makeReviewItem } from '../../domain/item.js'
-import type { TurnService } from '../../services/turn-service.js'
+import { TurnCapacityError, type TurnService } from '../../services/turn-service.js'
 import { jsonResponse, type JsonResponse } from '../response.js'
 import { readJsonBody } from '../read-json-body.js'
 import { ERRORS } from './runtime-error.js'
@@ -14,7 +14,13 @@ export async function startReview(
   turns: TurnService,
   threadId: string,
   request: Request,
-  onStarted?: (response: StartReviewResponse, target: StartReviewRequest['target'], model?: string) => void
+  onStarted?: (
+    response: StartReviewResponse,
+    target: StartReviewRequest['target'],
+    model?: string,
+    providerId?: string,
+    accountId?: string
+  ) => void
 ): Promise<JsonResponse | Response> {
   const body = await readJsonBody(request)
   if (!body.ok) return body.response
@@ -30,6 +36,7 @@ export async function startReview(
         prompt: reviewTargetPrompt(parsed.data.target),
         displayText: title,
         model: parsed.data.model,
+        providerId: parsed.data.providerId,
         mode: 'agent'
       }
     })
@@ -49,9 +56,18 @@ export async function startReview(
       ...started,
       reviewItemId
     }
-    onStarted?.(response, parsed.data.target, parsed.data.model)
+    onStarted?.(
+      response,
+      parsed.data.target,
+      parsed.data.model,
+      parsed.data.providerId,
+      parsed.data.accountId
+    )
     return jsonResponse(response, 202)
   } catch (error) {
+    if (error instanceof TurnCapacityError) {
+      return ERRORS.rateLimited(error.message, { maxConcurrentTurns: error.maxConcurrentTurns })
+    }
     if (error instanceof Error && /not found/i.test(error.message)) {
       return ERRORS.notFound(error.message)
     }

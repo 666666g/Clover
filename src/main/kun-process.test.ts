@@ -7,14 +7,21 @@ import { configureLogger } from './logger'
 import {
   defaultClawSettings,
   DEFAULT_LOG_RETENTION_DAYS,
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
   defaultWorkflowSettings,
+  getModelProviderPreset,
+  modelProviderPresetProfile,
+  resolveKunRuntimeSettings,
   defaultWriteSettings,
   defaultTerminalSettings,
-  type AppSettingsV1
+  type AppSettingsV1,
+  type ModelProviderModelProfileV1
 } from '../shared/app-settings'
 import { KunConfigSchema } from '../../kun/src/config/kun-config.js'
 
@@ -27,6 +34,7 @@ vi.mock('electron', () => ({
 }))
 
 let tempRoot: string | null = null
+let testKunPort = 18899
 
 function createSettings(binaryPath: string): AppSettingsV1 {
   return {
@@ -34,10 +42,12 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
-        ...defaultKunRuntimeSettings(18899),
+        ...defaultKunRuntimeSettings(testKunPort),
         binaryPath,
         autoStart: true
       }
@@ -45,7 +55,7 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -53,6 +63,7 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
@@ -95,8 +106,24 @@ function canBindTestPort(port: number): Promise<boolean> {
   })
 }
 
-beforeEach(() => {
+function allocateTestPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer()
+    server.unref()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      server.close(() => {
+        if (address && typeof address === 'object') resolve(address.port)
+        else reject(new Error('failed to allocate a test port'))
+      })
+    })
+  })
+}
+
+beforeEach(async () => {
   tempRoot = mkdtempSync(join(tmpdir(), 'kun-process-'))
+  testKunPort = await allocateTestPort()
   configureLogger({ dir: tempRoot, enabled: true, retentionDays: 7 })
 })
 
@@ -116,7 +143,7 @@ describe('startKunChild', () => {
       'ready-child.js',
       [
         "const http = require('node:http')",
-        "const port = 18899",
+        `const port = ${testKunPort}`,
         "const server = http.createServer((req, res) => {",
         "  res.setHeader('content-type', 'application/json')",
         "  res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
@@ -135,7 +162,55 @@ describe('startKunChild', () => {
     await module.stopKunChildAndWait()
     const logText = await readKunLog()
     expect(logText).toContain('KUN_READY')
-    expect(logText).toContain('ready marker received on port 18899')
+    expect(logText).toContain(`ready marker received on port ${testKunPort}`)
+  })
+
+  it('removes inherited Browser Use bridge authority when the feature is disabled', async () => {
+    const previousUrl = process.env.KUN_BROWSER_USE_BRIDGE_URL
+    const previousToken = process.env.KUN_BROWSER_USE_BRIDGE_TOKEN
+    const previousSigningKey = process.env.KUN_BROWSER_USE_APPROVAL_SIGNING_KEY
+    process.env.KUN_BROWSER_USE_BRIDGE_URL = 'http://127.0.0.1:65535'
+    process.env.KUN_BROWSER_USE_BRIDGE_TOKEN = 'inherited-secret-token'
+    process.env.KUN_BROWSER_USE_APPROVAL_SIGNING_KEY = 'inherited-signing-secret'
+    const script = writeScript(
+      'disabled-browser-use-env-child.js',
+      [
+        "const http = require('node:http')",
+        `const port = ${testKunPort}`,
+        "process.stdout.write('BRIDGE_URL=' + String(process.env.KUN_BROWSER_USE_BRIDGE_URL) + '\\n')",
+        "process.stdout.write('BRIDGE_TOKEN=' + String(process.env.KUN_BROWSER_USE_BRIDGE_TOKEN) + '\\n')",
+        "process.stdout.write('BRIDGE_SIGNING_KEY=' + String(process.env.KUN_BROWSER_USE_APPROVAL_SIGNING_KEY) + '\\n')",
+        "const server = http.createServer((_req, res) => {",
+        "  res.setHeader('content-type', 'application/json')",
+        "  res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "})",
+        "server.listen(port, '127.0.0.1', () => {",
+        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        "})",
+        "setInterval(() => {}, 1_000)"
+      ].join('\n')
+    )
+    try {
+      const module = await import('./kun-process')
+      await module.startKunChild(createSettings(script))
+      await module.stopKunChildAndWait()
+      const logText = await readKunLog()
+      expect(logText).toContain('BRIDGE_URL=undefined')
+      expect(logText).toContain('BRIDGE_TOKEN=undefined')
+      expect(logText).toContain('BRIDGE_SIGNING_KEY=undefined')
+      expect(logText).not.toContain('inherited-secret-token')
+      expect(logText).not.toContain('inherited-signing-secret')
+    } finally {
+      if (previousUrl === undefined) delete process.env.KUN_BROWSER_USE_BRIDGE_URL
+      else process.env.KUN_BROWSER_USE_BRIDGE_URL = previousUrl
+      if (previousToken === undefined) delete process.env.KUN_BROWSER_USE_BRIDGE_TOKEN
+      else process.env.KUN_BROWSER_USE_BRIDGE_TOKEN = previousToken
+      if (previousSigningKey === undefined) {
+        delete process.env.KUN_BROWSER_USE_APPROVAL_SIGNING_KEY
+      } else {
+        process.env.KUN_BROWSER_USE_APPROVAL_SIGNING_KEY = previousSigningKey
+      }
+    }
   })
 
   it('does not settle on the ready marker until the /health endpoint responds', async () => {
@@ -147,7 +222,7 @@ describe('startKunChild', () => {
         "const http = require('node:http')",
         "const { existsSync } = require('node:fs')",
         `const healthSignalPath = ${JSON.stringify(healthSignalPath)}`,
-        "const port = 18899",
+        `const port = ${testKunPort}`,
         // Emit the ready marker right away but serve no /health yet: the
         // marker alone must NOT be enough to settle the launch.
         "process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
@@ -194,7 +269,7 @@ describe('startKunChild', () => {
         "const http = require('node:http')",
         "const { existsSync } = require('node:fs')",
         `const readySignalPath = ${JSON.stringify(readySignalPath)}`,
-        "const port = 18899",
+        `const port = ${testKunPort}`,
         'let sentReady = false',
         // Only stand up the /health server once the signal exists so the
         // parallel health probe cannot settle the launch before then.
@@ -255,6 +330,40 @@ describe('startKunChild', () => {
   })
 })
 
+describe('startKunSharedRuntime', () => {
+  it('refuses to start a second writer beside an unpublished GUI-private runtime', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const body = JSON.stringify({ dataDir: tempRoot })
+    const server = createServer((socket) => {
+      socket.once('data', () => {
+        socket.end([
+          'HTTP/1.1 200 OK',
+          'Content-Type: application/json',
+          `Content-Length: ${Buffer.byteLength(body)}`,
+          'Connection: close',
+          '',
+          body
+        ].join('\r\n'))
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(testKunPort, '127.0.0.1', resolve)
+    })
+    try {
+      const module = await import('./kun-process')
+      const settings = createSettings('/tmp/unused-kun-entry.js')
+      settings.agents.kun.dataDir = tempRoot
+
+      await expect(module.startKunSharedRuntime(settings)).rejects.toThrow(
+        'older GUI-private Kun runtime'
+      )
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+})
+
 describe('resolveKunStartupTimeoutMs', () => {
   it('gives Windows the larger default and other platforms a smaller one', async () => {
     const { resolveKunStartupTimeoutMs } = await import('./kun-process')
@@ -305,7 +414,7 @@ describe('waitForKunStartupSettled', () => {
         "const http = require('node:http')",
         "const { existsSync } = require('node:fs')",
         `const readySignalPath = ${JSON.stringify(readySignalPath)}`,
-        "const port = 18899",
+        `const port = ${testKunPort}`,
         'let sentReady = false',
         // Only stand up the /health server once the signal exists so the
         // parallel health probe cannot settle the launch before then.
@@ -459,6 +568,18 @@ describe('resolveKunDataDir', () => {
 
     expect(module.resolveKunDataDir({ dataDir: '~other\\kun' })).toBe('~other\\kun')
   })
+
+  it('rejects the canonical legacy directory before managed config writes', async () => {
+    const module = await import('./kun-process')
+    const legacyDataDir = join(homedir(), '.deepseekgui', 'kun')
+
+    expect(() => module.resolveKunDataDir({ dataDir: legacyDataDir }))
+      .toThrow(/migration is required/)
+    await expect(module.syncGuiManagedKunConfig(
+      legacyDataDir,
+      defaultKunRuntimeSettings()
+    )).rejects.toThrow(/migration is required/)
+  })
 })
 
 describe('parseListeningPidsFromNetstat', () => {
@@ -495,6 +616,101 @@ describe('parseListeningPidsFromNetstat', () => {
 })
 
 describe('syncGuiManagedKunConfig', () => {
+  it('exports provider model profiles even when the runtime snapshot is stale', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const settings = createSettings('/tmp/fake-kun-child.js')
+    const preset = getModelProviderPreset('gemini-cli-subscription')
+    if (!preset) throw new Error('Gemini CLI subscription preset is missing')
+    const geminiProvider = modelProviderPresetProfile(preset, '')
+    settings.provider.providers.push(geminiProvider)
+    settings.agents.kun = {
+      ...settings.agents.kun,
+      providerId: geminiProvider.id,
+      model: 'gemini-2.5-flash',
+      modelProfiles: {}
+    }
+
+    await module.syncGuiManagedKunConfig(tempRoot, settings.agents.kun, {
+      scheduleMcp: {
+        settings,
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.models.profiles['gemini-2.5-flash']).toMatchObject({
+      contextWindowTokens: 1_048_576
+    })
+  })
+
+  it('keeps same-id model profiles scoped to their provider in runtime config', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const settings = createSettings('/tmp/fake-kun-child.js')
+    const profile = (
+      endpointFormat: 'messages' | 'responses',
+      contextWindowTokens: number
+    ): ModelProviderModelProfileV1 => ({
+      contextWindowTokens,
+      inputModalities: ['text'],
+      outputModalities: ['text'],
+      supportsToolCalling: true,
+      messageParts: ['text'],
+      endpointFormat
+    })
+    settings.provider.providers.push(
+      {
+        id: 'shared-a',
+        name: 'Shared A',
+        apiKey: 'sk-a',
+        baseUrl: 'https://a.example/v1',
+        endpointFormat: 'chat_completions',
+        models: ['shared-model'],
+        modelProfiles: { 'shared-model': profile('messages', 128_000) }
+      },
+      {
+        id: 'shared-b',
+        name: 'Shared B',
+        apiKey: 'sk-b',
+        baseUrl: 'https://b.example/v1',
+        endpointFormat: 'chat_completions',
+        models: ['shared-model'],
+        modelProfiles: { 'shared-model': profile('responses', 256_000) }
+      }
+    )
+    settings.agents.kun = {
+      ...settings.agents.kun,
+      providerId: 'shared-b',
+      model: 'shared-model'
+    }
+
+    await module.syncGuiManagedKunConfig(tempRoot, resolveKunRuntimeSettings(settings), {
+      appSettings: settings
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+    expect(parsed.models.profiles['shared-model']).toMatchObject({
+      endpointFormat: 'responses',
+      contextWindowTokens: 256_000
+    })
+    expect(parsed.serve.providers['shared-a'].modelProfiles['shared-model']).toMatchObject({
+      endpointFormat: 'messages',
+      contextWindowTokens: 128_000
+    })
+    expect(parsed.serve.providers['shared-b'].modelProfiles['shared-model']).toMatchObject({
+      endpointFormat: 'responses',
+      contextWindowTokens: 256_000
+    })
+  })
+
   it('creates GUI-managed config with attachments enabled for image paste/upload', async () => {
     if (!tempRoot) throw new Error('temp root not initialized')
     const configPath = join(tempRoot, 'config.json')
@@ -518,9 +734,13 @@ describe('syncGuiManagedKunConfig', () => {
         maxArrayItems: 80
       }
     })
+    expect(parsed.serve.toolOutputLimits).toEqual({
+      maxLines: DEFAULT_TOOL_OUTPUT_MAX_LINES,
+      maxBytes: DEFAULT_TOOL_OUTPUT_MAX_BYTES
+    })
     expect(parsed.contextCompaction).toMatchObject({
-      defaultSoftThreshold: 96000,
-      defaultHardThreshold: 108800,
+      defaultSoftThreshold: 192000,
+      defaultHardThreshold: 217600,
       summaryMode: 'model'
     })
     expect(parsed.models.profiles['deepseek-v4-pro']).toMatchObject({
@@ -539,19 +759,43 @@ describe('syncGuiManagedKunConfig', () => {
       }
     })
     expect(parsed.runtime.streamIdleTimeoutMs).toBe(450000)
+    expect(parsed.runtime.turnLimits).toMatchObject({
+      maxConcurrentTurns: 256,
+      maxWallTimeMs: 86400000
+    })
     expect(parsed.runtime.toolStorm).toMatchObject({ enabled: true, windowSize: 8, threshold: 3 })
     expect(parsed.runtime.toolArgumentRepair).toMatchObject({ maxStringBytes: 524288 })
     expect(parsed.capabilities.attachments).toMatchObject({ enabled: true })
     expect(parsed.capabilities.memory).toMatchObject({ enabled: false })
+    expect(parsed.capabilities.instructions).toMatchObject({ enabled: true })
+    expect(parsed.capabilities.browserUse).toEqual({
+      enabled: true,
+      mode: 'public',
+      approvalMode: 'auto-safe',
+      maxTabs: 2,
+      maxObservationActionsPerTurn: 30,
+      maxInteractionActionsPerTurn: 12,
+      maxSnapshotNodes: 250,
+      maxSnapshotTextChars: 20000,
+      maxImageDimension: 1280,
+      idleTimeoutMs: 300000
+    })
     // Subagents have no GUI enable toggle: they default ON so delegate_task + the
     // built-in profiles are always offered. maxParallel/maxChildRuns must be >=1 or
     // DelegationRuntime can never run a child. This locks the default against regressions.
-    expect(parsed.capabilities.subagents).toMatchObject({ enabled: true, maxParallel: 3, maxChildRuns: 12 })
+    expect(parsed.capabilities.subagents).toMatchObject({
+      enabled: true,
+      useExistingAgents: true,
+      maxParallel: 256,
+      maxChildRuns: 25
+    })
     expect(parsed.capabilities.web).toMatchObject({ enabled: true, fetchEnabled: true })
     expect(parsed.capabilities.mcp.search).toMatchObject({ enabled: false, mode: 'auto' })
     expect(parsed.capabilities.imageGen).toEqual({
       enabled: false,
       protocol: 'openai-images',
+      defaultResolution: '1K',
+      quality: 'auto',
       timeoutMs: 180000
     })
     expect(parsed.capabilities.speechGen).toEqual({
@@ -603,6 +847,108 @@ describe('syncGuiManagedKunConfig', () => {
     })
   })
 
+  it('writes the selected provider endpoint into the default model client config', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const settings = createSettings('/tmp/fake-kun-child.js')
+    settings.provider.proxy = { enabled: true, url: 'socks5://127.0.0.1:1080' }
+    settings.provider.providers = [
+      ...settings.provider.providers,
+      {
+        id: 'custom',
+        name: 'NewAPI',
+        apiKey: 'sk-newapi',
+        baseUrl: 'https://newapi.example/v1',
+        endpointFormat: 'chat_completions',
+        retry: {
+          maxAttempts: 0,
+          initialDelayMs: 3000,
+          httpStatusCodes: [429, 503]
+        },
+        models: ['glm-5.2'],
+        modelProfiles: {}
+      }
+    ]
+    settings.agents.kun = {
+      ...settings.agents.kun,
+      providerId: 'custom',
+      model: 'glm-5.2'
+    }
+
+    await module.syncGuiManagedKunConfig(tempRoot, resolveKunRuntimeSettings(settings), {
+      scheduleMcp: {
+        settings,
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.serve).toMatchObject({
+      baseUrl: 'https://newapi.example/v1',
+      endpointFormat: 'chat_completions',
+      model: 'glm-5.2',
+      modelProxyUrl: 'socks5://127.0.0.1:1080'
+    })
+    expect(parsed.serve.providers?.custom).toMatchObject({
+      apiKey: '',
+      credentialSourceId: 'settings:provider:custom',
+      baseUrl: 'https://newapi.example/v1',
+      endpointFormat: 'chat_completions',
+      models: ['glm-5.2'],
+      selectedModel: 'glm-5.2',
+      modelProxyUrl: 'socks5://127.0.0.1:1080'
+    })
+    expect(JSON.stringify(parsed)).not.toContain('sk-newapi')
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+  })
+
+  it('projects Ollama Cloud through the protected HTTP Chat Completions provider path', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const settings = createSettings('/tmp/fake-kun-child.js')
+    const preset = getModelProviderPreset('ollama')
+    if (!preset) throw new Error('Ollama Cloud preset is missing')
+    const ollama = modelProviderPresetProfile(preset, 'ollama-secret')
+    settings.provider.providers.push(ollama)
+    settings.agents.kun = {
+      ...settings.agents.kun,
+      providerId: ollama.id,
+      model: 'gpt-oss:120b'
+    }
+
+    await module.syncGuiManagedKunConfig(tempRoot, resolveKunRuntimeSettings(settings), {
+      scheduleMcp: {
+        settings,
+        launch: {
+          appPath: '/tmp/deepseek-gui-test-app',
+          execPath: '/tmp/electron',
+          isPackaged: false
+        }
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.serve).toMatchObject({
+      baseUrl: 'https://ollama.com/v1',
+      endpointFormat: 'chat_completions',
+      model: 'gpt-oss:120b'
+    })
+    expect(parsed.serve.providers.ollama).toMatchObject({
+      apiKey: '',
+      credentialSourceId: 'settings:provider:ollama',
+      baseUrl: 'https://ollama.com/v1',
+      endpointFormat: 'chat_completions'
+    })
+    expect(JSON.stringify(parsed)).not.toContain('ollama-secret')
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+  })
+
   it('writes the memory capability from the GUI memory toggle', async () => {
     if (!tempRoot) throw new Error('temp root not initialized')
     const configPath = join(tempRoot, 'config.json')
@@ -615,6 +961,20 @@ describe('syncGuiManagedKunConfig', () => {
 
     const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
     expect(parsed.capabilities.memory).toMatchObject({ enabled: true })
+  })
+
+  it('writes the instructions capability from the GUI instructions toggle', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, {
+      ...defaultKunRuntimeSettings(),
+      instructions: { enabled: false }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.instructions).toMatchObject({ enabled: false })
   })
 
   it('writes the image generation capability and omits cleared fields', async () => {
@@ -630,7 +990,9 @@ describe('syncGuiManagedKunConfig', () => {
         baseUrl: 'https://api.siliconflow.cn/v1',
         apiKey: 'sk-image-test',
         model: 'Kwai-Kolors/Kolors',
+        defaultResolution: '2K' as const,
         defaultSize: '',
+        quality: 'high' as const,
         timeoutMs: 240000
       }
     }
@@ -644,6 +1006,8 @@ describe('syncGuiManagedKunConfig', () => {
       baseUrl: 'https://api.siliconflow.cn/v1',
       apiKey: 'sk-image-test',
       model: 'Kwai-Kolors/Kolors',
+      defaultResolution: '2K',
+      quality: 'high',
       timeoutMs: 240000
     })
     expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
@@ -655,6 +1019,227 @@ describe('syncGuiManagedKunConfig', () => {
     })
     const cleared = JSON.parse(readFileSync(configPath, 'utf8')) as any
     expect('apiKey' in cleared.capabilities.imageGen).toBe(false)
+    expect('headers' in cleared.capabilities.imageGen).toBe(false)
+  })
+
+  it('unwraps Codex OAuth credentials and writes Codex headers for image generation', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const codexCredentials = JSON.stringify({
+      kind: 'codex-oauth',
+      accessToken: 'codex-access-token',
+      refreshToken: 'codex-refresh-token',
+      expiresAt: Date.now() + 3600_000,
+      accountId: 'acct_123',
+      email: 'user@example.com'
+    })
+
+    await module.syncGuiManagedKunConfig(tempRoot, {
+      ...defaultKunRuntimeSettings(),
+      imageGeneration: {
+        enabled: true,
+        providerId: 'codex',
+        protocol: 'codex-responses-image',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        apiKey: codexCredentials,
+        model: 'gpt-image-2',
+        defaultResolution: '1K',
+        defaultSize: '',
+        quality: 'medium',
+        timeoutMs: 180000
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.imageGen).toMatchObject({
+      enabled: true,
+      protocol: 'codex-responses-image',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: 'codex-access-token',
+      model: 'gpt-image-2',
+      defaultResolution: '1K',
+      quality: 'medium',
+      timeoutMs: 180000,
+      headers: {
+        'ChatGPT-Account-Id': 'acct_123',
+        originator: 'codex_cli_rs',
+        'OpenAI-Beta': 'responses=experimental'
+      }
+    })
+    expect(parsed.capabilities.imageGen.headers['User-Agent']).toMatch(/^codex_cli_rs\/0\.145\.0 \(.+; .+\)$/)
+    expect(parsed.capabilities.imageGen.headers['User-Agent']).not.toMatch(/deepseekgui|kun/i)
+    expect(typeof parsed.capabilities.imageGen.headers.session_id).toBe('string')
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+  })
+
+  it('unwraps Grok OAuth credentials for direct Imagine image and video requests', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const grokCredentials = JSON.stringify({
+      kind: 'grok-oauth',
+      accessToken: 'grok-access-token',
+      refreshToken: 'grok-refresh-token',
+      expiresAt: Date.now() + 3600_000,
+      email: 'grok@example.com'
+    })
+    const defaults = defaultKunRuntimeSettings()
+
+    await module.syncGuiManagedKunConfig(tempRoot, {
+      ...defaults,
+      imageGeneration: {
+        ...defaults.imageGeneration,
+        enabled: true,
+        providerId: 'grok-subscription',
+        protocol: 'grok-imagine-image',
+        baseUrl: 'https://api.x.ai/v1',
+        apiKey: grokCredentials,
+        model: 'grok-imagine-image-quality'
+      },
+      videoGeneration: {
+        ...defaults.videoGeneration,
+        enabled: true,
+        providerId: 'grok-subscription',
+        protocol: 'grok-imagine-video',
+        baseUrl: 'https://api.x.ai/v1',
+        apiKey: grokCredentials,
+        model: 'grok-imagine-video-1.5-preview',
+        defaultResolution: '480P'
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    for (const capability of [parsed.capabilities.imageGen, parsed.capabilities.videoGen]) {
+      expect(capability.apiKey).toBe('grok-access-token')
+      expect(capability.headers).toMatchObject({
+        'x-grok-client-version': expect.any(String),
+        'x-grok-client-identifier': 'grok-shell'
+      })
+      expect(capability.headers['X-XAI-Token-Auth']).toBeUndefined()
+      expect(capability.headers['x-authenticateresponse']).toBeUndefined()
+    }
+    expect(parsed.capabilities.imageGen).toMatchObject({
+      protocol: 'grok-imagine-image',
+      baseUrl: 'https://api.x.ai/v1',
+      model: 'grok-imagine-image-quality'
+    })
+    expect(parsed.capabilities.videoGen).toMatchObject({
+      protocol: 'grok-imagine-video',
+      baseUrl: 'https://api.x.ai/v1',
+      model: 'grok-imagine-video-1.5-preview',
+      defaultResolution: '480P'
+    })
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+  })
+
+  it('forwards the selected Volcano Ark media gateway and dedicated key to Kun', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const defaults = defaultKunRuntimeSettings()
+
+    await module.syncGuiManagedKunConfig(tempRoot, {
+      ...defaults,
+      imageGeneration: {
+        ...defaults.imageGeneration,
+        enabled: true,
+        providerId: 'volcengine-agent-plan',
+        protocol: 'volcengine-ark-image',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        apiKey: 'agent-plan-key',
+        model: 'doubao-seedream-5.0-lite',
+        defaultResolution: '4K'
+      },
+      videoGeneration: {
+        ...defaults.videoGeneration,
+        enabled: true,
+        providerId: 'volcengine-agent-plan',
+        protocol: 'volcengine-ark-video',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        apiKey: 'agent-plan-key',
+        model: 'doubao-seedance-2.0',
+        defaultDuration: 15,
+        defaultResolution: '4K'
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.imageGen).toMatchObject({
+      enabled: true,
+      protocol: 'volcengine-ark-image',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      apiKey: 'agent-plan-key',
+      model: 'doubao-seedream-5.0-lite',
+      defaultResolution: '4K'
+    })
+    expect(parsed.capabilities.videoGen).toMatchObject({
+      enabled: true,
+      protocol: 'volcengine-ark-video',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      apiKey: 'agent-plan-key',
+      model: 'doubao-seedance-2.0',
+      defaultDuration: 15,
+      defaultResolution: '4K'
+    })
+    expect(parsed.capabilities.imageGen.headers).toBeUndefined()
+    expect(parsed.capabilities.videoGen.headers).toBeUndefined()
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+  })
+
+  it('replaces stale GUI-managed model profile fields while preserving compaction overrides', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    writeFileSync(configPath, JSON.stringify({
+      models: {
+        profiles: {
+          'gpt-5.5': {
+            contextWindowTokens: 128000,
+            maxOutputTokens: 16000,
+            inputModalities: ['text', 'image'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text', 'image_url'],
+            endpointFormat: 'responses',
+            contextCompaction: { softThreshold: 900000 }
+          },
+          'user-model': {
+            contextWindowTokens: 96000,
+            endpointFormat: 'messages',
+            contextCompaction: { softThreshold: 86000 }
+          }
+        }
+      }
+    }), 'utf8')
+
+    await module.syncGuiManagedKunConfig(tempRoot, {
+      ...defaultKunRuntimeSettings(),
+      modelProfiles: {
+        'gpt-5.5': {
+          contextWindowTokens: 1_000_000,
+          inputModalities: ['text', 'image'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text', 'image_url']
+        }
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.models.profiles['gpt-5.5']).toMatchObject({
+      contextWindowTokens: 1_000_000,
+      inputModalities: ['text', 'image'],
+      contextCompaction: { softThreshold: 900000 }
+    })
+    expect(parsed.models.profiles['gpt-5.5'].endpointFormat).toBeUndefined()
+    expect(parsed.models.profiles['gpt-5.5'].maxOutputTokens).toBeUndefined()
+    expect(parsed.models.profiles['user-model']).toMatchObject({
+      contextWindowTokens: 96000,
+      endpointFormat: 'messages',
+      contextCompaction: { softThreshold: 86000 }
+    })
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
   })
 
   it('keeps the config stable across repeated syncs with imageGen configured', async () => {
@@ -670,7 +1255,9 @@ describe('syncGuiManagedKunConfig', () => {
         baseUrl: 'https://api.siliconflow.cn/v1',
         apiKey: 'sk-image-test',
         model: 'Kwai-Kolors/Kolors',
+        defaultResolution: '1K' as const,
         defaultSize: '1024x1024',
+        quality: 'auto' as const,
         timeoutMs: 180000
       }
     }
@@ -840,7 +1427,9 @@ describe('syncGuiManagedKunConfig', () => {
     expect(parsed.capabilities.skills.enabled).toBe(true)
     expect(parsed.capabilities.skills.legacySkillMd).toBe(true)
     expect(parsed.capabilities.skills.roots).toEqual(expect.arrayContaining([
-      join(workspaceRoot, '.codex', 'skills'),
+      join(workspaceRoot, '.codex', 'skills')
+    ]))
+    expect(parsed.capabilities.skills.globalRoots).toEqual(expect.arrayContaining([
       extraRoot
     ]))
   })
@@ -944,6 +1533,7 @@ describe('syncGuiManagedKunConfig', () => {
         }
       },
       serve: {
+        runtimeToken: 'keep-this-token',
         legacyServeFlag: true,
         tokenEconomy: {
           customTokenEconomyFlag: 'keep',
@@ -988,6 +1578,9 @@ describe('syncGuiManagedKunConfig', () => {
           summaryInputMaxBytes: 131072
         },
         runtimeTuning: {
+          defaultsVersion: 1,
+          maxConcurrentTurns: 32,
+          maxWallTimeMs: 7_200_000,
           streamIdleTimeoutMs: 120000,
           toolStorm: {
             enabled: false,
@@ -1019,6 +1612,10 @@ describe('syncGuiManagedKunConfig', () => {
             maxToolArgumentStringTokens: 1000,
             maxArrayItems: 40
           }
+        },
+        toolOutputLimits: {
+          maxLines: 30000,
+          maxBytes: 2 * 1024 * 1024
         }
       },
       { mcpConfigPath: join(tempRoot, 'missing-mcp.json') }
@@ -1028,6 +1625,7 @@ describe('syncGuiManagedKunConfig', () => {
     expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
     expect(parsed.legacyTopLevelFlag).toBeUndefined()
     expect(parsed.serve.legacyServeFlag).toBeUndefined()
+    expect(parsed.serve.runtimeToken).toBe('keep-this-token')
     expect(parsed.serve.storage).toMatchObject({
       backend: 'hybrid',
       sqlitePath: '/tmp/kun-index.sqlite3'
@@ -1048,6 +1646,10 @@ describe('syncGuiManagedKunConfig', () => {
     })
     expect(parsed.serve.tokenEconomy.customTokenEconomyFlag).toBeUndefined()
     expect(parsed.serve.tokenEconomy.historyHygiene.customHistoryFlag).toBeUndefined()
+    expect(parsed.serve.toolOutputLimits).toEqual({
+      maxLines: 30000,
+      maxBytes: 2 * 1024 * 1024
+    })
     expect(parsed.contextCompaction).toMatchObject({
       defaultSoftThreshold: 32000,
       defaultHardThreshold: 64000,
@@ -1080,6 +1682,10 @@ describe('syncGuiManagedKunConfig', () => {
     expect(parsed.runtime.toolStorm.customStormFlag).toBeUndefined()
     expect(parsed.runtime.customRuntimeFlag).toBeUndefined()
     expect(parsed.runtime.toolArgumentRepair).toMatchObject({ maxStringBytes: 262144 })
+    expect(parsed.runtime.turnLimits).toMatchObject({
+      maxConcurrentTurns: 32,
+      maxWallTimeMs: 7_200_000
+    })
     expect(parsed.runtime.streamIdleTimeoutMs).toBe(120000)
     expect(parsed.capabilities.attachments).toMatchObject({ enabled: true })
     expect(parsed.capabilities.mcp.servers.github.command).toBe('github-mcp')
@@ -1148,6 +1754,102 @@ describe('syncGuiManagedKunConfig', () => {
       },
       trustScope: 'user'
     })
+  })
+
+  it('imports user-managed workspace-scoped MCP servers into runtime capabilities', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const mcpConfigPath = join(tempRoot, 'mcp.json')
+    const workspaceRoot = join(tempRoot, 'workspace')
+    writeFileSync(mcpConfigPath, JSON.stringify({
+      servers: {
+        codegraph: {
+          command: 'uvx',
+          args: ['codegraph-mcp'],
+          workspaceRoots: [workspaceRoot],
+          trustScope: 'workspace',
+          trustedWorkspaceRoots: [workspaceRoot]
+        }
+      }
+    }), 'utf8')
+    mkdirSync(workspaceRoot, { recursive: true })
+    writeFileSync(join(workspaceRoot, '.mcp.json'), JSON.stringify({
+      servers: {
+        codegraph: {
+          command: 'repo-controlled-codegraph',
+          args: ['untrusted-project-config'],
+          trustScope: 'user'
+        }
+      }
+    }), 'utf8')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
+      mcpConfigPath
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.mcp.enabled).toBe(true)
+    expect(parsed.capabilities.mcp.servers.codegraph).toMatchObject({
+      enabled: true,
+      transport: 'stdio',
+      command: 'uvx',
+      args: ['codegraph-mcp'],
+      workspaceRoots: [workspaceRoot],
+      trustScope: 'workspace',
+      trustedWorkspaceRoots: [workspaceRoot]
+    })
+    expect(JSON.stringify(parsed.capabilities.mcp.servers.codegraph)).not.toContain('repo-controlled-codegraph')
+  })
+
+  it('does not auto-import workspace .mcp.json servers into the runtime', async () => {
+    // Security: a project file can suggest MCP setup, but it must not grant
+    // itself permission to run commands in the local runtime. Users can still
+    // opt in by copying the server into the GUI-managed MCP config above.
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const mcpConfigPath = join(tempRoot, 'mcp.json')
+    const workspaceRoot = join(tempRoot, 'workspace')
+    writeFileSync(mcpConfigPath, JSON.stringify({
+      servers: {
+        codegraph: {
+          command: 'global-codegraph',
+          args: ['global']
+        }
+      }
+    }), 'utf8')
+    mkdirSync(workspaceRoot, { recursive: true })
+    writeFileSync(join(workspaceRoot, '.mcp.json'), JSON.stringify({
+      servers: {
+        codegraph: {
+          command: 'uvx',
+          args: ['codegraph-mcp'],
+          trustScope: 'user'
+        },
+        evil: {
+          command: 'node',
+          args: ['evil.js'],
+          trustScope: 'user'
+        }
+      }
+    }), 'utf8')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
+      mcpConfigPath
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.mcp.enabled).toBe(true)
+    expect(parsed.capabilities.mcp.servers.codegraph).toMatchObject({
+      enabled: true,
+      transport: 'stdio',
+      command: 'global-codegraph',
+      args: ['global'],
+      trustScope: 'user'
+    })
+    expect(JSON.stringify(parsed.capabilities.mcp.servers)).not.toContain('codegraph-mcp')
+    expect(JSON.stringify(parsed.capabilities.mcp.servers)).not.toContain('evil.js')
   })
 
   it('does not auto-import repo-local .kun/mcp.json servers into the runtime', async () => {
@@ -1279,7 +1981,7 @@ describe('syncGuiManagedKunConfig', () => {
 })
 
 describe('subagentProfilesForRuntime', () => {
-  it('drops blank optional fields so the runtime config still parses', async () => {
+  it('drops blank fields and legacy partial routing so the profile inherits a coherent pair', async () => {
     const module = await import('./kun-process')
     // Built-in profiles store an empty `name` (the GUI localizes the label) and
     // the user picked a model on one of them. The runtime schema marks every
@@ -1303,7 +2005,46 @@ describe('subagentProfilesForRuntime', () => {
     expect(config.profiles.general).toBeDefined()
     expect('name' in config.profiles.general).toBe(false)
     expect('description' in config.profiles.general).toBe(false)
-    expect(config.profiles.general.model).toBe('deepseek-v4')
+    expect(config.profiles.general.model).toBeUndefined()
+    expect(config.profiles.general.providerId).toBeUndefined()
+    expect(config.useExistingAgents).toBe(true)
+  })
+
+  it('preserves the parent-generated delegation mode', async () => {
+    const module = await import('./kun-process')
+    const config = module.subagentProfilesForRuntime({
+      enabled: true,
+      useExistingAgents: false,
+      profiles: []
+    })
+
+    expect(config.useExistingAgents).toBe(false)
+  })
+
+  it('removes provider-only legacy routing without dropping the rest of the profile', async () => {
+    const module = await import('./kun-process')
+    const config = module.subagentProfilesForRuntime({
+      enabled: true,
+      profiles: [
+        {
+          id: 'custom',
+          enabled: true,
+          name: 'Safe reviewer',
+          mode: 'subagent',
+          toolPolicy: 'readOnly',
+          providerId: 'openai',
+          blockedTools: ['write']
+        }
+      ]
+    })
+
+    expect(config.profiles.custom).toMatchObject({
+      name: 'Safe reviewer',
+      toolPolicy: 'readOnly',
+      blockedTools: ['write']
+    })
+    expect(config.profiles.custom.model).toBeUndefined()
+    expect(config.profiles.custom.providerId).toBeUndefined()
   })
 
   it('keeps a non-empty name', async () => {
@@ -1315,5 +2056,58 @@ describe('subagentProfilesForRuntime', () => {
       ]
     })
     expect(config.profiles.custom.name).toBe('我的代理')
+  })
+
+  it('preserves legacy disabled builtin overrides while dropping disabled custom profiles', async () => {
+    const module = await import('./kun-process')
+    const config = module.subagentProfilesForRuntime({
+      enabled: true,
+      profiles: [
+        {
+          id: 'general',
+          enabled: false,
+          name: '',
+          mode: 'subagent',
+          toolPolicy: 'readOnly',
+          model: 'review-model',
+          providerId: 'provider-a',
+          blockedSkills: ['unsafe-skill']
+        },
+        {
+          id: 'custom-disabled',
+          enabled: false,
+          name: 'Disabled custom',
+          mode: 'subagent',
+          toolPolicy: 'readOnly'
+        },
+        {
+          id: 'component-designer',
+          enabled: false,
+          name: '',
+          mode: 'subagent',
+          toolPolicy: 'inherit'
+        },
+        {
+          id: 'security-auditor',
+          enabled: false,
+          name: '',
+          mode: 'subagent',
+          toolPolicy: 'readOnly',
+          model: 'security-model'
+        }
+      ]
+    })
+
+    expect(config.profiles.general).toMatchObject({
+      model: 'review-model',
+      providerId: 'provider-a',
+      toolPolicy: 'readOnly',
+      blockedSkills: ['unsafe-skill']
+    })
+    expect(config.profiles['component-designer']).toBeDefined()
+    expect(config.profiles['security-auditor']).toMatchObject({ toolPolicy: 'readOnly' })
+    expect(config.profiles['security-auditor'].model).toBeUndefined()
+    expect(config.profiles['security-auditor'].providerId).toBeUndefined()
+    expect(config.profiles['custom-disabled']).toBeUndefined()
   })
 })

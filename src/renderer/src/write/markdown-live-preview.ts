@@ -101,6 +101,9 @@ const writeMarkdownLiveTheme = EditorView.theme({
     backgroundColor: 'transparent'
   },
   '&.cm-write-live-preview .cm-line': {
+    boxSizing: 'border-box',
+    width: '100%',
+    minWidth: '0',
     maxWidth: '720px',
     marginLeft: 'auto',
     marginRight: 'auto',

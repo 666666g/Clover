@@ -223,10 +223,16 @@ export interface SdkHookMatcher {
 
 export interface SdkQueryOptions {
   model?: string
+  effort?: 'low' | 'medium' | 'high' | 'max'
+  thinking?: { type: 'adaptive' }
   cwd?: string
   systemPrompt?: string | SdkSystemPromptPreset
+  /** Base set of Claude Code built-ins. An empty array disables all built-ins. */
+  tools?: string[] | { type: 'preset'; preset: 'claude_code' }
   allowedTools?: string[]
   disallowedTools?: string[]
+  /** Use only the explicitly supplied MCP configuration. */
+  strictMcpConfig?: boolean
   mcpServers?: Record<string, SdkMcpServerConfig>
   permissionMode?: SdkPermissionMode
   canUseTool?: SdkCanUseTool

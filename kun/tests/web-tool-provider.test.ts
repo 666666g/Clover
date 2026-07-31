@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CapabilityRegistry } from '../src/adapters/tool/capability-registry.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
-import { buildWebToolProviders } from '../src/adapters/tool/web-tool-provider.js'
+import {
+  buildWebToolProviders,
+  FetchWebProvider,
+  type FetchWebTransportResponse
+} from '../src/adapters/tool/web-tool-provider.js'
 import {
   buildRuntimeCapabilityManifest,
-  KunCapabilitiesConfig
+  KunCapabilitiesConfig,
+  type WebCapabilityConfig
 } from '../src/contracts/capabilities.js'
 import { modelCapabilitiesForModel } from '../src/loop/model-context-profile.js'
 import { DeterministicWebProvider } from '../src/ports/web-provider.js'
@@ -47,6 +52,47 @@ function deterministicProvider() {
   })
 }
 
+type TestFetchResponse = {
+  status?: number
+  body?: string
+  contentType?: string
+  location?: string
+}
+
+function fetchProvider(
+  config: WebCapabilityConfig,
+  responses: Record<string, TestFetchResponse>,
+  options: {
+    resolveHost?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>
+    onRequest?: (url: URL) => void
+  } = {}
+) {
+  return new FetchWebProvider(config, {
+    nowIso: () => '2026-06-03T00:00:00.000Z',
+    resolveHost: options.resolveHost ?? (async () => [{ address: '93.184.216.34', family: 4 }]),
+    request: async ({ url }) => {
+      options.onRequest?.(url)
+      const response = responses[url.href]
+      if (!response) throw new Error(`missing test response for ${url.href}`)
+      return responseForTest(response)
+    }
+  })
+}
+
+function responseForTest(response: TestFetchResponse): FetchWebTransportResponse {
+  return {
+    status: response.status ?? 200,
+    contentType: response.contentType,
+    location: response.location,
+    body: bodyForTest(response.body ?? ''),
+    cancel: () => undefined
+  }
+}
+
+async function* bodyForTest(body: string): AsyncGenerator<Uint8Array> {
+  yield Buffer.from(body)
+}
+
 describe('Web tool provider', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -59,6 +105,50 @@ describe('Web tool provider', () => {
     expect(built.providers).toEqual([])
     expect(built.fetchAvailable).toBe(false)
     expect(built.searchAvailable).toBe(false)
+  })
+
+  it('owns one-hour request timeouts and ignores stale model timeout arguments', async () => {
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        searchEnabled: true,
+        provider: 'test-search',
+        allowDomains: ['docs.example.test']
+      }
+    })
+    const provider = deterministicProvider()
+    const timeoutValues: number[] = []
+    const fetch = provider.fetch.bind(provider)
+    const search = provider.search.bind(provider)
+    provider.fetch = async (request) => {
+      timeoutValues.push(request.timeoutMs)
+      return fetch(request)
+    }
+    provider.search = async (request) => {
+      timeoutValues.push(request.timeoutMs)
+      return search(request)
+    }
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, { provider }).providers)
+    })
+
+    const tools = await host.listTools(buildContext())
+    for (const tool of tools) {
+      expect(tool.inputSchema.properties).not.toHaveProperty('timeout_ms')
+    }
+    await host.execute({
+      callId: 'call_fetch_timeout',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/page', timeout_ms: 1 }
+    }, buildContext())
+    await host.execute({
+      callId: 'call_search_timeout',
+      toolName: 'web_search',
+      arguments: { query: 'kun web', timeout_ms: 1 }
+    }, buildContext())
+
+    expect(timeoutValues).toEqual([3_600_000, 3_600_000])
   })
 
   it('fetches allowed URLs with source metadata and telemetry', async () => {
@@ -110,12 +200,6 @@ describe('Web tool provider', () => {
   })
 
   it('truncates instead of failing when content-length exceeds max_bytes', async () => {
-    vi.stubGlobal('fetch', async () => new Response('abcdefghijklmnopqrstuvwxyz', {
-      headers: {
-        'content-length': '26',
-        'content-type': 'text/plain'
-      }
-    }))
     const config = KunCapabilitiesConfig.parse({
       web: {
         enabled: true,
@@ -125,7 +209,14 @@ describe('Web tool provider', () => {
       }
     })
     const host = new LocalToolHost({
-      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, {
+        provider: fetchProvider(config.web, {
+          'https://docs.example.test/large': {
+            body: 'abcdefghijklmnopqrstuvwxyz',
+            contentType: 'text/plain'
+          }
+        })
+      }).providers)
     })
 
     const result = await host.execute({
@@ -145,11 +236,6 @@ describe('Web tool provider', () => {
   })
 
   it('truncates oversized fetch responses via streaming when content-length is unknown', async () => {
-    vi.stubGlobal('fetch', async () => new Response('abcdefghijklmnopqrstuvwxyz', {
-      headers: {
-        'content-type': 'text/plain'
-      }
-    }))
     const config = KunCapabilitiesConfig.parse({
       web: {
         enabled: true,
@@ -159,7 +245,14 @@ describe('Web tool provider', () => {
       }
     })
     const host = new LocalToolHost({
-      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, {
+        provider: fetchProvider(config.web, {
+          'https://docs.example.test/large': {
+            body: 'abcdefghijklmnopqrstuvwxyz',
+            contentType: 'text/plain'
+          }
+        })
+      }).providers)
     })
 
     const result = await host.execute({
@@ -184,12 +277,6 @@ describe('Web tool provider', () => {
   })
 
   it('raises tiny model-passed max_bytes budgets to a usable floor', async () => {
-    vi.stubGlobal('fetch', async () => new Response('x'.repeat(3000), {
-      headers: {
-        'content-length': '3000',
-        'content-type': 'text/plain'
-      }
-    }))
     const config = KunCapabilitiesConfig.parse({
       web: {
         enabled: true,
@@ -198,7 +285,14 @@ describe('Web tool provider', () => {
       }
     })
     const host = new LocalToolHost({
-      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, {
+        provider: fetchProvider(config.web, {
+          'https://docs.example.test/page': {
+            body: 'x'.repeat(3000),
+            contentType: 'text/plain'
+          }
+        })
+      }).providers)
     })
 
     const result = await host.execute({
@@ -217,19 +311,6 @@ describe('Web tool provider', () => {
   })
 
   it('extracts HTML text without turning escaped tags into markup', async () => {
-    vi.stubGlobal('fetch', async () => new Response([
-      '<!doctype html>',
-      '<title>Docs &amp; Safety</title>',
-      '<script>alert("secret")</script>',
-      '<style>body{display:none}</style>',
-      '<h1>Hello&nbsp;World</h1>',
-      '<p>A &lt;script&gt; stays text.</p>',
-      '<div>Next &#60;b&#62; line &amp; more.</div>'
-    ].join(''), {
-      headers: {
-        'content-type': 'text/html'
-      }
-    }))
     const config = KunCapabilitiesConfig.parse({
       web: {
         enabled: true,
@@ -238,7 +319,22 @@ describe('Web tool provider', () => {
       }
     })
     const host = new LocalToolHost({
-      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, {
+        provider: fetchProvider(config.web, {
+          'https://docs.example.test/html': {
+            body: [
+              '<!doctype html>',
+              '<title>Docs &amp; Safety</title>',
+              '<script>alert("secret")</script>',
+              '<style>body{display:none}</style>',
+              '<h1>Hello&nbsp;World</h1>',
+              '<p>A &lt;script&gt; stays text.</p>',
+              '<div>Next &#60;b&#62; line &amp; more.</div>'
+            ].join(''),
+            contentType: 'text/html'
+          }
+        })
+      }).providers)
     })
 
     const result = await host.execute({
@@ -299,6 +395,187 @@ describe('Web tool provider', () => {
         telemetry: { policy: 'blocked' }
       })
     }
+  })
+
+  it('rejects loopback, private, link-local, metadata, and encoded IP fetch targets before contacting the provider', async () => {
+    let contacted = false
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true
+      }
+    })
+    const provider = new DeterministicWebProvider()
+    provider.fetch = async () => {
+      contacted = true
+      throw new Error('must not be called')
+    }
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, { provider }).providers)
+    })
+    const blockedUrls = [
+      'http://127.0.0.1/',
+      'http://2130706433/',
+      'http://0x7f000001/',
+      'http://[::1]/',
+      'http://[::ffff:127.0.0.1]/',
+      'http://[fe80::1]/',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://localhost./',
+      `http://localhost${'.'.repeat(10_000)}/`,
+      'http://metadata.google.internal/computeMetadata/v1/'
+    ]
+
+    for (const [index, url] of blockedUrls.entries()) {
+      const result = await host.execute({
+        callId: `call_blocked_${index}`,
+        toolName: 'web_fetch',
+        arguments: { url }
+      }, buildContext())
+      expect(result.item).toMatchObject({ kind: 'tool_result', isError: true })
+      if (result.item.kind === 'tool_result') {
+        expect(result.item.output).toMatchObject({
+          error: { code: 'policy_blocked' },
+          telemetry: { policy: 'blocked' }
+        })
+      }
+    }
+    expect(contacted).toBe(false)
+  })
+
+  it('rejects hostnames with any non-public DNS answer before opening a socket', async () => {
+    let contacted = false
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['docs.example.test']
+      }
+    })
+    const provider = fetchProvider(config.web, {
+      'https://docs.example.test/page': { body: 'must not be read' }
+    }, {
+      resolveHost: async () => [
+        { address: '93.184.216.34', family: 4 },
+        { address: '10.0.0.7', family: 4 }
+      ],
+      onRequest: () => {
+        contacted = true
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, { provider }).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_dns_private',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/page' }
+    }, buildContext())
+
+    expect(contacted).toBe(false)
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      isError: true,
+      output: {
+        error: { code: 'policy_blocked' },
+        telemetry: { policy: 'blocked' }
+      }
+    })
+  })
+
+  it('revalidates each redirect and never requests a private redirect target', async () => {
+    const requested: string[] = []
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['example.test']
+      }
+    })
+    const provider = fetchProvider(config.web, {
+      'https://start.example.test/page': {
+        status: 302,
+        location: 'https://redirect.example.test/private'
+      }
+    }, {
+      resolveHost: async (hostname) => hostname === 'redirect.example.test'
+        ? [{ address: '10.0.0.7', family: 4 }]
+        : [{ address: '93.184.216.34', family: 4 }],
+      onRequest: (url) => requested.push(url.href)
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, { provider }).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_redirect_private',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://start.example.test/page' }
+    }, buildContext())
+
+    expect(requested).toEqual(['https://start.example.test/page'])
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      isError: true,
+      output: {
+        error: { code: 'policy_blocked' },
+        telemetry: { policy: 'blocked' }
+      }
+    })
+  })
+
+  it('pins the vetted DNS answer into each allowed redirect request and caps redirect chains', async () => {
+    const pinnedAddresses: string[] = []
+    const requested: string[] = []
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['example.test']
+      }
+    })
+    const provider = new FetchWebProvider(config.web, {
+      resolveHost: async () => [{ address: '93.184.216.34', family: 4 }],
+      request: async ({ url, lookup }) => {
+        requested.push(url.href)
+        await new Promise<void>((resolve, reject) => {
+          lookup(url.hostname, { family: 4 }, (error, address, family) => {
+            if (error) {
+              reject(error)
+              return
+            }
+            expect(family).toBe(4)
+            expect(address).toBe('93.184.216.34')
+            pinnedAddresses.push(String(address))
+            resolve()
+          })
+        })
+        return responseForTest({
+          status: 302,
+          location: `/hop-${requested.length}`
+        })
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web, { provider }).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_redirect_limit',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://start.example.test/page' }
+    }, buildContext())
+
+    // One initial request plus five permitted hops; the sixth redirect is
+    // rejected without opening a seventh connection.
+    expect(requested).toHaveLength(6)
+    expect(pinnedAddresses).toEqual(Array(6).fill('93.184.216.34'))
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      isError: true,
+      output: { error: { code: 'fetch_failed' } }
+    })
   })
 
   it('returns unavailable-provider errors for search without a search provider', async () => {

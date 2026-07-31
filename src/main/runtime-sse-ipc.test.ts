@@ -64,6 +64,9 @@ describe('runtime-sse-ipc', () => {
             if (chunk === '__ERROR__') {
               throw new Error('Network Disruption')
             }
+            if (chunk === '__TERMINATED__') {
+              throw new Error('terminated')
+            }
             return { done: false, value: enc.encode(chunk) }
           }
         }
@@ -166,5 +169,188 @@ describe('runtime-sse-ipc', () => {
     expect(allEvents[1].text).toBe('world')
     expect(allEvents[2].seq).toBe(3)
     expect(allEvents[2].text).toBe('bye')
+  })
+
+  it('treats terminated stream reads as reconnectable SSE disconnects', async () => {
+    registerRuntimeSseIpc({
+      ipcMain: mockIpcMain,
+      store: mockStore,
+      ensureRuntime: mockEnsureRuntime,
+      logError: mockLogError
+    })
+
+    const startHandler = handlers.get('runtime:sse:start')
+    expect(startHandler).toBeDefined()
+
+    const stream1 = mockReadableStream([
+      'id: 7\ndata: {"text": "partial"}\n\n',
+      '__TERMINATED__'
+    ])
+    const stream2 = mockReadableStream([
+      'id: 8\ndata: {"text": "final"}\n\n'
+    ])
+
+    mockFetch.mockImplementation(async () => {
+      const callCount = mockFetch.mock.calls.length
+      if (callCount === 1) {
+        return { ok: true, status: 200, body: stream1 }
+      }
+      if (callCount === 2) {
+        return { ok: true, status: 200, body: stream2 }
+      }
+      return { ok: false, status: 400 }
+    })
+
+    const startRes = await startHandler!(mockEvent, {
+      threadId: 'thread-terminated',
+      sinceSeq: 0
+    })
+
+    await vi.advanceTimersByTimeAsync(750)
+
+    expect(mockFetch).toHaveBeenCalledTimes(3)
+    expect(mockFetch.mock.calls[1][0].toString()).toContain('since_seq=7')
+    expect(mockEvent.sender.send).not.toHaveBeenCalledWith(
+      'runtime:sse-error',
+      expect.objectContaining({ streamId: startRes.streamId, message: 'terminated' })
+    )
+    expect(mockLogError).not.toHaveBeenCalledWith(
+      'sse',
+      expect.stringContaining('SSE stream error'),
+      expect.objectContaining({ message: 'terminated' })
+    )
+
+    const stopHandler = handlers.get('runtime:sse:stop')
+    expect(stopHandler).toBeDefined()
+    await stopHandler!(mockEvent, startRes.streamId)
+
+    const allEvents = mockEvent.sender.send.mock.calls
+      .filter((call: any) => call[0] === 'runtime:sse-event')
+      .flatMap((call: any) => call[1].events)
+    expect(allEvents.map((event: any) => event.seq)).toEqual([7, 8])
+  })
+
+  it('re-resolves the shared runtime URL and token before reconnecting', async () => {
+    registerRuntimeSseIpc({
+      ipcMain: mockIpcMain,
+      store: mockStore,
+      ensureRuntime: mockEnsureRuntime,
+      logError: mockLogError
+    })
+    const startHandler = handlers.get('runtime:sse:start')
+    expect(startHandler).toBeDefined()
+
+    const first = {
+      agents: { kun: { port: 18899, runtimeToken: 'first-token' } }
+    }
+    const second = {
+      agents: { kun: { port: 18900, runtimeToken: 'second-token' } }
+    }
+    mockStore.load
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second)
+      .mockResolvedValue(second)
+    mockEnsureRuntime.mockImplementation(async (settings: unknown) => settings)
+    mockFetch.mockImplementation(async () => {
+      if (mockFetch.mock.calls.length === 1) {
+        return {
+          ok: true,
+          status: 200,
+          body: mockReadableStream([
+            'id: 4\ndata: {"text": "before restart"}\n\n',
+            '__ERROR__'
+          ])
+        }
+      }
+      return { ok: false, status: 400, body: null }
+    })
+
+    const started = await startHandler!(mockEvent, {
+      threadId: 'thread-runtime-restart',
+      sinceSeq: 0
+    })
+    await vi.advanceTimersByTimeAsync(750)
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expect(mockFetch.mock.calls[0][0].toString()).toContain('127.0.0.1:18899')
+    expect(mockFetch.mock.calls[1][0].toString()).toContain('127.0.0.1:18900')
+    expect(new Headers(mockFetch.mock.calls[0][1].headers).get('authorization'))
+      .toBe('Bearer first-token')
+    expect(new Headers(mockFetch.mock.calls[1][1].headers).get('authorization'))
+      .toBe('Bearer second-token')
+    expect(mockFetch.mock.calls[1][0].toString()).toContain('since_seq=4')
+
+    await handlers.get('runtime:sse:stop')!(mockEvent, started.streamId)
+  })
+
+  it('does not advance the reconnect cursor until the renderer acknowledges a batch', async () => {
+    registerRuntimeSseIpc({
+      ipcMain: mockIpcMain,
+      store: mockStore,
+      ensureRuntime: mockEnsureRuntime,
+      logError: mockLogError
+    })
+    const startHandler = handlers.get('runtime:sse:start')
+    const ackHandler = handlers.get('runtime:sse:ack')
+    expect(startHandler).toBeDefined()
+    expect(ackHandler).toBeDefined()
+
+    mockFetch.mockImplementation(async () => {
+      if (mockFetch.mock.calls.length === 1) {
+        return {
+          ok: true,
+          status: 200,
+          body: mockReadableStream(['id: 9\ndata: {"text": "await-ack"}\n\n'])
+        }
+      }
+      return { ok: false, status: 400, body: null }
+    })
+
+    const started = await startHandler!(mockEvent, {
+      threadId: 'thread-ack',
+      sinceSeq: 0,
+      acknowledgedBatches: true
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const batch = mockEvent.sender.send.mock.calls.find((call: any) => call[0] === 'runtime:sse-event')?.[1]
+    expect(batch).toMatchObject({ streamId: started.streamId, events: [{ seq: 9 }] })
+    expect(typeof batch.batchId).toBe('string')
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+
+    await expect(ackHandler!(mockEvent, {
+      streamId: started.streamId,
+      batchId: batch.batchId
+    })).resolves.toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expect(mockFetch.mock.calls[1][0].toString()).toContain('since_seq=9')
+  })
+
+  it('surfaces an id-less server replay error instead of reconnecting into the same cursor', async () => {
+    registerRuntimeSseIpc({
+      ipcMain: mockIpcMain,
+      store: mockStore,
+      ensureRuntime: mockEnsureRuntime,
+      logError: mockLogError
+    })
+    const startHandler = handlers.get('runtime:sse:start')
+    expect(startHandler).toBeDefined()
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: mockReadableStream(['event: error\ndata: {"message": "oversized replay record"}\n\n'])
+    })
+
+    const started = await startHandler!(mockEvent, { threadId: 'thread-server-error', sinceSeq: 0 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    expect(mockEvent.sender.send).toHaveBeenCalledWith(
+      'runtime:sse-error',
+      expect.objectContaining({ streamId: started.streamId, message: 'oversized replay record' })
+    )
   })
 })

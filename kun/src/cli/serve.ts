@@ -1,16 +1,23 @@
 import { z } from 'zod'
 import {
+  DEFAULT_FRESH_SERVE_PERMISSIONS,
   DEFAULT_SERVE_PORT,
   DEFAULT_SERVE_OPTIONS,
   ServeOptionsSchema,
   type ServeOptions
 } from './cli-options.js'
 import {
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_APPROVAL_REVIEWER,
+  DEFAULT_SANDBOX_MODE
+} from '../contracts/policy.js'
+import {
   kunConfigPathForDataDir,
   readKunConfigFile,
   readOptionalKunConfigFile,
   type LoadedKunConfig
 } from '../config/kun-config.js'
+import { parseOtlpHeaders, resolveOtlpTracesEndpoint } from '../telemetry/otlp-http-json-sink.js'
 
 /**
  * Parse the `kun serve` command line into validated options.
@@ -40,6 +47,16 @@ export function parseServeOptions(
   }
   const loadedConfig = loadServeConfig(raw, env)
   const configServe = loadedConfig?.config.serve ?? {}
+  const permissionDefaults: Pick<
+    ServeOptions,
+    'approvalPolicy' | 'sandboxMode' | 'approvalReviewer'
+  > = loadedConfig
+    ? {
+        approvalPolicy: DEFAULT_APPROVAL_POLICY,
+        sandboxMode: DEFAULT_SANDBOX_MODE,
+        approvalReviewer: DEFAULT_APPROVAL_REVIEWER
+      }
+    : DEFAULT_FRESH_SERVE_PERMISSIONS
   const portEnv = env.KUN_PORT
   const tokenEconomyMode =
     booleanFlag(raw, 'token-economy') ??
@@ -49,6 +66,53 @@ export function parseServeOptions(
     configServe.tokenEconomy?.enabled ??
     configServe.tokenEconomyMode ??
     DEFAULT_SERVE_OPTIONS.tokenEconomyMode
+  const explicitObservabilityEnabled =
+    booleanFlag(raw, 'observability') ??
+    envBoolean(env.KUN_OBSERVABILITY)
+  const observabilityOutputPath =
+    stringFlag(raw, 'observability-output') ??
+    stringFlag(raw, 'observabilityOutput') ??
+    env.KUN_OBSERVABILITY_OUTPUT_PATH ??
+    configServe.observability?.outputPath
+  const otlpProtocol = nonEmptyEnv(env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL) ??
+    nonEmptyEnv(env.OTEL_EXPORTER_OTLP_PROTOCOL)
+  const standardOtlpEnabled = env.OTEL_TRACES_EXPORTER
+    ?.split(',')
+    .map((entry) => entry.trim())
+    .includes('otlp') && otlpProtocol === 'http/json'
+  const observabilityEnabled = explicitObservabilityEnabled ??
+    (standardOtlpEnabled ? true : configServe.observability?.enabled)
+  const observabilityExporterValue =
+    stringFlag(raw, 'observability-exporter') ??
+    env.KUN_OBSERVABILITY_EXPORTER ??
+    (standardOtlpEnabled ? 'otlp-http-json' : undefined) ??
+    configServe.observability?.exporter
+  const observabilityExporter = observabilityExporterValue as
+    | 'jsonl'
+    | 'otlp-http-json'
+    | undefined
+  const otlpTracesEndpoint = nonEmptyEnv(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+  const otlpCommonEndpoint = nonEmptyEnv(env.OTEL_EXPORTER_OTLP_ENDPOINT)
+  const observabilityEndpoint =
+    otlpTracesEndpoint ??
+    (otlpCommonEndpoint
+      ? resolveOtlpTracesEndpoint({ commonEndpoint: otlpCommonEndpoint })
+      : undefined) ??
+    configServe.observability?.endpoint
+  const otlpHeaders = nonEmptyEnv(env.OTEL_EXPORTER_OTLP_TRACES_HEADERS) ??
+    nonEmptyEnv(env.OTEL_EXPORTER_OTLP_HEADERS)
+  const observabilityHeaders = parseOtlpHeaders(
+    otlpHeaders
+  ) ?? configServe.observability?.headers
+  const otlpTimeout = nonEmptyEnv(env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT) ??
+    nonEmptyEnv(env.OTEL_EXPORTER_OTLP_TIMEOUT)
+  const observabilityTimeoutMs = numberEnv(
+    otlpTimeout
+  ) ?? configServe.observability?.timeoutMs
+  const bundledExtensionsDir =
+    stringFlag(raw, 'bundled-extensions-dir') ??
+    stringFlag(raw, 'bundledExtensionsDir') ??
+    nonEmptyEnv(env.KUN_BUNDLED_EXTENSIONS_DIR)
   const merged: ServeOptions = {
     ...DEFAULT_SERVE_OPTIONS,
     ...(loadedConfig ? { configPath: loadedConfig.path } : {}),
@@ -70,6 +134,7 @@ export function parseServeOptions(
           : env.KUN_DATA_DIR ??
             configServe.dataDir ??
             DEFAULT_SERVE_OPTIONS.dataDir,
+    ...(bundledExtensionsDir ? { bundledExtensionsDir } : {}),
     runtimeToken:
       typeof raw['runtime-token'] === 'string'
         ? raw['runtime-token']
@@ -84,6 +149,7 @@ export function parseServeOptions(
         : typeof raw.apiKey === 'string'
           ? raw.apiKey
           : env.DEEPSEEK_API_KEY ?? configServe.apiKey ?? DEFAULT_SERVE_OPTIONS.apiKey,
+    credentialSourceId: configServe.credentialSourceId,
     baseUrl:
       typeof raw['base-url'] === 'string'
         ? raw['base-url']
@@ -107,6 +173,7 @@ export function parseServeOptions(
           : env.KUN_ENDPOINT_FORMAT as ServeOptions['endpointFormat'] | undefined ??
             configServe.endpointFormat ??
             DEFAULT_SERVE_OPTIONS.endpointFormat,
+    retry: configServe.retry ?? DEFAULT_SERVE_OPTIONS.retry,
     model:
       typeof raw.model === 'string'
         ? raw.model
@@ -114,16 +181,23 @@ export function parseServeOptions(
     approvalPolicy:
       typeof raw['approval-policy'] === 'string'
         ? (raw['approval-policy'] as ServeOptions['approvalPolicy'])
-        : configServe.approvalPolicy ?? DEFAULT_SERVE_OPTIONS.approvalPolicy,
+        : configServe.approvalPolicy ?? permissionDefaults.approvalPolicy,
     sandboxMode:
       typeof raw['sandbox-mode'] === 'string'
         ? (raw['sandbox-mode'] as ServeOptions['sandboxMode'])
-        : configServe.sandboxMode ?? DEFAULT_SERVE_OPTIONS.sandboxMode,
+        : configServe.sandboxMode ?? permissionDefaults.sandboxMode,
+    approvalReviewer:
+      typeof raw['approval-reviewer'] === 'string'
+        ? (raw['approval-reviewer'] as ServeOptions['approvalReviewer'])
+        : env.KUN_APPROVAL_REVIEWER as ServeOptions['approvalReviewer'] | undefined ??
+          configServe.approvalReviewer ??
+          permissionDefaults.approvalReviewer,
     tokenEconomyMode,
     tokenEconomy: {
       ...(configServe.tokenEconomy ?? {}),
       enabled: tokenEconomyMode
     },
+    toolOutputLimits: configServe.toolOutputLimits ?? DEFAULT_SERVE_OPTIONS.toolOutputLimits,
     insecure:
       typeof raw.insecure === 'string'
         ? raw.insecure !== 'false' && raw.insecure !== '0'
@@ -139,16 +213,43 @@ export function parseServeOptions(
         ? { sqlitePath: storageSqlitePathFromRawOrEnv(raw, env) ?? configServe.storage?.sqlitePath }
         : {})
     },
+    observability:
+      observabilityEnabled !== undefined || observabilityOutputPath || observabilityExporter
+        ? {
+            ...(configServe.observability ?? {}),
+            enabled: observabilityEnabled ?? false,
+            ...(observabilityOutputPath ? { outputPath: observabilityOutputPath } : {}),
+            ...(observabilityExporter ? { exporter: observabilityExporter } : {}),
+            ...(observabilityEndpoint ? { endpoint: observabilityEndpoint } : {}),
+            ...(observabilityHeaders ? { headers: observabilityHeaders } : {}),
+            ...(observabilityTimeoutMs ? { timeoutMs: observabilityTimeoutMs } : {})
+          }
+        : configServe.observability,
+    headers: configServe.headers,
     providers: configServe.providers,
+    routePools: configServe.routePools,
+    localModelGateway: configServe.localModelGateway,
     models: loadedConfig?.config.models,
     contextCompaction: loadedConfig?.config.contextCompaction,
     runtime: loadedConfig?.config.runtime,
+    graph: loadedConfig?.config.graph ?? DEFAULT_SERVE_OPTIONS.graph,
     roles: loadedConfig?.config.roles,
     capabilities: loadedConfig?.config.capabilities ?? DEFAULT_SERVE_OPTIONS.capabilities,
     hooks: loadedConfig?.config.hooks,
     quality: loadedConfig?.config.quality
   }
   return ServeOptionsSchema.parse(merged)
+}
+
+function numberEnv(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function nonEmptyEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed || undefined
 }
 
 /**
@@ -167,6 +268,8 @@ Options:
   --host <host>            Bind address (default 127.0.0.1)
   --port <port>            HTTP port (default ${DEFAULT_SERVE_PORT})
   --data-dir <path>        Root directory for threads, events, and usage
+  --bundled-extensions-dir <path>
+                           Product-owned catalog of default local .kunx packages
   --runtime-token <token>  Bearer token for /v1/* requests
   --api-key <key>          DeepSeek-compatible API key
   --base-url <url>         DeepSeek-compatible base URL
@@ -174,10 +277,16 @@ Options:
   --model <model>          Default model id
   --approval-policy <p>    on-request | untrusted | never | auto | suggest
   --sandbox-mode <mode>    read-only | workspace-write | danger-full-access | external-sandbox
+  --approval-reviewer <r>  user | agent
   --token-economy          Compress safe tool context before model calls
   --insecure               Disable bearer token check (local dev only)
   --storage-backend <b>    hybrid | file (default hybrid)
   --sqlite-path <path>     SQLite index path for hybrid storage
+  --observability          Write sanitized OpenTelemetry-style agent spans
+  --observability-output <path>
+                           JSONL span output path (default {data-dir}/observability/agent-spans.jsonl)
+  --observability-exporter <exporter>
+                           jsonl | otlp-http-json
 `
 
 export const ServeExitCode = {

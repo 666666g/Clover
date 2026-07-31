@@ -35,6 +35,11 @@ async function fetchViaProxy(
         agent
       },
       (response) => {
+        if (settled) {
+          response.resume()
+          return
+        }
+        settled = true
         const responseHeaders = new Headers()
         for (const [key, value] of Object.entries(response.headers)) {
           if (Array.isArray(value)) {
@@ -53,16 +58,23 @@ async function fetchViaProxy(
     )
 
     const signal = init?.signal
+    let settled = false
+    const settleReject = (error: Error): void => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
     const abort = (): void => {
       request.destroy(new Error('The operation was aborted.'))
     }
+    request.on('error', settleReject)
+    request.on('close', () => signal?.removeEventListener('abort', abort))
     if (signal?.aborted) {
       abort()
+      settleReject(new Error('The operation was aborted.'))
       return
     }
     signal?.addEventListener('abort', abort, { once: true })
-    request.on('error', reject)
-    request.on('close', () => signal?.removeEventListener('abort', abort))
     if (body) request.write(body)
     request.end()
   })

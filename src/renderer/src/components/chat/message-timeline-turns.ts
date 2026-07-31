@@ -1,33 +1,82 @@
 import type { ChatBlock } from '../../agent/types'
+import { isBackgroundShellNoticeUserMessage } from '@shared/background-shell-notice'
+import { isBackgroundSubagentNoticeUserMessage } from '@shared/background-subagent-notice'
+import { hasPendingRuntimeWork } from '../../store/chat-store-runtime-helpers'
 
 export type Turn = {
+  turnId?: string
   user?: Extract<ChatBlock, { kind: 'user' }>
   blocks: ChatBlock[]
 }
 
+export function isBackgroundShellNoticeBlock(block: ChatBlock): boolean {
+  return block.kind === 'user' && isBackgroundShellNoticeUserMessage(block)
+}
+
+export function isBackgroundSubagentNoticeBlock(block: ChatBlock): boolean {
+  return block.kind === 'user' && isBackgroundSubagentNoticeUserMessage(block)
+}
+
+export function isGraphRuntimeNoticeBlock(block: ChatBlock): boolean {
+  return block.kind === 'user' && block.meta?.messageSource === 'graph_runtime'
+}
+
+export function isBackgroundNoticeBlock(block: ChatBlock): boolean {
+  return (
+    isBackgroundShellNoticeBlock(block) ||
+    isBackgroundSubagentNoticeBlock(block) ||
+    isGraphRuntimeNoticeBlock(block)
+  )
+}
+
 export function groupTurns(blocks: ChatBlock[]): Turn[] {
   const turns: Turn[] = []
+  const turnsById = new Map<string, Turn>()
   let current: Turn | null = null
 
   for (const block of blocks) {
-    if (block.kind === 'user') {
-      if (current) turns.push(current)
-      current = { user: block, blocks: [] }
+    const turnId = block.turnId?.trim()
+    if (turnId) {
+      let turn = turnsById.get(turnId)
+      if (!turn) {
+        turn = { turnId, blocks: [] }
+        turnsById.set(turnId, turn)
+        turns.push(turn)
+      }
+      if (block.kind === 'user' && !isBackgroundNoticeBlock(block) && !turn.user) {
+        turn.user = block
+      } else {
+        turn.blocks.push(block)
+      }
+      if (block.kind === 'user' && !isBackgroundNoticeBlock(block)) current = turn
       continue
     }
-    if (!current) current = { blocks: [] }
+    if (block.kind === 'user') {
+      if (isBackgroundNoticeBlock(block)) {
+        if (!current) current = { blocks: [] }
+        current.blocks.push(block)
+        continue
+      }
+      current = { user: block, blocks: [] }
+      turns.push(current)
+      continue
+    }
+    if (!current) {
+      current = { blocks: [] }
+      turns.push(current)
+    }
     current.blocks.push(block)
   }
 
-  if (current) turns.push(current)
   return turns
 }
 
 export function stableTurnKey(turn: Turn, fallbackIndex: number): string {
-  return turn.user?.id ?? turn.blocks[0]?.id ?? `turn-${fallbackIndex}`
+  return turn.turnId ?? turn.user?.id ?? turn.blocks[0]?.id ?? `turn-${fallbackIndex}`
 }
 
 export function sameTurnContent(left: Turn, right: Turn): boolean {
+  if (left.turnId !== right.turnId) return false
   if (left.user !== right.user) return false
   if (left.blocks.length !== right.blocks.length) return false
   for (let index = 0; index < left.blocks.length; index += 1) {
@@ -46,20 +95,18 @@ export function splitThink(text: string): { think: string; content: string } {
 }
 
 export function blockHasPendingRuntimeWork(block: ChatBlock): boolean {
-  if (block.kind === 'tool') return block.status === 'running'
-  if (block.kind === 'compaction') return block.status === 'running'
-  if (block.kind === 'review') return block.status === 'running'
-  if (block.kind === 'approval') return block.status === 'pending'
-  if (block.kind === 'user_input') return block.status === 'pending'
-  return false
+  return hasPendingRuntimeWork(block)
 }
 
 export function isProcessBlock(block: ChatBlock): boolean {
   return (
+    isBackgroundShellNoticeBlock(block) ||
+    isBackgroundSubagentNoticeBlock(block) ||
     block.kind === 'reasoning' ||
     block.kind === 'tool' ||
     block.kind === 'compaction' ||
     block.kind === 'approval' ||
+    block.kind === 'approval_review' ||
     block.kind === 'user_input' ||
     block.kind === 'system'
   )

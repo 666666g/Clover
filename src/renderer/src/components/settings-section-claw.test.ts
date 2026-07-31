@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -91,12 +92,14 @@ function buildSettings(): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.88,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: { kun: defaultKunRuntimeSettings() },
     workspaceRoot: '/tmp/workspace',
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: true, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -104,6 +107,7 @@ function buildSettings(): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
@@ -232,6 +236,7 @@ describe('ClawSettingsSection', () => {
 
     expect(html).toContain('Telegram Bot Credentials')
     expect(html).toContain('@kun_test_bot is connected and saved locally.')
-    expect(html).not.toContain('Connect Telegram Bot')
+    expect(html).not.toContain('Connect Telegram Bot description')
+    expect(html).not.toContain('Paste the token below')
   })
 })

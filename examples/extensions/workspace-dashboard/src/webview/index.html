@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>Workspace Dashboard</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Workspace</p>
+          <h1 id="workspace-name">Workspace Dashboard</h1>
+        </div>
+        <button id="refresh" type="button">Refresh</button>
+      </header>
+      <p id="status" role="status">Waiting for a workspace summary.</p>
+      <dl>
+        <div><dt>Root</dt><dd id="root">—</dd></div>
+        <div><dt>Trusted</dt><dd id="trusted">—</dd></div>
+        <div><dt>Entries</dt><dd id="entry-count">0</dd></div>
+      </dl>
+      <h2>First entries</h2>
+      <ol id="entries"></ol>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

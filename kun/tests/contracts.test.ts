@@ -18,6 +18,8 @@ import {
   KunErrorBody,
   KunCapabilitiesConfig,
   RuntimeCapabilityManifest,
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
   buildRuntimeCapabilityManifest,
   emptyUsageSnapshot,
   type RuntimeEvent as RuntimeEventType
@@ -112,6 +114,17 @@ describe('contracts', () => {
     expect(result.success).toBe(false)
   })
 
+  it('bounds and deduplicates start-turn attachment ids', () => {
+    expect(StartTurnRequest.safeParse({
+      prompt: 'too many attachments',
+      attachmentIds: Array.from({ length: 9 }, (_value, index) => `att_${index}`)
+    }).success).toBe(false)
+    expect(StartTurnRequest.safeParse({
+      prompt: 'duplicate attachment',
+      attachmentIds: ['att_same', 'att_same']
+    }).success).toBe(false)
+  })
+
   it('accepts per-turn reasoning effort on start turn payloads', () => {
     const parsed = StartTurnRequest.parse({
       prompt: 'Compare the approaches',
@@ -119,6 +132,17 @@ describe('contracts', () => {
       reasoningEffort: 'max'
     })
     expect(parsed.reasoningEffort).toBe('max')
+  })
+
+  it('accepts only the canonical priority service tier on start turns', () => {
+    expect(StartTurnRequest.parse({
+      prompt: 'Move faster',
+      serviceTier: 'priority'
+    }).serviceTier).toBe('priority')
+    expect(StartTurnRequest.safeParse({
+      prompt: 'Do not use the legacy label on the wire',
+      serviceTier: 'fast'
+    }).success).toBe(false)
   })
 
   it('accepts per-turn execution policy on start turn payloads', () => {
@@ -155,6 +179,102 @@ describe('contracts', () => {
     })
   })
 
+  it('preserves the immutable authority snapshot on turn lifecycle events', () => {
+    const event = RuntimeEvent.parse({
+      kind: 'turn_started',
+      seq: 1,
+      timestamp: '2026-07-30T00:00:01.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })
+
+    expect(event).toMatchObject({
+      kind: 'turn_started',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })
+  })
+
+  it('accepts replayable automatic approval lifecycle and agent decision source', () => {
+    const started = RuntimeEvent.parse({
+      kind: 'approval_review_started',
+      seq: 1,
+      timestamp: '2026-07-30T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      reviewId: 'review_1',
+      approvalId: 'approval_1',
+      toolName: 'bash',
+      reviewer: 'agent',
+      status: 'in-progress',
+      summary: 'Canonical action data unavailable'
+    })
+    const resolved = RuntimeEvent.parse({
+      kind: 'approval_resolved',
+      seq: 3,
+      timestamp: '2026-07-30T00:00:00.002Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      approvalId: 'approval_1',
+      toolName: 'bash',
+      status: 'denied',
+      approvalReviewer: 'agent',
+      decisionSource: 'agent',
+      summary: 'Canonical action data unavailable',
+      reason: 'Automatic review failed closed.'
+    })
+
+    expect(started).toMatchObject({
+      kind: 'approval_review_started',
+      reviewer: 'agent',
+      status: 'in-progress'
+    })
+    expect(started).not.toHaveProperty('action')
+    expect(resolved).toMatchObject({
+      kind: 'approval_resolved',
+      status: 'denied',
+      decisionSource: 'agent'
+    })
+  })
+
+  it('accepts request-local context snapshot events', () => {
+    const event = RuntimeEvent.parse({
+      kind: 'context_snapshot',
+      seq: 2,
+      timestamp: '2026-07-24T00:00:01.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      model: 'deepseek-v4-pro',
+      providerId: 'deepseek',
+      stepIndex: 1,
+      contextWindowTokens: 256_000,
+      softThresholdTokens: 192_000,
+      hardThresholdTokens: 217_600,
+      estimatedInputTokens: 12_000,
+      breakdown: {
+        tools: 3_000,
+        system: 2_000,
+        skills: 1_000,
+        messages: 5_000,
+        other: 1_000
+      },
+      toolCount: 21,
+      activeSkillIds: ['openspec-apply-change']
+    })
+
+    expect(event).toMatchObject({
+      kind: 'context_snapshot',
+      model: 'deepseek-v4-pro',
+      stepIndex: 1,
+      softThresholdTokens: 192_000,
+      breakdown: { tools: 3_000, messages: 5_000 }
+    })
+  })
+
   it('accepts GUI plan context on start turn payloads', () => {
     const parsed = StartTurnRequest.parse({
       prompt: 'Plan auth',
@@ -183,6 +303,31 @@ describe('contracts', () => {
       }
     })
     expect(result.success).toBe(false)
+  })
+
+  it('accepts only reserved versioned SVG artifact paths on Design turns', () => {
+    const parsed = StartTurnRequest.parse({
+      prompt: 'Animate the logo',
+      guiDesignMode: true,
+      guiDesignArtifact: {
+        kind: 'svg',
+        artifactId: 'motion',
+        relativePath: '.kun-design/doc/motion/v2.svg'
+      }
+    })
+    expect(parsed.guiDesignArtifact).toEqual({
+      kind: 'svg',
+      artifactId: 'motion',
+      relativePath: '.kun-design/doc/motion/v2.svg'
+    })
+    expect(StartTurnRequest.safeParse({
+      prompt: 'Unsafe SVG',
+      guiDesignArtifact: {
+        kind: 'svg',
+        artifactId: 'motion',
+        relativePath: '../motion.svg'
+      }
+    }).success).toBe(false)
   })
 
   it('produces a deterministic empty usage snapshot', () => {
@@ -293,6 +438,41 @@ describe('contracts', () => {
 })
 
 describe('cli', () => {
+  it('uses full access for a genuinely new serve profile', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kun-fresh-serve-'))
+    try {
+      expect(parseServeOptions(['--data-dir', dir])).toMatchObject({
+        approvalPolicy: 'auto',
+        sandboxMode: 'danger-full-access',
+        approvalReviewer: 'user'
+      })
+      expect(validateServeOptions({ dataDir: dir })).toMatchObject({
+        approvalPolicy: 'auto',
+        sandboxMode: 'danger-full-access',
+        approvalReviewer: 'user'
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps compatibility defaults for an existing config that predates permission fields', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kun-legacy-serve-'))
+    try {
+      const configPath = join(dir, 'config.json')
+      await writeFile(configPath, JSON.stringify({
+        serve: { dataDir: join(dir, 'data'), model: 'legacy-model' }
+      }), 'utf8')
+      expect(parseServeOptions(['--config', configPath])).toMatchObject({
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write',
+        approvalReviewer: 'user'
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('parses serve options with the canonical flags', () => {
     const parsed = parseServeOptions([
       '--host',
@@ -309,14 +489,39 @@ describe('cli', () => {
       'auto',
       '--sandbox-mode',
       'workspace-write',
+      '--approval-reviewer',
+      'agent',
       '--token-economy',
       '--insecure'
     ])
     expect(parsed.host).toBe('127.0.0.1')
     expect(parsed.port).toBe(18787)
     expect(parsed.tokenEconomyMode).toBe(true)
+    expect(parsed.approvalReviewer).toBe('agent')
     expect(parsed.tokenEconomy?.enabled).toBe(true)
+    expect(parsed.toolOutputLimits).toEqual({
+      maxLines: DEFAULT_TOOL_OUTPUT_MAX_LINES,
+      maxBytes: DEFAULT_TOOL_OUTPUT_MAX_BYTES
+    })
     expect(parsed.insecure).toBe(true)
+  })
+
+  it('rejects insecure serve on a non-loopback host', () => {
+    expect(() => parseServeOptions([
+      '--data-dir', '/tmp/kun',
+      '--host', '0.0.0.0',
+      '--insecure'
+    ])).toThrow(/loopback host/)
+    expect(() => parseServeOptions([
+      '--data-dir', '/tmp/kun',
+      '--host', '127.evil.example',
+      '--insecure'
+    ])).toThrow(/loopback host/)
+    expect(() => parseServeOptions([
+      '--data-dir', '/tmp/kun',
+      '--host', 'localhost',
+      '--insecure'
+    ])).toThrow(/loopback host/)
   })
 
   it('parses flags in --key=value form', () => {
@@ -332,6 +537,130 @@ describe('cli', () => {
     expect(parsed.storage.backend).toBe('file')
   })
 
+  it('accepts the product-owned bundled extension directory from CLI or environment', () => {
+    expect(parseServeOptions([
+      '--data-dir=/srv/ca',
+      '--bundled-extensions-dir=/opt/kun/bundled-extensions'
+    ]).bundledExtensionsDir).toBe('/opt/kun/bundled-extensions')
+    expect(parseServeOptions(['--data-dir=/srv/ca'], {
+      KUN_BUNDLED_EXTENSIONS_DIR: '/Applications/Kun/resources/bundled-extensions'
+    }).bundledExtensionsDir).toBe('/Applications/Kun/resources/bundled-extensions')
+  })
+
+  it('enables sanitized observability from env and output flag', () => {
+    const parsed = parseServeOptions([
+      '--data-dir=/srv/ca',
+      '--observability-output=otel/spans.jsonl'
+    ], {
+      KUN_OBSERVABILITY: '1'
+    })
+    expect(parsed.observability).toEqual({
+      enabled: true,
+      outputPath: 'otel/spans.jsonl',
+      includeSensitiveContent: false
+    })
+  })
+
+  it('enables the OTLP HTTP JSON exporter from standard environment variables', () => {
+    const parsed = parseServeOptions(['--data-dir=/srv/ca'], {
+      OTEL_TRACES_EXPORTER: 'otlp',
+      OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example/otel',
+      OTEL_EXPORTER_OTLP_HEADERS: 'api-key=hello%20world',
+      OTEL_EXPORTER_OTLP_TIMEOUT: '2500'
+    })
+    expect(parsed.observability).toEqual({
+      enabled: true,
+      exporter: 'otlp-http-json',
+      endpoint: 'https://collector.example/otel/v1/traces',
+      headers: { 'api-key': 'hello world' },
+      timeoutMs: 2500,
+      includeSensitiveContent: false
+    })
+  })
+
+  it('treats empty trace-specific OTLP variables as unset and falls back to common values', () => {
+    const parsed = parseServeOptions(['--data-dir=/srv/ca'], {
+      OTEL_TRACES_EXPORTER: 'otlp',
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: ' ',
+      OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: '',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example/otel',
+      OTEL_EXPORTER_OTLP_TRACES_HEADERS: '   ',
+      OTEL_EXPORTER_OTLP_HEADERS: 'api-key=common',
+      OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '',
+      OTEL_EXPORTER_OTLP_TIMEOUT: '3000'
+    })
+
+    expect(parsed.observability).toEqual({
+      enabled: true,
+      exporter: 'otlp-http-json',
+      endpoint: 'https://collector.example/otel/v1/traces',
+      headers: { 'api-key': 'common' },
+      timeoutMs: 3000,
+      includeSensitiveContent: false
+    })
+  })
+
+  it('rejects non-HTTP observability endpoints', () => {
+    const base = parseServeOptions(['--data-dir=/srv/ca'])
+
+    expect(() => validateServeOptions({
+      ...base,
+      observability: {
+        enabled: true,
+        exporter: 'otlp-http-json',
+        endpoint: 'file:///tmp/traces'
+      }
+    })).toThrow()
+    expect(validateServeOptions({
+      ...base,
+      observability: {
+        enabled: true,
+        exporter: 'otlp-http-json',
+        endpoint: 'https://collector.example/v1/traces'
+      }
+    }).observability?.endpoint).toBe('https://collector.example/v1/traces')
+  })
+
+  it('applies CLI and standard OTLP environment precedence over config', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kun-observability-config-'))
+    try {
+      const configPath = join(dir, 'kun.config.json')
+      await writeFile(configPath, JSON.stringify({
+        serve: {
+          dataDir: join(dir, 'data'),
+          observability: {
+            enabled: false,
+            exporter: 'jsonl',
+            endpoint: 'https://config.example/v1/traces'
+          }
+        }
+      }))
+      const env = {
+        OTEL_TRACES_EXPORTER: 'otlp',
+        OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
+        OTEL_EXPORTER_OTLP_ENDPOINT: 'https://env.example/otel'
+      }
+
+      const standard = parseServeOptions(['--config', configPath], env)
+      expect(standard.observability).toMatchObject({
+        enabled: true,
+        exporter: 'otlp-http-json',
+        endpoint: 'https://env.example/otel/v1/traces'
+      })
+
+      const cli = parseServeOptions([
+        '--config', configPath,
+        '--observability',
+        '--observability-exporter=jsonl'
+      ], env)
+      expect(cli.observability).toMatchObject({ enabled: true, exporter: 'jsonl' })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   it('loads serve and context compaction settings from an explicit config file', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kun-config-'))
     try {
@@ -343,6 +672,7 @@ describe('cli', () => {
           dataDir: join(dir, 'data'),
           model: 'deepseek-v4-flash',
           approvalPolicy: 'auto',
+          approvalReviewer: 'agent',
           tokenEconomy: {
             enabled: true,
             compressToolDescriptions: false,
@@ -356,6 +686,10 @@ describe('cli', () => {
               maxToolArgumentStringTokens: 1000,
               maxArrayItems: 40
             }
+          },
+          toolOutputLimits: {
+            maxLines: 30000,
+            maxBytes: 1048576
           },
           storage: {
             backend: 'hybrid',
@@ -424,6 +758,7 @@ describe('cli', () => {
       expect(parsed.port).toBe(19091)
       expect(parsed.model).toBe('deepseek-v4-pro')
       expect(parsed.approvalPolicy).toBe('auto')
+      expect(parsed.approvalReviewer).toBe('agent')
       expect(parsed.tokenEconomyMode).toBe(true)
       expect(parsed.tokenEconomy).toMatchObject({
         enabled: true,
@@ -438,6 +773,10 @@ describe('cli', () => {
           maxToolArgumentStringTokens: 1000,
           maxArrayItems: 40
         }
+      })
+      expect(parsed.toolOutputLimits).toEqual({
+        maxLines: 30000,
+        maxBytes: 1048576
       })
       expect(parsed.storage).toEqual({
         backend: 'hybrid',
@@ -489,7 +828,8 @@ describe('cli', () => {
     expect(config.mcp.search.mode).toBe('auto')
     expect(config.web.enabled).toBe(false)
     expect(config.skills.enabled).toBe(false)
-    expect(config.subagents.maxParallel).toBe(0)
+    expect(config.subagents.useExistingAgents).toBe(true)
+    expect(config.subagents.maxParallel).toBe(256)
     expect(config.attachments.allowedMimeTypes).toContain('image/png')
     expect(config.attachments.textFallbackMaxBase64Bytes).toBe(512 * 1024)
     expect(config.attachments.textFallbackMaxImageDimension).toBe(1280)
@@ -512,6 +852,7 @@ describe('cli', () => {
 
     expect(config.subagents).toMatchObject({
       enabled: true,
+      useExistingAgents: true,
       maxParallel: 2,
       maxChildRuns: 4
     })
@@ -526,7 +867,12 @@ describe('cli', () => {
         maxChildRuns: 10,
         defaultProfile: 'reviewer',
         profiles: {
-          reviewer: { model: 'deepseek-v4-pro', promptPreamble: 'Review for bugs.', toolPolicy: 'readOnly' },
+          reviewer: {
+            model: 'deepseek-v4-pro',
+            providerId: 'deepseek',
+            promptPreamble: 'Review for bugs.',
+            toolPolicy: 'readOnly'
+          },
           fixer: { toolPolicy: 'inherit' },
           helper: {}
         }
@@ -546,6 +892,11 @@ describe('cli', () => {
     expect(() => KunCapabilitiesConfig.parse({
       subagents: { enabled: true, maxParallel: 1, maxChildRuns: 1, defaultProfile: 'ghost' }
     })).toThrow(/defaultProfile/)
+    for (const inheritedName of ['constructor', 'toString', '__proto__']) {
+      expect(KunCapabilitiesConfig.safeParse({
+        subagents: { enabled: true, maxParallel: 1, maxChildRuns: 1, defaultProfile: inheritedName }
+      }).success).toBe(false)
+    }
   })
 
   it('surfaces subagent profiles and policy in the runtime capability manifest', () => {
@@ -554,15 +905,23 @@ describe('cli', () => {
       config: KunCapabilitiesConfig.parse({
         subagents: {
           enabled: true,
+          useExistingAgents: false,
           maxParallel: 2,
           maxChildRuns: 6,
           defaultProfile: 'reviewer',
-          profiles: { reviewer: { model: 'deepseek-v4-pro', toolPolicy: 'readOnly' } }
+          profiles: {
+            reviewer: {
+              model: 'deepseek-v4-pro',
+              providerId: 'deepseek',
+              toolPolicy: 'readOnly'
+            }
+          }
         }
       }),
       subagents: { available: true }
     })
     expect(manifest.subagents).toMatchObject({
+      useExistingAgents: false,
       maxParallel: 2,
       maxChildRuns: 6,
       defaultToolPolicy: 'inherit',
@@ -669,7 +1028,12 @@ describe('cli', () => {
       await writeFile(join(dataDir, 'config.json'), JSON.stringify({
         serve: {
           baseUrl: 'https://example.invalid/v1',
-          model: 'deepseek-v4-flash'
+          model: 'deepseek-v4-flash',
+          retry: {
+            maxAttempts: 3,
+            initialDelayMs: 1000,
+            httpStatusCodes: [429]
+          }
         },
         contextCompaction: {
           defaultSoftThreshold: 12_345,
@@ -683,6 +1047,11 @@ describe('cli', () => {
       expect(parsed.dataDir).toBe(dataDir)
       expect(parsed.baseUrl).toBe('https://example.invalid/v1')
       expect(parsed.model).toBe('deepseek-v4-flash')
+      expect(parsed.retry).toEqual({
+        maxAttempts: 3,
+        initialDelayMs: 1000,
+        httpStatusCodes: [429]
+      })
       expect(parsed.approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
       expect(parsed.contextCompaction?.defaultHardThreshold).toBe(23_456)
     } finally {

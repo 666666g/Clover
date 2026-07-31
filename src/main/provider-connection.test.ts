@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AppSettingsV1 } from '../shared/app-settings'
-import { probeModelProvider, providerProbeHeaders } from './provider-connection'
+import { CHATGPT_SUBSCRIPTION_MODEL_IDS, GROK_SUBSCRIPTION_MODEL_IDS } from '../shared/app-settings'
+import { parseModelIds, probeModelProvider, providerProbeHeaders } from './provider-connection'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -32,6 +33,64 @@ describe('providerProbeHeaders', () => {
 })
 
 describe('probeModelProvider', () => {
+  it('validates ChatGPT subscription OAuth locally and returns its shared catalog', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await probeModelProvider({
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: JSON.stringify({
+        kind: 'codex-oauth',
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        accountId: 'account',
+        expiresAt: Date.now() + 60_000
+      }),
+      endpointFormat: 'responses'
+    })
+
+    expect(result).toEqual({ ok: true, latencyMs: 0, modelIds: [...CHATGPT_SUBSCRIPTION_MODEL_IDS] })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('validates Grok subscription OAuth locally and returns its shared catalog', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await probeModelProvider({
+      baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+      apiKey: JSON.stringify({
+        kind: 'grok-oauth',
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        // Outside the 5-minute early-invalidation window so probe does not refresh.
+        expiresAt: Date.now() + 60 * 60_000,
+        email: 'user@x.ai'
+      }),
+      endpointFormat: 'responses'
+    })
+
+    expect(result).toEqual({ ok: true, latencyMs: 0, modelIds: [...GROK_SUBSCRIPTION_MODEL_IDS] })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('does not treat a URL containing the Grok hostname as a subscription endpoint', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'remote-model' }] })))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await probeModelProvider({
+      baseUrl: 'https://attacker.example/cli-chat-proxy.grok.com/v1',
+      apiKey: JSON.stringify({
+        kind: 'grok-oauth',
+        accessToken: 'access',
+        refreshToken: 'refresh',
+        expiresAt: Date.now() + 60 * 60_000,
+        email: 'user@x.ai'
+      }),
+      endpointFormat: 'responses'
+    })
+
+    expect(result).toMatchObject({ ok: true, modelIds: ['remote-model'] })
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
   it('rejects non-http base urls without fetching', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
@@ -70,6 +129,73 @@ describe('probeModelProvider', () => {
       'https://api.example.com/v1/models',
       expect.objectContaining({ method: 'GET' })
     )
+  })
+
+  it('discovers Ollama Cloud models with bearer auth and preserves wire punctuation', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({
+        object: 'list',
+        data: [
+          { id: 'gpt-oss:120b' },
+          { id: 'qwen3.5:397b' },
+          { id: 'gpt-oss:120b' }
+        ]
+      }), { status: 200 })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await probeModelProvider({
+      baseUrl: 'https://ollama.com/v1',
+      apiKey: 'ollama-secret',
+      endpointFormat: 'chat_completions'
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      latencyMs: expect.any(Number),
+      modelIds: ['gpt-oss:120b', 'qwen3.5:397b']
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://ollama.com/v1/models',
+      expect.objectContaining({
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ollama-secret'
+        }
+      })
+    )
+  })
+
+  it('parses top-level arrays and provider-specific models envelopes without changing wire IDs', () => {
+    expect(parseModelIds(JSON.stringify([
+      { id: 'MiniMaxAI/MiniMax-M3' },
+      { id: 'model-b' },
+      { id: 'MiniMaxAI/MiniMax-M3' }
+    ]))).toEqual(['MiniMaxAI/MiniMax-M3', 'model-b'])
+    expect(parseModelIds(JSON.stringify({ models: [{ id: 'Provider/Model-A' }] }))).toEqual(['Provider/Model-A'])
+  })
+
+  it('rejects unbounded or nested model payloads instead of recursively scanning them', () => {
+    expect(parseModelIds(JSON.stringify({ response: { data: [{ id: 'hidden-model' }] } }))).toEqual([])
+    expect(parseModelIds('x'.repeat(2_000_001))).toEqual([])
+    expect(parseModelIds(JSON.stringify([{ id: 'x'.repeat(513) }, { id: 'ok' }]))).toEqual(['ok'])
+  })
+
+  it('fails clearly when the model list response exceeds the bounded body limit', async () => {
+    const fetchMock = vi.fn(async () => new Response('x'.repeat(2_000_001), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await probeModelProvider({
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-x',
+      endpointFormat: 'chat_completions'
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      message: 'Model list response exceeded the 2000000 byte limit.'
+    })
   })
 
   it('reports http errors with status and body excerpt', async () => {

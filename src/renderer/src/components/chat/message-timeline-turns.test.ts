@@ -29,16 +29,140 @@ describe('message timeline turns', () => {
     expect(sameTurnContent(first, second)).toBe(true)
   })
 
-  it('detects updates to a block inside an otherwise stable turn', () => {
-    const firstBlocks: ChatBlock[] = [
-      { kind: 'user', id: 'user_1', text: 'Hello' },
-      { kind: 'assistant', id: 'assistant_1', text: 'Hi' }
-    ]
-    const nextBlocks: ChatBlock[] = [
-      firstBlocks[0],
-      { kind: 'assistant', id: 'assistant_1', text: 'Hi again' }
+  it('keeps background shell notices inside the current turn instead of splitting it', () => {
+    const notice: ChatBlock = {
+      kind: 'user',
+      id: 'notice_1',
+      text: '<background_shell_completed><session_id>abcd1234</session_id><command>npm run build</command><exit_code>0</exit_code><output_preview>ok</output_preview><hint>read output</hint></background_shell_completed>',
+      meta: { displayText: 'Background shell abcd1234 completed', messageSource: 'background_shell' }
+    }
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user_1', text: 'Run build in background' },
+      { kind: 'assistant', id: 'assistant_1', text: 'Started.' },
+      notice,
+      { kind: 'assistant', id: 'assistant_2', text: 'Build finished.' }
     ]
 
-    expect(sameTurnContent(groupTurns(firstBlocks)[0], groupTurns(nextBlocks)[0])).toBe(false)
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.user?.id).toBe('user_1')
+    expect(turns[0]?.blocks.map((block) => block.id)).toEqual(['assistant_1', 'notice_1', 'assistant_2'])
+  })
+
+  it('detects background shell notices from client-inferred xml text', () => {
+    const notice: ChatBlock = {
+      kind: 'user',
+      id: 'notice_2',
+      text: '<background_shell_completed><session_id>abcd1234</session_id><command>npm run build</command><exit_code>0</exit_code><output_preview>ok</output_preview><hint>read output</hint></background_shell_completed>'
+    }
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user_1', text: 'Run build in background' },
+      notice
+    ]
+
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.user?.text).toBe('Run build in background')
+    expect(turns[0]?.blocks).toHaveLength(1)
+    expect(turns[0]?.blocks[0]?.id).toBe('notice_2')
+  })
+
+  it('keeps background subagent notices inside the current turn', () => {
+    const notice: ChatBlock = {
+      kind: 'user',
+      id: 'notice_subagent_1',
+      text: '<background_subagent_completed><child_id>child-1</child_id><label>后台休眠</label><status>completed</status><summary>done</summary></background_subagent_completed>',
+      meta: {
+        displayText: 'Background subagent 后台休眠 completed',
+        messageSource: 'background_subagent'
+      }
+    }
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user_1', text: 'Run one background subagent' },
+      { kind: 'assistant', id: 'assistant_1', text: 'Started.' },
+      notice,
+      { kind: 'assistant', id: 'assistant_2', text: 'Background finished.' }
+    ]
+
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.user?.id).toBe('user_1')
+    expect(turns[0]?.blocks.map((block) => block.id)).toEqual([
+      'assistant_1',
+      'notice_subagent_1',
+      'assistant_2'
+    ])
+  })
+
+  it('does not treat ordinary user prompts as background subagent notices', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user_1', text: 'Run one background subagent' },
+      { kind: 'assistant', id: 'assistant_1', text: 'Started.' },
+      { kind: 'user', id: 'user_2', text: 'Background subagent 后台休眠 completed' }
+    ]
+
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(2)
+    expect(turns[1]?.user?.id).toBe('user_2')
+  })
+
+  it('keeps internal Graph supervision prompts in the source turn without rendering them as work', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        turnId: 'turn_1',
+        text: 'Build the feature.'
+      },
+      {
+        kind: 'user',
+        id: 'graph_runtime_1',
+        turnId: 'turn_1',
+        text: 'Graph Lead supervision for durable run run_1.',
+        meta: { messageSource: 'graph_runtime' }
+      },
+      {
+        kind: 'assistant',
+        id: 'milestone_1',
+        turnId: 'turn_1',
+        text: 'The first node passed review.'
+      }
+    ]
+
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(1)
+    expect(turns[0]?.user?.id).toBe('user_1')
+    expect(turns[0]?.blocks.map((block) => block.id)).toEqual([
+      'graph_runtime_1',
+      'milestone_1'
+    ])
+  })
+
+  it('routes a delayed tool update back to its owning turn by turnId', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'user_1', turnId: 'turn_1', text: 'First' },
+      { kind: 'assistant', id: 'assistant_1', turnId: 'turn_1', text: 'Done first' },
+      { kind: 'user', id: 'user_2', turnId: 'turn_2', text: 'Second' },
+      { kind: 'assistant', id: 'assistant_2', turnId: 'turn_2', text: 'Done second' },
+      {
+        kind: 'tool',
+        id: 'tool_late',
+        turnId: 'turn_1',
+        summary: 'late update',
+        status: 'success'
+      }
+    ]
+
+    const turns = groupTurns(blocks)
+
+    expect(turns).toHaveLength(2)
+    expect(turns[0]?.turnId).toBe('turn_1')
+    expect(turns[0]?.blocks.map((block) => block.id)).toEqual(['assistant_1', 'tool_late'])
+    expect(turns[1]?.blocks.map((block) => block.id)).toEqual(['assistant_2'])
   })
 })

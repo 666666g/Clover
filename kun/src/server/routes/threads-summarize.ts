@@ -10,7 +10,8 @@ const SummarizeThreadRequest = z
   .object({
     /** Optional per-request model override (falls back to summary role precedence). */
     model: z.string().min(1).optional(),
-    providerId: z.string().min(1).optional()
+    providerId: z.string().min(1).optional(),
+    accountId: z.string().min(1).optional()
   })
   .optional()
 
@@ -55,9 +56,11 @@ export async function summarizeThread(
   const resolved = resolveRoleModel({
     roleModel: parsed.data?.model ?? runtime.roles?.summaryModel,
     roleProviderId: parsed.data?.providerId ?? runtime.roles?.summaryProviderId,
+    roleAccountId: parsed.data?.accountId ?? runtime.roles?.summaryAccountId,
     roles: runtime.roles,
     mainModel: thread.model || runtime.defaultModel,
-    mainProviderId: thread.providerId
+    mainProviderId: thread.providerId,
+    mainAccountId: thread.accountId
   })
   if (!resolved) return ERRORS.unavailable('no model is configured for session summary')
 
@@ -72,6 +75,7 @@ export async function summarizeThread(
       modelClient: runtime.modelClient,
       model: resolved.model,
       ...(resolved.providerId ? { providerId: resolved.providerId } : {}),
+      ...(resolved.accountId ? { accountId: resolved.accountId } : {}),
       ...(runtime.immutablePrefix?.systemPrompt ? { systemPrompt: runtime.immutablePrefix.systemPrompt } : {}),
       items,
       ...(runtime.roles?.summaryReasoningEffort

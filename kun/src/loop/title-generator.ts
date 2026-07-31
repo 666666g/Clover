@@ -26,21 +26,35 @@ const TITLE_SYSTEM_PROMPT = [
 export function resolveRoleModel(input: {
   roleModel?: string
   roleProviderId?: string
+  roleAccountId?: string
   roles?: RolesConfig
   mainModel?: string
   mainProviderId?: string
-}): { model: string; providerId?: string } | undefined {
+  mainAccountId?: string
+}): { model: string; providerId?: string; accountId?: string } | undefined {
   const role = trim(input.roleModel)
   if (role) {
-    return { model: role, ...(trim(input.roleProviderId) ? { providerId: trim(input.roleProviderId) } : {}) }
+    return {
+      model: role,
+      ...(trim(input.roleProviderId) ? { providerId: trim(input.roleProviderId) } : {}),
+      ...(trim(input.roleAccountId) ? { accountId: trim(input.roleAccountId) } : {})
+    }
   }
   const small = trim(input.roles?.smallModel)
   if (small) {
-    return { model: small, ...(trim(input.roles?.smallModelProviderId) ? { providerId: trim(input.roles?.smallModelProviderId) } : {}) }
+    return {
+      model: small,
+      ...(trim(input.roles?.smallModelProviderId) ? { providerId: trim(input.roles?.smallModelProviderId) } : {}),
+      ...(trim(input.roles?.smallModelAccountId) ? { accountId: trim(input.roles?.smallModelAccountId) } : {})
+    }
   }
   const main = trim(input.mainModel)
   if (main) {
-    return { model: main, ...(trim(input.mainProviderId) ? { providerId: trim(input.mainProviderId) } : {}) }
+    return {
+      model: main,
+      ...(trim(input.mainProviderId) ? { providerId: trim(input.mainProviderId) } : {}),
+      ...(trim(input.mainAccountId) ? { accountId: trim(input.mainAccountId) } : {})
+    }
   }
   return undefined
 }
@@ -59,11 +73,10 @@ export async function generateThreadTitle(input: {
   model: string
   /** Optional per-provider routing id. */
   providerId?: string
+  accountId?: string
   systemPrompt?: string
   /** First user message text (intent). Required for a meaningful title. */
   userText: string
-  /** First assistant reply text. Optional supporting context. */
-  assistantText?: string
   /** Reasoning depth for the title call. Invalid/missing => 'off'. */
   reasoningEffort?: string
   timeoutMs?: number
@@ -80,7 +93,7 @@ export async function generateThreadTitle(input: {
   input.abortSignal?.addEventListener('abort', onAbort, { once: true })
 
   try {
-    const promptText = buildTitlePrompt(userText, input.assistantText)
+    const promptText = buildTitlePrompt(userText)
     const requestItem: TurnItem = {
       id: `item_${input.turnId}_title_request`,
       turnId: input.turnId,
@@ -97,6 +110,7 @@ export async function generateThreadTitle(input: {
       turnId: `${input.turnId}_title`,
       model: input.model,
       ...(input.providerId ? { providerId: input.providerId } : {}),
+      ...(input.accountId ? { accountId: input.accountId } : {}),
       ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
       contextInstructions: [TITLE_SYSTEM_PROMPT],
       prefix: [],
@@ -123,14 +137,13 @@ export async function generateThreadTitle(input: {
   }
 }
 
-function buildTitlePrompt(userText: string, assistantText?: string): string {
-  const lines = ['User message:', clip(userText, MAX_TITLE_INPUT_CHARS)]
-  const assistant = trim(assistantText)
-  if (assistant) {
-    lines.push('', 'Assistant reply (for context only):', clip(assistant, 1_000))
-  }
-  lines.push('', `Title (single line, <= ${MAX_TITLE_CHARS} chars):`)
-  return lines.join('\n')
+function buildTitlePrompt(userText: string): string {
+  return [
+    'User message:',
+    clip(userText, MAX_TITLE_INPUT_CHARS),
+    '',
+    `Title (single line, <= ${MAX_TITLE_CHARS} chars):`
+  ].join('\n')
 }
 
 /** Strip quotes/markdown/leading "Title:" and clamp to the char cap. */

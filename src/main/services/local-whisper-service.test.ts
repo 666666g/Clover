@@ -1,8 +1,13 @@
 import { existsSync, statSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }))
+
+vi.mock('node:child_process', () => ({ spawn: spawnMock }))
 
 vi.mock('electron', () => ({
   app: {
@@ -13,7 +18,11 @@ vi.mock('electron', () => ({
 
 import { app } from 'electron'
 import { LOCAL_WHISPER_MODELS, LOCAL_WHISPER_SMALL_MODEL_ID, localWhisperModelById } from '../../shared/local-whisper'
-import { _internals, getLocalWhisperModelStatus } from './local-whisper-service'
+import {
+  _internals,
+  getLocalWhisperModelStatus,
+  shutdownLocalWhisperService
+} from './local-whisper-service'
 
 describe('local-whisper-service helpers', () => {
   let rootDir = ''
@@ -22,14 +31,20 @@ describe('local-whisper-service helpers', () => {
     rootDir = await mkdtemp(join(tmpdir(), 'kun-local-whisper-'))
     vi.mocked(app.getPath).mockReturnValue(rootDir)
     _internals.setLocalWhisperDownloadStateForTest(null)
+    _internals.resetShutdownForTest()
+    spawnMock.mockReset()
   })
 
   it('keeps checksum metadata for every downloadable model', () => {
     for (const model of LOCAL_WHISPER_MODELS) {
       expect(model.sha256).toMatch(/^[a-f0-9]{64}$/)
-      expect(model.downloadUrl).toContain('https://huggingface.co/')
-      expect(model.downloadMirrors.some((mirror) => mirror.downloadUrl.includes('https://hf-mirror.com/'))).toBe(true)
-      expect(model.downloadMirrors.some((mirror) => mirror.downloadUrl.includes('https://hf-cdn.sufy.com/'))).toBe(true)
+      expect(new URL(model.downloadUrl).origin).toBe('https://huggingface.co')
+      expect(model.downloadMirrors.some((mirror) => (
+        new URL(mirror.downloadUrl).origin === 'https://hf-mirror.com'
+      ))).toBe(true)
+      expect(model.downloadMirrors.some((mirror) => (
+        new URL(mirror.downloadUrl).origin === 'https://hf-cdn.sufy.com'
+      ))).toBe(true)
     }
   })
 
@@ -37,8 +52,10 @@ describe('local-whisper-service helpers', () => {
     const model = localWhisperModelById(LOCAL_WHISPER_SMALL_MODEL_ID)
 
     expect(_internals.localWhisperDownloadUrl(model, 'huggingface')).toBe(model.downloadUrl)
-    expect(_internals.localWhisperDownloadUrl(model, 'hf-mirror')).toContain('https://hf-mirror.com/')
-    expect(_internals.localWhisperDownloadUrl(model, 'hf-sufy')).toContain('https://hf-cdn.sufy.com/')
+    expect(new URL(_internals.localWhisperDownloadUrl(model, 'hf-mirror')).origin)
+      .toBe('https://hf-mirror.com')
+    expect(new URL(_internals.localWhisperDownloadUrl(model, 'hf-sufy')).origin)
+      .toBe('https://hf-cdn.sufy.com')
   })
 
   it('bundles Whisper runners for supported desktop platforms', () => {
@@ -83,5 +100,29 @@ describe('local-whisper-service helpers', () => {
 
     expect(status.state).toBe('ready')
     expect(status.path).toBe(path)
+  })
+
+  it('kills and awaits an active Whisper runner during shutdown', async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter
+      stderr: EventEmitter
+      kill: ReturnType<typeof vi.fn>
+    }
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = vi.fn((signal: string) => {
+      queueMicrotask(() => child.emit('exit', null, signal))
+      return true
+    })
+    spawnMock.mockReturnValue(child)
+
+    const run = _internals.runWhisper('whisper-cli', [], 60_000)
+    const rejected = expect(run).rejects.toThrow('local Whisper exited with code null')
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1))
+
+    await shutdownLocalWhisperService()
+
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL')
+    await rejected
   })
 })

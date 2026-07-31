@@ -2,8 +2,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_CONVERSATION_WORKSPACE_ROOT,
   defaultConversationWorkspaceRoot,
-  isConversationWorkspacePath
+  isConversationWorkspacePath,
+  isInternalDeepSeekGuiWorkspace,
+  workspaceRootScopeKey
 } from './workspace-path'
+
+describe('workspaceRootScopeKey', () => {
+  it('normalizes separators and trailing slashes without merging case-sensitive roots', () => {
+    expect(workspaceRootScopeKey('/workspace/project///')).toBe('/workspace/project')
+    expect(workspaceRootScopeKey('C:\\workspace\\project\\')).toBe('C:/workspace/project')
+    expect(workspaceRootScopeKey('/workspace/Project')).not.toBe(workspaceRootScopeKey('/workspace/project'))
+    expect(workspaceRootScopeKey('/')).toBe('/')
+  })
+})
 
 describe('defaultConversationWorkspaceRoot', () => {
   afterEach(() => {
@@ -28,6 +39,15 @@ describe('defaultConversationWorkspaceRoot', () => {
   it('DEFAULT_CONVERSATION_WORKSPACE_ROOT resolves at import time from the platform', () => {
     expect(typeof DEFAULT_CONVERSATION_WORKSPACE_ROOT).toBe('string')
     expect(DEFAULT_CONVERSATION_WORKSPACE_ROOT.length).toBeGreaterThan(0)
+  })
+})
+
+describe('isInternalDeepSeekGuiWorkspace', () => {
+  it('treats write and design workspaces as internal GUI workspaces', () => {
+    expect(isInternalDeepSeekGuiWorkspace('/Users/alice/.kun/write_workspace')).toBe(true)
+    expect(isInternalDeepSeekGuiWorkspace('/Users/alice/.kun/design-workspace')).toBe(true)
+    expect(isInternalDeepSeekGuiWorkspace('~/.kun/design-workspace')).toBe(true)
+    expect(isInternalDeepSeekGuiWorkspace('/Users/alice/projects/design-workspace')).toBe(false)
   })
 })
 

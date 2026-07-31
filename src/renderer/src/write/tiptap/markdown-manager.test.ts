@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
+import { getSchema } from '@tiptap/core'
+import { EditorState, TextSelection } from '@tiptap/pm/state'
 import {
+  WRITE_BACKTICK_FENCE_INPUT_REGEX,
   WRITE_RICH_MAX_CHARS,
   auditWriteMarkdownFidelity,
+  buildWriteRichExtensions,
+  closeWriteRichCodeFence,
   parseWriteMarkdown,
   serializeWriteMarkdown
 } from './markdown-manager'
@@ -46,11 +51,64 @@ describe('write markdown round-trip', () => {
     expect(firstPass).toContain('![架构图](images/arch.png)')
   })
 
+  it('parses dash and asterisk bullets as rich list nodes', () => {
+    const doc = parseWriteMarkdown('- Dash item\n- Second item\n\n* Star item\n')
+    const bulletLists = doc.content?.filter((node) => node.type === 'bulletList') ?? []
+
+    expect(bulletLists).toHaveLength(2)
+    expect(bulletLists.every((list) =>
+      list.content?.every((item) => item.type === 'listItem') === true
+    )).toBe(true)
+  })
+
   it('keeps pending infographic tokens intact across the round trip', () => {
     const token = '![信息图](kun-pending-infographic://0a1b2c3d-e4f5-6789-abcd-ef0123456789)'
     const doc = `第一段。\n\n${token}\n\n第二段。\n`
     const firstPass = serializeWriteMarkdown(parseWriteMarkdown(doc))
     expect(firstPass).toContain(token)
+  })
+
+  it('parses four-backtick fenced Markdown as a code block', () => {
+    const doc = parseWriteMarkdown('````ts\nconst value = 1\n````\n')
+    expect(doc.content?.[0]).toMatchObject({
+      type: 'codeBlock',
+      attrs: { language: 'ts' },
+      content: [{ type: 'text', text: 'const value = 1' }]
+    })
+  })
+
+  it('matches typed three-or-longer backtick fences and preserves their length', () => {
+    expect('````ts '.match(WRITE_BACKTICK_FENCE_INPUT_REGEX)?.slice(1)).toEqual(['````', 'ts'])
+    expect('`````\n'.match(WRITE_BACKTICK_FENCE_INPUT_REGEX)?.[1]).toBe('`````')
+    expect('``` '.match(WRITE_BACKTICK_FENCE_INPUT_REGEX)?.[1]).toBe('```')
+  })
+
+  it('serializes a safe longer fence when code contains triple backticks', () => {
+    const source = '````\nconst marker = "```"\n````\n'
+    expect(serializeWriteMarkdown(parseWriteMarkdown(source))).toContain('````\nconst marker = "```"\n````')
+  })
+
+  it('closes a typed four-backtick code block into a following paragraph', () => {
+    const schema = getSchema(buildWriteRichExtensions())
+    const codeBlock = schema.nodes.codeBlock.create(
+      { language: 'ts', writeFenceLength: 4 },
+      schema.text('const value = 1\n```')
+    )
+    const doc = schema.nodes.doc.create(null, [codeBlock])
+    const cursor = codeBlock.nodeSize - 1
+    const state = EditorState.create({
+      doc,
+      selection: TextSelection.create(doc, cursor)
+    })
+
+    const tr = closeWriteRichCodeFence(state, cursor, cursor, '`')
+    expect(tr).not.toBeNull()
+    const next = state.apply(tr!)
+    expect(next.doc.childCount).toBe(2)
+    expect(next.doc.child(0).type.name).toBe('codeBlock')
+    expect(next.doc.child(0).textContent).toBe('const value = 1')
+    expect(next.doc.child(1).type.name).toBe('paragraph')
+    expect(next.selection.$from.parent.type.name).toBe('paragraph')
   })
 })
 

@@ -5,11 +5,18 @@ import type {
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import type { CapabilityToolProvider } from './capability-registry.js'
 import { LocalToolHost, type LocalTool } from './local-tool-host.js'
+import {
+  VirtualToolCatalog,
+  type FrozenToolCatalogView,
+  type VirtualToolEntry
+} from './virtual-tool-catalog.js'
 
 const MCP_SEARCH_TOOL_NAME = 'mcp_search'
 const MCP_DESCRIBE_TOOL_NAME = 'mcp_describe'
 const MCP_CALL_TOOL_NAME = 'mcp_call'
+const MCP_READ_ONLY_CALL_TOOL_NAME = 'mcp_read_only_call'
 const MCP_REFRESH_CATALOG_TOOL_NAME = 'mcp_refresh_catalog'
+const MAX_FROZEN_MCP_CATALOGS = 256
 
 const STOP_WORDS = new Set([
   'the',
@@ -121,6 +128,11 @@ export type McpSearchProviderOptions = {
   isServerAvailable: (server: McpServerConfig, workspace: string) => boolean
 }
 
+type McpVirtualCatalogRuntime = {
+  live: VirtualToolCatalog<McpSearchCatalogRecord>
+  frozenByTurn: Map<string, FrozenToolCatalogView<McpSearchCatalogRecord>>
+}
+
 type IndexedTool = {
   record: McpSearchCatalogRecord
   tokens: string[]
@@ -151,12 +163,16 @@ type SearchResult = {
 export function createMcpSearchProvider(
   options: McpSearchProviderOptions
 ): CapabilityToolProvider {
+  const catalog: McpVirtualCatalogRuntime = {
+    live: new VirtualToolCatalog(toVirtualCatalogEntries(options.state.records)),
+    frozenByTurn: new Map()
+  }
   return {
     id: 'mcp:search',
     kind: 'mcp',
     enabled: true,
     available: true,
-    tools: createMcpSearchTools(options)
+    tools: createMcpSearchTools(options, catalog)
   }
 }
 
@@ -212,7 +228,10 @@ export function tokenizeMcpSearchText(text = ''): string[] {
   return tokens
 }
 
-function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
+function createMcpSearchTools(
+  options: McpSearchProviderOptions,
+  catalog: McpVirtualCatalogRuntime
+): LocalTool[] {
   return [
     LocalToolHost.defineTool({
       name: MCP_SEARCH_TOOL_NAME,
@@ -227,19 +246,23 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         required: ['query']
       },
       policy: 'auto',
+      sideEffect: 'read-only',
       execute: async (args, context) => {
         const query = stringArg(args.query)
         if (!query) return { output: { error: 'query is required' }, isError: true }
         const serverId = stringArg(args.serverId)
         const topK = clampPositiveInt(numberArg(args.topK), options.config.topKDefault, options.config.topKMax)
-        const records = availableRecords(options, context)
+        const view = frozenMcpCatalogView(options, catalog, context)
+        const records = availableRecords(options, view, context)
           .filter((record) => !serverId || record.serverId === serverId)
         const results = searchRecords(records, query, topK, options.config)
         return {
           output: {
             query,
-            totalIndexed: options.state.records.length,
+            totalIndexed: view.size(),
             searchedTools: records.length,
+            catalogVersion: view.frozenVersion,
+            catalogUpdatePending: view.pendingUpdate(),
             results: results.map(formatSearchResult)
           }
         }
@@ -251,16 +274,57 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
       inputSchema: {
         type: 'object',
         properties: {
-          toolId: { type: 'string', description: 'Canonical MCP tool id in the form serverId/toolName.' }
+          toolId: { type: 'string', description: 'Canonical MCP tool id in the form mcp_<server>_<tool>.' }
         },
         required: ['toolId']
       },
       policy: 'auto',
+      sideEffect: 'read-only',
       execute: async (args, context) => {
         const toolId = stringArg(args.toolId)
-        const record = resolveAvailableRecord(options, context, toolId)
+        const record = resolveAvailableRecord(options, catalog, context, toolId)
         if (!record) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
         return { output: describeRecord(record) }
+      }
+    }),
+    LocalToolHost.defineTool({
+      name: MCP_READ_ONLY_CALL_TOOL_NAME,
+      description: 'Call a host-approved read-only MCP tool by canonical tool id. Available in Plan mode; rejects tools not listed in the server planModeReadOnlyTools configuration.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          toolId: { type: 'string', description: 'Canonical MCP tool id in the form mcp_<server>_<tool>.' },
+          arguments: { type: 'object', description: 'Arguments matching the MCP tool input schema.' }
+        },
+        required: ['toolId', 'arguments']
+      },
+      policy: 'on-request',
+      sideEffect: 'read-only',
+      toolKind: 'command_execution',
+      execute: async (args, context) => {
+        const toolId = stringArg(args.toolId)
+        const record = resolveAvailableRecord(options, catalog, context, toolId)
+        if (!record) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
+        if (!record.server.planModeReadOnlyTools?.includes(record.descriptor.name)) {
+          return {
+            output: { error: `MCP tool ${record.toolId} is not host-approved as read-only` },
+            isError: true
+          }
+        }
+        const callArgs = objectArg(args.arguments)
+        const result = await record.client.callTool(
+          { name: record.descriptor.name, arguments: callArgs },
+          { signal: context.abortSignal, timeout: record.server.timeoutMs }
+        )
+        return {
+          output: {
+            serverId: record.serverId,
+            toolName: record.descriptor.name,
+            toolId: record.toolId,
+            result
+          },
+          isError: typeof result === 'object' && result !== null && (result as { isError?: boolean }).isError === true
+        }
       }
     }),
     LocalToolHost.defineTool({
@@ -269,15 +333,16 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
       inputSchema: {
         type: 'object',
         properties: {
-          toolId: { type: 'string', description: 'Canonical MCP tool id in the form serverId/toolName.' },
+          toolId: { type: 'string', description: 'Canonical MCP tool id in the form mcp_<server>_<tool>.' },
           arguments: { type: 'object', description: 'Arguments matching the MCP tool input schema.' }
         },
         required: ['toolId', 'arguments']
       },
       policy: 'on-request',
+      toolKind: 'command_execution',
       execute: async (args, context) => {
         const toolId = stringArg(args.toolId)
-        const record = resolveAvailableRecord(options, context, toolId)
+        const record = resolveAvailableRecord(options, catalog, context, toolId)
         if (!record) return { output: { error: `unknown MCP tool: ${toolId}` }, isError: true }
         const callArgs = objectArg(args.arguments)
         const result = await record.client.callTool(
@@ -302,15 +367,28 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
         type: 'object',
         properties: {}
       },
-      policy: 'auto',
-      execute: async () => {
+      // Refreshing invokes every connected MCP server, so it is an external
+      // command boundary just like mcp_call rather than a local index read.
+      policy: 'on-request',
+      toolKind: 'command_execution',
+      // A child turn can explicitly block individual MCP servers. A catalog
+      // refresh is global state and cannot safely refresh only a subset, so do
+      // not let such a turn contact any MCP server through this back door.
+      shouldAdvertise: (context) => !context.blockedProviderIds?.some((id) => id.startsWith('mcp:')),
+      execute: async (_args, context) => {
+        const visible = frozenMcpCatalogView(options, catalog, context)
         const records = await options.refreshCatalog()
+        options.state.records = records
+        catalog.live.replaceAll(toVirtualCatalogEntries(records))
         return {
           output: {
             refreshedAt: options.state.lastRefreshedAt,
             totalIndexed: records.length,
             catalogFingerprint: options.state.catalogFingerprint,
-            catalogDrift: options.state.catalogDrift === true
+            catalogDrift: options.state.catalogDrift === true,
+            visibleCatalogVersion: visible.frozenVersion,
+            catalogVersion: catalog.live.currentVersion(),
+            catalogUpdatePending: visible.pendingUpdate()
           }
         }
       }
@@ -318,9 +396,13 @@ function createMcpSearchTools(options: McpSearchProviderOptions): LocalTool[] {
   ]
 }
 
-function availableRecords(options: McpSearchProviderOptions, context: ToolHostContext): McpSearchCatalogRecord[] {
+function availableRecords(
+  options: McpSearchProviderOptions,
+  view: FrozenToolCatalogView<McpSearchCatalogRecord>,
+  context: ToolHostContext
+): McpSearchCatalogRecord[] {
   const blocked = context.blockedProviderIds
-  return options.state.records.filter((record) =>
+  return view.list().flatMap((entry) => entry.value ? [entry.value] : []).filter((record) =>
     options.isServerAvailable(record.server, context.workspace)
     // Honor the per-turn provider deny-list (e.g. a subagent's blockedMcpServers).
     // In search mode the per-server `mcp:<id>` provider is never registered, so
@@ -333,11 +415,53 @@ function availableRecords(options: McpSearchProviderOptions, context: ToolHostCo
 
 function resolveAvailableRecord(
   options: McpSearchProviderOptions,
+  catalog: McpVirtualCatalogRuntime,
   context: ToolHostContext,
   toolId: string
 ): McpSearchCatalogRecord | undefined {
   if (!toolId) return undefined
-  return availableRecords(options, context).find((record) => record.toolId === toolId)
+  const view = frozenMcpCatalogView(options, catalog, context)
+  return availableRecords(options, view, context).find((record) => record.toolId === toolId)
+}
+
+function frozenMcpCatalogView(
+  options: McpSearchProviderOptions,
+  catalog: McpVirtualCatalogRuntime,
+  context: ToolHostContext
+): FrozenToolCatalogView<McpSearchCatalogRecord> {
+  catalog.live.replaceAll(toVirtualCatalogEntries(options.state.records))
+  const key = JSON.stringify([context.threadId, context.turnId])
+  const existing = catalog.frozenByTurn.get(key)
+  if (existing) return existing
+  const frozen = catalog.live.freeze()
+  catalog.frozenByTurn.set(key, frozen)
+  if (catalog.frozenByTurn.size > MAX_FROZEN_MCP_CATALOGS) {
+    const oldest = catalog.frozenByTurn.keys().next().value
+    if (oldest !== undefined) catalog.frozenByTurn.delete(oldest)
+  }
+  return frozen
+}
+
+function toVirtualCatalogEntries(
+  records: McpSearchCatalogRecord[]
+): VirtualToolEntry<McpSearchCatalogRecord>[] {
+  return records.map((record) => ({
+    id: record.toolId,
+    name: record.descriptor.name,
+    kind: 'mcp',
+    description: record.descriptor.description ?? '',
+    inputSchema: record.descriptor.inputSchema ?? { type: 'object' },
+    keywords: [record.serverId, record.normalizedName],
+    metadata: {
+      outputSchema: record.descriptor.outputSchema,
+      annotations: record.descriptor.annotations,
+      execution: record.descriptor.execution,
+      icons: record.descriptor.icons,
+      meta: record.descriptor._meta,
+      policy: record.policy
+    },
+    value: record
+  }))
 }
 
 function searchRecords(

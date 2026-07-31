@@ -36,4 +36,21 @@ describe('OutputAccumulator', () => {
 
     expect(output.snapshot().content).toBe('测试')
   })
+
+  it('keeps only a bounded preview when full-output persistence is disabled', () => {
+    const output = new OutputAccumulator({
+      maxLines: 2,
+      maxBytes: 16,
+      tempFilePrefix: 'kun-output-test',
+      persistFullOutput: false
+    })
+
+    output.append(Buffer.from('x'.repeat(1_024), 'utf8'))
+    output.finish()
+
+    const snapshot = output.snapshot({ persistIfTruncated: true })
+    expect(snapshot.truncation.truncated).toBe(true)
+    expect(snapshot.fullOutputPath).toBeUndefined()
+    expect(Buffer.byteLength(snapshot.content, 'utf8')).toBeLessThanOrEqual(16)
+  })
 })

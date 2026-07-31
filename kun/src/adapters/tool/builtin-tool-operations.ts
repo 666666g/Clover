@@ -1,6 +1,5 @@
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type {
@@ -19,11 +18,9 @@ import {
   DEFAULT_IMAGE_MAX_DIMENSION
 } from './builtin-tool-types.js'
 import {
+  createShellCommandRunner,
   detectImageMimeType,
   resolveExecutable,
-  shellCommandArgs,
-  shellRuntimeInfo,
-  shellSpawnEnv,
   spawnCapture,
   terminateSpawnTree,
   waitForSpawnExit
@@ -132,16 +129,16 @@ export const defaultReadLocalToolOperations: ReadLocalToolOperations = {
 }
 
 export function createLocalBashOperations(): BashLocalToolOperations {
+  const shellRunner = createShellCommandRunner()
   return {
     exec: async (command, cwd, options) => {
-      const { shell, args, name } = shellRuntimeInfo()
-      const child = spawn(shell, shellCommandArgs({ shell, args }, command), {
+      const started = await shellRunner.spawn(command, {
         cwd,
-        env: shellSpawnEnv(),
         detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true
       })
+      const child = started.child
       let timedOut = false
       const kill = () => terminateSpawnTree(child)
       const timer = setTimeout(() => {
@@ -162,7 +159,7 @@ export function createLocalBashOperations(): BashLocalToolOperations {
       })
       if (options.signal.aborted) throw new Error('command aborted')
       if (timedOut) throw new Error(`command timed out after ${options.timeoutSeconds} seconds`)
-      return { exitCode, shell: name }
+      return { exitCode, shell: started.runtime.name }
     }
   }
 }

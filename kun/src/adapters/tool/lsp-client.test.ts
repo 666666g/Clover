@@ -1,14 +1,25 @@
 import { EventEmitter } from 'node:events'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { accessMock, spawnMock } = vi.hoisted(() => ({
+const { accessMock, existsSyncMock, spawnMock } = vi.hoisted(() => ({
   accessMock: vi.fn(),
+  existsSyncMock: vi.fn(),
   spawnMock: vi.fn()
 }))
 
 vi.mock('node:child_process', () => ({
   spawn: spawnMock
 }))
+
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs')
+  return {
+    ...actual,
+    existsSync: existsSyncMock
+  }
+})
 
 vi.mock('node:fs/promises', async () => {
   const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
@@ -59,17 +70,39 @@ function emitJsonRpc(proc: MockProcess, message: Record<string, unknown>): void 
   proc.stdout.emit('data', Buffer.from(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`, 'utf8'))
 }
 
+beforeEach(() => {
+  existsSyncMock.mockReturnValue(false)
+})
+
 afterEach(() => {
   shutdownAllLspSessions()
   spawnMock.mockReset()
   accessMock.mockReset()
+  existsSyncMock.mockReset()
   vi.restoreAllMocks()
   vi.useRealTimers()
 })
 
 describe('resolveServerCommand', () => {
+  it('prefers the TypeScript language server bundled under Kun', async () => {
+    existsSyncMock.mockReturnValue(true)
+
+    const resolved = await resolveServerCommand('/workspace', 'typescript')
+
+    expect(resolved).toEqual({
+      command: process.execPath,
+      args: [
+        expect.stringMatching(
+          /kun[\\/]node_modules[\\/]typescript-language-server[\\/]lib[\\/]cli\.mjs$/
+        ),
+        '--stdio'
+      ],
+      env: { ELECTRON_RUN_AS_NODE: '1' }
+    })
+    expect(spawnMock).not.toHaveBeenCalled()
+  })
+
   it('uses where on Windows when looking up a server on PATH', async () => {
-    accessMock.mockRejectedValueOnce(new Error('missing local install'))
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
 
     spawnMock.mockImplementation((command: string, args: string[]) => {
@@ -87,6 +120,42 @@ describe('resolveServerCommand', () => {
       command: 'typescript-language-server',
       args: ['--stdio']
     })
+    expect(accessMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('bundled LSP process', () => {
+  it('launches the bundled server with Electron Node mode preserved', async () => {
+    existsSyncMock.mockReturnValue(true)
+    let spawnOptions: { env?: NodeJS.ProcessEnv } | undefined
+
+    spawnMock.mockImplementation(
+      (command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+        expect(command).toBe(process.execPath)
+        expect(args).toEqual([
+          expect.stringMatching(
+            /kun[\\/]node_modules[\\/]typescript-language-server[\\/]lib[\\/]cli\.mjs$/
+          ),
+          '--stdio'
+        ])
+        spawnOptions = options
+        return createMockProcess((chunk, proc) => {
+          const request = parseJsonRpc(chunk)
+          if (request.method === 'initialize') {
+            queueMicrotask(() => emitJsonRpc(proc, {
+              jsonrpc: '2.0',
+              id: request.id,
+              result: {}
+            }))
+          }
+        })
+      }
+    )
+
+    const session = await acquireLspSession('/workspace/bundled', 'typescript')
+
+    expect(spawnOptions?.env).toMatchObject({ ELECTRON_RUN_AS_NODE: '1' })
+    releaseLspSession('/workspace/bundled', 'typescript')
   })
 })
 
@@ -149,6 +218,38 @@ describe('LSP session cooldown', () => {
     expect(session.serverKey).toBe('typescript')
     expect(serverProcesses).toHaveLength(2)
     releaseLspSession('/workspace/cooldown', 'typescript')
+  })
+})
+
+describe('LSP shutdown', () => {
+  it('terminates a language server even while initialization is pending', async () => {
+    accessMock.mockRejectedValue(new Error('missing local install'))
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
+    let serverProcess: MockProcess | undefined
+
+    spawnMock.mockImplementation((command: string) => {
+      if (command === 'which') {
+        const proc = createMockProcess()
+        queueMicrotask(() => {
+          proc.stdout.emit('data', Buffer.from('/usr/local/bin/typescript-language-server\n', 'utf8'))
+          proc.emit('close', 0)
+        })
+        return proc
+      }
+      if (command === 'typescript-language-server') {
+        serverProcess = createMockProcess()
+        return serverProcess
+      }
+      throw new Error(`Unexpected spawn: ${command}`)
+    })
+
+    const acquiring = acquireLspSession('/workspace/shutdown', 'typescript')
+    await vi.waitFor(() => expect(serverProcess?.stdin.write).toHaveBeenCalledTimes(1))
+
+    shutdownAllLspSessions()
+
+    expect(serverProcess?.kill).toHaveBeenCalledWith('SIGTERM')
+    await expect(acquiring).rejects.toThrow('LSP session closed')
   })
 })
 
@@ -241,24 +342,27 @@ describe('LSP notifications', () => {
       throw new Error(`Unexpected spawn: ${command}`)
     })
 
-    const session = await acquireLspSession('/workspace/diagnostics', 'typescript')
+    const workspaceRoot = resolve('/workspace/diagnostics')
+    const filePath = join(workspaceRoot, 'app.ts')
+    const fileUri = pathToFileURL(filePath).href
+    const session = await acquireLspSession(workspaceRoot, 'typescript')
     emitJsonRpc(serverProcess as MockProcess, {
       jsonrpc: '2.0',
       method: 'textDocument/publishDiagnostics',
       params: {
-        uri: 'file:///workspace/diagnostics/app.ts',
+        uri: fileUri,
         diagnostics: [{ message: 'boom', severity: 1 }]
       }
     })
 
-    expect(session.diagnostics.get('file:///workspace/diagnostics/app.ts')).toEqual([
+    expect(session.diagnostics.get(fileUri)).toEqual([
       { message: 'boom', severity: 1 }
     ])
-    await expect(lspGetDiagnostics(session, '/workspace/diagnostics/app.ts')).resolves.toEqual({
+    await expect(lspGetDiagnostics(session, filePath)).resolves.toEqual({
       diagnostics: [{ message: 'boom', severity: 1 }],
       source: 'publishDiagnostics-cache'
     })
-    releaseLspSession('/workspace/diagnostics', 'typescript')
+    releaseLspSession(workspaceRoot, 'typescript')
   })
 
   it('logs server messages from window/logMessage notifications', async () => {

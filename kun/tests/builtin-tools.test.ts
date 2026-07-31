@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LocalToolHost, defaultLocalTools } from '../src/adapters/tool/local-tool-host.js'
 import {
   allBuiltinToolNames,
@@ -43,6 +43,7 @@ import {
   createLsTool,
   createLsToolDefinition
 } from '../src/adapters/tool/builtin-tools.js'
+import { createBackgroundShellTool } from '../src/adapters/tool/background-shell-tool.js'
 import { createReadTool as createReadToolFromModule } from '../src/adapters/tool/read.js'
 import { createBashTool as createBashToolFromModule } from '../src/adapters/tool/bash.js'
 import { createEditTool as createEditToolFromModule } from '../src/adapters/tool/edit.js'
@@ -52,9 +53,10 @@ import { createLsTool as createLsToolFromModule } from '../src/adapters/tool/ls.
 import { createWriteTool as createWriteToolFromModule } from '../src/adapters/tool/write.js'
 import { computeEditDiff } from '../src/adapters/tool/edit-diff.js'
 import { withFileMutationQueue } from '../src/adapters/tool/file-mutation-queue.js'
-import { DEFAULT_MAX_BYTES } from '../src/adapters/tool/truncate.js'
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from '../src/adapters/tool/truncate.js'
+import { BackgroundShellOutputWriter } from '../src/services/background-shell-output.js'
 import type { TurnItem } from '../src/contracts/items.js'
-import type { FsStats } from '../src/adapters/tool/builtin-tool-types.js'
+import { DEFAULT_BASH_TIMEOUT_SECONDS, type FsStats } from '../src/adapters/tool/builtin-tool-types.js'
 import type { ToolHostContext } from '../src/ports/tool-host.js'
 
 function buildContext(workspace: string, overrides: Partial<ToolHostContext> = {}): ToolHostContext {
@@ -63,6 +65,9 @@ function buildContext(workspace: string, overrides: Partial<ToolHostContext> = {
     turnId: 'turn_1',
     workspace,
     approvalPolicy: 'on-request',
+    // These tests exercise the full builtin family; product defaults are
+    // intentionally safer and are covered by policy/settings tests.
+    sandboxMode: 'danger-full-access',
     abortSignal: new AbortController().signal,
     awaitApproval: async () => 'allow',
     ...overrides
@@ -92,21 +97,39 @@ async function executeTool(
 
 describe('Kun built-in tools', () => {
   let workspace: string
+  let backgroundShellDataDir: string
   let host: LocalToolHost
+
+  function createBackgroundBashLocalTool(
+    options: Parameters<typeof createBashLocalTool>[0] = {}
+  ): ReturnType<typeof createBashLocalTool> {
+    return createBashLocalTool({
+      ...options,
+      backgroundShellDataDir
+    })
+  }
 
   beforeEach(async () => {
     workspace = await mkdtemp(join(tmpdir(), 'kun-tools-'))
+    backgroundShellDataDir = await mkdtemp(join(tmpdir(), 'kun-bg-shell-data-'))
     host = new LocalToolHost({ tools: defaultLocalTools })
   })
 
   afterEach(async () => {
     await rm(workspace, { recursive: true, force: true })
+    await rm(backgroundShellDataDir, { recursive: true, force: true })
   })
 
   it('advertises the pi-style built-in tool family by default', async () => {
     const tools = await host.listTools(buildContext(workspace))
     const toolNames = new Set(tools.map((tool) => tool.name))
-    expect([...allBuiltinToolNames].every((name) => toolNames.has(name))).toBe(true)
+    expect([...allBuiltinToolNames].filter((name) => name !== 'find').every((name) => toolNames.has(name))).toBe(true)
+    expect(toolNames).not.toContain('find')
+  })
+
+  it('uses 500kb and 20000 lines as the default tool output caps', () => {
+    expect(DEFAULT_MAX_BYTES).toBe(500 * 1024)
+    expect(DEFAULT_MAX_LINES).toBe(20_000)
   })
 
   it('converts a throwing tool execute into an error tool result instead of failing the turn', async () => {
@@ -161,18 +184,28 @@ describe('Kun built-in tools', () => {
     const tools = await host.listTools(buildContext(workspace, { sandboxMode: 'read-only' }))
     const names = tools.map((tool) => tool.name)
 
-    expect(names).toEqual(expect.arrayContaining(['read', 'grep', 'find', 'ls']))
+    expect(names).toEqual(expect.arrayContaining(['read', 'grep', 'glob', 'ls']))
+    expect(names).not.toContain('find')
     expect(names).not.toContain('bash')
+    expect(names).not.toContain('lsp')
     expect(names).not.toContain('edit')
     expect(names).not.toContain('write')
   })
 
-  it('allows file tools but hides host shell commands in workspace-write sandbox mode', async () => {
+  it('advertises approved shell tools but keeps other process tools hidden in workspace-write', async () => {
     const tools = await host.listTools(buildContext(workspace, { sandboxMode: 'workspace-write' }))
     const names = tools.map((tool) => tool.name)
 
-    expect(names).toEqual(expect.arrayContaining(['read', 'grep', 'find', 'ls', 'edit', 'write']))
-    expect(names).not.toContain('bash')
+    expect(names).toEqual(expect.arrayContaining([
+      'read',
+      'grep',
+      'glob',
+      'ls',
+      'edit',
+      'write',
+      'bash'
+    ]))
+    expect(names).not.toContain('lsp')
   })
 
   it('blocks direct file writes in read-only sandbox mode', async () => {
@@ -249,27 +282,53 @@ describe('Kun built-in tools', () => {
     const output = result.item.kind === 'tool_result'
       ? result.item.output as { hint?: string }
       : {}
-    expect(String(output.hint)).toContain('ls, find, or grep')
+    expect(String(output.hint)).toContain('ls, glob, or grep')
   })
 
-  it('blocks host shell execution in workspace-write sandbox mode', async () => {
+  it('requires approval before host shell execution in workspace-write sandbox mode', async () => {
+    const awaitApproval = vi.fn(async () => 'allow' as const)
     const result = await host.execute(
       {
         callId: 'call_bash',
         toolName: 'bash',
         arguments: { command: 'echo hello' }
       },
-      buildContext(workspace, { sandboxMode: 'workspace-write' })
+      buildContext(workspace, {
+        approvalPolicy: 'auto',
+        sandboxMode: 'workspace-write',
+        awaitApproval
+      })
+    )
+
+    expect(awaitApproval).toHaveBeenCalledOnce()
+    expect(result.approved).toBe(false)
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      toolName: 'bash',
+      isError: false,
+      output: {
+        command: 'echo hello',
+        exit_code: 0
+      }
+    })
+  })
+
+  it('blocks language-server process startup in a read-only sandbox', async () => {
+    const result = await host.execute(
+      {
+        callId: 'call_lsp',
+        toolName: 'lsp',
+        arguments: { operation: 'getDiagnostics', filePath: 'app.ts' }
+      },
+      buildContext(workspace, { sandboxMode: 'read-only' })
     )
 
     expect(result.approved).toBe(false)
     expect(result.item).toMatchObject({
       kind: 'tool_result',
-      toolName: 'bash',
+      toolName: 'lsp',
       isError: true,
-      output: {
-        code: 'sandbox_command_blocked'
-      }
+      output: { code: 'sandbox_command_blocked' }
     })
   })
 
@@ -319,16 +378,24 @@ describe('Kun built-in tools', () => {
     })
   })
 
-  it('hides GUI input tools when the turn context has no user-input gate', async () => {
+  it('keeps GUI input tools in the stable catalog without a user-input gate', async () => {
     const tools = await host.listTools(buildContext(workspace))
     const names = tools.map((tool) => tool.name)
-    expect(names).not.toContain('user_input')
-    expect(names).not.toContain('request_user_input')
+    expect(names).toContain('user_input')
+    expect(names).toContain('request_user_input')
   })
 
   it('exposes pi-style coding and read-only tool groups', () => {
     expect(buildCodingBuiltinLocalTools().map((tool) => tool.name)).toEqual(['read', 'bash', 'edit', 'write'])
-    expect(buildReadOnlyBuiltinLocalTools().map((tool) => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(buildReadOnlyBuiltinLocalTools().map((tool) => tool.name)).toEqual([
+      'read',
+      'grep',
+      'glob',
+      'find',
+      'ls',
+      'repo_map',
+      'git_inspect'
+    ])
   })
 
   it('supports pi-style configurable built-in tool factory APIs', async () => {
@@ -337,14 +404,33 @@ describe('Kun built-in tools', () => {
       grep: { defaultLimit: 1 },
       find: { defaultLimit: 1 },
       ls: { defaultLimit: 1 },
-      bash: { defaultTimeoutSeconds: 5 }
+      bash: { defaultTimeoutSeconds: 5, maxLines: 1, maxBytes: 64 }
     })
-    expect(Object.keys(toolRecord).sort()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'lsp', 'read', 'write'])
+    expect(Object.keys(toolRecord).sort()).toEqual([
+      'bash',
+      'edit',
+      'find',
+      'git_inspect',
+      'glob',
+      'grep',
+      'ls',
+      'lsp',
+      'read',
+      'repo_map',
+      'send_im_attachment',
+      'verify_changes',
+      'write'
+    ])
 
     await writeFile(join(workspace, 'limited.txt'), 'one\ntwo\nthree\n', 'utf8')
     const customHost = new LocalToolHost({ tools: [toolRecord.read, toolRecord.ls] })
     const readOutput = await executeTool(customHost, workspace, 'read', { path: 'limited.txt' })
-    expect(String(readOutput.content)).toContain('Use offset=2 to continue')
+    expect(readOutput).toMatchObject({
+      content: 'one',
+      has_more: true,
+      next_offset: 2,
+      truncation_by: 'requested_limit'
+    })
   })
 
   it('exposes pi-style alias composition helpers and tool-name set', async () => {
@@ -356,13 +442,57 @@ describe('Kun built-in tools', () => {
     expect(defaultGrepLocalToolOperations).toEqual({})
     expect(defaultLsLocalToolOperations.readdir).toBeTypeOf('function')
     expect(createCodingTools().map((tool) => tool.name)).toEqual(['read', 'bash', 'edit', 'write'])
-    expect(createReadOnlyTools().map((tool) => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(createReadOnlyTools().map((tool) => tool.name)).toEqual([
+      'read',
+      'grep',
+      'glob',
+      'find',
+      'ls',
+      'repo_map',
+      'git_inspect'
+    ])
     expect(createCodingToolDefinitions().map((tool) => tool.name)).toEqual(['read', 'bash', 'edit', 'write'])
-    expect(createReadOnlyToolDefinitions().map((tool) => tool.name)).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(createReadOnlyToolDefinitions().map((tool) => tool.name)).toEqual([
+      'read',
+      'grep',
+      'glob',
+      'find',
+      'ls',
+      'repo_map',
+      'git_inspect'
+    ])
     const allTools = createAllTools()
     const allDefinitions = createAllToolDefinitions()
-    expect(Object.keys(allTools).sort()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'lsp', 'read', 'write'])
-    expect(Object.keys(allDefinitions).sort()).toEqual(['bash', 'edit', 'find', 'grep', 'ls', 'lsp', 'read', 'write'])
+    expect(Object.keys(allTools).sort()).toEqual([
+      'bash',
+      'edit',
+      'find',
+      'git_inspect',
+      'glob',
+      'grep',
+      'ls',
+      'lsp',
+      'read',
+      'repo_map',
+      'send_im_attachment',
+      'verify_changes',
+      'write'
+    ])
+    expect(Object.keys(allDefinitions).sort()).toEqual([
+      'bash',
+      'edit',
+      'find',
+      'git_inspect',
+      'glob',
+      'grep',
+      'ls',
+      'lsp',
+      'read',
+      'repo_map',
+      'send_im_attachment',
+      'verify_changes',
+      'write'
+    ])
     expect(createReadTool).toBe(createReadLocalTool)
     expect(createReadToolDefinition).toBe(createReadLocalTool)
     expect(createWriteTool).toBeTypeOf('function')
@@ -393,7 +523,12 @@ describe('Kun built-in tools', () => {
     })
     await writeFile(join(workspace, 'alias.txt'), 'a\nb\n', 'utf8')
     const output = await executeTool(singleToolHost, workspace, 'read', { path: 'alias.txt' })
-    expect(String(output.content)).toContain('Use offset=2 to continue')
+    expect(output).toMatchObject({
+      content: 'a',
+      has_more: true,
+      next_offset: 2,
+      truncation_by: 'requested_limit'
+    })
   })
 
   it('supports injected backend operations like pi tool factories', async () => {
@@ -425,9 +560,10 @@ describe('Kun built-in tools', () => {
       }
     })
     const customBash = createBashLocalTool({
+      maxLines: 1,
       operations: {
         exec: async (_command, _cwd, options) => {
-          options.onData?.(Buffer.from('streamed from custom bash\n'))
+          options.onData?.(Buffer.from('first custom bash line\nstreamed from custom bash\n'))
           return { exitCode: 0 }
         }
       }
@@ -443,6 +579,8 @@ describe('Kun built-in tools', () => {
     expect(grepOutput.backend).toBe('custom')
     const bashOutput = await executeTool(customHost, workspace, 'bash', { command: 'echo ignored' })
     expect(String(bashOutput.output)).toContain('streamed from custom bash')
+    expect(String(bashOutput.output)).not.toContain('first custom bash line')
+    expect(bashOutput.truncation).toMatchObject({ total_lines: 2, output_lines: 1 })
   })
 
   it('exposes a reusable local bash backend constructor like pi', async () => {
@@ -460,7 +598,9 @@ describe('Kun built-in tools', () => {
     expect(String(output.output)).toContain('hello local bash')
   })
 
-  it('prefers the fd backend path when an fd executable candidate is provided', async () => {
+  it.skipIf(process.platform === 'win32')(
+    'prefers the fd backend path when a POSIX executable candidate is provided',
+    async () => {
     await mkdir(join(workspace, 'notes'), { recursive: true })
     await writeFile(join(workspace, 'notes', 'demo.txt'), 'demo\n', 'utf8')
     const fdHost = new LocalToolHost({
@@ -477,7 +617,8 @@ describe('Kun built-in tools', () => {
     })
     expect(output.backend).toBe('fd')
     expect(output.matches).toHaveLength(1)
-  })
+    }
+  )
 
   it('writes, reads, edits, and searches workspace files', async () => {
     const writeOutput = await executeTool(host, workspace, 'write', {
@@ -524,7 +665,7 @@ describe('Kun built-in tools', () => {
     expect(Array.isArray((grepOutput.matches as Array<Record<string, unknown>>)[0]?.context_before)).toBe(true)
     expect(['rg', 'scan']).toContain(String(grepOutput.backend))
 
-    const findOutput = await executeTool(host, workspace, 'find', {
+    const findOutput = await executeTool(host, workspace, 'glob', {
       pattern: '**/*.txt',
       path: '.'
     })
@@ -549,101 +690,570 @@ describe('Kun built-in tools', () => {
     expect(output.truncation).toBe(null)
   })
 
-  it('finishes bash commands after the shell exits even when a background child keeps stdio open', async () => {
+  it('keeps the Bash timeout runtime-owned at 24 hours', async () => {
+    const exec = vi.fn(async () => ({ exitCode: 0, stdout: 'done' }))
+    const bash = createBashLocalTool({ operations: { exec } })
+    const properties = bash.inputSchema.properties as Record<string, unknown>
+    expect(properties).not.toHaveProperty('timeout')
+    expect(DEFAULT_BASH_TIMEOUT_SECONDS).toBe(86_400)
+
+    await executeTool(new LocalToolHost({ tools: [bash] }), workspace, 'bash', {
+      command: 'echo done'
+    })
+    expect(exec).toHaveBeenCalledWith(
+      'echo done',
+      workspace,
+      expect.objectContaining({ timeoutSeconds: 86_400 })
+    )
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'finishes POSIX shell commands after a background child keeps stdio open',
+    async () => {
     const startedAt = Date.now()
     const output = await executeTool(host, workspace, 'bash', {
-      command: 'sleep 5 & echo done',
-      timeout: 2
+      command: 'sleep 5 & echo done'
     })
 
     expect(output.exit_code).toBe(0)
     expect(String(output.output)).toContain('done')
     expect(Date.now() - startedAt).toBeLessThan(1500)
-  })
+    }
+  )
 
-  it('returns a pollable bash session for foreground long-running commands', async () => {
+  it('blocks foreground bash commands until the process exits', async () => {
     const startedAt = Date.now()
     const output = await executeTool(host, workspace, 'bash', {
-      command: 'echo ready; sleep 5',
-      yield_seconds: 1,
-      timeout: 10
+      command: 'echo ready; sleep 2; echo done'
     })
 
-    expect(output.exit_code).toBe(null)
-    expect(output.status).toBe('running')
-    expect(typeof output.session_id).toBe('string')
+    expect(output.exit_code).toBe(0)
     expect(String(output.output)).toContain('ready')
-    expect(Date.now() - startedAt).toBeLessThan(2500)
-
-    const stopped = await executeTool(host, workspace, 'bash', {
-      action: 'stop',
-      session_id: String(output.session_id)
-    })
-    expect(stopped.status).toBe('stopped')
-    expect(stopped.stop_sent).toBe(true)
+    expect(String(output.output)).toContain('done')
+    expect(output.session_id).toBeUndefined()
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1800)
   })
 
-  it('polls completed bash sessions for final output', async () => {
-    const output = await executeTool(host, workspace, 'bash', {
-      command: 'echo ready; sleep 2; echo done',
-      yield_seconds: 1,
-      timeout: 10
+  it('returns a running background bash session and keeps running after abort', async () => {
+    const hooks = {
+      started: [] as string[],
+      settled: [] as string[]
+    }
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({
+          backgroundShell: {
+            onSessionStarted: async (record) => {
+              hooks.started.push(record.id)
+            },
+            onSessionSettled: async (record) => {
+              hooks.settled.push(record.id)
+            },
+            isDetachedSession: (sessionId) => hooks.started.includes(sessionId)
+          }
+        }),
+        createBackgroundShellTool()
+      ]
     })
+    const abortController = new AbortController()
+    const output = await backgroundHost.execute(
+      {
+        callId: 'call_bash_background',
+        toolName: 'bash',
+        arguments: {
+          command: 'echo bg-ready; sleep 5; echo bg-done',
+          background: true
+        }
+      },
+      buildContext(workspace, { abortSignal: abortController.signal })
+    )
+    expect(output.item.kind).toBe('tool_result')
+    if (output.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const payload = output.item.output as Record<string, unknown>
+    expect(payload.status).toBe('running')
+    expect(typeof payload.session_id).toBe('string')
+    expect(String(payload.session_id)).toMatch(/^[a-z0-9]{8}$/)
+    expect(typeof payload.output_file).toBe('string')
+    expect(String(payload.output_file)).toMatch(/\.output$/)
+    expect(hooks.started).toHaveLength(1)
 
-    expect(output.status).toBe('running')
+    abortController.abort()
+    const read = await backgroundHost.execute(
+      {
+        callId: 'call_bash_background_read',
+        toolName: 'background_shell',
+        arguments: {
+          action: 'read',
+          session_id: String(payload.session_id)
+        }
+      },
+      buildContext(workspace)
+    )
+    expect(read.item.kind).toBe('tool_result')
+    if (read.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const readPayload = read.item.output as Record<string, unknown>
+    expect(readPayload.status).toBe('running')
+
+    await backgroundHost.execute(
+      {
+        callId: 'call_bash_background_stop',
+        toolName: 'background_shell',
+        arguments: {
+          action: 'stop',
+          session_id: String(payload.session_id)
+        }
+      },
+      buildContext(workspace)
+    )
+    await vi.waitFor(() => {
+      expect(hooks.settled.length).toBeGreaterThanOrEqual(1)
+    })
+  })
+
+  it('blocks background shell control in a read-only sandbox', async () => {
+    let listCalls = 0
+    const backgroundHost = new LocalToolHost({
+      tools: [createBackgroundShellTool({
+        listBackgroundSessions: () => {
+          listCalls += 1
+          return []
+        }
+      })]
+    })
+    const context = buildContext(workspace, { sandboxMode: 'read-only' })
+
+    const advertised = await backgroundHost.listTools(context)
+    expect(advertised.map((tool) => tool.name)).not.toContain('background_shell')
+
+    const result = await backgroundHost.execute({
+      callId: 'call_background_shell_readonly',
+      toolName: 'background_shell',
+      arguments: { action: 'list' }
+    }, context)
+    expect(result.item).toMatchObject({
+      kind: 'tool_result',
+      isError: true,
+      output: { code: 'sandbox_command_blocked' }
+    })
+    expect(listCalls).toBe(0)
+  })
+
+  it('rejects a background shell once its running-session capacity is full', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({
+          maxBackgroundSessions: 1,
+          maxBackgroundSessionsPerThread: 1
+        }),
+        createBackgroundShellTool()
+      ]
+    })
+    const first = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_capacity_first',
+        toolName: 'bash',
+        arguments: { command: 'sleep 10', background: true }
+      },
+      buildContext(workspace)
+    )
+    expect(first.item.kind).toBe('tool_result')
+    if (first.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const sessionId = String((first.item.output as { session_id?: string }).session_id)
+
+    const second = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_capacity_second',
+        toolName: 'bash',
+        arguments: { command: 'sleep 10', background: true }
+      },
+      buildContext(workspace)
+    )
+    expect(second.item.kind).toBe('tool_result')
+    if (second.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    expect(second.item.isError).toBe(true)
+    expect(second.item.output).toMatchObject({ error: expect.stringContaining('capacity reached') })
+
+    await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'stop',
+      session_id: sessionId
+    })
+  })
+
+  it('rejects a background shell timeout above its configured maximum', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({ maxBackgroundTimeoutSeconds: 1 })
+      ]
+    })
+    const result = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_timeout_limit',
+        toolName: 'bash',
+        arguments: { command: 'sleep 10', background: true }
+      },
+      buildContext(workspace)
+    )
+    expect(result.item.kind).toBe('tool_result')
+    if (result.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    expect(result.item.isError).toBe(true)
+    expect(result.item.output).toMatchObject({ error: expect.stringContaining('timeout exceeds 1 seconds') })
+  })
+
+  it('does not expose a background shell session to another thread', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [createBackgroundBashLocalTool(), createBackgroundShellTool()]
+    })
+    const started = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_thread_owner',
+        toolName: 'bash',
+        arguments: { command: 'sleep 10', background: true }
+      },
+      buildContext(workspace, { threadId: 'thr_owner' })
+    )
+    expect(started.item.kind).toBe('tool_result')
+    if (started.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const sessionId = String((started.item.output as { session_id?: string }).session_id)
+
+    const foreignRead = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_foreign_read',
+        toolName: 'background_shell',
+        arguments: { action: 'read', session_id: sessionId }
+      },
+      buildContext(workspace, { threadId: 'thr_other' })
+    )
+    expect(foreignRead.item.kind).toBe('tool_result')
+    if (foreignRead.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    expect(foreignRead.item.isError).toBe(true)
+    expect(foreignRead.item.output).toMatchObject({ error: 'background shell session not found' })
+
+    await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_thread_owner_stop',
+        toolName: 'background_shell',
+        arguments: { action: 'stop', session_id: sessionId }
+      },
+      buildContext(workspace, { threadId: 'thr_owner' })
+    )
+  })
+
+  it('polls completed background shell sessions via background_shell', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [createBackgroundBashLocalTool(), createBackgroundShellTool()]
+    })
+    const started = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_poll',
+        toolName: 'bash',
+        arguments: {
+          command: 'echo ready; sleep 2; echo done',
+          background: true
+        }
+      },
+      buildContext(workspace)
+    )
+    expect(started.item.kind).toBe('tool_result')
+    if (started.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const sessionId = String((started.item.output as { session_id?: string }).session_id)
     await new Promise((resolve) => setTimeout(resolve, 2500))
-    const polled = await executeTool(host, workspace, 'bash', {
+    const polled = await executeTool(backgroundHost, workspace, 'background_shell', {
       action: 'poll',
-      session_id: String(output.session_id)
+      session_id: sessionId,
+      yield_seconds: 1
     })
     expect(polled.status).toBe('completed')
     expect(polled.exit_code).toBe(0)
     expect(String(polled.output)).toContain('done')
+    expect(typeof polled.output_file).toBe('string')
   })
 
-  it('blocks the poll action for at least yield_seconds while the session keeps running', async () => {
-    const output = await executeTool(host, workspace, 'bash', {
-      command: 'echo ready; sleep 5; echo done',
-      yield_seconds: 1,
-      timeout: 10
+  it('orders fast background shell lifecycle hooks from start through settlement', async () => {
+    const lifecycle: string[] = []
+    let resolveStartEntered: (() => void) | undefined
+    const startEntered = new Promise<void>((resolve) => {
+      resolveStartEntered = resolve
     })
-    expect(output.status).toBe('running')
+    let releaseStart: (() => void) | undefined
+    const holdStart = new Promise<void>((resolve) => {
+      releaseStart = resolve
+    })
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({
+          backgroundShell: {
+            onSessionStarted: async () => {
+              resolveStartEntered?.()
+              await holdStart
+              lifecycle.push('started')
+            },
+            onSessionSettled: async () => {
+              lifecycle.push('settled')
+            }
+          }
+        })
+      ]
+    })
+    const run = backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_lifecycle_order',
+        toolName: 'bash',
+        arguments: { command: 'true', background: true }
+      },
+      buildContext(workspace)
+    )
 
-    const startedAt = Date.now()
-    const polled = await executeTool(host, workspace, 'bash', {
+    await startEntered
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(lifecycle).toEqual([])
+
+    releaseStart?.()
+    await run
+    await vi.waitFor(() => expect(lifecycle).toEqual(['started', 'settled']))
+  })
+
+  it('finalizes the background output writer when a shell exits without being polled', async () => {
+    const closeWriter = vi.spyOn(BackgroundShellOutputWriter.prototype, 'close')
+    let resolveSettled: (() => void) | undefined
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve
+    })
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({
+          backgroundShell: {
+            onSessionSettled: async () => resolveSettled?.()
+          }
+        })
+      ]
+    })
+    try {
+      const started = await backgroundHost.execute(
+        {
+          callId: 'call_bash_bg_finalize_on_exit',
+          toolName: 'bash',
+          arguments: {
+            command: "node -e \"setTimeout(() => process.stdout.write('closed-without-poll'), 10)\"",
+            background: true
+          }
+        },
+        buildContext(workspace)
+      )
+      expect(started.item.kind).toBe('tool_result')
+      if (started.item.kind !== 'tool_result') throw new Error('expected tool_result')
+      const outputFile = String((started.item.output as { output_file?: string }).output_file)
+
+      await settled
+      await vi.waitFor(() => expect(closeWriter).toHaveBeenCalled())
+      await expect(readFile(outputFile, 'utf-8')).resolves.toContain('closed-without-poll')
+    } finally {
+      closeWriter.mockRestore()
+    }
+  })
+
+  it('coalesces slow background shell update notifications', async () => {
+    let updateInFlight = 0
+    let maxUpdatesInFlight = 0
+    let updateCount = 0
+    let resolveSettled: (() => void) | undefined
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve
+    })
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool({
+          backgroundShell: {
+            onSessionUpdated: async () => {
+              updateCount += 1
+              updateInFlight += 1
+              maxUpdatesInFlight = Math.max(maxUpdatesInFlight, updateInFlight)
+              await new Promise((resolve) => setTimeout(resolve, 180))
+              updateInFlight -= 1
+            },
+            onSessionSettled: async () => resolveSettled?.()
+          }
+        })
+      ]
+    })
+    const started = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_coalesced_updates',
+        toolName: 'bash',
+        arguments: {
+          command: "node -e \"let n = 0; const timer = setInterval(() => { process.stdout.write('x'); if (++n === 80) clearInterval(timer) }, 5)\"",
+          background: true
+        }
+      },
+      buildContext(workspace),
+      async () => undefined
+    )
+    expect(started.item.kind).toBe('tool_result')
+
+    await settled
+    await vi.waitFor(() => expect(updateInFlight).toBe(0))
+    expect(updateCount).toBeGreaterThan(0)
+    expect(maxUpdatesInFlight).toBe(1)
+  })
+
+  it('lists background shell sessions via background_shell', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundBashLocalTool(),
+        createBackgroundShellTool({
+          listBackgroundSessions: () => [
+            {
+              id: 'abcd1234',
+              threadId: 'thr_1',
+              turnId: 'turn_1',
+              command: 'sleep 10',
+              cwd: workspace,
+              shell: 'bash',
+              status: 'running',
+              startedAt: '2026-01-01T00:00:00.000Z',
+              exitCode: null,
+              output: 'running',
+              detached: true
+            }
+          ]
+        })
+      ]
+    })
+    const listed = await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'list',
+      thread_only: false
+    })
+    expect(listed.running).toBe(1)
+    expect((listed.sessions as Array<{ session_id?: string }>)?.[0]?.session_id).toBe('abcd1234')
+  })
+
+  it('never exposes another thread\'s shell sessions when thread_only is false', async () => {
+    const requestedThreadIds: Array<string | undefined> = []
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundShellTool({
+          listBackgroundSessions: (threadId) => {
+            requestedThreadIds.push(threadId)
+            return [
+              {
+                id: 'owner001', threadId: 'thr_1', turnId: 'turn_1', command: 'safe', cwd: workspace,
+                shell: 'bash', status: 'running' as const, startedAt: '2026-01-01T00:00:00.000Z',
+                exitCode: null, output: 'owner output', detached: true
+              },
+              {
+                id: 'other001', threadId: 'thr_2', turnId: 'turn_2', command: 'secret', cwd: '/other-workspace',
+                shell: 'bash', status: 'running' as const, startedAt: '2026-01-01T00:00:00.000Z',
+                exitCode: null, output: 'other output', detached: true
+              }
+            ].filter((session) => session.threadId === threadId)
+          }
+        })
+      ]
+    })
+
+    const listed = await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'list',
+      thread_only: false,
+      include_finished: true
+    })
+
+    expect(requestedThreadIds).toEqual(['thr_1'])
+    expect((listed.sessions as Array<{ session_id?: string }>).map((session) => session.session_id)).toEqual(['owner001'])
+  })
+
+  it('persists full background shell output to the thread record directory', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [createBackgroundBashLocalTool(), createBackgroundShellTool()]
+    })
+    const started = await backgroundHost.execute(
+      {
+        callId: 'call_bash_bg_output_file',
+        toolName: 'bash',
+        arguments: {
+          command: "node -e \"process.stdout.write('line-one\\n'); process.stdout.write('x'.repeat(10050))\"",
+          background: true
+        }
+      },
+      buildContext(workspace)
+    )
+    expect(started.item.kind).toBe('tool_result')
+    if (started.item.kind !== 'tool_result') throw new Error('expected tool_result')
+    const payload = started.item.output as Record<string, unknown>
+    const outputFile = String(payload.output_file)
+    expect(outputFile).toContain('background-shells')
+    expect(outputFile.endsWith(`${String(payload.session_id)}.output`)).toBe(true)
+    const completed = await executeTool(backgroundHost, workspace, 'background_shell', {
       action: 'poll',
-      session_id: String(output.session_id),
+      session_id: String(payload.session_id),
       yield_seconds: 2
     })
-    const elapsed = Date.now() - startedAt
-    expect(elapsed).toBeGreaterThanOrEqual(1800)
-    expect(polled.status).toBe('running')
-
-    await executeTool(host, workspace, 'bash', {
-      action: 'stop',
-      session_id: String(output.session_id)
+    expect(completed.status).toBe('completed')
+    const full = await readFile(outputFile, 'utf-8')
+    expect(full.replace(/\r\n/g, '\n').startsWith('line-one\n')).toBe(true)
+    expect([...full].length).toBeGreaterThan(10_000)
+    const read = await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'read',
+      session_id: String(payload.session_id)
     })
+    expect(String(read.output)).toContain('[background shell output truncated')
+    expect(read.output_file).toBe(outputFile)
+    expect(read.full_output_path).toBeUndefined()
+    expect(read.truncation).toBeUndefined()
+    expect(read.output_truncated).toBeUndefined()
   })
 
-  it('returns from poll early once the session exits before yield_seconds', async () => {
-    const output = await executeTool(host, workspace, 'bash', {
-      command: 'echo ready; sleep 1; echo done',
-      yield_seconds: 1,
-      timeout: 10
+  it('hides finished background shell sessions from list unless include_finished=true', async () => {
+    const backgroundHost = new LocalToolHost({
+      tools: [
+        createBackgroundShellTool({
+          listBackgroundSessions: () => [
+            {
+              id: 'runng001',
+              threadId: 'thr_1',
+              turnId: 'turn_1',
+              command: 'sleep 10',
+              cwd: workspace,
+              shell: 'bash',
+              status: 'running',
+              startedAt: '2026-01-01T00:00:00.000Z',
+              exitCode: null,
+              output: 'running',
+              detached: true
+            },
+            {
+              id: 'done0001',
+              threadId: 'thr_1',
+              turnId: 'turn_1',
+              command: 'echo done',
+              cwd: workspace,
+              shell: 'bash',
+              status: 'completed',
+              startedAt: '2026-01-01T00:00:00.000Z',
+              finishedAt: '2026-01-01T00:00:05.000Z',
+              exitCode: 0,
+              output: 'done',
+              detached: true
+            }
+          ]
+        })
+      ]
     })
-    expect(output.status).toBe('running')
+    const runningOnly = await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'list',
+      thread_only: false
+    })
+    expect(runningOnly.running).toBe(1)
+    expect((runningOnly.sessions as Array<{ session_id?: string }>).map((s) => s.session_id)).toEqual(['runng001'])
 
-    const startedAt = Date.now()
-    const polled = await executeTool(host, workspace, 'bash', {
-      action: 'poll',
-      session_id: String(output.session_id),
-      yield_seconds: 10
+    const withFinished = await executeTool(backgroundHost, workspace, 'background_shell', {
+      action: 'list',
+      thread_only: false,
+      include_finished: true
     })
-    const elapsed = Date.now() - startedAt
-    expect(elapsed).toBeLessThan(3000)
-    expect(polled.status).toBe('completed')
-    expect(polled.exit_code).toBe(0)
-    expect(String(polled.output)).toContain('done')
+    expect(withFinished.running).toBe(1)
+    expect((withFinished.sessions as Array<{ session_id?: string }>).map((s) => s.session_id)).toEqual([
+      'runng001',
+      'done0001'
+    ])
   })
 
   it('includes the active shell in bash partial updates', async () => {
@@ -749,7 +1359,46 @@ describe('Kun built-in tools', () => {
       limit: 2
     })
     expect(output.start_line).toBe(2)
-    expect(String(output.content)).toContain('Use offset=4 to continue')
+    expect(output.content).toBe('two\nthree')
+    expect(output).toMatchObject({
+      has_more: true,
+      next_offset: 4,
+      truncation_by: 'requested_limit'
+    })
+  })
+
+  it('allows an edit after a read window reaches EOF but omits leading lines', async () => {
+    await writeFile(join(workspace, 'paged-edit.txt'), 'one\ntwo\nthree\nfour', 'utf8')
+    const guardedHost = new LocalToolHost({
+      tools: buildCodingBuiltinLocalTools(),
+      readTracker: true
+    })
+    const context = buildContext(workspace)
+
+    const read = await guardedHost.execute(
+      {
+        callId: 'call_read_paged_edit',
+        toolName: 'read',
+        arguments: { path: 'paged-edit.txt', offset: 3 }
+      },
+      context
+    )
+    expect(read.item).toMatchObject({
+      kind: 'tool_result',
+      isError: false,
+      output: { start_line: 3, end_line: 4, total_lines: 4, truncated: false }
+    })
+
+    const edit = await guardedHost.execute(
+      {
+        callId: 'call_edit_paged_edit',
+        toolName: 'edit',
+        arguments: { path: 'paged-edit.txt', oldText: 'one', newText: 'ONE' }
+      },
+      context
+    )
+    expect(edit.item).toMatchObject({ kind: 'tool_result', isError: false })
+    await expect(readFile(join(workspace, 'paged-edit.txt'), 'utf8')).resolves.toContain('ONE')
   })
 
   it('reads supported images with pi-style structured image metadata', async () => {
@@ -849,9 +1498,14 @@ describe('Kun built-in tools', () => {
     const target = join(workspace, 'serial.txt')
     const order: string[] = []
 
+    let markFirstStarted!: () => void
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve
+    })
     let releaseFirst!: () => void
     const first = withFileMutationQueue(target, async () => {
       order.push('first:start')
+      markFirstStarted()
       await new Promise<void>((resolve) => {
         releaseFirst = resolve
       })
@@ -863,7 +1517,7 @@ describe('Kun built-in tools', () => {
       order.push('second:end')
     })
 
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    await firstStarted
     expect(order).toEqual(['first:start'])
     releaseFirst()
     await Promise.all([first, second])

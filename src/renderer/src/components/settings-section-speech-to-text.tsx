@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useState, type ReactElement } from 'react'
 import {
   CUSTOM_SPEECH_TO_TEXT_PROVIDER_ID,
   DEFAULT_SPEECH_TO_TEXT_PROTOCOL,
@@ -16,20 +16,26 @@ import {
   type LocalWhisperModelId,
   type LocalWhisperModelStatus
 } from '@shared/local-whisper'
-import { Download, Loader2, PlugZap, Square, Trash2 } from 'lucide-react'
+import { Download, Loader2, Mic, PlugZap, SlidersHorizontal, Square, Trash2 } from 'lucide-react'
 import {
   AdvancedSettingsDisclosure,
   InlineNoticeView,
   ModelSelect,
   SecretInput,
   SettingsCard,
+  SettingsTabPanel,
+  SettingsTabs,
   SettingRow,
   Toggle,
   type InlineNotice
 } from './settings-controls'
 
+type SpeechToTextSettingsTab = 'provider' | 'model' | 'advanced'
+
 const SPEECH_LANGUAGE_OPTIONS: readonly string[] = ['', 'zh', 'en', 'ja', 'ko']
-const CUSTOM_SPEECH_PROTOCOLS = SPEECH_TO_TEXT_PROTOCOLS.filter((protocol) => protocol !== 'local-whisper')
+const CUSTOM_SPEECH_PROTOCOLS = SPEECH_TO_TEXT_PROTOCOLS.filter(
+  (protocol) => protocol !== 'local-whisper' && protocol !== 'gemini-cli-audio'
+)
 
 /**
  * 0.5s 440Hz mono 16kHz sine tone — enough for the ASR endpoint to accept the
@@ -103,8 +109,24 @@ function formatTransferRate(bytesPerSecond: number | undefined, pendingLabel: st
 
 function speechProtocolLabel(t: (key: string) => string, protocol: string): string {
   if (protocol === 'mimo-asr') return t('speechProtocolMimoAsr')
+  if (protocol === 'xai-stt') return t('speechProtocolXaiStt')
+  if (protocol === 'gemini-audio') return t('speechProtocolGeminiAudio')
+  if (protocol === 'gemini-cli-audio') return t('speechProtocolGeminiCliAudio')
   if (protocol === 'local-whisper') return t('speechProtocolLocalWhisper')
   return t('speechProtocolOpenAi')
+}
+
+function supportsSpeechProvider(item: {
+  kind?: string
+  speech?: { protocol?: string }
+}): boolean {
+  if (!item.speech) return false
+  if (item.speech.protocol === 'gemini-cli-audio') return item.kind === 'gemini-cli-api'
+  return (
+    item.kind !== 'cursor-sdk' &&
+    item.kind !== 'agent-sdk' &&
+    item.kind !== 'antigravity-cli'
+  )
 }
 
 function localWhisperQualityLabel(t: (key: string) => string, tier: string): string {
@@ -149,9 +171,7 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
   const effectiveSpeechToText = form
     ? resolveKunSpeechToTextSettings(form)
     : speechToText
-  const speechProviders = (provider?.providers ?? []).filter((item: {
-    speech?: unknown
-  }) => Boolean(item.speech))
+  const speechProviders = (provider?.providers ?? []).filter(supportsSpeechProvider)
   const selectedProviderId = speechToText.protocol === 'local-whisper'
     ? LOCAL_WHISPER_PROVIDER_ID
     : speechToText.providerId || CUSTOM_SPEECH_TO_TEXT_PROVIDER_ID
@@ -169,6 +189,7 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
     : usingCustomProvider
     ? []
     : selectedProviderSpeech?.models ?? []
+  const [activeTab, setActiveTab] = useState<SpeechToTextSettingsTab>('provider')
   const [showSpeechApiKey, setShowSpeechApiKey] = useState(false)
   const [testState, setTestState] = useState<'idle' | 'busy' | InlineNotice>('idle')
   const [localWhisperStatuses, setLocalWhisperStatuses] = useState<Partial<Record<LocalWhisperModelId, LocalWhisperModelStatus>>>({})
@@ -186,20 +207,22 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
     })
   }
 
-  const setLocalWhisperModelStatus = (status: LocalWhisperModelStatus): void => {
+  const setLocalWhisperModelStatus = useCallback((status: LocalWhisperModelStatus): void => {
     setLocalWhisperStatuses((current) => ({
       ...current,
       [status.modelId]: status
     }))
-  }
+  }, [])
 
-  const refreshLocalWhisperStatus = async (modelId: LocalWhisperModelId = selectedLocalWhisperModelId): Promise<void> => {
+  const refreshLocalWhisperStatus = useCallback(async (
+    modelId: LocalWhisperModelId = selectedLocalWhisperModelId
+  ): Promise<void> => {
     if (typeof window.kunGui?.getLocalWhisperModelStatus !== 'function') return
     const status = await window.kunGui.getLocalWhisperModelStatus(modelId)
     setLocalWhisperModelStatus(status)
-  }
+  }, [selectedLocalWhisperModelId, setLocalWhisperModelStatus])
 
-  const refreshLocalWhisperModelStatuses = async (): Promise<void> => {
+  const refreshLocalWhisperModelStatuses = useCallback(async (): Promise<void> => {
     if (typeof window.kunGui?.getLocalWhisperModelStatus !== 'function') return
     const statuses = await Promise.all(
       LOCAL_WHISPER_MODELS.map((model) => window.kunGui.getLocalWhisperModelStatus(model.id))
@@ -209,9 +232,9 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
       for (const status of statuses) next[status.modelId] = status
       return next
     })
-  }
+  }, [])
 
-  const refreshLocalWhisperSourceStatuses = async (): Promise<void> => {
+  const refreshLocalWhisperSourceStatuses = useCallback(async (): Promise<void> => {
     if (typeof window.kunGui?.checkLocalWhisperDownloadSources !== 'function') return
     setLocalWhisperSourceStatuses(null)
     setLocalWhisperSourceCheckBusy(true)
@@ -221,7 +244,7 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
     } finally {
       setLocalWhisperSourceCheckBusy(false)
     }
-  }
+  }, [selectedLocalWhisperModelId])
 
   useEffect(() => {
     if (!usingLocalWhisper) return
@@ -256,12 +279,12 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
         }
       })
     })
-  }, [usingLocalWhisper])
+  }, [refreshLocalWhisperModelStatuses, refreshLocalWhisperSourceStatuses, usingLocalWhisper])
 
   useEffect(() => {
     if (!usingLocalWhisper) return
     void refreshLocalWhisperStatus(selectedLocalWhisperModelId).catch(() => undefined)
-  }, [usingLocalWhisper, selectedLocalWhisperModelId])
+  }, [refreshLocalWhisperStatus, selectedLocalWhisperModelId, usingLocalWhisper])
 
   const downloadLocalWhisper = async (): Promise<void> => {
     if (typeof window.kunGui?.downloadLocalWhisperModel !== 'function') return
@@ -341,38 +364,56 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
   }
 
   return (
-    <SettingsCard title={t('speechToText')}>
-      <SettingRow
-        title={t('speechToTextEnabled')}
-        description={t('speechToTextEnabledDesc')}
-        control={
-          <Toggle
-            checked={speechToText.enabled}
-            onChange={(enabled) => {
-              // 首次开启时直接选中本地 Whisper,
-              // 避免落进字段全空的「自定义」模式。providerId 为空但已填过
-              // baseUrl/key/model 说明用户在用隐式自定义配置,不能覆盖。
-              const customUntouched =
-                !speechToText.baseUrl.trim() && !speechToText.apiKey.trim() && !speechToText.model.trim()
-              if (enabled && !speechToText.providerId.trim() && customUntouched) {
-                updateSpeechToText({
-                  enabled,
-                  providerId: LOCAL_WHISPER_PROVIDER_ID,
-                  baseUrl: '',
-                  apiKey: '',
-                  protocol: 'local-whisper',
-                  model: LOCAL_WHISPER_DEFAULT_MODEL_ID,
-                  localWhisperDownloadSource: LOCAL_WHISPER_DEFAULT_DOWNLOAD_SOURCE_ID
-                })
-                return
-              }
-              updateSpeechToText({ enabled })
-            }}
-          />
-        }
+    <div className="space-y-5">
+      <SettingsTabs<SpeechToTextSettingsTab>
+        baseId="speech-to-text-settings"
+        ariaLabel={t('speechToText')}
+        items={[
+          { id: 'provider', label: t('speechToTextProvider'), icon: PlugZap },
+          { id: 'model', label: t('speechToTextModel'), icon: Mic },
+          { id: 'advanced', label: t('speechToTextAdvanced'), icon: SlidersHorizontal }
+        ]}
+        value={activeTab}
+        onChange={setActiveTab}
       />
-      {speechToText.enabled ? (
-        <>
+
+      <SettingsTabPanel
+        baseId="speech-to-text-settings"
+        tabId="provider"
+        active={activeTab === 'provider'}
+      >
+        <SettingsCard title={t('speechToTextProvider')}>
+          <SettingRow
+            title={t('speechToTextEnabled')}
+            description={t('speechToTextEnabledDesc')}
+            control={
+              <Toggle
+                checked={speechToText.enabled}
+                onChange={(enabled) => {
+                  // 首次开启时直接选中本地 Whisper,
+                  // 避免落进字段全空的「自定义」模式。providerId 为空但已填过
+                  // baseUrl/key/model 说明用户在用隐式自定义配置,不能覆盖。
+                  const customUntouched =
+                    !speechToText.baseUrl.trim() && !speechToText.apiKey.trim() && !speechToText.model.trim()
+                  if (enabled && !speechToText.providerId.trim() && customUntouched) {
+                    updateSpeechToText({
+                      enabled,
+                      providerId: LOCAL_WHISPER_PROVIDER_ID,
+                      baseUrl: '',
+                      apiKey: '',
+                      protocol: 'local-whisper',
+                      model: LOCAL_WHISPER_DEFAULT_MODEL_ID,
+                      localWhisperDownloadSource: LOCAL_WHISPER_DEFAULT_DOWNLOAD_SOURCE_ID
+                    })
+                    return
+                  }
+                  updateSpeechToText({ enabled })
+                }}
+              />
+            }
+          />
+          {speechToText.enabled ? (
+            <>
           <SettingRow
             title={t('speechToTextProvider')}
             description={t('speechToTextProviderDesc')}
@@ -414,7 +455,10 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
                   ))}
                   <option value={CUSTOM_SPEECH_TO_TEXT_PROVIDER_ID}>{t('speechToTextProviderCustom')}</option>
                 </select>
-                {!usingLocalWhisper && !usingCustomProvider && !selectedSpeechProvider?.apiKey?.trim() ? (
+                {!usingLocalWhisper &&
+                !usingCustomProvider &&
+                selectedProviderSpeech?.protocol !== 'gemini-cli-audio' &&
+                !selectedSpeechProvider?.apiKey?.trim() ? (
                   <p className="mt-2 text-[12px] text-amber-700 dark:text-amber-300">
                     {t('speechToTextProviderMissingKey', { provider: selectedSpeechProvider?.name ?? selectedProviderId })}
                   </p>
@@ -471,6 +515,18 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
               />
             </>
           ) : null}
+            </>
+          ) : null}
+        </SettingsCard>
+      </SettingsTabPanel>
+
+      <SettingsTabPanel
+        baseId="speech-to-text-settings"
+        tabId="model"
+        active={activeTab === 'model'}
+      >
+        {speechToText.enabled ? (
+          <SettingsCard title={t('speechToTextModel')}>
           {usingLocalWhisper ? (
             <SettingRow
               title={t('speechToTextLocalDownloadSource')}
@@ -702,6 +758,17 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
               </select>
             }
           />
+          </SettingsCard>
+        ) : null}
+      </SettingsTabPanel>
+
+      <SettingsTabPanel
+        baseId="speech-to-text-settings"
+        tabId="advanced"
+        active={activeTab === 'advanced'}
+      >
+        {speechToText.enabled ? (
+          <SettingsCard title={t('speechToTextAdvanced')}>
           <div className="px-3 py-4">
             <AdvancedSettingsDisclosure
               title={t('speechToTextAdvanced')}
@@ -746,8 +813,9 @@ export function SpeechToTextSettingsSection({ ctx }: { ctx: Record<string, any> 
               </div>
             }
           />
-        </>
-      ) : null}
-    </SettingsCard>
+          </SettingsCard>
+        ) : null}
+      </SettingsTabPanel>
+    </div>
   )
 }

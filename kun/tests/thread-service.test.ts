@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { InMemorySessionStore } from '../src/adapters/in-memory-session-store.js'
@@ -43,6 +43,86 @@ function buildService(): {
 function withId(item: TurnItem, id: string): TurnItem {
   return { ...item, id }
 }
+
+describe('ThreadService runtime defaults', () => {
+  it('uses runtime defaults for policy and Agent Perspective capture on new threads only', async () => {
+    const bus = new InMemoryEventBus()
+    const threadStore = new InMemoryThreadStore()
+    const sessionStore = new InMemorySessionStore()
+    const service = new ThreadService({
+      threadStore,
+      sessionStore,
+      events: new RuntimeEventRecorder({
+        eventBus: bus,
+        sessionStore,
+        allocateSeq: (threadId) => bus.allocateSeq(threadId),
+        nowIso: () => '2026-07-10T00:00:00.000Z'
+      }),
+      ids: new SequentialIdGenerator(),
+      nowIso: () => '2026-07-10T00:00:00.000Z',
+      defaultApprovalPolicy: 'never',
+      defaultSandboxMode: 'read-only',
+      defaultModelRequestCaptureEnabled: true
+    })
+
+    const thread = await service.create({ workspace: '/tmp', model: 'm', mode: 'agent' })
+    expect(thread).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxMode: 'read-only',
+      approvalReviewer: 'user',
+      modelRequestCaptureEnabled: true
+    })
+
+    const explicitlyDisabled = await service.create({
+      workspace: '/tmp',
+      model: 'm',
+      mode: 'agent',
+      modelRequestCaptureEnabled: false
+    })
+    expect(explicitlyDisabled.modelRequestCaptureEnabled).toBe(false)
+
+    service.updateRuntimeDefaults({
+      approvalPolicy: 'never',
+      sandboxMode: 'read-only',
+      approvalReviewer: 'agent',
+      modelRequestCaptureEnabled: false
+    })
+    const later = await service.create({ workspace: '/tmp', model: 'm', mode: 'agent' })
+    expect(later.modelRequestCaptureEnabled).toBe(false)
+    expect(later.approvalReviewer).toBe('agent')
+    expect((await service.get(thread.id))?.modelRequestCaptureEnabled).toBe(true)
+
+    const toggled = await service.update(thread.id, { modelRequestCaptureEnabled: false })
+    expect(toggled.modelRequestCaptureEnabled).toBe(false)
+  })
+})
+
+describe('ThreadService status updates', () => {
+  it('only treats archive state as mutable and derives restored execution state from turns', async () => {
+    const { service, threadStore, nowIso } = buildService()
+    const thread = await service.create(
+      { workspace: '/tmp/status', model: 'deepseek-chat', mode: 'agent' },
+      { id: 'thr_status', title: 'Status' }
+    )
+    const active = startTurn(createTurnRecord({
+      id: 'turn_active',
+      threadId: thread.id,
+      prompt: 'still running',
+      createdAt: nowIso()
+    }), nowIso())
+    await threadStore.upsert({ ...thread, status: 'running', turns: [active] })
+
+    const archived = await service.update(thread.id, { status: 'archived' })
+    expect(archived.status).toBe('archived')
+
+    const restored = await service.update(thread.id, { status: 'idle' })
+    expect(restored.status).toBe('running')
+
+    await expect(service.update(thread.id, { status: 'deleted' } as never))
+      .rejects.toThrow('thread status is managed by the runtime')
+    expect((await threadStore.get(thread.id))?.status).toBe('running')
+  })
+})
 
 async function seedParentWithTurns(
   service: ThreadService,
@@ -135,7 +215,14 @@ describe('ThreadService.fork with side relation', () => {
   it('sets parentThreadId and side relation on the new thread', async () => {
     const { service, threadStore } = buildService()
     await service.create(
-      { workspace: '/tmp/p', model: 'deepseek-chat', mode: 'agent' },
+      {
+        workspace: '/tmp/p',
+        model: 'deepseek-chat',
+        mode: 'agent',
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write',
+        approvalReviewer: 'agent'
+      },
       { id: 'thr_1', title: 'Parent' }
     )
     const side = await service.fork('thr_1', { relation: 'side' })
@@ -143,6 +230,15 @@ describe('ThreadService.fork with side relation', () => {
     expect(side.parentThreadId).toBe('thr_1')
     expect(side.forkedFromThreadId).toBe('thr_1')
     expect(side.title).toBe('Parent · side')
+    expect(side).toMatchObject({
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'agent'
+    })
+    await expect(service.fork('thr_1', {
+      relation: 'side',
+      approvalReviewer: 'user'
+    })).rejects.toThrow(/reviewer/i)
     // The parent record must not be mutated by the spawn.
     const parent = await threadStore.get('thr_1')
     expect(parent?.relation ?? 'primary').toBe('primary')
@@ -221,6 +317,23 @@ describe('ThreadService.fork with side relation', () => {
     expect(fork.title).toBe('Forker fork')
   })
 
+  it('preserves pinned model routing, persona, and additional roots on forks', async () => {
+    const { service } = buildService()
+    await service.create(
+      {
+        workspace: '/tmp/p', additionalWorkspaces: ['/tmp/shared'], model: 'pinned-model',
+        providerId: 'provider-a', accountId: 'account-a', agentId: 'reviewer',
+        systemPrompt: 'Review carefully', mode: 'agent'
+      },
+      { id: 'thr_pinned', title: 'Pinned' }
+    )
+    const fork = await service.fork('thr_pinned')
+    expect(fork).toMatchObject({
+      model: 'pinned-model', providerId: 'provider-a', accountId: 'account-a',
+      agentId: 'reviewer', systemPrompt: 'Review carefully', additionalWorkspaces: ['/tmp/shared']
+    })
+  })
+
   it('forks a plan-mode thread as a fresh agent conversation', async () => {
     const { service } = buildService()
     await service.create(
@@ -251,6 +364,23 @@ describe('ThreadService.fork with side relation', () => {
     expect(fork.forkedFromThreadId).toBe('thr_branch')
     expect(fork.forkedFromTurnCount).toBe(1)
     expect(fork.forkedFromMessageCount).toBe(1)
+  })
+
+  it('forks immediately before a requested turn for non-destructive undo', async () => {
+    const { service, sessionStore, threadStore, nowIso } = buildService()
+    await seedParentWithTurns(service, threadStore, sessionStore, nowIso, {
+      parentId: 'thr_undo',
+      inflight: true
+    })
+
+    const beforeFirst = await service.fork('thr_undo', { turnId: 'turn_completed', beforeTurn: true })
+    expect(beforeFirst.turns).toEqual([])
+    expect(beforeFirst.forkedFromThreadId).toBe('thr_undo')
+    expect(beforeFirst.forkedFromTurnCount).toBe(0)
+
+    const beforeSecond = await service.fork('thr_undo', { turnId: 'turn_inflight', beforeTurn: true })
+    expect(beforeSecond.turns.map((turn) => turn.id)).toEqual(['turn_completed'])
+    expect((await threadStore.get('thr_undo'))?.turns).toHaveLength(2)
   })
 
   it('repairs malformed tool-call history when cloning a fork', async () => {
@@ -369,6 +499,21 @@ describe('ThreadService goals', () => {
     expect(events.map((event) => event.kind)).toContain('goal_cleared')
   })
 
+  it('accumulates goal token usage and marks a reached budget as usage limited', async () => {
+    const { service } = buildService()
+    await service.create({ workspace: '/tmp/p', model: 'm', mode: 'agent' }, { id: 'thr_goal_usage' })
+    await service.setGoal('thr_goal_usage', { objective: 'bounded work', tokenBudget: 100 })
+
+    await expect(service.recordGoalUsage('thr_goal_usage', 60)).resolves.toMatchObject({
+      tokensUsed: 60,
+      status: 'active'
+    })
+    await expect(service.recordGoalUsage('thr_goal_usage', 40)).resolves.toMatchObject({
+      tokensUsed: 100,
+      status: 'usageLimited'
+    })
+  })
+
   it('rejects status-only updates when no goal exists', async () => {
     const { service } = buildService()
     await service.create(
@@ -432,6 +577,48 @@ describe('ThreadService todos', () => {
       expect(events.some((event) => event.kind === 'todos_updated')).toBe(true)
     } finally {
       await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to patch a plan path that escapes through a symlink', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-todos-workspace-'))
+    const outside = await mkdtemp(join(tmpdir(), 'kun-todos-outside-'))
+    try {
+      const relativePath = '.kunsdd/plan/demo.md'
+      const planDir = join(workspace, '.kunsdd', 'plan')
+      const planPath = join(planDir, 'demo.md')
+      const markdown = '# Plan\n\n- [ ] Keep this private\n'
+      await mkdir(planDir, { recursive: true })
+      await writeFile(planPath, markdown, 'utf-8')
+
+      const { service } = buildService()
+      await service.create(
+        { workspace, model: 'deepseek-chat', mode: 'agent' },
+        { id: 'thr_todos_symlink', title: 'Todos' }
+      )
+      const synced = await service.syncTodosFromPlan('thr_todos_symlink', {
+        planId: 'plan_1',
+        relativePath,
+        markdown
+      })
+
+      const outsidePlan = join(outside, 'demo.md')
+      await writeFile(outsidePlan, markdown, 'utf-8')
+      await rm(planDir, { recursive: true, force: true })
+      await symlink(outside, planDir, 'dir')
+
+      await expect(service.setTodos('thr_todos_symlink', {
+        todos: synced.items.map((item) => ({
+          id: item.id,
+          content: item.content,
+          status: 'completed' as const,
+          source: item.source
+        }))
+      })).rejects.toThrow(/plan path escapes workspace/)
+      await expect(readFile(outsidePlan, 'utf-8')).resolves.toBe(markdown)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
     }
   })
 })

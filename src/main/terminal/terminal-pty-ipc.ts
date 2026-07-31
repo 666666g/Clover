@@ -10,15 +10,17 @@
  * Cross-platform notes:
  *  - macOS / Linux: node-pty uses forkpty; the `$SHELL` env var (fallback
  *    /bin/zsh on mac, /bin/bash on linux) selects the program.
- *  - Windows: node-pty uses ConPTY (`useConpty: true`); we prefer PowerShell
- *    7 (pwsh.exe), then Windows PowerShell, then cmd.exe.
+ *  - Windows: node-pty uses ConPTY (`useConpty: true`); Git Bash is preferred
+ *    when Git for Windows is installed, followed by PowerShell and cmd.exe.
  *  - `useConpty` is a no-op on non-Windows, so we always pass it.
  */
-import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
 import type { BrowserWindow, IpcMain, WebContents } from 'electron'
 import type { IPty } from 'node-pty'
+import {
+  resolveWindowsShellCandidates,
+  type WindowsShellResolverOptions
+} from '../../../kun/src/adapters/tool/windows-shell-resolver.js'
 import {
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS,
@@ -64,27 +66,23 @@ async function loadNodePty(): Promise<typeof import('node-pty') | null> {
  *        falling back to zsh which has shipped as the system default since
  *        Catalina.
  * Linux: respects $SHELL, falling back to bash (the de-facto standard).
- * Windows: PowerShell 7 (pwsh.exe) if installed, else Windows PowerShell,
- *        else the COMSPEC command interpreter (usually cmd.exe).
+ * Windows: Git Bash if installed, then PowerShell 7, Windows PowerShell, and
+ *        finally the COMSPEC command interpreter (usually cmd.exe).
  */
-function resolveDefaultShell(): { file: string; args: string[] } {
-  if (process.platform === 'win32') {
-    const programFiles = process.env.PROGRAMFILES ?? 'C:\\Program Files'
-    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows'
-    const pwsh7 = join(programFiles, 'PowerShell', '7', 'pwsh.exe')
-    if (existsSync(pwsh7)) return { file: pwsh7, args: ['-NoLogo'] }
-    const windowsPwsh = join(
-      systemRoot,
-      'System32',
-      'WindowsPowerShell',
-      'v1.0',
-      'powershell.exe'
-    )
-    if (existsSync(windowsPwsh)) return { file: windowsPwsh, args: ['-NoLogo'] }
-    return { file: process.env.COMSPEC ?? 'cmd.exe', args: [] }
+export function resolveTerminalShellCandidates(
+  platform: NodeJS.Platform = process.platform,
+  options: WindowsShellResolverOptions = {}
+): Array<{ file: string; args: string[]; gitBash: boolean }> {
+  if (platform === 'win32') {
+    return resolveWindowsShellCandidates(options).map((candidate) => ({
+      file: candidate.file,
+      args: [...candidate.terminalArgs],
+      gitBash: candidate.kind === 'git-bash'
+    }))
   }
-  const fallback = process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
-  return { file: process.env.SHELL || fallback, args: [] }
+  const env = options.env ?? process.env
+  const fallback = platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+  return [{ file: env.SHELL || fallback, args: [], gitBash: false }]
 }
 
 /**
@@ -241,7 +239,6 @@ export function registerTerminalPtyIpc(options: RegisterTerminalPtyIpcOptions): 
       }
     }
 
-    const { file, args: shellArgs } = resolveDefaultShell()
     const cols = request.cols ?? TERMINAL_DEFAULT_COLS
     const rows = request.rows ?? TERMINAL_DEFAULT_ROWS
     const cwd = request.cwd && request.cwd.trim() ? request.cwd.trim() : homedir()
@@ -255,17 +252,39 @@ export function registerTerminalPtyIpc(options: RegisterTerminalPtyIpcOptions): 
       })
     }
 
-    try {
-      const pty = ptyModule.spawn(file, shellArgs, {
-        name: 'xterm-256color',
-        cols,
-        rows,
-        cwd,
-        env: buildShellEnv(colorMode),
-        // ConPTY on Windows, ignored elsewhere.
-        useConpty: true
-      })
+    let pty: IPty | undefined
+    const spawnAttempts: Array<{ file: string; message: string }> = []
+    for (const candidate of resolveTerminalShellCandidates()) {
+      try {
+        const env = buildShellEnv(colorMode)
+        if (candidate.gitBash) env.CHERE_INVOKING = '1'
+        pty = ptyModule.spawn(candidate.file, candidate.args, {
+          name: 'xterm-256color',
+          cols,
+          rows,
+          cwd,
+          env,
+          // ConPTY on Windows, ignored elsewhere.
+          useConpty: true
+        })
+        break
+      } catch (error) {
+        spawnAttempts.push({
+          file: candidate.file,
+          message: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
 
+    if (!pty) {
+      const message = spawnAttempts.length > 0
+        ? `Failed to start a terminal shell: ${spawnAttempts.map((attempt) => attempt.message).join('; ')}`
+        : 'No terminal shell is available on this system.'
+      logError('terminal', 'Failed to spawn PTY', { sessionId: request.sessionId, spawnAttempts })
+      return { ok: false as const, message }
+    }
+
+    try {
       const session: TerminalSession = {
         pty,
         sender: event.sender,
@@ -290,6 +309,11 @@ export function registerTerminalPtyIpc(options: RegisterTerminalPtyIpcOptions): 
 
       return { ok: true as const, sessionId: request.sessionId }
     } catch (error) {
+      try {
+        pty.kill()
+      } catch {
+        // Best effort: setup failed before the session became renderer-owned.
+      }
       const message = error instanceof Error ? error.message : String(error)
       logError('terminal', 'Failed to spawn PTY', { sessionId: request.sessionId, message })
       return { ok: false as const, message }

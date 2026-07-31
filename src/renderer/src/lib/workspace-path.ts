@@ -24,6 +24,24 @@ export function workspaceRootIdentityKey(path?: string): string {
   return normalized
 }
 
+/**
+ * Lexical, case-preserving key for security-sensitive workspace scoping.
+ * Unlike the navigation identity key, this must not merge distinct paths on
+ * case-sensitive filesystems. Main already resolves Extension View workspace
+ * roots; the renderer only normalizes separator spelling and trailing slashes.
+ */
+export function workspaceRootScopeKey(path?: string): string {
+  let normalized = path?.trim().replace(/\\/g, '/') ?? ''
+  while (
+    normalized.length > 1 &&
+    normalized.endsWith('/') &&
+    !/^[A-Za-z]:\/$/.test(normalized)
+  ) {
+    normalized = normalized.slice(0, -1)
+  }
+  return normalized
+}
+
 export function isInternalTemporaryWorkspace(path?: string): boolean {
   const trimmed = path?.trim() ?? ''
   if (!trimmed) return false
@@ -89,12 +107,16 @@ export function isInternalDeepSeekGuiWorkspace(path?: string): boolean {
   return (
     normalized === '~/.kun/write_workspace'
     || normalized.endsWith('/.kun/write_workspace')
+    || normalized === '~/.kun/design-workspace'
+    || normalized.endsWith('/.kun/design-workspace')
     || normalized === '~/.deepseekgui/write_workspace'
     || normalized.endsWith('/.deepseekgui/write_workspace')
+    || normalized === '~/.deepseekgui/design-workspace'
+    || normalized.endsWith('/.deepseekgui/design-workspace')
   )
 }
 
-export function normalizeWorkspaceRoot(path?: string): string {
+export function normalizeWorkspaceRoot(path?: string | null): string {
   const trimmed = path?.trim() ?? ''
   if (!trimmed) return ''
   if (isInternalTemporaryWorkspace(trimmed)) return ''

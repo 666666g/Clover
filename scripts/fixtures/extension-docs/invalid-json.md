@@ -1,0 +1,5 @@
+# Invalid JSON
+
+```json
+{"missing": }
+```

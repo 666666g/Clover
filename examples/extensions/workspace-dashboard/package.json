@@ -1,0 +1,23 @@
+{
+  "name": "@kun-examples/workspace-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:host && npm run build:webview",
+    "build:host": "tsc -p tsconfig.host.json",
+    "build:webview": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.webview.json",
+    "validate": "node ../run-repository-kun-cli.mjs extension validate .",
+    "pack": "npm run build && node ../run-repository-kun-cli.mjs extension pack ."
+  },
+  "dependencies": {
+    "@kun/extension-api": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}

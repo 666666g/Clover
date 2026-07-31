@@ -1,0 +1,88 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "external-release",
+  "publisher": "kun-release-fixtures",
+  "version": "1.0.0",
+  "displayName": "External Release Acceptance",
+  "description": "Clean-project acceptance for a View, Agent command, tool, and streaming Provider.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "browser": "view/index.html",
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "commands": [
+      {
+        "id": "run-agent",
+        "title": "Run Kun Agent"
+      }
+    ],
+    "views.rightSidebar": [
+      {
+        "id": "release-view",
+        "title": "Release Acceptance",
+        "entry": "view/index.html",
+        "localResourceRoots": ["view"]
+      }
+    ],
+    "tools": [
+      {
+        "id": "release-echo",
+        "description": "Echo a value through the public Kun tool contract.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "value": { "type": "string" }
+          },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "sideEffects": "none",
+        "idempotent": true
+      }
+    ],
+    "authentication": [
+      {
+        "id": "release-key",
+        "displayName": "Release API Key",
+        "type": "api-key"
+      }
+    ],
+    "modelProviders": [
+      {
+        "id": "external-stream",
+        "displayName": "External Stream",
+        "authenticationProviderId": "release-key",
+        "adapterApiVersion": "1.0.0",
+        "models": [
+          {
+            "id": "echo-1",
+            "displayName": "Echo 1",
+            "capabilities": {
+              "input": ["text"],
+              "output": ["text"],
+              "reasoning": false,
+              "tools": false,
+              "parallelTools": false,
+              "streaming": true
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": [
+    "commands.register",
+    "ui.views",
+    "webview",
+    "agent.run",
+    "tools.register",
+    "providers.register",
+    "accounts.read"
+  ],
+  "stateSchemaVersion": 1
+}

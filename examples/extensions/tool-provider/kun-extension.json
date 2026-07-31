@@ -1,0 +1,54 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "tool-provider",
+  "publisher": "kun-examples",
+  "version": "0.1.0",
+  "displayName": "Workspace Tool Provider",
+  "description": "A headless extension tool dispatched through Kun ToolHost.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "activationEvents": [
+    "onTool:workspace-summary"
+  ],
+  "contributes": {
+    "tools": [
+      {
+        "id": "workspace-summary",
+        "description": "List a bounded set of entries under a workspace-relative path.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative directory, defaults to the root."
+            }
+          },
+          "additionalProperties": false
+        },
+        "outputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "entryCount": { "type": "number" },
+            "entries": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["path", "entryCount", "entries"],
+          "additionalProperties": false
+        },
+        "sideEffects": "read",
+        "idempotent": true,
+        "maxOutputBytes": 65536
+      }
+    ]
+  },
+  "permissions": [
+    "tools.register",
+    "workspace.read"
+  ],
+  "stateSchemaVersion": 1
+}

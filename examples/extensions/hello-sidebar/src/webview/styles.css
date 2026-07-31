@@ -1,0 +1,34 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  color: var(--kun-foreground, CanvasText);
+  background: var(--kun-background, Canvas);
+}
+
+main {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--kun-mutedForeground, GrayText);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+h1,
+p {
+  margin: 0;
+}
+
+button {
+  width: fit-content;
+  padding: 0.5rem 0.75rem;
+}

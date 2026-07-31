@@ -33,6 +33,11 @@ describe('UpdateThreadRequest', () => {
     }
   })
 
+  it('rejects execution and deletion statuses from a generic patch', () => {
+    expect(UpdateThreadRequest.safeParse({ status: 'running' }).success).toBe(false)
+    expect(UpdateThreadRequest.safeParse({ status: 'deleted' }).success).toBe(false)
+  })
+
   it('accepts workspace as the only field (refine guard)', () => {
     const result = UpdateThreadRequest.safeParse({
       workspace: '/tmp/test'

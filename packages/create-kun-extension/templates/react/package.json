@@ -1,0 +1,31 @@
+{
+  "name": "{{EXTENSION_ID}}",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:host && npm run build:webview",
+    "build:host": "tsc -p tsconfig.host.json",
+    "build:webview": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.host.json && tsc --noEmit -p tsconfig.webview.json",
+    "test": "npm run build && node --test dist/extension.test.js",
+    "validate": "kun extension validate .",
+    "pack": "npm run build && kun extension pack ."
+  },
+  "dependencies": {
+    "@kun/extension-api": "^1.0.0",
+    "@kun/extension-react": "^1.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@kun/extension-test": "^1.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}

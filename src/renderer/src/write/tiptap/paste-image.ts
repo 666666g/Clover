@@ -1,9 +1,11 @@
 import { Extension } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
+import { writeDocumentContextMatches } from '../write-document-context'
 
 export type WritePasteImageOptions = {
   getWorkspaceRoot: () => string
   getFilePath: () => string
+  getDocumentEpoch: () => number
   getImageDirectory: () => string
   isReadOnly: () => boolean
   onSaved: () => void
@@ -27,6 +29,7 @@ export const WritePasteImage = Extension.create<WritePasteImageOptions>({
     return {
       getWorkspaceRoot: () => '',
       getFilePath: () => '',
+      getDocumentEpoch: () => 0,
       getImageDirectory: () => '',
       isReadOnly: () => false,
       onSaved: () => undefined,
@@ -46,6 +49,7 @@ export const WritePasteImage = Extension.create<WritePasteImageOptions>({
             if (!clipboardHasImage(event)) return false
             const workspaceRoot = options.getWorkspaceRoot().trim()
             const filePath = options.getFilePath().trim()
+            const documentEpoch = options.getDocumentEpoch()
             if (!workspaceRoot || !filePath) {
               options.onError('Open a workspace file before pasting an image.')
               return true
@@ -60,6 +64,17 @@ export const WritePasteImage = Extension.create<WritePasteImageOptions>({
                 ...(imageDirectory ? { imageDirectory } : {})
               })
               .then((result) => {
+                if (
+                  editor.isDestroyed ||
+                  !writeDocumentContextMatches(
+                    {
+                      workspaceRoot: options.getWorkspaceRoot(),
+                      activeFilePath: options.getFilePath(),
+                      documentEpoch: options.getDocumentEpoch()
+                    },
+                    { workspaceRoot, filePath, documentEpoch }
+                  )
+                ) return
                 if (!result.ok) {
                   options.onError(result.message)
                   return
@@ -72,6 +87,17 @@ export const WritePasteImage = Extension.create<WritePasteImageOptions>({
                 options.onSaved()
               })
               .catch((error) => {
+                if (
+                  editor.isDestroyed ||
+                  !writeDocumentContextMatches(
+                    {
+                      workspaceRoot: options.getWorkspaceRoot(),
+                      activeFilePath: options.getFilePath(),
+                      documentEpoch: options.getDocumentEpoch()
+                    },
+                    { workspaceRoot, filePath, documentEpoch }
+                  )
+                ) return
                 options.onError(error instanceof Error ? error.message : String(error))
               })
             return true

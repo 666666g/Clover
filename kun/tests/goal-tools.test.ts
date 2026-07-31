@@ -52,11 +52,57 @@ describe('goal local tools', () => {
     const { service } = buildService()
     const host = new LocalToolHost({ tools: buildGoalLocalTools(service) })
 
-    const names = (await host.listTools(toolContext('thr_goal'))).map((tool) => tool.name)
+    const tools = await host.listTools(toolContext('thr_goal'))
+    const names = tools.map((tool) => tool.name)
+    const createGoal = tools.find((tool) => tool.name === CREATE_GOAL_TOOL_NAME)
 
     expect(names).toContain(GET_GOAL_TOOL_NAME)
     expect(names).toContain(CREATE_GOAL_TOOL_NAME)
     expect(names).toContain(UPDATE_GOAL_TOOL_NAME)
+    expect(createGoal?.inputSchema).toMatchObject({
+      type: 'object',
+      properties: { objective: expect.any(Object) },
+      required: ['objective'],
+      additionalProperties: false
+    })
+    expect(createGoal?.inputSchema.properties).not.toHaveProperty('token_budget')
+    expect(createGoal?.description).toContain('no token limit')
+  })
+
+  it('creates unbounded goals and ignores stale model-supplied token budgets', async () => {
+    const { service } = buildService()
+    await service.create(
+      { workspace: '/tmp', model: 'deepseek-chat', mode: 'agent' },
+      { id: 'thr_unbounded_goal', title: 'Unbounded goal thread' }
+    )
+    const host = new LocalToolHost({ tools: buildGoalLocalTools(service) })
+
+    const result = await host.execute({
+      callId: 'call_goal_create',
+      toolName: CREATE_GOAL_TOOL_NAME,
+      arguments: {
+        objective: 'finish the requested work',
+        token_budget: 10
+      }
+    }, toolContext('thr_unbounded_goal'))
+
+    expect(result.item.kind).toBe('tool_result')
+    if (result.item.kind !== 'tool_result') return
+    expect(result.item.isError).toBeFalsy()
+    expect(result.item.output).toMatchObject({
+      goal: {
+        status: 'active',
+        objective: 'finish the requested work',
+        tokensUsed: 0
+      },
+      remainingTokens: null
+    })
+    expect(result.item.output).not.toHaveProperty('goal.tokenBudget')
+    expect(await service.getGoal('thr_unbounded_goal')).not.toHaveProperty('tokenBudget')
+
+    const afterUsage = await service.recordGoalUsage('thr_unbounded_goal', 250)
+    expect(afterUsage).toMatchObject({ status: 'active', tokensUsed: 250 })
+    expect(afterUsage).not.toHaveProperty('tokenBudget')
   })
 
   it('lets the model mark an existing goal complete', async () => {

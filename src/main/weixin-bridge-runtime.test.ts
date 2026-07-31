@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
-import { weixinBridgeRuntimeInternals } from './weixin-bridge-runtime'
+import {
+  configureWeixinBridgeRuntimeContextProvider,
+  weixinBridgeRuntimeInternals
+} from './weixin-bridge-runtime'
 
 vi.mock('electron', () => ({
   app: {
@@ -61,5 +64,74 @@ describe('weixin bridge runtime', () => {
 
     expect(webhookGeneratedFiles({ ok: true, reply: 'no files' })).toEqual([])
     expect(webhookGeneratedFiles({ files: 'not-an-array' })).toEqual([])
+  })
+
+  it('keeps a webhook failure reply deliverable for WeChat', async () => {
+    configureWeixinBridgeRuntimeContextProvider(async () => ({
+      webhookUrl: 'http://127.0.0.1:18787/claw/im',
+      webhookSecret: 'secret',
+      channelId: 'channel_weixin'
+    }))
+    const responseBody = {
+      ok: false,
+      message: 'Kun: model request failed: fetch failed',
+      reply: 'Kun: model request failed: fetch failed'
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => responseBody,
+      text: async () => JSON.stringify(responseBody)
+    } as Response)
+
+    try {
+      await expect(weixinBridgeRuntimeInternals.postToDeepSeekGuiWebhook({
+        message_id: 'wx_msg_1',
+        from_user_id: 'wx_user_1',
+        item_list: [{ type: 1, text_item: { text: '你好' } }]
+      }, 'wx_account_1')).resolves.toMatchObject({
+        ok: false,
+        reply: 'Kun: model request failed: fetch failed'
+      })
+    } finally {
+      fetchMock.mockRestore()
+      configureWeixinBridgeRuntimeContextProvider(null)
+    }
+  })
+
+  it('cancels an in-flight GUI webhook when its account monitor stops', async () => {
+    configureWeixinBridgeRuntimeContextProvider(async () => ({
+      webhookUrl: 'http://127.0.0.1:18787/claw/im',
+      webhookSecret: '',
+      channelId: 'channel_weixin'
+    }))
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | undefined
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (_url, init) => {
+        requestSignal = init?.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          requestSignal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'))
+          }, { once: true })
+        })
+      }
+    )
+
+    try {
+      const pending = weixinBridgeRuntimeInternals.postToDeepSeekGuiWebhook({
+        message_id: 'wx_msg_abort',
+        from_user_id: 'wx_user_abort',
+        item_list: [{ type: 1, text_item: { text: '停止测试' } }]
+      }, 'wx_account_1', controller.signal)
+      await vi.waitFor(() => expect(requestSignal).toBeDefined())
+      controller.abort()
+
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      expect(requestSignal?.aborted).toBe(true)
+    } finally {
+      fetchMock.mockRestore()
+      configureWeixinBridgeRuntimeContextProvider(null)
+    }
   })
 })

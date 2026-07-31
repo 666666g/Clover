@@ -25,9 +25,10 @@ export function selectLivePendingUserInput(blocks: ChatBlock[]): UserInputBlock 
 /**
  * Shared, framework-free helpers for the user_input / ask-user interaction.
  *
- * The runtime models each question as having exactly one answer
- * (`UserInputAnswer` = `{ id, label, value }`), so selection is single-choice
- * per question. Free-form questions (no options) and the "type your own"
+ * The runtime models each question as having one answer object. Single-choice
+ * answers keep using `{ id, label, value }`; multi-select answers add
+ * `labels` / `values` while preserving the joined `label` / `value` string for
+ * older consumers. Free-form questions (no options) and the "type your own"
  * escape hatch both resolve to a synthetic label below.
  *
  * Both the composer-docked panel and the (read-only) timeline bubble import
@@ -35,6 +36,7 @@ export function selectLivePendingUserInput(blocks: ChatBlock[]): UserInputBlock 
  */
 export const USER_INPUT_OTHER_LABEL = 'Other'
 export const USER_INPUT_FREEFORM_LABEL = 'Answer'
+const USER_INPUT_MULTI_VALUE_SEPARATOR = ', '
 
 export function answersByQuestionId(
   answers: UserInputAnswer[] | undefined
@@ -53,6 +55,72 @@ export function answerFromOption(
   return { id: question.id, label: option.label, value: option.label }
 }
 
+export function isMultipleChoiceQuestion(question: UserInputQuestion): boolean {
+  return question.selectionMode === 'multiple' && question.options.length > 0
+}
+
+export function questionMaxSelections(question: UserInputQuestion): number | undefined {
+  if (!isMultipleChoiceQuestion(question)) return undefined
+  const raw = question.maxSelections
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
+  const normalized = Math.floor(raw)
+  return normalized > 0 ? Math.min(normalized, question.options.length) : undefined
+}
+
+export function questionMinSelections(question: UserInputQuestion): number {
+  if (!isMultipleChoiceQuestion(question)) return 1
+  const raw = question.minSelections
+  const normalized = typeof raw === 'number' && Number.isFinite(raw) ? Math.floor(raw) : 1
+  const max = questionMaxSelections(question) ?? question.options.length
+  return Math.min(Math.max(1, normalized), max)
+}
+
+export function answerDisplayValues(answer: UserInputAnswer | undefined): string[] {
+  if (!answer) return []
+  if (answer.values && answer.values.length > 0) return answer.values.filter((value) => value.trim())
+  if (answer.labels && answer.labels.length > 0) return answer.labels.filter((label) => label.trim())
+  if (answer.value.trim()) return [answer.value.trim()]
+  if (answer.label !== USER_INPUT_OTHER_LABEL && answer.label.trim()) return [answer.label.trim()]
+  return []
+}
+
+export function selectedOptionValues(answer: UserInputAnswer | undefined): string[] {
+  if (!answer || answer.label === USER_INPUT_OTHER_LABEL) return []
+  if (answer.values && answer.values.length > 0) return answer.values
+  if (answer.labels && answer.labels.length > 0) return answer.labels
+  return answer.value.trim() ? [answer.value.trim()] : []
+}
+
+export function answerFromOptions(
+  question: UserInputQuestion,
+  options: UserInputOption[]
+): UserInputAnswer {
+  const labels = options.map((option) => option.label)
+  const value = labels.join(USER_INPUT_MULTI_VALUE_SEPARATOR)
+  return {
+    id: question.id,
+    label: value,
+    value,
+    labels,
+    values: labels
+  }
+}
+
+export function toggleOptionAnswer(
+  question: UserInputQuestion,
+  answer: UserInputAnswer | undefined,
+  option: UserInputOption
+): UserInputAnswer | null {
+  const selected = new Set(selectedOptionValues(answer))
+  if (selected.has(option.label)) {
+    selected.delete(option.label)
+  } else {
+    selected.add(option.label)
+  }
+  const ordered = question.options.filter((candidate) => selected.has(candidate.label))
+  return ordered.length > 0 ? answerFromOptions(question, ordered) : null
+}
+
 /**
  * Map free-typed composer text onto the current question. An exact (case- and
  * whitespace-insensitive) match against an option collapses to that option;
@@ -68,6 +136,7 @@ export function answerFromTypedText(
     (option) => option.label.trim().toLowerCase() === trimmed.toLowerCase()
   )
   if (matched) {
+    if (isMultipleChoiceQuestion(question)) return answerFromOptions(question, [matched])
     return { id: question.id, label: matched.label, value: matched.label }
   }
   const label = question.options.length > 0 ? USER_INPUT_OTHER_LABEL : USER_INPUT_FREEFORM_LABEL
@@ -81,6 +150,11 @@ export function isQuestionAnswered(
   if (!answer) return false
   if (question.options.length === 0 || answer.label === USER_INPUT_OTHER_LABEL) {
     return answer.value.trim().length > 0
+  }
+  if (isMultipleChoiceQuestion(question)) {
+    const selectedCount = selectedOptionValues(answer).length
+    const max = questionMaxSelections(question)
+    return selectedCount >= questionMinSelections(question) && (max === undefined || selectedCount <= max)
   }
   return true
 }

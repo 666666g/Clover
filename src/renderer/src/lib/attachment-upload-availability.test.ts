@@ -46,13 +46,23 @@ describe('isChatAttachmentUploadEnabled', () => {
     })).toBe(false)
   })
 
-  it('keeps the attachment picker reachable for non-image documents', () => {
+  it('keeps document attachments available when the model cannot accept images', () => {
     expect(isChatAttachmentUploadEnabled({
       runtimeConnection: 'ready',
       route: 'chat',
       mode: 'agent',
-      attachmentStoreAvailable: false,
+      attachmentStoreAvailable: true,
       modelSupportsImageInput: false
+    })).toBe(true)
+  })
+
+  it('enables composer attachments in Design mode assistants', () => {
+    expect(isChatAttachmentUploadEnabled({
+      runtimeConnection: 'ready',
+      route: 'design',
+      mode: 'agent',
+      attachmentStoreAvailable: true,
+      modelSupportsImageInput: true
     })).toBe(true)
   })
 })

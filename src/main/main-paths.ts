@@ -13,7 +13,15 @@ export function resolvePreloadPath(
   distDir: string,
   fileExists: (path: string) => boolean = existsSync
 ): string {
-  const cjsPath = join(distDir, '../preload/index.cjs')
+  return resolveNamedPreloadPath(distDir, 'index', fileExists)
+}
+
+export function resolveNamedPreloadPath(
+  distDir: string,
+  name: 'index' | 'extension-view' | 'extension-protected-surface' | 'tray-quota',
+  fileExists: (path: string) => boolean = existsSync
+): string {
+  const cjsPath = join(distDir, `../preload/${name}.cjs`)
   if (fileExists(cjsPath)) return cjsPath
-  return join(distDir, '../preload/index.mjs')
+  return join(distDir, `../preload/${name}.mjs`)
 }

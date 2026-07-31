@@ -41,7 +41,12 @@ export class Router {
         const want = route.segments[i]
         const got = segments[i]
         if (want.startsWith(':')) {
-          params[want.slice(1)] = decodeURIComponent(got)
+          const decoded = decodePathSegment(got)
+          if (decoded === null) {
+            matches = false
+            break
+          }
+          params[want.slice(1)] = decoded
         } else if (want !== got) {
           matches = false
           break
@@ -50,5 +55,20 @@ export class Router {
       if (matches) return { handler: route.handler, params }
     }
     return undefined
+  }
+}
+
+/**
+ * A route parameter always represents one URL path segment. Encoded path
+ * separators and NUL bytes must therefore be rejected rather than decoded
+ * into a value that a downstream filesystem adapter could interpret as a
+ * path. Invalid percent encodings are treated as an unmatched route.
+ */
+function decodePathSegment(segment: string): string | null {
+  try {
+    const decoded = decodeURIComponent(segment)
+    return /[\\/\0]/.test(decoded) ? null : decoded
+  } catch {
+    return null
   }
 }

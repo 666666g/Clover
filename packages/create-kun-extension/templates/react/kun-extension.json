@@ -1,0 +1,43 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "{{NAME}}",
+  "publisher": "{{PUBLISHER}}",
+  "version": "0.1.0",
+  "displayName": "{{DISPLAY_NAME_JSON}}",
+  "description": "A Kun extension with a Node host and React Webview",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "browser": "dist/webview/index.html",
+  "activationEvents": [
+    "onView:main",
+    "onCommand:refresh"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "refresh",
+        "title": "{{REFRESH_TITLE_JSON}}"
+      }
+    ],
+    "views.rightSidebar": [
+      {
+        "id": "main",
+        "title": "{{DISPLAY_NAME_JSON}}",
+        "entry": "dist/webview/index.html",
+        "localResourceRoots": ["dist/webview"]
+      }
+    ]
+  },
+  "permissions": [
+    "commands.register",
+    "ui.views",
+    "webview",
+    "storage.workspace"
+  ],
+  "stateSchemaVersion": 1
+}

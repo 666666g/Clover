@@ -1,5 +1,8 @@
-import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 import type { KunGuiApi } from '../shared/kun-gui-api'
+import { registerExtensionContentScriptPreload } from './extension-content-script'
+
+registerExtensionContentScriptPreload({ contextBridge, ipcRenderer, webFrame })
 
 // The preload runs sandboxed (webPreferences.sandbox = true), so it cannot
 // require node built-ins like node:os. The home dir is passed in from the main
@@ -11,9 +14,57 @@ const homeDirFromArgs =
 const api = {
   platform: process.platform,
   homeDir: homeDirFromArgs,
+  dataMigration: {
+    pickExportPackage: (defaultPath) => ipcRenderer.invoke('data-migration:pick-export', { defaultPath }),
+    pickImportPackage: (defaultPath) => ipcRenderer.invoke('data-migration:pick-import', { defaultPath }),
+    pickDestinationDirectory: (defaultPath) => ipcRenderer.invoke('data-migration:pick-destination', { defaultPath }),
+    estimateExport: (input) => ipcRenderer.invoke('data-migration:estimate-export', input),
+    inspectPackage: (input) => ipcRenderer.invoke('data-migration:inspect', input),
+    planImport: (input) => ipcRenderer.invoke('data-migration:plan-import', input),
+    startExport: (input) => ipcRenderer.invoke('data-migration:start-export', input),
+    startImport: (input) => ipcRenderer.invoke('data-migration:start-import', input),
+    cancel: (operationId) => ipcRenderer.invoke('data-migration:cancel', { operationId }),
+    recover: (operationId, action) => ipcRenderer.invoke('data-migration:recover', { operationId, action }),
+    getStatus: () => ipcRenderer.invoke('data-migration:status'),
+    listReports: () => ipcRenderer.invoke('data-migration:reports:list'),
+    getReport: (operationId) => ipcRenderer.invoke('data-migration:reports:get', { operationId }),
+    deleteReport: (operationId) => ipcRenderer.invoke('data-migration:reports:delete', { operationId }),
+    onProgress: (handler) => {
+      let latest: Parameters<typeof handler>[0] | null = null
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const flush = () => {
+        timer = null
+        if (!latest) return
+        const value = latest
+        latest = null
+        handler(value)
+      }
+      const wrapped = (_: Electron.IpcRendererEvent, payload: Parameters<typeof handler>[0]) => {
+        latest = payload
+        if (!timer) timer = setTimeout(flush, 100)
+      }
+      ipcRenderer.on('data-migration:progress', wrapped)
+      return () => {
+        ipcRenderer.removeListener('data-migration:progress', wrapped)
+        if (timer) clearTimeout(timer)
+        timer = null
+        latest = null
+      }
+    },
+    onRendererRequest: (handler) => {
+      const wrapped = (_: Electron.IpcRendererEvent, request: Parameters<typeof handler>[0]) => handler(request)
+      ipcRenderer.on('data-migration:renderer-request', wrapped)
+      return () => ipcRenderer.removeListener('data-migration:renderer-request', wrapped)
+    },
+    respondRendererRequest: (response) => ipcRenderer.invoke('data-migration:renderer-response', response)
+  },
   getSettings: () => ipcRenderer.invoke('settings:get'),
+  resetUnreadableCredentials: () => ipcRenderer.invoke('credentials:reset-unreadable'),
+  cliInstallStatus: () => ipcRenderer.invoke('cli-install:status'),
+  cliInstallAction: (action) => ipcRenderer.invoke('cli-install:action', action),
   claudeSubscriptionStatus: () => ipcRenderer.invoke('claude-subscription:status'),
   claudeSubscriptionLogin: () => ipcRenderer.invoke('claude-subscription:login'),
+  claudeSubscriptionProbe: (token) => ipcRenderer.invoke('claude-subscription:probe', token),
   claudeSubscriptionModels: (token) => ipcRenderer.invoke('claude-subscription:models', token),
   claudeSubscriptionSdkStatus: () => ipcRenderer.invoke('claude-subscription:sdk-status'),
   claudeSubscriptionSdkInstall: () => ipcRenderer.invoke('claude-subscription:sdk-install'),
@@ -25,17 +76,42 @@ const api = {
     ipcRenderer.on('claude-subscription:sdk-progress', wrapped)
     return () => ipcRenderer.removeListener('claude-subscription:sdk-progress', wrapped)
   },
+  geminiSubscriptionCliStatus: () => ipcRenderer.invoke('gemini-subscription:cli-status'),
+  geminiSubscriptionCliInstall: () => ipcRenderer.invoke('gemini-subscription:cli-install'),
+  onGeminiSubscriptionCliProgress: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('gemini-subscription:cli-progress', wrapped)
+    return () => ipcRenderer.removeListener('gemini-subscription:cli-progress', wrapped)
+  },
+  geminiSubscriptionModels: () => ipcRenderer.invoke('gemini-subscription:models'),
+  geminiCliSubscriptionStatus: () => ipcRenderer.invoke('gemini-cli-subscription:status'),
+  geminiCliSubscriptionModels: () => ipcRenderer.invoke('gemini-cli-subscription:models'),
+  cursorSubscriptionDiscover: (apiKey) =>
+    ipcRenderer.invoke('cursor-subscription:discover', { apiKey }),
   setSettings: (partial) =>
     ipcRenderer.invoke('settings:set', partial),
   saveSettingsSilent: (partial) =>
     ipcRenderer.invoke('settings:save-silent', partial),
   runtimeRequest: (path, method, body) =>
     ipcRenderer.invoke('runtime:request', { path, method, body }),
+  getRuntimeSettingsSyncStatus: () =>
+    ipcRenderer.invoke('runtime:settings-sync-status:get'),
   uploadRuntimeAttachment: (payload) =>
     ipcRenderer.invoke('runtime:upload-attachment', payload),
+  uploadRuntimeImageAttachment: (request) =>
+    ipcRenderer.invoke('runtime:attachment:upload-image', request),
+  readLocalOfficeDocument: (options) =>
+    ipcRenderer.invoke('file:read-local-office-document', options),
+  resolveKunApproval: (request) => ipcRenderer.invoke('approval:decide', request),
   restartRuntime: () => ipcRenderer.invoke('runtime:restart'),
   fetchUpstreamModels: () => ipcRenderer.invoke('upstream:models'),
   probeModelProvider: (payload) => ipcRenderer.invoke('provider:probe', payload),
+  listProviderQuotas: () => ipcRenderer.invoke('provider:quota:list'),
+  fetchModelsDevCatalog: (payload) => ipcRenderer.invoke('provider:models-dev-catalog', payload),
+  optimizePrompt: (payload) => ipcRenderer.invoke('prompt:optimize', payload),
   getClawStatus: () => ipcRenderer.invoke('claw:status'),
   runClawTask: (taskId) =>
     ipcRenderer.invoke('claw:task:run', taskId),
@@ -58,12 +134,28 @@ const api = {
     ipcRenderer.invoke('claw:im-install:poll', { provider, deviceCode }),
   connectTelegramBot: (botToken, allowedChatIds) =>
     ipcRenderer.invoke('claw:im-install:telegram-token', { botToken, allowedChatIds }),
+  startCodexAuth: () =>
+    ipcRenderer.invoke('codex:auth:start'),
+  pollCodexAuth: (deviceCode, userCode) =>
+    ipcRenderer.invoke('codex:auth:poll', { deviceCode, userCode }),
+  startCodexBrowserAuth: () =>
+    ipcRenderer.invoke('codex:auth:browser'),
+  startGrokBrowserAuth: () =>
+    ipcRenderer.invoke('grok:auth:browser'),
+  submitGrokBrowserAuthCode: (code) =>
+    ipcRenderer.invoke('grok:auth:browser:paste', { code }),
+  cancelGrokBrowserAuth: () =>
+    ipcRenderer.invoke('grok:auth:browser:cancel'),
   pickWorkspaceDirectory: (defaultPath) =>
     ipcRenderer.invoke('workspace:pick-directory', defaultPath),
+  workspaceDirectoryExists: (workspaceRoot) =>
+    ipcRenderer.invoke('workspace:directory-exists', workspaceRoot),
   pickLocalFiles: (defaultPath) =>
     ipcRenderer.invoke('file:pick-local-files', defaultPath),
   createConversationWorkspace: (root) =>
     ipcRenderer.invoke('conversation:create-workspace', { root }),
+  alertDialog: (options) =>
+    ipcRenderer.invoke('dialog:alert', options),
   confirmDialog: (options) =>
     ipcRenderer.invoke('dialog:confirm', options),
   detectLegacySessions: () =>
@@ -80,6 +172,7 @@ const api = {
     ipcRenderer.invoke('skill:save-file', { rootPath, skillName, content, manifestContent }),
   importSkillsFromGitHub: (rootPath, url) =>
     ipcRenderer.invoke('skill:import-github', { rootPath, url }),
+  ensurePptMaster: () => ipcRenderer.invoke('ppt-master:ensure'),
   openSkillRoot: (rootPath) =>
     ipcRenderer.invoke('skill:open-root', rootPath),
   listUiPlugins: () =>
@@ -90,12 +183,28 @@ const api = {
     ipcRenderer.invoke('ui-plugin:remove', { id }),
   loadUiPlugin: (id) =>
     ipcRenderer.invoke('ui-plugin:load', { id }),
+  activateUiPluginTheme: (id) =>
+    ipcRenderer.invoke('ui-plugin:theme:activate', { id }),
+  deactivateUiPluginTheme: () =>
+    ipcRenderer.invoke('ui-plugin:theme:deactivate'),
   getKunConfigFile: () =>
     ipcRenderer.invoke('kun:config:read'),
   setKunConfigFile: (content) =>
     ipcRenderer.invoke('kun:config:write', content),
   openKunConfigDir: () =>
     ipcRenderer.invoke('kun:config:open-dir'),
+  getKunProjectConfigFile: (workspaceRoot) =>
+    ipcRenderer.invoke('kun:project-config:read', { workspaceRoot }),
+  setKunProjectConfigFile: (workspaceRoot, content) =>
+    ipcRenderer.invoke('kun:project-config:write', { workspaceRoot, content }),
+  setKunProjectConfigTrust: (workspaceRoot, trusted, expectedDigest) =>
+    ipcRenderer.invoke('kun:project-config:trust', {
+      workspaceRoot,
+      trusted,
+      ...(trusted && expectedDigest ? { expectedDigest } : {})
+    }),
+  openKunProjectConfigDir: (workspaceRoot) =>
+    ipcRenderer.invoke('kun:project-config:open-dir', { workspaceRoot }),
   getGitBranches: (workspaceRoot) =>
     ipcRenderer.invoke('git:branches', workspaceRoot),
   switchGitBranch: (workspaceRoot, branch) =>
@@ -147,18 +256,28 @@ const api = {
     ipcRenderer.invoke('file:list-workspace-directory', options),
   resolveWorkspaceFile: (options) =>
     ipcRenderer.invoke('file:resolve-workspace', options),
+  openWorkspaceFileInSystem: (options) =>
+    ipcRenderer.invoke('file:open-workspace-system', options),
   readWorkspaceFile: (options) =>
     ipcRenderer.invoke('file:read-workspace', options),
+  lintProjectDesignMd: (content) =>
+    ipcRenderer.invoke('design:lint-project-design-md', { content }),
   readWorkspaceImage: (options) =>
     ipcRenderer.invoke('file:read-workspace-image', options),
   readWorkspaceMedia: (options) =>
     ipcRenderer.invoke('file:read-workspace-media', options),
   readWorkspacePdf: (options) =>
     ipcRenderer.invoke('file:read-workspace-pdf', options),
+  openWorkspacePreviewResource: (options) =>
+    ipcRenderer.invoke('file:open-workspace-preview', options),
+  releaseWorkspacePreviewResource: (payload) =>
+    ipcRenderer.invoke('file:release-workspace-preview', payload),
   readLocalPdfText: (options) =>
     ipcRenderer.invoke('file:read-local-pdf-text', options),
   saveWorkspaceFileAs: (payload) =>
     ipcRenderer.invoke('file:save-as', payload),
+  openExtensionArtifact: (payload) =>
+    ipcRenderer.invoke('extension:artifact:open', payload),
   writeWorkspaceFile: (payload) =>
     ipcRenderer.invoke('file:write-workspace', payload),
   createWorkspaceFile: (payload) =>
@@ -167,6 +286,10 @@ const api = {
     ipcRenderer.invoke('file:create-workspace-directory', payload),
   saveWorkspaceClipboardImage: (payload) =>
     ipcRenderer.invoke('file:save-workspace-clipboard-image', payload),
+  pickWorkspaceImage: (payload) =>
+    ipcRenderer.invoke('file:pick-workspace-image', payload),
+  saveWorkspaceImageBytes: (payload) =>
+    ipcRenderer.invoke('file:save-workspace-image-bytes', payload),
   readClipboardImage: () =>
     ipcRenderer.invoke('clipboard:read-image'),
   getPathForFile: (file) =>
@@ -189,6 +312,12 @@ const api = {
   },
   exportWriteDocument: (payload) =>
     ipcRenderer.invoke('write:export', payload),
+  exportConversation: (payload) =>
+    ipcRenderer.invoke('conversation:export', payload),
+  exportMemoryMarkdown: (payload) =>
+    ipcRenderer.invoke('memory:export-markdown', payload),
+  exportDesignPrototype: (payload) =>
+    ipcRenderer.invoke('design:export-prototype', payload),
   copyWriteDocumentAsRichText: (payload) =>
     ipcRenderer.invoke('write:copy-rich-text', payload),
   requestWriteInlineCompletion: (payload) =>
@@ -226,9 +355,10 @@ const api = {
     ipcRenderer.invoke('write:inline-completion-debug:list'),
   clearWriteInlineCompletionDebugEntries: () =>
     ipcRenderer.invoke('write:inline-completion-debug:clear'),
-  startSse: (threadId, sinceSeq, streamId) =>
-    ipcRenderer.invoke('runtime:sse:start', { threadId, sinceSeq, streamId }),
+  startSse: (threadId, sinceSeq, streamId, options) =>
+    ipcRenderer.invoke('runtime:sse:start', { threadId, sinceSeq, streamId, ...options }),
   stopSse: (streamId) => ipcRenderer.invoke('runtime:sse:stop', streamId),
+  ackSse: (streamId, batchId) => ipcRenderer.invoke('runtime:sse:ack', { streamId, batchId }),
   onSseEvent: (handler) => {
     const wrapped = (
       _: Electron.IpcRendererEvent,
@@ -277,6 +407,14 @@ const api = {
     ipcRenderer.on('runtime:status', wrapped)
     return () => ipcRenderer.removeListener('runtime:status', wrapped)
   },
+  onRuntimeSettingsSyncStatus: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('runtime:settings-sync-status', wrapped)
+    return () => ipcRenderer.removeListener('runtime:settings-sync-status', wrapped)
+  },
   mirrorClawChannelMessage: (threadId, text, direction) =>
     ipcRenderer.invoke('claw:channel:mirror', { threadId, text, direction }),
   mirrorClawChannelMessageToFeishu: (threadId, text, direction) =>
@@ -306,6 +444,30 @@ const api = {
   getComputerUsePermissions: () => ipcRenderer.invoke('computer-use:permissions'),
   requestComputerUsePermission: (kind) =>
     ipcRenderer.invoke('computer-use:request-permission', kind),
+  getBrowserUseState: (threadId) =>
+    ipcRenderer.invoke('browser-use:state:get', { threadId }),
+  mountBrowserUse: (input) =>
+    ipcRenderer.invoke('browser-use:mount', input),
+  decideBrowserUseOrigin: (input) =>
+    ipcRenderer.invoke('browser-use:origin:decide', input),
+  decideBrowserUseAction: (input) =>
+    ipcRenderer.invoke('browser-use:action:decide', input),
+  setBrowserUseControl: (input) =>
+    ipcRenderer.invoke('browser-use:control', input),
+  navigateBrowserUse: (input) =>
+    ipcRenderer.invoke('browser-use:navigate', input),
+  stopBrowserUse: (threadId) =>
+    ipcRenderer.invoke('browser-use:stop', { threadId }),
+  clearBrowserUse: (threadId) =>
+    ipcRenderer.invoke('browser-use:clear', { threadId }),
+  onBrowserUseState: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('browser-use:state', wrapped)
+    return () => ipcRenderer.removeListener('browser-use:state', wrapped)
+  },
   showTurnCompleteNotification: (payload) => ipcRenderer.invoke('notification:turn-complete', payload),
   getAppVersion: () => ipcRenderer.invoke('app:version'),
   getGuiUpdateState: () => ipcRenderer.invoke('gui:update-state'),
@@ -326,6 +488,103 @@ const api = {
     ipcRenderer.invoke('log:error', { category, message, detail }),
   getLogPath: () => ipcRenderer.invoke('log:get-path'),
   openLogDir: () => ipcRenderer.invoke('log:open-dir'),
+  extensionPickPackage: () => ipcRenderer.invoke('extension:pick-package'),
+  extensionPickDevelopmentDirectory: () =>
+    ipcRenderer.invoke('extension:pick-development-directory'),
+  extensionGetWorkbench: (request) =>
+    ipcRenderer.invoke('extension:workbench:get', request),
+  extensionList: (request) => ipcRenderer.invoke('extension:list', request),
+  extensionGet: (extensionId) => ipcRenderer.invoke('extension:get', extensionId),
+  extensionDiagnostics: (extensionId) =>
+    ipcRenderer.invoke('extension:diagnostics', extensionId),
+  extensionInstall: (request) => ipcRenderer.invoke('extension:install', request),
+  extensionEnable: (request) => ipcRenderer.invoke('extension:enable', request),
+  extensionDisable: (request) => ipcRenderer.invoke('extension:disable', request),
+  extensionSetPermissions: (request) =>
+    ipcRenderer.invoke('extension:set-permissions', request),
+  extensionReviewPermissions: (request) =>
+    ipcRenderer.invoke('extension:review-permissions', request),
+  extensionRollback: (request) => ipcRenderer.invoke('extension:rollback', request),
+  extensionUninstall: (request) => ipcRenderer.invoke('extension:uninstall', request),
+  extensionReload: (request) => ipcRenderer.invoke('extension:reload', request),
+  extensionInvokeCommand: (request) =>
+    ipcRenderer.invoke('extension:invoke-command', request),
+  extensionCreateViewSession: (request) =>
+    ipcRenderer.invoke('extension:view-session:create', request),
+  extensionDisposeViewSession: (request) =>
+    ipcRenderer.invoke('extension:view-session:dispose', request),
+  extensionExternalBrowserControl: (request) =>
+    ipcRenderer.invoke('extension:external-browser:control', request),
+  onExtensionExternalBrowserState: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('extension:external-browser-state', wrapped)
+    return () => ipcRenderer.removeListener('extension:external-browser-state', wrapped)
+  },
+  extensionPostViewMessage: (request) =>
+    ipcRenderer.invoke('extension:view-session:message', request),
+  extensionReadViewEvents: (request) =>
+    ipcRenderer.invoke('extension:view-session:events', request),
+  onExtensionViewEvent: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('extension:view-event', wrapped)
+    return () => ipcRenderer.removeListener('extension:view-event', wrapped)
+  },
+  onExtensionComposerContext: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('extension:composer-context-attached', wrapped)
+    return () => ipcRenderer.removeListener('extension:composer-context-attached', wrapped)
+  },
+  onExtensionNotifications: (handler) => {
+    const wrapped = (
+      _: Electron.IpcRendererEvent,
+      payload: Parameters<typeof handler>[0]
+    ) => handler(payload)
+    ipcRenderer.on('extension:notifications', wrapped)
+    return () => ipcRenderer.removeListener('extension:notifications', wrapped)
+  },
+  extensionRespondNotification: (request) =>
+    ipcRenderer.invoke('extension:notification:respond', request),
+  extensionListAccounts: (request) =>
+    ipcRenderer.invoke('extension:accounts:list', request),
+  extensionListModelProviders: (request) =>
+    ipcRenderer.invoke('extension:model-providers:list', request),
+  extensionListProviderModels: (request) =>
+    ipcRenderer.invoke('extension:model-providers:list-models', request),
+  extensionLoadConfiguration: (request) =>
+    ipcRenderer.invoke('extension:configuration:load', request),
+  extensionUpdateConfiguration: (request) =>
+    ipcRenderer.invoke('extension:configuration:update', request),
+  extensionCreateAccountSession: (request) =>
+    ipcRenderer.invoke('extension:accounts:create-session', request),
+  extensionGetAccountSession: (request) =>
+    ipcRenderer.invoke('extension:accounts:get-session', request),
+  extensionCompleteAccountSession: (request) =>
+    ipcRenderer.invoke('extension:accounts:complete-session', request),
+  extensionCancelAccountSession: (request) =>
+    ipcRenderer.invoke('extension:accounts:cancel-session', request),
+  extensionDeleteAccount: (request) =>
+    ipcRenderer.invoke('extension:accounts:delete', request),
+  extensionRenameAccount: (request) =>
+    ipcRenderer.invoke('extension:accounts:rename', request),
+  extensionReplaceApiKeyAccount: (request) =>
+    ipcRenderer.invoke('extension:accounts:replace-api-key', request),
+  extensionCreateApiKeyAccount: (request) =>
+    ipcRenderer.invoke('extension:accounts:create-api-key', request),
+  extensionSetProviderBinding: (request) =>
+    ipcRenderer.invoke('extension:providers:set-binding', request),
+  extensionRequestConsent: (request) =>
+    ipcRenderer.invoke('extension:consent:request', request),
+  extensionSyncHostContentScripts: (request) =>
+    ipcRenderer.invoke('extension:sync-host-content-scripts', request),
   createTerminal: (payload) => ipcRenderer.invoke('terminal:create', payload),
   writeToTerminal: (payload) => ipcRenderer.invoke('terminal:write', payload),
   resizeTerminal: (payload) => ipcRenderer.invoke('terminal:resize', payload),

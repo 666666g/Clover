@@ -1,15 +1,23 @@
+import { randomUUID } from 'node:crypto'
 import type {
   ToolHost,
   ToolHostContext,
   ToolHostResult,
   ToolCallLike,
-  ToolExecutionUpdate
+  ToolExecutionUpdate,
+  ToolEffects
 } from '../../ports/tool-host.js'
+import type { UserInputQuestion } from '../../ports/user-input-gate.js'
 import type { ApprovalRequest } from '../../domain/approval.js'
-import { createApprovalRequest } from '../../domain/approval.js'
+import {
+  createApprovalActionEnvelope,
+  createApprovalRequest,
+  safeApprovalActionSummary
+} from '../../domain/approval.js'
 import type { TurnItem } from '../../contracts/items.js'
-import { makeToolResultItem, makeApprovalItem } from '../../domain/item.js'
+import { makeToolResultItem } from '../../domain/item.js'
 import { buildBuiltinLocalTools } from './builtin-tools.js'
+import type { BuiltinLocalToolsOptions } from './builtin-tool-types.js'
 import { CapabilityRegistry } from './capability-registry.js'
 import {
   runPostToolUseHooks,
@@ -26,17 +34,36 @@ import {
   ReadTracker,
   type ReadTrackerOptions
 } from './read-tracker.js'
-import { sandboxBlockForTool, type SandboxBlock } from './sandbox-policy.js'
+import {
+  effectiveSandboxMode,
+  externalWriteTargetsForApproval,
+  isWorkspaceApprovalCommandTool,
+  sandboxBlockForTool,
+  type SandboxBlock
+} from './sandbox-policy.js'
+import {
+  createToolOperationIdentity,
+  ToolOperationJournal
+} from '../../reliability/operation-journal.js'
+import { planModeToolBlock } from './plan-mode-tool-policy.js'
+
+const KUN_ACTION_APPROVAL_GRANT_TTL_MS = 2 * 60 * 1_000
 
 /**
  * A single registered tool. Tools are pure functions that observe the
  * abort signal and may be guarded by an approval policy.
  */
+export type ToolSideEffect = 'read-only' | 'unknown'
+
 export type LocalTool = {
   name: string
   description: string
   inputSchema: Record<string, unknown>
   toolKind: 'tool_call' | 'command_execution' | 'file_change'
+  /** Host-authored side-effect classification. Unknown is denied in Plan mode. */
+  sideEffect?: ToolSideEffect
+  /** Host-authored effects. Omission is intentionally treated as unknown. */
+  effects?: ToolEffects
   /**
    * Tool policy. `auto` runs the tool without asking. `on-request` and
    * `suggest` always ask the user. `never` blocks the tool. `untrusted`
@@ -44,12 +71,29 @@ export type LocalTool = {
    */
   policy: 'auto' | 'on-request' | 'suggest' | 'never' | 'untrusted'
   /**
+   * Require the configured Kun reviewer even when the low-level policy would
+   * otherwise allow the call. The canonical Full access pair bypasses this
+   * Kun-level gate; protected host/OS/OAuth consent remains independent.
+   */
+  requiresExplicitApproval?:
+    | boolean
+    | ((call: ToolCallLike, context: ToolHostContext) => boolean)
+  /**
+   * String argument names that are exact file mutation targets eligible for a
+   * one-call external workspace grant. Tools must opt in explicitly; merely
+   * being a `file_change` tool never grants inferred path arguments. Opted-in
+   * tools must still resolve and validate the target with `resolveWorkspacePath`.
+   */
+  externalWritePathArguments?: readonly string[]
+  /**
    * Optional gating predicate. When present, the tool is only listed
    * and only executed when `shouldAdvertise` returns true for the
    * active turn context. Use this for mode/plan-only tools such as
    * `create_plan`.
    */
   shouldAdvertise?: (context: ToolHostContext) => boolean
+  /** Hide a legacy compatibility tool from model schemas without blocking a persisted/direct execution. */
+  modelAdvertised?: boolean
   execute: (
     args: Record<string, unknown>,
     context: ToolHostContext,
@@ -66,6 +110,13 @@ export type LocalToolHostOptions = {
   hooks?: readonly ResolvedHook[]
   /** Runtime read-before-edit guard. Disabled by default for direct unit use. */
   readTracker?: boolean | ReadTrackerOptions
+  /**
+   * Turn-scoped operation journal. Defaults to an in-memory journal so fallback
+   * call ids such as `call_1` are isolated by turnId/toolName/argsHash.
+   */
+  operationJournal?: ToolOperationJournal
+  /** Lazy runtime preparation hook (for example, activating declared extension providers). */
+  prepare?: (context?: ToolHostContext) => Promise<void> | void
 }
 
 /**
@@ -84,20 +135,51 @@ export type LocalToolHostOptions = {
  */
 export class LocalToolHost implements ToolHost {
   readonly id = 'local'
-  private readonly registry: CapabilityRegistry
+  private registry: CapabilityRegistry
   private readonly allowList: Set<string>
-  private readonly hooks: readonly ResolvedHook[]
+  private hooks: readonly ResolvedHook[]
   private readonly readTracker: ReadTracker
+  private readonly operationJournal: ToolOperationJournal
+  private prepare?: (context?: ToolHostContext) => Promise<void> | void
+  private generation = 0
+  private readonly turnComponents = new Map<string, {
+    registry: CapabilityRegistry
+    hooks: readonly ResolvedHook[]
+    prepare?: (context?: ToolHostContext) => Promise<void> | void
+    generation: number
+    touchedAt: number
+  }>()
 
   constructor(options: LocalToolHostOptions) {
     this.registry = options.registry ?? CapabilityRegistry.fromLocalTools(options.tools ?? [])
     this.allowList = new Set(options.allowList ?? [])
     this.hooks = options.hooks ?? []
     this.readTracker = new ReadTracker(normalizeReadTrackerOptions(options.readTracker))
+    this.operationJournal = options.operationJournal ?? new ToolOperationJournal()
+    this.prepare = options.prepare
+  }
+
+  replaceRuntimeComponents(input: {
+    registry?: CapabilityRegistry
+    hooks?: readonly ResolvedHook[]
+    prepare?: (context?: ToolHostContext) => Promise<void> | void
+  }): void {
+    if (input.registry) this.registry = input.registry
+    if (input.hooks) this.hooks = input.hooks
+    if (input.prepare) this.prepare = input.prepare
+    this.generation += 1
+    this.pruneTurnComponents()
   }
 
   listTools(context?: ToolHostContext) {
-    return Promise.resolve(this.registry.listTools(context))
+    const components = this.componentsFor(context)
+    const prepared = components.prepare?.(context)
+    if (prepared && typeof (prepared as PromiseLike<void>).then === 'function') {
+      return Promise.resolve(prepared).then(() => components.registry.listTools(context))
+    }
+    // Evaluate before Promise.resolve so existing callers retain synchronous
+    // catalog-drift validation when no lazy preparation is configured.
+    return Promise.resolve(components.registry.listTools(context))
   }
 
   diagnostics() {
@@ -109,10 +191,16 @@ export class LocalToolHost implements ToolHost {
     context: ToolHostContext,
     onUpdate?: (item: TurnItem) => Promise<void> | void
   ): Promise<ToolHostResult> {
+    const components = this.componentsFor(context)
+    await components.prepare?.(context)
     if (context.abortSignal.aborted) {
       throw new Error('tool call aborted before start')
     }
-    const { tool } = this.registry.resolveTool(call.toolName, context, call.providerId)
+    const { tool, provider } = components.registry.resolveTool(
+      call.toolName,
+      context,
+      call.providerId
+    )
     if (tool.policy === 'never') {
       throw new Error(`tool ${call.toolName} is disabled by policy`)
     }
@@ -125,7 +213,7 @@ export class LocalToolHost implements ToolHost {
     }
     let preHooks: PreToolUseOutcome
     try {
-      preHooks = await runPreToolUseHooks(this.hooks, {
+      preHooks = await runPreToolUseHooks(components.hooks, {
         call,
         context: hookContext(context)
       })
@@ -142,10 +230,34 @@ export class LocalToolHost implements ToolHost {
       }
     }
     const activeCall = preHooks.call
+    const planModeBlock = await planModeToolBlock(tool, activeCall, context)
+    if (planModeBlock) {
+      return {
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          planModeBlock.message,
+          planModeBlock.code
+        ),
+        approved: false
+      }
+    }
     const readValidation = this.readTracker.validateBeforeTool({ context, call: activeCall })
     if (!readValidation.ok) {
       return {
-        item: this.errorToolResult(context, activeCall, tool, readValidation.message, 'read_before_edit_required'),
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          readValidation.message,
+          'read_before_edit_required',
+          {
+            guidance: readValidation.guidance,
+            next_action: readValidation.nextAction,
+            retry_tool: activeCall.toolName
+          }
+        ),
         approved: false
       }
     }
@@ -162,35 +274,215 @@ export class LocalToolHost implements ToolHost {
         approved: false
       }
     }
-    const needsApproval = !preHooks.autoApproved && this.requiresApproval(tool, activeCall, context)
+    let externalWriteTargets: Awaited<ReturnType<typeof externalWriteTargetsForApproval>>
+    try {
+      externalWriteTargets = await externalWriteTargetsForApproval(tool, activeCall, context)
+    } catch (error) {
+      return {
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          error instanceof Error ? error.message : String(error),
+          'sandbox_write_blocked'
+        ),
+        approved: false
+      }
+    }
+    const externalPathApproval = externalWriteTargets.length > 0
+    const workspaceCommandApproval =
+      effectiveSandboxMode(context) === 'workspace-write' &&
+      isWorkspaceApprovalCommandTool({
+        name: activeCall.toolName,
+        toolKind: activeCall.toolKind ?? tool.toolKind
+      })
+    let explicitApprovalRequired: boolean
+    try {
+      explicitApprovalRequired = typeof tool.requiresExplicitApproval === 'function'
+        ? tool.requiresExplicitApproval(activeCall, context)
+        : tool.requiresExplicitApproval === true
+    } catch (error) {
+      return {
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          error instanceof Error ? error.message : String(error),
+          'approval_classification_failed'
+        ),
+        approved: false
+      }
+    }
+    // A configured hook may auto-approve ordinary tool calls, but it must not
+    // bypass an explicit user decision for an external side effect or an
+    // unrestricted host command exposed by workspace-write.
+    const fullAccess =
+      context.approvalPolicy === 'auto' &&
+      effectiveSandboxMode(context) === 'danger-full-access'
+    const needsApproval = !fullAccess && (
+      externalPathApproval ||
+      workspaceCommandApproval ||
+      explicitApprovalRequired ||
+      (!preHooks.autoApproved && this.requiresApproval(tool, activeCall, context))
+    )
+    let kunActionApprovalGrant: ToolHostContext['kunActionApprovalGrant']
     if (needsApproval) {
-      const approvalId = `appr_${activeCall.callId}`
+      const approvalId = `appr_${randomUUID().replaceAll('-', '')}`
+      const approvalReason = externalPathApproval
+        ? 'exact external workspace file write requires approval'
+        : workspaceCommandApproval
+          ? 'host command execution from the workspace sandbox requires approval'
+          : explicitApprovalRequired
+            ? 'external side effect requires explicit approval'
+            : 'runtime tool policy requires approval'
+      const action = createApprovalActionEnvelope({
+        toolName: activeCall.toolName,
+        providerId: provider.id,
+        providerKind: provider.kind,
+        toolKind: activeCall.toolKind ?? tool.toolKind,
+        effects: tool.effects ?? provider.effects,
+        arguments: activeCall.arguments,
+        workspace: context.workspace,
+        cwd: typeof activeCall.arguments.cwd === 'string'
+          ? activeCall.arguments.cwd
+          : context.workspace,
+        exactFileTargets: externalWriteTargets.map((target) => target.path),
+        reason: approvalReason
+      })
       const approval: ApprovalRequest = createApprovalRequest({
         id: approvalId,
         threadId: context.threadId,
         turnId: context.turnId,
         toolName: activeCall.toolName,
-        summary: this.buildApprovalSummary(activeCall)
+        summary: safeApprovalActionSummary(action),
+        action
       })
-      const decision = await context.awaitApproval(approval)
+      const resolution = await context.awaitApproval(approval)
+      const decision = typeof resolution === 'string' ? resolution : resolution.decision
       if (decision !== 'allow') {
-        const item = makeApprovalItem({
-          id: `item_${approvalId}`,
-          turnId: context.turnId,
-          threadId: context.threadId,
-          approvalId,
-          toolName: activeCall.toolName,
-          summary: approval.summary
-        })
-        return { item, approved: false }
+        const reason = typeof resolution === 'string' ? undefined : resolution.reason
+        const reviewer = typeof resolution === 'string'
+          ? context.approvalReviewer ?? 'user'
+          : resolution.reviewer ?? context.approvalReviewer ?? 'user'
+        const reviewDetails = typeof resolution === 'string'
+          ? {}
+          : {
+              ...(resolution.reviewId ? { reviewId: resolution.reviewId } : {}),
+              ...(resolution.riskLevel ? { riskLevel: resolution.riskLevel } : {}),
+              ...(resolution.reviewStatus ? { reviewStatus: resolution.reviewStatus } : {})
+            }
+        const actor = reviewer === 'agent' ? 'Agent reviewer' : 'User'
+        return {
+          item: makeToolResultItem({
+            id: `item_${activeCall.callId}`,
+            turnId: context.turnId,
+            threadId: context.threadId,
+            callId: activeCall.callId,
+            toolName: activeCall.toolName,
+            toolKind: activeCall.toolKind ?? tool.toolKind,
+            output: {
+              code: 'approval_denied',
+              error: reason
+                ? `${actor} denied approval for ${activeCall.toolName}: ${reason}`
+                : `${actor} denied approval for ${activeCall.toolName}`,
+              approvalId,
+              reviewer,
+              ...(reason ? { reason } : {}),
+              ...reviewDetails
+            },
+            isError: true
+          }),
+          approved: false
+        }
       }
+      const reviewer = typeof resolution === 'string'
+        ? context.approvalReviewer ?? 'user'
+        : resolution.reviewer ?? context.approvalReviewer ?? 'user'
+      const issuedAt = new Date()
+      kunActionApprovalGrant = Object.freeze({
+        id: approvalId,
+        source: reviewer,
+        toolName: activeCall.toolName,
+        callId: activeCall.callId,
+        argumentsHash: ToolOperationJournal.argsHash(activeCall.arguments),
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: new Date(
+          issuedAt.getTime() + KUN_ACTION_APPROVAL_GRANT_TTL_MS
+        ).toISOString()
+      })
+    } else if (fullAccess && explicitApprovalRequired) {
+      const issuedAt = new Date()
+      kunActionApprovalGrant = Object.freeze({
+        id: `grant_${randomUUID().replaceAll('-', '')}`,
+        source: 'full-access',
+        toolName: activeCall.toolName,
+        callId: activeCall.callId,
+        argumentsHash: ToolOperationJournal.argsHash(activeCall.arguments),
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: new Date(
+          issuedAt.getTime() + KUN_ACTION_APPROVAL_GRANT_TTL_MS
+        ).toISOString()
+      })
     }
     if (context.abortSignal.aborted) {
       throw new Error('tool call aborted while waiting for approval')
     }
+    const operationIdentity = createToolOperationIdentity({
+      threadId: context.threadId,
+      turnId: context.turnId,
+      callId: activeCall.callId,
+      toolName: activeCall.toolName,
+      args: activeCall.arguments
+    })
+    const priorOperation = this.operationJournal.get(operationIdentity)
+    if (priorOperation?.status === 'unknown') {
+      return {
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          `Tool side-effect outcome is unknown and will not be retried automatically: ${priorOperation.reason}`,
+          'tool_outcome_unknown'
+        ),
+        approved: !needsApproval
+      }
+    }
+    if (priorOperation?.status === 'started') {
+      return {
+        item: this.errorToolResult(
+          context,
+          activeCall,
+          tool,
+          'An invocation with the same operation identity is still in progress.',
+          'tool_invocation_in_progress'
+        ),
+        approved: !needsApproval
+      }
+    }
+    const replayed = this.operationJournal.getCompleted(operationIdentity)
+    if (replayed) {
+      return {
+        item: this.completedToolResult(context, activeCall, tool, replayed.output, replayed.isError),
+        approved: !needsApproval
+      }
+    }
+    this.operationJournal.begin(operationIdentity)
+    // Grants are minted by this host after an approval and must never be
+    // accepted from a reused/caller-supplied context.
+    const ungrantedContext = { ...context }
+    delete ungrantedContext.approvedExternalWriteTargets
+    delete ungrantedContext.kunActionApprovalGrant
+    const approvedExternalWriteTargets = Object.freeze(
+      externalWriteTargets.map((target) => Object.freeze({ ...target }))
+    )
+    const executionContext = {
+      ...ungrantedContext,
+      ...(externalPathApproval ? { approvedExternalWriteTargets } : {}),
+      ...(kunActionApprovalGrant ? { kunActionApprovalGrant } : {})
+    }
     let result: Awaited<ReturnType<LocalTool['execute']>>
     try {
-      result = await tool.execute(activeCall.arguments, context, async (update) => {
+      result = await tool.execute(activeCall.arguments, executionContext, async (update) => {
         if (!onUpdate) return
         const partialItem = makeToolResultItem({
           id: `item_${activeCall.callId}`,
@@ -209,7 +501,15 @@ export class LocalToolHost implements ToolHost {
       // A tool blowing up (an MCP server returning a protocol error, a
       // provider bug) is feedback for the model, not a reason to kill the
       // whole turn. Only abort keeps propagating.
-      if (context.abortSignal.aborted) throw error
+      if (context.abortSignal.aborted) {
+        this.operationJournal.unknown(operationIdentity, 'tool call aborted during execution')
+        throw error
+      }
+      if (isUnknownOutcomeError(error)) {
+        this.operationJournal.unknown(operationIdentity, error instanceof Error ? error.message : String(error))
+      } else {
+        this.operationJournal.fail(operationIdentity, error)
+      }
       const message = error instanceof Error ? error.message : String(error)
       return {
         item: this.errorToolResult(context, activeCall, tool, message, 'tool_execution_failed'),
@@ -218,19 +518,20 @@ export class LocalToolHost implements ToolHost {
     }
     let hookedResult: PostToolUseOutcome
     try {
-      hookedResult = await runPostToolUseHooks(this.hooks, {
+      hookedResult = await runPostToolUseHooks(components.hooks, {
         call: activeCall,
         context: hookContext(context),
         result
       })
     } catch (error) {
+      this.operationJournal.fail(operationIdentity, error)
       return {
         item: this.errorToolResult(context, activeCall, tool, hookErrorMessage(error), 'hook_failed'),
         approved: true
       }
     }
     const rateLimited = normalizeRateLimitedToolOutput(hookedResult.output)
-    const output = rateLimited.rateLimited ? rateLimited.output : hookedResult.output
+    let output = rateLimited.rateLimited ? rateLimited.output : hookedResult.output
     const isError = hookedResult.isError || rateLimited.isError
     this.readTracker.observeToolResult({
       context,
@@ -238,21 +539,61 @@ export class LocalToolHost implements ToolHost {
       output,
       isError
     })
-    const item = makeToolResultItem({
-      id: `item_${activeCall.callId}`,
-      turnId: context.turnId,
-      threadId: context.threadId,
-      callId: activeCall.callId,
-      toolName: activeCall.toolName,
-      toolKind: activeCall.toolKind ?? tool.toolKind,
-      output,
-      isError
-    })
+    if (!isError) output = await offloadLargeToolOutput(output, activeCall.toolName, context)
+    this.operationJournal.complete(operationIdentity, { output, isError })
+    const item = this.completedToolResult(context, activeCall, tool, output, isError)
     return { item, approved: !needsApproval }
   }
 
   clearReadTracker(threadId?: string): void {
     this.readTracker.clear(threadId)
+  }
+
+  private componentsFor(context?: ToolHostContext): {
+    registry: CapabilityRegistry
+    hooks: readonly ResolvedHook[]
+    prepare?: (context?: ToolHostContext) => Promise<void> | void
+    generation: number
+    touchedAt: number
+  } {
+    const turnId = context?.turnId
+    const now = Date.now()
+    if (!turnId) {
+      return {
+        registry: this.registry,
+        hooks: this.hooks,
+        ...(this.prepare ? { prepare: this.prepare } : {}),
+        generation: this.generation,
+        touchedAt: now
+      }
+    }
+    const existing = this.turnComponents.get(turnId)
+    if (existing) {
+      existing.touchedAt = now
+      return existing
+    }
+    const pinned = {
+      registry: this.registry,
+      hooks: this.hooks,
+      ...(this.prepare ? { prepare: this.prepare } : {}),
+      generation: this.generation,
+      touchedAt: now
+    }
+    this.turnComponents.set(turnId, pinned)
+    this.pruneTurnComponents(now)
+    return pinned
+  }
+
+  private pruneTurnComponents(now = Date.now()): void {
+    const staleBefore = now - 6 * 60 * 60 * 1_000
+    for (const [turnId, components] of this.turnComponents) {
+      if (components.touchedAt < staleBefore) this.turnComponents.delete(turnId)
+    }
+    if (this.turnComponents.size <= 4_000) return
+    const oldest = [...this.turnComponents.entries()]
+      .sort((left, right) => left[1].touchedAt - right[1].touchedAt)
+      .slice(0, this.turnComponents.size - 2_000)
+    for (const [turnId] of oldest) this.turnComponents.delete(turnId)
   }
 
   private runtimePolicyBlock(
@@ -295,19 +636,12 @@ export class LocalToolHost implements ToolHost {
     return toolName === 'user_input' || toolName === 'request_user_input'
   }
 
-  private buildApprovalSummary(call: ToolCallLike): string {
-    const args = Object.entries(call.arguments)
-      .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
-      .join(', ')
-    return `Run ${call.toolName}(${args})`
-  }
-
-  private errorToolResult(
+  private completedToolResult(
     context: ToolHostContext,
     call: ToolCallLike,
     tool: LocalTool,
-    message: string,
-    code: string
+    output: unknown,
+    isError?: boolean
   ): TurnItem {
     return makeToolResultItem({
       id: `item_${call.callId}`,
@@ -316,7 +650,27 @@ export class LocalToolHost implements ToolHost {
       callId: call.callId,
       toolName: call.toolName,
       toolKind: call.toolKind ?? tool.toolKind,
-      output: { code, error: message },
+      output,
+      isError
+    })
+  }
+
+  private errorToolResult(
+    context: ToolHostContext,
+    call: ToolCallLike,
+    tool: LocalTool,
+    message: string,
+    code: string,
+    details: Record<string, unknown> = {}
+  ): TurnItem {
+    return makeToolResultItem({
+      id: `item_${call.callId}`,
+      turnId: context.turnId,
+      threadId: context.threadId,
+      callId: call.callId,
+      toolName: call.toolName,
+      toolKind: call.toolKind ?? tool.toolKind,
+      output: { ...details, code, error: message },
       isError: true
     })
   }
@@ -334,20 +688,72 @@ export class LocalToolHost implements ToolHost {
       description: tool.description,
       inputSchema: tool.inputSchema,
       toolKind: tool.toolKind ?? 'tool_call',
+      ...(tool.sideEffect ? { sideEffect: tool.sideEffect } : {}),
+      ...(tool.effects ? { effects: { ...tool.effects } } : {}),
       execute: tool.execute,
-      ...(tool.shouldAdvertise ? { shouldAdvertise: tool.shouldAdvertise } : {})
+      ...(tool.modelAdvertised === false ? { modelAdvertised: false } : {}),
+      ...(tool.shouldAdvertise ? { shouldAdvertise: tool.shouldAdvertise } : {}),
+      ...(tool.requiresExplicitApproval
+        ? { requiresExplicitApproval: tool.requiresExplicitApproval }
+        : {}),
+      ...(tool.externalWritePathArguments?.length
+        ? { externalWritePathArguments: [...tool.externalWritePathArguments] }
+        : {})
     }
+  }
+}
+
+function isUnknownOutcomeError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'unknownOutcome' in error && error.unknownOutcome === true)
+}
+
+const ARTIFACT_OUTPUT_THRESHOLD_BYTES = 128 * 1024
+
+async function offloadLargeToolOutput(
+  output: unknown,
+  toolName: string,
+  context: ToolHostContext
+): Promise<unknown> {
+  if (!context.artifactStore) return output
+  let content: string
+  try {
+    content = typeof output === 'string' ? output : JSON.stringify(output)
+  } catch {
+    return output
+  }
+  if (Buffer.byteLength(content, 'utf8') <= ARTIFACT_OUTPUT_THRESHOLD_BYTES) return output
+  try {
+    const stored = await context.artifactStore.put({ content, source: 'tool', origin: toolName })
+    return {
+      artifactId: stored.meta.id,
+      byteSize: stored.meta.byteSize,
+      lineCount: stored.meta.lineCount,
+      truncated: stored.summary.truncated,
+      preview: stored.summary.inline
+    }
+  } catch {
+    return output
   }
 }
 
 function hookContext(
   context: ToolHostContext
-): Pick<ToolHostContext, 'threadId' | 'turnId' | 'workspace' | 'threadMode' | 'approvalPolicy' | 'sandboxMode'> {
+): Pick<
+  ToolHostContext,
+  | 'threadId'
+  | 'turnId'
+  | 'workspace'
+  | 'threadMode'
+  | 'approvalPolicy'
+  | 'sandboxMode'
+  | 'clientSurface'
+> {
   return {
     threadId: context.threadId,
     turnId: context.turnId,
     workspace: context.workspace,
     approvalPolicy: context.approvalPolicy,
+    ...(context.clientSurface ? { clientSurface: context.clientSurface } : {}),
     ...(context.sandboxMode ? { sandboxMode: context.sandboxMode } : {}),
     ...(context.threadMode ? { threadMode: context.threadMode } : {})
   }
@@ -391,7 +797,7 @@ function createUserInputTool(name: string): LocalTool {
   }
   return LocalToolHost.defineTool({
     name,
-    description: 'Ask the GUI user a structured question and wait for the answer.',
+    description: 'Ask the user a structured question through the current interactive client and wait for the answer.',
     toolKind: 'tool_call',
     inputSchema: {
       type: 'object',
@@ -404,6 +810,21 @@ function createUserInputTool(name: string): LocalTool {
           description: 'Optional answer choices for a single question. Use strings or {label, description} objects.',
           items: optionSchema
         },
+        selectionMode: {
+          type: 'string',
+          enum: ['single', 'multiple'],
+          description: 'Use "multiple" only when the user may choose more than one option.'
+        },
+        minSelections: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Minimum required selections for a multiple-choice question.'
+        },
+        maxSelections: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Maximum allowed selections for a multiple-choice question.'
+        },
         questions: {
           type: 'array',
           description: 'One to three structured questions. Each question may include answer options.',
@@ -413,32 +834,58 @@ function createUserInputTool(name: string): LocalTool {
               header: { type: 'string' },
               id: { type: 'string' },
               question: { type: 'string' },
+              prompt: {
+                type: 'string',
+                description: 'Alias for question used by delegated SDK tool callers.'
+              },
+              message: {
+                type: 'string',
+                description: 'Alias for question used by delegated SDK tool callers.'
+              },
               options: {
                 type: 'array',
                 items: optionSchema
+              },
+              selectionMode: {
+                type: 'string',
+                enum: ['single', 'multiple']
+              },
+              minSelections: {
+                type: 'integer',
+                minimum: 1
+              },
+              maxSelections: {
+                type: 'integer',
+                minimum: 1
               }
-            },
-            required: ['question']
+            }
           }
         }
       },
       required: []
     },
     policy: 'auto',
-    // Only advertised when the turn can actually resolve structured
-    // input (IM bridges and headless runs omit `awaitUserInput`).
-    shouldAdvertise: (context) => typeof context.awaitUserInput === 'function',
     execute: async (args, context) => {
       if (!context.awaitUserInput) {
         return {
-          output: { error: 'GUI user input is not available in this runtime context' },
+          output: { error: 'structured user input is not available in this client context' },
           isError: true
         }
       }
       const inputId = `in_${Math.random().toString(36).slice(2, 10)}`
       const itemId = `item_${inputId}`
-      const prompt = String(args.prompt ?? args.question ?? args.message ?? 'Input requested')
-      const questions = normalizeUserInputQuestions(args, inputId, prompt)
+      const explicitPrompt = firstNonEmptyString(args.prompt, args.question, args.message)
+      const questions = normalizeUserInputQuestions(args, inputId, explicitPrompt)
+      if (questions.length === 0) {
+        return {
+          output: {
+            error:
+              'user_input requires a non-empty prompt, question, message, or questions[].question'
+          },
+          isError: true
+        }
+      }
+      const prompt = explicitPrompt ?? questions[0]!.question
       const resolution = await context.awaitUserInput({ id: inputId, itemId, prompt, questions })
       return {
         output: resolution,
@@ -461,20 +908,16 @@ export const defaultLocalTools: LocalTool[] = [
 function normalizeUserInputQuestions(
   args: Record<string, unknown>,
   fallbackId: string,
-  fallbackPrompt: string
-): Array<{
-  header: string
-  id: string
-  question: string
-  options: Array<{ label: string; description: string }>
-}> {
+  fallbackPrompt: string | undefined
+): UserInputQuestion[] {
   const rawQuestions = Array.isArray(args.questions) ? args.questions : null
   if (rawQuestions && rawQuestions.length > 0) {
     const questions = rawQuestions
       .map((question, index) => normalizeUserInputQuestion(question, index, fallbackId))
-      .filter((question) => question !== null)
+      .filter((question): question is UserInputQuestion => question !== null)
     if (questions.length > 0) return questions
   }
+  if (!fallbackPrompt) return []
   const options = Array.isArray(args.options)
     ? args.options
         .map((option) => normalizeUserInputOption(option))
@@ -485,7 +928,8 @@ function normalizeUserInputQuestions(
       header: 'Input',
       id: String(args.id ?? fallbackId),
       question: fallbackPrompt,
-      options
+      options,
+      ...normalizeUserInputSelection(args, options.length)
     }
   ]
 }
@@ -494,17 +938,10 @@ function normalizeUserInputQuestion(
   value: unknown,
   index: number,
   fallbackId: string
-): {
-  header: string
-  id: string
-  question: string
-  options: Array<{ label: string; description: string }>
-} | null {
+): UserInputQuestion | null {
   if (!value || typeof value !== 'object') return null
   const raw = value as Record<string, unknown>
-  const question = typeof raw.question === 'string' && raw.question.trim()
-    ? raw.question.trim()
-    : null
+  const question = firstNonEmptyString(raw.question, raw.prompt, raw.message)
   if (!question) return null
   const options = Array.isArray(raw.options)
     ? raw.options
@@ -515,8 +952,43 @@ function normalizeUserInputQuestion(
     header: typeof raw.header === 'string' && raw.header.trim() ? raw.header.trim() : `Question ${index + 1}`,
     id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : `${fallbackId}_${index + 1}`,
     question,
-    options
+    options,
+    ...normalizeUserInputSelection(raw, options.length)
   }
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const normalized = value.trim()
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
+function normalizeUserInputSelection(
+  raw: Record<string, unknown>,
+  optionCount: number
+): Pick<UserInputQuestion, 'selectionMode' | 'minSelections' | 'maxSelections'> {
+  if (raw.selectionMode !== 'multiple' || optionCount === 0) {
+    return { selectionMode: 'single' }
+  }
+  const rawMax = positiveInteger(raw.maxSelections)
+  const maxSelections = rawMax === undefined ? undefined : Math.min(rawMax, optionCount)
+  const minCeiling = maxSelections ?? optionCount
+  const rawMin = positiveInteger(raw.minSelections)
+  const minSelections = Math.min(rawMin ?? 1, minCeiling)
+  return {
+    selectionMode: 'multiple',
+    minSelections,
+    ...(maxSelections !== undefined ? { maxSelections } : {})
+  }
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const normalized = Math.floor(value)
+  return normalized > 0 ? normalized : undefined
 }
 
 function normalizeUserInputOption(
@@ -546,6 +1018,12 @@ import { createCreatePlanTool, type CreatePlanAdapterOptions } from './create-pl
  * `shouldAdvertise` predicate, so it is safe to ship with the
  * default set: non-plan turns never see it in the model tool list.
  */
-export function buildDefaultLocalTools(planOptions: CreatePlanAdapterOptions = {}): LocalTool[] {
-  return [...defaultLocalTools, createCreatePlanTool(planOptions)]
+export function buildDefaultLocalTools(
+  planOptions: CreatePlanAdapterOptions = {},
+  builtinOptions: BuiltinLocalToolsOptions = {}
+): LocalTool[] {
+  const baseTools = Object.keys(builtinOptions).length
+    ? [...buildBuiltinLocalTools(builtinOptions), echoTool, userInputTool, requestUserInputTool]
+    : defaultLocalTools
+  return [...baseTools, createCreatePlanTool(planOptions)]
 }

@@ -1,7 +1,18 @@
-import { describe, expect, it } from 'vitest'
-import { chatBlockFromItem, dispatchKunRuntimeEvent, mergeChatBlocks } from './kun-mapper'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  chatBlockFromItem,
+  dispatchKunRuntimeEvent,
+  mergeChatBlocks,
+  runtimeProjectionActionsFromEvent,
+  threadFromCore
+} from './kun-mapper'
 import type { CoreRuntimeEventJson, CoreTurnItemJson } from './kun-contract'
 import type { ThreadErrorOptions, ThreadEventSink } from './types'
+import {
+  PRESENTATION_STUDIO_EXTENSION_ID,
+  presentationStudioCanonicalToolId,
+  presentationStudioModelAlias
+} from '@shared/presentation-artifact'
 
 function makeSink(): ThreadEventSink {
   return {
@@ -20,14 +31,225 @@ function makeSink(): ThreadEventSink {
   }
 }
 
+describe('runtime projection action normalization', () => {
+  it('defaults a legacy thread without reviewer metadata to manual user review', () => {
+    const thread = threadFromCore({
+      id: 'thread_1',
+      title: 'Legacy thread',
+      model: 'model_1',
+      mode: 'agent',
+      status: 'idle',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      createdAt: '2026-07-29T00:00:00.000Z',
+      updatedAt: '2026-07-29T00:00:00.000Z'
+    })
+
+    expect(thread.approvalReviewer).toBe('user')
+  })
+
+  it('normalizes automatic approval review lifecycle events into visible transcript updates', () => {
+    const started = runtimeProjectionActionsFromEvent({
+      kind: 'approval_review_started',
+      seq: 12,
+      timestamp: '2026-07-29T00:00:00.000Z',
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      reviewId: 'review_1',
+      approvalId: 'approval_1',
+      reviewer: 'agent',
+      status: 'in-progress',
+      toolName: 'exec_command',
+      summary: 'Run the project tests'
+    })
+    const completed = runtimeProjectionActionsFromEvent({
+      kind: 'approval_review_completed',
+      seq: 13,
+      timestamp: '2026-07-29T00:00:01.000Z',
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      reviewId: 'review_1',
+      approvalId: 'approval_1',
+      reviewer: 'agent',
+      status: 'denied',
+      decision: 'deny',
+      riskLevel: 'high',
+      toolName: 'exec_command',
+      summary: 'Run the project tests',
+      rationale: 'The command writes outside the workspace.'
+    })
+
+    expect(started).toEqual([{
+      type: 'approval_review_updated',
+      payload: {
+        reviewId: 'review_1',
+        approvalId: 'approval_1',
+        turnId: 'turn_1',
+        createdAt: '2026-07-29T00:00:00.000Z',
+        summary: 'Run the project tests',
+        toolName: 'exec_command',
+        status: 'in-progress'
+      }
+    }])
+    expect(completed).toEqual([{
+      type: 'approval_review_updated',
+      payload: {
+        reviewId: 'review_1',
+        approvalId: 'approval_1',
+        turnId: 'turn_1',
+        createdAt: '2026-07-29T00:00:01.000Z',
+        summary: 'Run the project tests',
+        toolName: 'exec_command',
+        status: 'denied',
+        decision: 'deny',
+        riskLevel: 'high',
+        rationale: 'The command writes outside the workspace.'
+      }
+    }])
+  })
+
+  it('does not project malformed or non-agent review events', () => {
+    expect(runtimeProjectionActionsFromEvent({
+      kind: 'approval_review_started',
+      reviewId: 'review_1',
+      approvalId: 'approval_1',
+      reviewer: 'user',
+      status: 'in-progress'
+    })).toEqual([])
+  })
+
+  it('keeps agent approval resolutions out of the manual approval projection', async () => {
+    const event: CoreRuntimeEventJson = {
+      kind: 'approval_resolved',
+      seq: 14,
+      timestamp: '2026-07-29T00:00:02.000Z',
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      approvalId: 'approval_1',
+      toolName: 'exec_command',
+      status: 'denied',
+      approvalReviewer: 'agent',
+      decisionSource: 'agent',
+      summary: 'Run the project tests',
+      reason: 'The automatic reviewer denied the action.'
+    }
+    expect(runtimeProjectionActionsFromEvent(event)).toEqual([])
+
+    const onApprovalStatus = vi.fn()
+    await dispatchKunRuntimeEvent(
+      event,
+      { ...makeSink(), onApprovalStatus },
+      async () => undefined
+    )
+    expect(onApprovalStatus).not.toHaveBeenCalled()
+    expect(chatBlockFromItem({
+      id: 'item_agent_resolution',
+      turnId: 'turn_1',
+      threadId: 'thread_1',
+      role: 'tool',
+      status: 'denied',
+      createdAt: '2026-07-29T00:00:02.000Z',
+      kind: 'approval',
+      approvalId: 'approval_1',
+      toolName: 'exec_command',
+      summary: 'Run the project tests',
+      approvalReviewer: 'agent',
+      decisionSource: 'agent'
+    })).toBeNull()
+  })
+
+  it('normalizes a required-tool gate as a stable runtime status, not assistant text', () => {
+    const actions = runtimeProjectionActionsFromEvent({
+      kind: 'required_tool_gate',
+      seq: 42,
+      timestamp: '2026-07-27T00:00:00.000Z',
+      threadId: 'thread_1',
+      turnId: 'turn_1',
+      toolName: 'graph_create_run',
+      phase: 'retrying',
+      attempt: 2,
+      maxAttempts: 3,
+      failureSummary: 'plan.nodes.0: Required'
+    })
+
+    expect(actions).toEqual([{
+      type: 'runtime_status_received',
+      payload: {
+        kind: 'required_tool_gate',
+        itemId: 'runtime_status_turn_1_required_tool_graph_create_run',
+        turnId: 'turn_1',
+        createdAt: '2026-07-27T00:00:00.000Z',
+        toolName: 'graph_create_run',
+        phase: 'retrying',
+        attempt: 2,
+        maxAttempts: 3,
+        failureSummary: 'plan.nodes.0: Required'
+      }
+    }])
+  })
+
+  it('normalizes the same goal event to a stable action transcript', () => {
+    const event: CoreRuntimeEventJson = {
+      kind: 'goal_updated',
+      seq: 9,
+      timestamp: '2026-07-11T00:00:00.000Z',
+      threadId: 'thread_1',
+      goal: {
+        threadId: 'thread_1',
+        objective: 'Finish projection extraction',
+        status: 'active',
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: '2026-07-11T00:00:00.000Z',
+        updatedAt: '2026-07-11T00:00:00.000Z'
+      }
+    }
+
+    const first = runtimeProjectionActionsFromEvent(event)
+    const replay = runtimeProjectionActionsFromEvent(structuredClone(event))
+
+    expect(replay).toEqual(first)
+    expect(first).toEqual([{
+      type: 'goal_changed',
+      payload: {
+        threadId: 'thread_1',
+        goal: {
+          threadId: 'thread_1',
+          objective: 'Finish projection extraction',
+          status: 'active',
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: '2026-07-11T00:00:00.000Z',
+          updatedAt: '2026-07-11T00:00:00.000Z'
+        },
+        createdAt: '2026-07-11T00:00:00.000Z'
+      }
+    }])
+  })
+
+  it('uses a deterministic fallback identity for legacy user-input events', () => {
+    const actions = runtimeProjectionActionsFromEvent({
+      kind: 'user_input_resolved',
+      status: 'cancelled'
+    })
+    expect(actions).toEqual([{
+      type: 'user_input_status_changed',
+      payload: { itemId: 'input_unknown', status: 'cancelled' }
+    }])
+  })
+})
+
 describe('assistant stream mapping', () => {
-  it('does not append completed assistant snapshots after streaming deltas', async () => {
+  it('keeps delta identity and emits the completed assistant snapshot as an authoritative upsert', async () => {
     const deltas: unknown[] = []
+    const assistantItems: unknown[] = []
     const sink: ThreadEventSink = {
       ...makeSink(),
       onDeltas: (events) => {
         deltas.push(...events)
-      }
+      },
+      onAssistantItem: (item) => assistantItems.push(item)
     }
 
     await dispatchKunRuntimeEvent({
@@ -74,9 +296,34 @@ describe('assistant stream mapping', () => {
     }, sink, async () => undefined)
 
     expect(deltas).toEqual([
-      { text: 'he', kind: 'agent_message', seq: 1 },
-      { text: 'llo', kind: 'agent_message', seq: 2 }
+      {
+        text: 'he',
+        kind: 'agent_message',
+        seq: 1,
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        itemId: 'item_answer',
+        createdAt: '2024-01-01T00:00:00.000Z'
+      },
+      {
+        text: 'llo',
+        kind: 'agent_message',
+        seq: 2,
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        itemId: 'item_answer',
+        createdAt: '2024-01-01T00:00:00.000Z'
+      }
     ])
+    expect(assistantItems).toEqual([{
+      itemId: 'item_answer',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      kind: 'agent_message',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      text: 'hello'
+    }])
   })
 })
 
@@ -210,7 +457,169 @@ describe('create_plan tool mapping', () => {
       message: 'model stream exploded',
       severity: 'error'
     })
-    expect(capturedErrorOptions).toEqual({ terminal: true })
+    expect(capturedErrorOptions).toEqual({ terminal: true, scope: 'conversation' })
+  })
+
+  it('settles message-less turn failures without adding a generic duplicate error', async () => {
+    let capturedErrorOptions: ThreadErrorOptions | null = null
+    let runtimeErrorCount = 0
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onRuntimeError: () => {
+        runtimeErrorCount += 1
+      },
+      onError: (_error, options) => {
+        capturedErrorOptions = options ?? null
+      }
+    }
+
+    await dispatchKunRuntimeEvent({
+      kind: 'turn_failed',
+      seq: 8,
+      timestamp: '2024-01-01T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1'
+    }, sink, async () => undefined)
+
+    expect(runtimeErrorCount).toBe(0)
+    expect(capturedErrorOptions).toEqual({ terminal: true, scope: 'conversation' })
+  })
+
+  it('does not finish the parent turn for child lifecycle events', async () => {
+    let completed = 0
+    let fatalErrors = 0
+    let childUpdate: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onTurnComplete: () => {
+        completed += 1
+      },
+      onTool: (event) => {
+        childUpdate = event
+      },
+      onError: () => {
+        fatalErrors += 1
+      }
+    }
+    const child = {
+      parentThreadId: 'thr_1',
+      parentTurnId: 'turn_1',
+      childId: 'child_1',
+      childLabel: 'child',
+      childProfile: 'security-auditor',
+      childProfileName: 'Security Auditor',
+      childModel: 'gpt-5.6-sol',
+      childStatus: 'completed' as const,
+      childSeq: 1,
+      detached: true
+    }
+
+    await dispatchKunRuntimeEvent({
+      kind: 'turn_started',
+      seq: 8,
+      timestamp: '2024-01-01T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      child: { ...child, childStatus: 'running' }
+    }, sink, async () => undefined)
+    expect(childUpdate).toMatchObject({
+      status: 'running',
+      updateOnly: true,
+      meta: {
+        child: {
+          childId: 'child_1',
+          childStatus: 'running',
+          detached: true,
+          childProfile: 'security-auditor',
+          childProfileName: 'Security Auditor',
+          childModel: 'gpt-5.6-sol'
+        }
+      }
+    })
+
+    await dispatchKunRuntimeEvent({
+      kind: 'turn_completed',
+      seq: 9,
+      timestamp: '2024-01-01T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      child
+    }, sink, async () => undefined)
+    await dispatchKunRuntimeEvent({
+      kind: 'turn_aborted',
+      seq: 10,
+      timestamp: '2024-01-01T00:00:01.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      child: { ...child, childStatus: 'aborted' }
+    }, sink, async () => undefined)
+    await dispatchKunRuntimeEvent({
+      kind: 'turn_failed',
+      seq: 11,
+      timestamp: '2024-01-01T00:00:02.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      child: { ...child, childStatus: 'failed' },
+      message: 'child failed'
+    }, sink, async () => undefined)
+
+    expect(completed).toBe(0)
+    expect(fatalErrors).toBe(0)
+    expect(childUpdate).toMatchObject({
+      status: 'error',
+      updateOnly: true,
+      meta: {
+        child: {
+          childId: 'child_1',
+          childStatus: 'failed',
+          detached: true,
+          childProfile: 'security-auditor',
+          childProfileName: 'Security Auditor',
+          childModel: 'gpt-5.6-sol'
+        }
+      }
+    })
+  })
+
+  it('keeps detached delegate_task results running until the child settles', async () => {
+    let captured: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onTool: (event) => {
+        captured = event
+      }
+    }
+
+    await dispatchKunRuntimeEvent({
+      kind: 'item_completed',
+      seq: 12,
+      item: {
+        id: 'item_delegate',
+        turnId: 'turn_1',
+        threadId: 'thr_1',
+        role: 'tool',
+        status: 'completed',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        kind: 'tool_result',
+        toolName: 'delegate_task',
+        callId: 'call_delegate',
+        output: {
+          childId: 'child_background',
+          status: 'queued',
+          detached: true
+        }
+      }
+    }, sink, async () => undefined)
+
+    expect(captured).toMatchObject({
+      itemId: 'tool_call_delegate',
+      status: 'running'
+    })
+    expect(JSON.parse((captured as { detail: string }).detail)).toMatchObject({
+      childId: 'child_background',
+      status: 'queued',
+      detached: true
+    })
   })
 
   it('routes live error items to runtime error timeline events without fatal stream errors', async () => {
@@ -253,6 +662,75 @@ describe('create_plan tool mapping', () => {
       code: 'stream_read_error',
       details: { token: 'secret-token' }
     })
+  })
+
+  it('marks persisted error items for direct conversation rendering', () => {
+    const block = chatBlockFromItem({
+      id: 'item_error_persisted',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'system',
+      status: 'failed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'error',
+      message: 'provider rejected the request',
+      code: 'provider_error'
+    })
+
+    expect(block).toMatchObject({
+      kind: 'system',
+      id: 'item_error_persisted',
+      text: 'provider rejected the request',
+      code: 'provider_error',
+      runtimeError: true
+    })
+  })
+
+  it('omits legacy persisted tool catalog drift items from the conversation', () => {
+    const block = chatBlockFromItem({
+      id: 'item_tool_catalog_changed',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'system',
+      status: 'failed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'error',
+      message: 'Tool catalog changed for this thread',
+      code: 'tool_catalog_changed',
+      severity: 'info'
+    })
+
+    expect(block).toBeNull()
+  })
+
+  it('omits legacy live tool catalog drift items without hiding actionable errors', async () => {
+    const runtimeError = vi.fn()
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onRuntimeError: runtimeError
+    }
+
+    await dispatchKunRuntimeEvent({
+      kind: 'item_created',
+      seq: 10,
+      timestamp: '2024-01-01T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      item: {
+        id: 'item_tool_catalog_changed',
+        turnId: 'turn_1',
+        threadId: 'thr_1',
+        role: 'system',
+        status: 'failed',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        kind: 'error',
+        message: 'Tool catalog changed for this thread',
+        code: 'tool_catalog_changed',
+        severity: 'info'
+      }
+    }, sink, async () => undefined)
+
+    expect(runtimeError).not.toHaveBeenCalled()
   })
 
   it('maps a successful create_plan result to a tool block with plan metadata', () => {
@@ -388,6 +866,115 @@ describe('create_plan tool mapping', () => {
     }
   })
 
+  it('does not treat generic tool_result files as generated files', () => {
+    const item: CoreTurnItemJson = {
+      id: 'item_read_1',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'read',
+      callId: 'call_read_1',
+      output: {
+        files: [
+          { path: 'src/parser.js' },
+          { path: 'src/admin_system.md' }
+        ]
+      }
+    }
+    const block = chatBlockFromItem(item)
+    expect(block).not.toBeNull()
+    if (block && block.kind === 'tool') {
+      expect(block.meta?.generatedFiles).toBeUndefined()
+    } else {
+      throw new Error('expected tool block')
+    }
+  })
+
+  it('still trusts explicit generatedFiles from tool_result output', () => {
+    const item: CoreTurnItemJson = {
+      id: 'item_export_1',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'export_report',
+      callId: 'call_export_1',
+      output: {
+        files: [{ path: 'src/parser.js' }],
+        generatedFiles: [{ relativePath: 'reports/summary.md', mimeType: 'text/markdown' }]
+      }
+    }
+    const block = chatBlockFromItem(item)
+    expect(block).not.toBeNull()
+    if (block && block.kind === 'tool') {
+      expect(block.meta?.generatedFiles).toEqual([
+        { relativePath: 'reports/summary.md', mimeType: 'text/markdown' }
+      ])
+    } else {
+      throw new Error('expected tool block')
+    }
+  })
+
+  it('projects top-level extension generatedArtifacts without paths or ephemeral URLs', () => {
+    const item: CoreTurnItemJson = {
+      id: 'item_artifact_1',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'video-render',
+      callId: 'call_artifact_1',
+      output: {
+        content: { status: 'completed' },
+        generatedArtifacts: [{
+          schemaVersion: 1,
+          artifactId: 'artifact_1234567890',
+          mediaHandleId: 'media_123456789012',
+          displayName: 'final.mp4',
+          mediaKind: 'video',
+          mimeType: 'video/mp4',
+          byteSize: 4096,
+          durationMicros: 1_500_000,
+          completionIdentity: 'identity_1234567890',
+          availability: 'available',
+          ownerExtensionId: 'kun.video-editor',
+          ownerExtensionVersion: '1.0.0',
+          workspaceId: 'workspace-1',
+          provenance: { jobId: 'job_12345678', operation: 'video-render' }
+        }]
+      }
+    }
+    const block = chatBlockFromItem(item)
+    expect(block).not.toBeNull()
+    if (block && block.kind === 'tool') {
+      expect(block.meta?.generatedFiles).toEqual([{
+        id: 'artifact_1234567890',
+        artifactId: 'artifact_1234567890',
+        mediaHandleId: 'media_123456789012',
+        availability: 'available',
+        name: 'final.mp4',
+        mimeType: 'video/mp4',
+        byteSize: 4096,
+        durationMicros: 1_500_000,
+        mediaKind: 'video',
+        completionIdentity: 'identity_1234567890',
+        ownerExtensionId: 'kun.video-editor',
+        ownerExtensionVersion: '1.0.0',
+        workspaceId: 'workspace-1',
+        provenance: { jobId: 'job_12345678', operation: 'video-render' }
+      }])
+    } else {
+      throw new Error('expected tool block')
+    }
+  })
+
   it('omits meta attachments when tool_result output has none worth showing', () => {
     const item: CoreTurnItemJson = {
       id: 'item_img_2',
@@ -447,6 +1034,134 @@ describe('create_plan tool mapping', () => {
   })
 })
 
+describe('component prototype mapping', () => {
+  const item = (status: 'preparing' | 'running' | 'completed' | 'failed'): CoreTurnItemJson => ({
+    id: `item_component_${status}`,
+    turnId: 'turn_component',
+    threadId: 'thread_component',
+    role: 'tool',
+    status: 'completed',
+    createdAt: '2026-07-16T00:00:00.000Z',
+    kind: 'tool_result',
+    toolName: 'design_component',
+    callId: 'call_component',
+    output: {
+      status,
+      componentPrototype: {
+        version: 1,
+        status,
+        artifactId: 'component_abcdef1234',
+        title: 'Date range picker',
+        relativePath: '.kun-design/component-prototypes/date-range/prototype.html',
+        viewport: { width: 720, height: 460 },
+        profile: 'component-designer',
+        childId: 'child_component',
+        byteSize: 4096,
+        contentHash: 'a'.repeat(64),
+        summary: 'Added range preview.'
+      }
+    }
+  })
+
+  it('maps preparing and running payloads to a running inline artifact', () => {
+    for (const status of ['preparing', 'running'] as const) {
+      expect(chatBlockFromItem(item(status))).toMatchObject({
+        kind: 'tool',
+        status: 'running',
+        meta: {
+          toolName: 'design_component',
+          componentPrototype: {
+            version: 1,
+            status,
+            artifactId: 'component_abcdef1234',
+            relativePath: '.kun-design/component-prototypes/date-range/prototype.html',
+            viewport: { width: 720, height: 460 },
+            producer: 'component-designer',
+            profile: 'component-designer'
+          }
+        }
+      })
+    }
+  })
+
+  it('maps completed and failed prototype status independently of the generic item status', () => {
+    expect(chatBlockFromItem(item('completed'))).toMatchObject({ kind: 'tool', status: 'success' })
+    expect(chatBlockFromItem(item('failed'))).toMatchObject({ kind: 'tool', status: 'error' })
+  })
+
+  it('maps direct main-agent prototypes without child metadata', () => {
+    const direct = item('completed')
+    const prototype = (direct.output as Record<string, unknown>).componentPrototype as Record<string, unknown>
+    delete prototype.profile
+    delete prototype.childId
+    prototype.producer = 'main-agent'
+
+    expect(chatBlockFromItem(direct)).toMatchObject({
+      kind: 'tool',
+      status: 'success',
+      meta: {
+        componentPrototype: {
+          producer: 'main-agent',
+          status: 'completed'
+        }
+      }
+    })
+  })
+
+  it('keeps historical component-designer payloads compatible when producer is absent', () => {
+    const legacy = item('completed')
+    const prototype = (legacy.output as Record<string, unknown>).componentPrototype as Record<string, unknown>
+    delete prototype.producer
+
+    expect(chatBlockFromItem(legacy)).toMatchObject({
+      kind: 'tool',
+      meta: {
+        componentPrototype: {
+          producer: 'component-designer',
+          profile: 'component-designer'
+        }
+      }
+    })
+  })
+
+  it('surfaces the same structured card metadata through a live SSE item update', async () => {
+    let captured: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onTool: (event) => {
+        captured = event
+      }
+    }
+
+    await dispatchKunRuntimeEvent({
+      kind: 'item_updated',
+      seq: 18,
+      item: item('running')
+    }, sink, async () => undefined)
+
+    expect(captured).toMatchObject({
+      itemId: 'tool_call_component',
+      status: 'running',
+      meta: {
+        toolName: 'design_component',
+        componentPrototype: {
+          status: 'running',
+          relativePath: '.kun-design/component-prototypes/date-range/prototype.html'
+        }
+      }
+    })
+  })
+
+  it('drops unsafe or malformed prototype paths instead of surfacing a webview', () => {
+    const unsafe = item('completed')
+    ;((unsafe.output as Record<string, unknown>).componentPrototype as Record<string, unknown>).relativePath =
+      '../outside/prototype.html'
+    const block = chatBlockFromItem(unsafe)
+    expect(block).toMatchObject({ kind: 'tool' })
+    if (block?.kind === 'tool') expect(block.meta?.componentPrototype).toBeUndefined()
+  })
+})
+
 describe('user input mapping', () => {
   it('maps structured user-input items without inventing submit-only options', () => {
     const item: CoreTurnItemJson = {
@@ -488,6 +1203,61 @@ describe('user input mapping', () => {
     })
   })
 
+  it('maps multi-select questions and submitted answers from user-input items', () => {
+    const item: CoreTurnItemJson = {
+      id: 'item_input_multi',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'submitted',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'user_input',
+      inputId: 'input_multi',
+      prompt: 'Pick requirements',
+      questions: [
+        {
+          header: 'Requirements',
+          id: 'reqs',
+          question: 'Pick requirements',
+          selectionMode: 'multiple',
+          minSelections: 2,
+          maxSelections: 3,
+          options: [
+            { label: 'Keep ratio', description: '' },
+            { label: 'App icon', description: '' }
+          ]
+        }
+      ],
+      answers: [
+        {
+          id: 'reqs',
+          label: 'Keep ratio, App icon',
+          value: 'Keep ratio, App icon',
+          labels: ['Keep ratio', 'App icon'],
+          values: ['Keep ratio', 'App icon']
+        }
+      ]
+    }
+    expect(chatBlockFromItem(item)).toMatchObject({
+      kind: 'user_input',
+      status: 'submitted',
+      questions: [
+        {
+          id: 'reqs',
+          selectionMode: 'multiple',
+          minSelections: 2,
+          maxSelections: 3
+        }
+      ],
+      answers: [
+        {
+          id: 'reqs',
+          values: ['Keep ratio', 'App icon']
+        }
+      ]
+    })
+  })
+
   it('surfaces structured user-input requests from runtime events', async () => {
     let request: unknown = null
     const sink: ThreadEventSink = {
@@ -524,6 +1294,119 @@ describe('user input mapping', () => {
           id: 'mode',
           question: 'Choose',
           options: [{ label: 'Fast', description: 'Use the faster path' }]
+        }
+      ]
+    })
+  })
+
+  it('maps prompt/message aliases on user-input questions', async () => {
+    let request: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onUserInput: (payload) => {
+        request = payload
+      }
+    }
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'user_input_requested',
+        seq: 8,
+        itemId: 'item_input_alias',
+        inputId: 'input_alias',
+        questions: [
+          {
+            id: 'next_action',
+            prompt: 'Release review finished. What should I do next?',
+            options: [{ label: 'Fix blockers', description: '' }]
+          }
+        ]
+      },
+      sink,
+      async () => undefined
+    )
+    expect(request).toMatchObject({
+      itemId: 'item_input_alias',
+      requestId: 'input_alias',
+      questions: [
+        {
+          id: 'next_action',
+          question: 'Release review finished. What should I do next?',
+          options: [{ label: 'Fix blockers', description: '' }]
+        }
+      ]
+    })
+  })
+
+  it('drops empty user-input requests instead of inventing placeholder text', async () => {
+    let request: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onUserInput: (payload) => {
+        request = payload
+      }
+    }
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'user_input_requested',
+        seq: 9,
+        itemId: 'item_input_empty',
+        inputId: 'input_empty',
+        questions: [{ id: 'blank', options: [{ label: 'Continue', description: '' }] }]
+      },
+      sink,
+      async () => undefined
+    )
+    expect(request).toBeNull()
+    expect(
+      chatBlockFromItem({
+        id: 'item_input_empty',
+        turnId: 'turn_1',
+        threadId: 'thr_1',
+        role: 'tool',
+        status: 'pending',
+        createdAt: '2024-01-01T00:00:00.000Z',
+        kind: 'user_input',
+        inputId: 'input_empty',
+        questions: [{ id: 'blank', options: [{ label: 'Continue', description: '' }] }]
+      })
+    ).toBeNull()
+  })
+
+  it('surfaces submitted user-input answers from runtime events', async () => {
+    let status: unknown = null
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onUserInputStatus: (payload) => {
+        status = payload
+      }
+    }
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'user_input_resolved',
+        seq: 9,
+        itemId: 'item_input_3',
+        inputId: 'input_3',
+        status: 'submitted',
+        answers: [
+          {
+            id: 'reqs',
+            label: 'Keep ratio, App icon',
+            value: 'Keep ratio, App icon',
+            labels: ['Keep ratio', 'App icon'],
+            values: ['Keep ratio', 'App icon']
+          }
+        ]
+      },
+      sink,
+      async () => undefined
+    )
+    expect(status).toMatchObject({
+      itemId: 'item_input_3',
+      status: 'submitted',
+      answers: [
+        {
+          id: 'reqs',
+          values: ['Keep ratio', 'App icon']
         }
       ]
     })
@@ -591,6 +1474,46 @@ describe('approval mapping', () => {
     )
     expect(called).toBe(false)
   })
+
+  it('rehydrates expired approval items as non-actionable blocks', () => {
+    expect(chatBlockFromItem({
+      id: 'item_approval_expired',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'expired',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'approval',
+      approvalId: 'appr_expired',
+      toolName: 'shell',
+      summary: 'Approval required'
+    })).toMatchObject({
+      kind: 'approval',
+      approvalId: 'appr_expired',
+      status: 'expired'
+    })
+  })
+
+  it('maps live approval resolution events to status updates', async () => {
+    const onApprovalStatus = vi.fn()
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'approval_resolved',
+        seq: 10,
+        approvalId: 'appr_expired',
+        status: 'expired',
+        reason: 'turn aborted while awaiting approval'
+      },
+      { ...makeSink(), onApprovalStatus },
+      async () => undefined
+    )
+
+    expect(onApprovalStatus).toHaveBeenCalledWith({
+      approvalId: 'appr_expired',
+      status: 'expired',
+      errorMessage: 'turn aborted while awaiting approval'
+    })
+  })
 })
 
 describe('tool block merging', () => {
@@ -625,7 +1548,10 @@ describe('tool block merging', () => {
     expect(blocks[0]).toMatchObject({
       kind: 'tool',
       id: 'tool_call_1',
-      status: 'success'
+      status: 'success',
+      meta: {
+        sourceItemKind: 'tool_result'
+      }
     })
   })
 })
@@ -700,7 +1626,7 @@ describe('streaming runtime status events', () => {
     })
   })
 
-	  it('surfaces tool catalog drift as a runtime status event', async () => {
+	  it('keeps tool catalog drift out of the conversation projection', async () => {
 	    let captured: unknown = null
     const sink: ThreadEventSink = {
       ...makeSink(),
@@ -724,13 +1650,7 @@ describe('streaming runtime status events', () => {
       async () => undefined
     )
 
-	    expect(captured).toMatchObject({
-	      kind: 'tool_catalog_changed',
-	      itemId: 'runtime_status_tool_catalog_fp_next',
-	      turnId: 'turn_1',
-	      createdAt: '2026-06-03T10:00:01.000Z',
-	      message: 'Tool catalog changed'
-	    })
+	    expect(captured).toBeNull()
 	  })
 
 	  it('surfaces storm suppression as a runtime status event', async () => {
@@ -768,6 +1688,72 @@ describe('streaming runtime status events', () => {
 	      message: 'read repeated the same arguments'
 	    })
 	  })
+
+  it('surfaces model request retries as runtime status events', async () => {
+    let captured: unknown = null
+    const runtimeError = vi.fn()
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onRuntimeStatus: (event) => {
+        captured = event
+      },
+      onRuntimeError: runtimeError
+    }
+
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'model_request_retry',
+        seq: 24,
+        timestamp: '2026-06-03T10:00:03.000Z',
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        status: 429,
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 3000
+      },
+      sink,
+      async () => undefined
+    )
+
+    expect(captured).toMatchObject({
+      kind: 'model_request_retry',
+      itemId: 'runtime_status_turn_1_model_retry',
+      turnId: 'turn_1',
+      createdAt: '2026-06-03T10:00:03.000Z',
+      status: 429,
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 3000
+    })
+
+    captured = null
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'model_request_retry',
+        seq: 25,
+        timestamp: '2026-06-03T10:00:04.000Z',
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        attempt: 2,
+        maxAttempts: 5,
+        delayMs: 6000,
+        reason: 'network'
+      },
+      sink,
+      async () => undefined
+    )
+
+    expect(captured).toMatchObject({
+      kind: 'model_request_retry',
+      attempt: 2,
+      maxAttempts: 5,
+      delayMs: 6000,
+      retryReason: 'network'
+    })
+    expect(captured).not.toHaveProperty('status')
+    expect(runtimeError).not.toHaveBeenCalled()
+  })
 	})
 
 describe('Kun extension metadata mapping', () => {
@@ -782,6 +1768,8 @@ describe('Kun extension metadata mapping', () => {
       kind: 'user_message',
       text: 'look at this',
       displayText: 'Inspect attached image',
+      guiDesignCanvas: true,
+      guiDesignMode: false,
       attachmentIds: ['att_1'],
       fileReferences: [{
         path: '/workspace/deepseek-gui/src/App.tsx',
@@ -797,6 +1785,7 @@ describe('Kun extension metadata mapping', () => {
       kind: 'user',
       meta: {
         displayText: 'Inspect attached image',
+        guiDesignCanvas: true,
         attachmentIds: ['att_1'],
         fileReferences: [{
           path: '/workspace/deepseek-gui/src/App.tsx',
@@ -862,6 +1851,99 @@ describe('Kun extension metadata mapping', () => {
         child: { childId: 'child_research', childLabel: 'research' },
         sources: [{ title: 'Docs', url: 'https://example.com/docs' }]
       }
+    })
+  })
+
+  it('forwards safe child activity to the dedicated runtime sink', async () => {
+    const childEvents: unknown[] = []
+    const sink: ThreadEventSink = {
+      ...makeSink(),
+      onChildRuntimeEvent: (event) => childEvents.push(event)
+    }
+    await dispatchKunRuntimeEvent(
+      {
+        kind: 'item_updated',
+        seq: 17,
+        timestamp: '2026-07-28T00:00:17.000Z',
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        child: {
+          parentThreadId: 'thr_1',
+          parentTurnId: 'turn_1',
+          childId: 'child_geo',
+          childLabel: 'Inspect Geo',
+          childStatus: 'running',
+          childSeq: 1,
+          childProviderId: 'deepseek',
+          activity: {
+            phase: 'tool',
+            label: 'Scanning the repository',
+            toolName: 'repo_map',
+            startedAt: '2026-07-28T00:00:00.000Z',
+            updatedAt: '2026-07-28T00:00:17.000Z'
+          }
+        }
+      },
+      sink,
+      async () => undefined
+    )
+
+    expect(childEvents).toEqual([{
+      seq: 17,
+      timestamp: '2026-07-28T00:00:17.000Z',
+      child: expect.objectContaining({
+        childId: 'child_geo',
+        childProviderId: 'deepseek',
+        activity: {
+          phase: 'tool',
+          label: 'Scanning the repository',
+          toolName: 'repo_map',
+          startedAt: '2026-07-28T00:00:00.000Z',
+          updatedAt: '2026-07-28T00:00:17.000Z'
+        }
+      })
+    }])
+  })
+
+  it('preserves background subagent message source on user messages', () => {
+    const block = chatBlockFromItem({
+      id: 'item_subagent_notice',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'user',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'user_message',
+      text: '<background_subagent_completed><child_id>child-1</child_id><label>后台休眠</label><status>completed</status><summary>done</summary></background_subagent_completed>',
+      displayText: 'Background subagent 后台休眠 completed',
+      messageSource: 'background_subagent'
+    })
+
+    expect(block).toMatchObject({
+      kind: 'user',
+      meta: {
+        displayText: 'Background subagent 后台休眠 completed',
+        messageSource: 'background_subagent'
+      }
+    })
+  })
+
+  it('preserves internal Graph supervision source for timeline filtering', () => {
+    const block = chatBlockFromItem({
+      id: 'item_graph_supervision',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'user',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'user_message',
+      text: 'Graph Lead supervision for durable run run_1.',
+      messageSource: 'graph_runtime'
+    })
+
+    expect(block).toMatchObject({
+      kind: 'user',
+      meta: { messageSource: 'graph_runtime' }
     })
   })
 })
@@ -940,6 +2022,152 @@ describe('usage event mapping', () => {
       tokenEconomySavingsTokens: 4096,
       turns: 1
     })
+  })
+})
+
+describe('context snapshot event mapping', () => {
+  it('preserves request-local categories and runtime thresholds', () => {
+    const actions = runtimeProjectionActionsFromEvent({
+      kind: 'context_snapshot',
+      seq: 14,
+      timestamp: '2026-07-24T00:00:00.000Z',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      model: 'deepseek-v4-pro',
+      providerId: 'deepseek',
+      stepIndex: 1,
+      contextWindowTokens: 256_000,
+      softThresholdTokens: 192_000,
+      hardThresholdTokens: 217_600,
+      estimatedInputTokens: 12_000,
+      breakdown: {
+        tools: 3_000,
+        system: 2_000,
+        skills: 1_000,
+        messages: 5_000,
+        other: 1_000
+      },
+      toolCount: 21,
+      activeSkillIds: [' skill-a ', '', 'skill-b']
+    })
+
+    expect(actions).toEqual([{
+      type: 'context_snapshot_received',
+      payload: {
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        model: 'deepseek-v4-pro',
+        providerId: 'deepseek',
+        stepIndex: 1,
+        contextWindowTokens: 256_000,
+        softThresholdTokens: 192_000,
+        hardThresholdTokens: 217_600,
+        estimatedInputTokens: 12_000,
+        breakdown: {
+          tools: 3_000,
+          system: 2_000,
+          skills: 1_000,
+          messages: 5_000,
+          other: 1_000
+        },
+        toolCount: 21,
+        activeSkillIds: ['skill-a', 'skill-b']
+      }
+    }])
+  })
+
+  it('drops incomplete snapshot events instead of showing mixed accounting', () => {
+    expect(runtimeProjectionActionsFromEvent({
+      kind: 'context_snapshot',
+      threadId: 'thr_1',
+      model: 'deepseek-v4-pro'
+    })).toEqual([])
+  })
+
+  it('drops snapshots whose declared total does not equal their categories', () => {
+    expect(runtimeProjectionActionsFromEvent({
+      kind: 'context_snapshot',
+      threadId: 'thr_1',
+      model: 'deepseek-v4-pro',
+      stepIndex: 0,
+      contextWindowTokens: 256_000,
+      softThresholdTokens: 192_000,
+      hardThresholdTokens: 217_600,
+      estimatedInputTokens: 999,
+      breakdown: { tools: 1, system: 2, skills: 3, messages: 4, other: 5 },
+      toolCount: 1,
+      activeSkillIds: []
+    })).toEqual([])
+  })
+
+  it('preserves SDK-managed unknown native history without inventing occupancy', () => {
+    const actions = runtimeProjectionActionsFromEvent({
+      kind: 'context_snapshot',
+      threadId: 'thr_1',
+      turnId: 'turn_2',
+      model: 'claude-sonnet-4-5',
+      providerId: 'claude-subscription',
+      stepIndex: 0,
+      contextWindowTokens: 200_000,
+      softThresholdTokens: 150_000,
+      hardThresholdTokens: 170_000,
+      estimatedInputTokens: 12,
+      breakdown: { tools: 1, system: 2, skills: 3, messages: 6, other: 0 },
+      toolCount: 1,
+      activeSkillIds: [],
+      contextManagement: 'sdk-managed',
+      nativeHistory: 'unknown'
+    })
+    expect(actions).toEqual([{
+      type: 'context_snapshot_received',
+      payload: expect.objectContaining({
+        contextManagement: 'sdk-managed',
+        nativeHistory: 'unknown',
+        estimatedInputTokens: 12
+      })
+    }])
+  })
+})
+
+describe('delegated runtime capability mapping', () => {
+  it('maps bounded capability and rebase state without a native session id', () => {
+    expect(runtimeProjectionActionsFromEvent({
+      kind: 'delegated_runtime',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      providerKind: 'cursor-sdk',
+      providerId: 'cursor-subscription',
+      phase: 'rebased',
+      reason: 'history_changed',
+      capabilities: {
+        nativeResume: true,
+        structuredStreaming: true,
+        kunTools: false,
+        externalApproval: false,
+        liveSteering: false,
+        nativeContextTelemetry: false,
+        fork: false
+      }
+    })).toEqual([{
+      type: 'delegated_runtime_received',
+      payload: {
+        threadId: 'thr_1',
+        turnId: 'turn_1',
+        providerKind: 'cursor-sdk',
+        providerId: 'cursor-subscription',
+        phase: 'rebased',
+        reason: 'history_changed',
+        capabilities: {
+          nativeResume: true,
+          structuredStreaming: true,
+          kunTools: false,
+          externalApproval: false,
+          liveSteering: false,
+          nativeContextTelemetry: false,
+          fork: false
+        }
+      }
+    }])
   })
 })
 
@@ -1042,6 +2270,127 @@ describe('tool presentation inference', () => {
     })
   })
 
+  it('surfaces final output and destination path aliases for generated artifacts', () => {
+    const ppt = chatBlockFromItem({
+      id: 'item_ppt',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'ppt_master_run',
+      toolKind: 'file_change',
+      callId: 'call_ppt',
+      output: {
+        output_path: '/tmp/presentations/brief.pptx',
+        generatedFiles: [{
+          relativePath: 'presentations/brief.pptx',
+          mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        }]
+      }
+    })
+    const htmlCopy = chatBlockFromItem({
+      id: 'item_html_copy',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: presentationStudioModelAlias('presentation-export-copy'),
+      toolKind: 'file_change',
+      callId: 'call_html_copy',
+      output: {
+        content: {
+          sourcePath: 'brief.kun-ppt.html',
+          destinationPath: 'brief-copy.kun-ppt.html',
+          contentSha256: 'a'.repeat(64)
+        },
+        summary: 'Exported copy'
+      }
+    })
+
+    expect(ppt).toMatchObject({
+      filePath: '/tmp/presentations/brief.pptx',
+      meta: {
+        generatedFiles: [{
+          relativePath: 'presentations/brief.pptx',
+          mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        }]
+      }
+    })
+    expect(htmlCopy).toMatchObject({
+      filePath: 'brief-copy.kun-ppt.html',
+      meta: {
+        canonicalToolId: presentationStudioCanonicalToolId('presentation-export-copy'),
+        presentationArtifactProducer: PRESENTATION_STUDIO_EXTENSION_ID,
+        presentationArtifactSha256: 'a'.repeat(64)
+      }
+    })
+  })
+
+  it('unwraps progressive extension gateway presentation writes with trusted provenance', () => {
+    const block = chatBlockFromItem({
+      id: 'item_gateway_html',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'extension_tool_call',
+      toolKind: 'tool_call',
+      callId: 'call_gateway_html',
+      output: {
+        canonicalToolId: presentationStudioCanonicalToolId('presentation-apply'),
+        result: {
+          content: {
+            path: 'brief.kun-ppt.html',
+            resultingRevision: 2,
+            contentSha256: 'b'.repeat(64)
+          },
+          summary: 'Applied operations'
+        }
+      }
+    })
+
+    expect(block).toMatchObject({
+      toolKind: 'file_change',
+      filePath: 'brief.kun-ppt.html',
+      meta: {
+        canonicalToolId: presentationStudioCanonicalToolId('presentation-apply'),
+        presentationArtifactProducer: PRESENTATION_STUDIO_EXTENSION_ID,
+        presentationArtifactSha256: 'b'.repeat(64)
+      }
+    })
+  })
+
+  it('preserves workspace-write semantics from a generic progressive extension gateway', () => {
+    const block = chatBlockFromItem({
+      id: 'item_gateway_ppt',
+      turnId: 'turn_1',
+      threadId: 'thr_1',
+      role: 'tool',
+      status: 'completed',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      kind: 'tool_result',
+      toolName: 'extension_tool_call',
+      toolKind: 'tool_call',
+      callId: 'call_gateway_ppt',
+      output: {
+        canonicalToolId: 'extension:example.exporter/export-ppt',
+        sideEffect: 'workspace-write',
+        result: { content: { destinationPath: 'presentations/brief.pptx' } }
+      }
+    })
+
+    expect(block).toMatchObject({
+      toolKind: 'file_change',
+      filePath: 'presentations/brief.pptx'
+    })
+  })
+
   it('classifies built-in write/edit tools as file_change by name when toolKind is omitted', () => {
     const block = chatBlockFromItem({
       id: 'item_write_builtin',
@@ -1099,6 +2448,40 @@ describe('tool presentation inference', () => {
       kind: 'tool',
       toolKind: 'command_execution',
       meta: { command: 'npm test' }
+    })
+  })
+
+  it('keeps validated extension composer metadata on persisted user blocks', () => {
+    const composerContext = {
+      schemaVersion: 1 as const,
+      id: 'video-selection',
+      title: 'Interview selection',
+      summary: 'Revision 4 with one selected clip',
+      reference: { projectId: 'project-1', selectedItemIds: ['clip-1'] },
+      revision: 4,
+      generation: 7,
+      attachmentId: `extension-context:${'a'.repeat(64)}`,
+      provenance: {
+        extensionId: 'acme.video-editor',
+        extensionVersion: '1.1.0',
+        viewContributionId: 'extension:acme.video-editor/editor',
+        workspaceId: 'b'.repeat(64)
+      }
+    }
+    const block = chatBlockFromItem({
+      id: 'item-user-context',
+      turnId: 'turn-1',
+      threadId: 'thread-1',
+      role: 'user',
+      status: 'completed',
+      createdAt: '2026-07-14T00:00:00.000Z',
+      kind: 'user_message',
+      text: 'Use the selection',
+      composerContexts: [composerContext]
+    })
+    expect(block).toMatchObject({
+      kind: 'user',
+      meta: { composerContexts: [composerContext] }
     })
   })
 })

@@ -2,13 +2,24 @@ import { z } from 'zod'
 import { TurnSchema } from './turns.js'
 import {
   ApprovalPolicySchema,
+  ApprovalReviewerSchema,
   DEFAULT_APPROVAL_POLICY,
+  DEFAULT_APPROVAL_REVIEWER,
   DEFAULT_SANDBOX_MODE,
   SandboxModeSchema
 } from './policy.js'
 
 export const ThreadStatus = z.enum(['idle', 'running', 'archived', 'deleted'])
 export type ThreadStatus = z.infer<typeof ThreadStatus>
+
+/**
+ * The generic thread PATCH endpoint only owns the archival visibility
+ * overlay. Execution and deletion states are controlled by TurnService and
+ * ThreadService.delete respectively, so an HTTP client cannot manufacture a
+ * running/deleted lifecycle state.
+ */
+export const ThreadUpdateStatus = z.enum(['idle', 'archived'])
+export type ThreadUpdateStatus = z.infer<typeof ThreadUpdateStatus>
 
 export const ThreadMode = z.enum(['agent', 'plan'])
 export type ThreadMode = z.infer<typeof ThreadMode>
@@ -90,6 +101,71 @@ export const ThreadTodoListSchema = z.object({
 })
 export type ThreadTodoList = z.infer<typeof ThreadTodoListSchema>
 
+/** Visibility of a thread created through the public Extension Agent API. */
+export const ExtensionThreadVisibilitySchema = z.enum(['private', 'workspace'])
+export type ExtensionThreadVisibility = z.infer<typeof ExtensionThreadVisibilitySchema>
+
+/**
+ * Effective (already policy-clamped) limits captured when an extension run is
+ * created. Keeping this snapshot on the thread makes headless resume and audit
+ * behavior independent from later manifest or host-policy changes.
+ */
+export const ExtensionRunBudgetSchema = z.object({
+  maxTokens: z.number().int().positive(),
+  maxElapsedMs: z.number().int().positive(),
+  maxConcurrentRuns: z.number().int().positive(),
+  maxModelRequests: z.number().int().positive(),
+  maxToolInvocations: z.number().int().positive(),
+  maxRetainedEvents: z.number().int().positive()
+})
+export type ExtensionRunBudget = z.infer<typeof ExtensionRunBudgetSchema>
+
+/** Resolved, immutable profile data used by an extension-owned thread. */
+export const ExtensionAgentProfileSnapshotSchema = z.object({
+  id: z.string().min(1),
+  instructionDigest: z.string().min(1),
+  /** Bounded, attributed context appended after Kun's immutable system prefix. */
+  instructionOverlay: z.string().max(32_000).optional(),
+  model: z.string().min(1),
+  providerId: z.string().min(1).optional(),
+  accountId: z.string().min(1).optional(),
+  allowedToolScopes: z.array(z.string().min(1)).default([])
+})
+export type ExtensionAgentProfileSnapshot = z.infer<typeof ExtensionAgentProfileSnapshotSchema>
+
+/** Canonical, permission-eligible tool snapshot pinned to a thread boundary. */
+export const ExtensionToolCatalogEntrySchema = z.object({
+  canonicalToolId: z.string().min(1),
+  modelAlias: z.string().min(1),
+  description: z.string(),
+  inputSchema: z.record(z.string(), z.unknown()),
+  sideEffect: z.enum(['none', 'workspace-read', 'workspace-write', 'network', 'external'])
+})
+export type ExtensionToolCatalogEntry = z.infer<typeof ExtensionToolCatalogEntrySchema>
+
+export const ExtensionToolCatalogEpochSchema = z.object({
+  id: z.string().min(1),
+  fingerprint: z.string().min(1),
+  toolCount: z.number().int().nonnegative(),
+  canonicalToolIds: z.array(z.string().min(1)),
+  schemaDigests: z.record(z.string(), z.string().min(1)),
+  tools: z.array(ExtensionToolCatalogEntrySchema).optional(),
+  createdAt: z.string().min(1)
+})
+export type ExtensionToolCatalogEpoch = z.infer<typeof ExtensionToolCatalogEpochSchema>
+
+/** Internal metadata supplied only by the authenticated Extension broker. */
+export const ExtensionThreadMetadataSchema = z.object({
+  ownerExtensionId: z.string().min(1),
+  ownerExtensionVersion: z.string().min(1),
+  accountId: z.string().min(1).optional(),
+  extensionVisibility: ExtensionThreadVisibilitySchema,
+  extensionProfile: ExtensionAgentProfileSnapshotSchema.optional(),
+  extensionBudget: ExtensionRunBudgetSchema,
+  toolCatalogEpoch: ExtensionToolCatalogEpochSchema.optional()
+})
+export type ExtensionThreadMetadata = z.infer<typeof ExtensionThreadMetadataSchema>
+
 export const ThreadSchema = z.object({
   id: z.string().min(1),
   title: z.string(),
@@ -108,6 +184,7 @@ export const ThreadSchema = z.object({
    */
   summary: z.string().optional(),
   workspace: z.string(),
+  additionalWorkspaces: z.array(z.string().min(1)).max(32).optional(),
   model: z.string(),
   /**
    * Optional provider id. When set, every turn on this thread routes its
@@ -116,6 +193,16 @@ export const ThreadSchema = z.object({
    * bridges pin a non-runtime provider per thread.
    */
   providerId: z.string().optional(),
+  /** Stable owner derived from the authenticated Extension Host session. */
+  ownerExtensionId: z.string().min(1).optional(),
+  /** Creating extension version retained as audit metadata across upgrades. */
+  ownerExtensionVersion: z.string().min(1).optional(),
+  /** Opaque account reference; never credential material. */
+  accountId: z.string().min(1).optional(),
+  extensionVisibility: ExtensionThreadVisibilitySchema.optional(),
+  extensionProfile: ExtensionAgentProfileSnapshotSchema.optional(),
+  extensionBudget: ExtensionRunBudgetSchema.optional(),
+  toolCatalogEpoch: ExtensionToolCatalogEpochSchema.optional(),
   /**
    * Optional subagent profile id this thread is bound to. When set, the
    * thread persona (model / providerId / systemPrompt below) is a snapshot
@@ -133,6 +220,9 @@ export const ThreadSchema = z.object({
   status: ThreadStatus,
   approvalPolicy: ApprovalPolicySchema.default(DEFAULT_APPROVAL_POLICY),
   sandboxMode: SandboxModeSchema.default(DEFAULT_SANDBOX_MODE),
+  approvalReviewer: ApprovalReviewerSchema.default(DEFAULT_APPROVAL_REVIEWER),
+  /** Whether future model requests for this thread are retained for Agent Perspective. */
+  modelRequestCaptureEnabled: z.boolean().optional(),
   pinned: z.boolean().optional(),
   costBudgetUsd: z.number().positive().optional(),
   costBudgetWarningSent: z.boolean().optional(),
@@ -157,14 +247,24 @@ export const ThreadSummarySchema = ThreadSchema.pick({
   titleAuto: true,
   summary: true,
   workspace: true,
+  additionalWorkspaces: true,
   model: true,
   providerId: true,
+  ownerExtensionId: true,
+  ownerExtensionVersion: true,
+  accountId: true,
+  extensionVisibility: true,
+  extensionProfile: true,
+  extensionBudget: true,
+  toolCatalogEpoch: true,
   agentId: true,
   systemPrompt: true,
   mode: true,
   status: true,
   approvalPolicy: true,
   sandboxMode: true,
+  approvalReviewer: true,
+  modelRequestCaptureEnabled: true,
   pinned: true,
   costBudgetUsd: true,
   costBudgetWarningSent: true,
@@ -187,6 +287,7 @@ export const CreateThreadRequest = z.object({
   /** Marks the provided title as an auto/provisional title (see ThreadSchema.titleAuto). */
   titleAuto: z.boolean().optional(),
   workspace: z.string().min(1),
+  additionalWorkspaces: z.array(z.string().min(1)).max(32).optional(),
   model: z.string().min(1),
   /**
    * Optional provider id. The runtime keeps using its default provider
@@ -195,6 +296,8 @@ export const CreateThreadRequest = z.object({
    * provider's HTTP client.
    */
   providerId: z.string().optional(),
+  /** Opaque core-managed account reference for the selected provider. */
+  accountId: z.string().min(1).optional(),
   /** Optional subagent profile id to bind this thread to. */
   agentId: z.string().optional(),
   /** Optional persona systemPrompt snapshot applied to every ModelRequest on this thread. */
@@ -202,6 +305,8 @@ export const CreateThreadRequest = z.object({
   mode: ThreadMode.default('agent'),
   approvalPolicy: ApprovalPolicySchema.optional(),
   sandboxMode: SandboxModeSchema.optional(),
+  approvalReviewer: ApprovalReviewerSchema.optional(),
+  modelRequestCaptureEnabled: z.boolean().optional(),
   costBudgetUsd: z.number().positive().optional()
 })
 export type CreateThreadRequest = z.infer<typeof CreateThreadRequest>
@@ -217,7 +322,17 @@ export const ForkThreadRequest = z
   .object({
     relation: ThreadRelation.default('fork'),
     title: z.string().optional(),
-    turnId: z.string().trim().min(1).optional()
+    turnId: z.string().trim().min(1).optional(),
+    /** Exclude turnId itself, allowing a faithful undo branch before turn one. */
+    beforeTurn: z.boolean().optional(),
+    /**
+     * Compatibility echo only. A fork cannot replace the source reviewer;
+     * ThreadService rejects any value that differs from the captured source.
+     */
+    approvalReviewer: ApprovalReviewerSchema.optional()
+  })
+  .refine((value) => !value.beforeTurn || value.turnId !== undefined, {
+    message: 'beforeTurn requires turnId'
   })
   .optional()
 export type ForkThreadRequest = z.infer<typeof ForkThreadRequest>
@@ -284,9 +399,13 @@ export const UpdateThreadRequest = z
     /** Marks the new title as auto/provisional (true) or user-set/locked (false). */
     titleAuto: z.boolean().optional(),
     workspace: z.string().min(1).optional(),
-    status: ThreadStatus.optional(),
+    additionalWorkspaces: z.array(z.string().min(1)).max(32).optional(),
+    mode: ThreadMode.optional(),
+    status: ThreadUpdateStatus.optional(),
     approvalPolicy: ApprovalPolicySchema.optional(),
     sandboxMode: SandboxModeSchema.optional(),
+    approvalReviewer: ApprovalReviewerSchema.optional(),
+    modelRequestCaptureEnabled: z.boolean().optional(),
     pinned: z.boolean().optional(),
     costBudgetUsd: z.number().positive().nullable().optional(),
     costBudgetWarningSent: z.boolean().optional(),
@@ -297,9 +416,13 @@ export const UpdateThreadRequest = z
       value.title !== undefined ||
       value.titleAuto !== undefined ||
       value.workspace !== undefined ||
+      value.additionalWorkspaces !== undefined ||
+      value.mode !== undefined ||
       value.status !== undefined ||
       value.approvalPolicy !== undefined ||
       value.sandboxMode !== undefined ||
+      value.approvalReviewer !== undefined ||
+      value.modelRequestCaptureEnabled !== undefined ||
       value.pinned !== undefined ||
       value.costBudgetUsd !== undefined ||
       value.costBudgetWarningSent !== undefined ||

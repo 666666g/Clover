@@ -1,24 +1,259 @@
 import type { ReactElement } from 'react'
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { useTranslation } from 'react-i18next'
-import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Download, File, FileEdit, GitFork, ImageIcon, Loader2, MessageSquareQuote, PencilLine, RotateCcw, Terminal, Video, Wrench } from 'lucide-react'
+import { Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Copy, Download, File, FileEdit, GitFork, ImageIcon, Layers3, Loader2, MessageSquareQuote, PencilLine, RotateCcw, Sparkles, Terminal, Video, Wrench } from 'lucide-react'
 import type { AttachmentReference, ChatBlock, GeneratedFileReference, RuntimeDisclosureMetadata, ToolBlock, UserFileReference, UserInputAnswer } from '../../agent/types'
 import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useChatStore } from '../../store/chat-store'
+import { runTrustedUserActivation } from '../../extensions/protected-user-activation'
 import { getProvider } from '../../agent/registry'
 import { parseWritePromptForDisplay } from '../../write/quoted-selection'
 import { parseClawUserPromptForDisplay, type ClawUserPromptDisplay } from '@shared/app-settings'
+import { parseBackgroundShellCompletionNotice } from '@shared/background-shell-notice'
+import { parseBackgroundSubagentCompletionNotice } from '@shared/background-subagent-notice'
+import type { WriteExportFormat } from '@shared/write-export'
+import { isBackgroundShellNoticeBlock, isBackgroundSubagentNoticeBlock } from './message-timeline-turns'
 import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
 import { DiffView } from '../DiffView'
 import { AssistantMarkdown } from './AssistantMarkdown'
 import { ImagePreviewLightbox } from './ImagePreviewLightbox'
 import { ModelMetaTag, WritePromptMetaDisclosure } from './message-timeline-cards'
-import { readNumber, formatDuration, formatToolTitle } from './message-timeline-tools'
-import { answersByQuestionId, shouldShowQuestionHeader } from './user-input-panel-logic'
+import { readNumber, formatDuration, formatToolTitle, summarizeBackgroundShellToolBlock } from './message-timeline-tools'
+import {
+  answerDisplayValues,
+  answersByQuestionId
+} from './user-input-panel-logic'
+import { InjectedMemoryMetaChip } from './injected-memory-meta-chip'
+import { isPresentationArtifactPath } from './presentation-file-artifacts'
+import { readGeneratedWorkspaceImagePreview } from './generated-media-preview'
+import { useTimelineFilePreviewWorkspaceRoot } from './timeline-file-preview-workspace'
+import {
+  attachmentPreviewFailureStateForScope,
+  attachmentPreviewLoader,
+  type AttachmentPreview,
+  type AttachmentPreviewFailureState
+} from './attachment-preview-loader'
+import { useDeferredRender } from '../../hooks/use-deferred-render'
 
 const COPY_FEEDBACK_RESET_MS = 1600
+const ASSISTANT_EXPORT_FORMATS: WriteExportFormat[] = ['pdf', 'docx', 'png', 'html']
+
+function BackgroundShellNoticeBubble({
+  block,
+  nested = false
+}: {
+  block: Extract<ChatBlock, { kind: 'user' }>
+  nested?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const [outputExpanded, setOutputExpanded] = useState(false)
+  const parsed = useMemo(() => parseBackgroundShellCompletionNotice(block.text), [block.text])
+  const title =
+    block.meta?.displayText?.trim() ||
+    t('backgroundShellNotice.title', { defaultValue: 'Background shell completed' })
+  const outputPreview = parsed?.outputPreview ?? ''
+  const canExpandOutput = outputPreview.length > 180
+  const exitCodeTone =
+    parsed && parsed.exitCode === 0
+      ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+      : 'border-orange-400/30 bg-orange-500/10 text-orange-800 dark:text-orange-200'
+
+  return (
+    <div className={nested ? 'min-w-0' : 'flex w-full justify-start'}>
+      <div className="w-full max-w-[min(640px,calc(100vw-3rem))] rounded-[18px] border border-accent/25 bg-[linear-gradient(180deg,rgba(79,124,255,0.06),rgba(79,124,255,0.1))] px-3.5 py-3 text-ds-muted shadow-sm">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-accent/25 bg-accent/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-accent">
+            {t('backgroundShellNotice.kindLabel', { defaultValue: 'Background callback' })}
+          </span>
+          {parsed ? (
+            <>
+              <span
+                className="inline-flex items-center gap-1 rounded-full border border-ds-border/80 bg-ds-card/70 px-2 py-0.5 font-mono text-[11px] text-ds-ink"
+                title={parsed.sessionId}
+              >
+                <span className="font-sans font-medium text-ds-muted">
+                  {t('backgroundShellNotice.sessionId', { defaultValue: 'Session' })}
+                </span>
+                <span>{parsed.sessionId}</span>
+              </span>
+              <span
+                className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[11px] ${exitCodeTone}`}
+              >
+                <span className="font-sans font-medium opacity-80">
+                  {t('backgroundShellNotice.exitCode', { defaultValue: 'Exit code' })}
+                </span>
+                <span>{parsed.exitCode}</span>
+              </span>
+            </>
+          ) : null}
+        </div>
+        <div className="min-w-0">
+            <p className="text-[13px] font-medium text-ds-ink">{title}</p>
+            {parsed ? (
+              <dl className="mt-2 space-y-1.5 text-[12.5px] leading-5">
+                <div className="flex flex-wrap gap-x-2">
+                  <dt className="font-medium text-ds-muted">
+                    {t('backgroundShellNotice.command', { defaultValue: 'Command' })}
+                  </dt>
+                  <dd className="min-w-0 break-all font-mono text-ds-ink">{parsed.command}</dd>
+                </div>
+              </dl>
+            ) : null}
+            {outputPreview ? (
+              <div className="mt-2.5">
+                <button
+                  type="button"
+                  className={`flex w-full items-center justify-between gap-2 text-left text-[12px] font-medium text-ds-muted ${
+                    canExpandOutput ? 'hover:text-ds-ink' : 'cursor-default'
+                  }`}
+                  onClick={() => {
+                    if (canExpandOutput) setOutputExpanded((value) => !value)
+                  }}
+                  disabled={!canExpandOutput}
+                >
+                  <span>{t('backgroundShellNotice.outputPreview', { defaultValue: 'Output preview' })}</span>
+                  {canExpandOutput ? (
+                    outputExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )
+                  ) : null}
+                </button>
+                <pre
+                  className={`mt-1 overflow-auto whitespace-pre-wrap break-words rounded-[10px] border border-ds-border/70 bg-ds-card/70 px-2.5 py-2 font-mono text-[11.5px] leading-5 text-ds-ink ${
+                    canExpandOutput && !outputExpanded ? 'max-h-24' : 'max-h-72'
+                  }`}
+                >
+                  {outputPreview}
+                </pre>
+              </div>
+            ) : null}
+            {parsed?.outputFile ? (
+              <p className="mt-2 truncate font-mono text-[11px] text-ds-muted" title={parsed.outputFile}>
+                {t('backgroundShellNotice.outputFile', { defaultValue: 'Full output file' })}: {parsed.outputFile}
+              </p>
+            ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function BackgroundSubagentNoticeBubble({
+  block,
+  nested = false
+}: {
+  block: Extract<ChatBlock, { kind: 'user' }>
+  nested?: boolean
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const [summaryExpanded, setSummaryExpanded] = useState(false)
+  const parsed = useMemo(() => parseBackgroundSubagentCompletionNotice(block.text), [block.text])
+  const isFailed = parsed?.status === 'failed'
+  const title =
+    parsed?.label ||
+    block.meta?.displayText?.trim() ||
+    t('backgroundSubagentNotice.title', { defaultValue: 'Background subagent completed' })
+  const statusLabel = isFailed
+    ? t('backgroundSubagentNotice.failed', { defaultValue: 'Failed' })
+    : t('backgroundSubagentNotice.completed', { defaultValue: 'Completed' })
+  const summary = parsed?.summary ?? ''
+  const canExpandSummary = summary.length > 900 || summary.split('\n').length > 14
+  const statusTone = isFailed
+    ? 'border-orange-400/35 bg-orange-500/8 text-orange-800 dark:text-orange-200'
+    : 'border-emerald-500/25 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300'
+  const StatusIcon = isFailed ? CircleAlert : CheckCircle2
+
+  return (
+    <div className={nested ? 'min-w-0' : 'flex w-full justify-start'}>
+      <div
+        data-background-subagent-card="true"
+        className="relative w-full max-w-[min(760px,calc(100vw-3rem))] overflow-hidden rounded-[16px] border border-ds-border bg-ds-card text-ds-muted shadow-[0_8px_24px_rgba(42,52,72,0.06)]"
+      >
+        <div
+          aria-hidden="true"
+          className={`absolute inset-y-0 left-0 w-[3px] ${isFailed ? 'bg-orange-500/80' : 'bg-accent/90'}`}
+        />
+        <div className="flex min-w-0 items-center gap-3 px-4 py-3.5 pl-[18px]">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] border border-accent/15 bg-accent/[0.07] text-accent">
+            <Sparkles className="h-[17px] w-[17px]" strokeWidth={1.9} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              <h3 className="truncate text-[14px] font-semibold leading-5 text-ds-ink">{title}</h3>
+              <span className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusTone}`}>
+                <StatusIcon className="h-3 w-3" strokeWidth={2} />
+                {statusLabel}
+              </span>
+            </div>
+            {parsed?.childId ? (
+              <p className="mt-0.5 truncate font-mono text-[11.5px] leading-4 text-ds-faint" title={parsed.childId}>
+                {parsed.childId}
+              </p>
+            ) : null}
+          </div>
+          <span className="hidden shrink-0 items-center gap-1.5 text-[11.5px] text-ds-faint sm:inline-flex">
+            <Layers3 className="h-3.5 w-3.5" strokeWidth={1.8} />
+            {t('backgroundSubagentNotice.taskKind', { defaultValue: 'Background task' })}
+          </span>
+        </div>
+        {summary || parsed?.error ? (
+          <div className="border-t border-ds-border/80 px-4 pb-3.5 pl-[18px] pt-3">
+            {summary ? (
+              <div data-background-subagent-result="true">
+                <p className="mb-2 text-[12px] font-semibold tracking-[0.01em] text-ds-muted">
+                  {t('backgroundSubagentNotice.resultTitle', { defaultValue: 'Execution result' })}
+                </p>
+                <div className="relative">
+                  <div
+                    className={`ds-markdown text-[13.5px] leading-[1.68] text-ds-ink ${
+                      canExpandSummary && !summaryExpanded ? 'max-h-[360px] overflow-hidden' : ''
+                    }`}
+                  >
+                    <AssistantMarkdown text={summary} streaming={false} />
+                  </div>
+                  {canExpandSummary && !summaryExpanded ? (
+                    <div
+                      aria-hidden="true"
+                      className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-ds-card"
+                    />
+                  ) : null}
+                </div>
+                {canExpandSummary ? (
+                  <button
+                    type="button"
+                    onClick={() => setSummaryExpanded((value) => !value)}
+                    aria-expanded={summaryExpanded}
+                    className="mt-2.5 flex w-full items-center justify-between gap-3 border-t border-ds-border/70 pt-2.5 text-left text-[12px] font-medium text-ds-muted transition hover:text-ds-ink"
+                  >
+                    <span>
+                      {summaryExpanded
+                        ? t('backgroundSubagentNotice.collapseOutput', { defaultValue: 'Collapse output' })
+                        : t('backgroundSubagentNotice.showFullOutput', { defaultValue: 'View full output' })}
+                    </span>
+                    {summaryExpanded ? (
+                      <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.9} />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" strokeWidth={1.9} />
+                    )}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+            {parsed?.error ? (
+              <div
+                className={`${summary ? 'mt-3' : ''} overflow-auto whitespace-pre-wrap break-words rounded-[10px] border border-orange-400/30 bg-orange-500/[0.07] px-3 py-2.5 font-mono text-[11.5px] leading-5 text-orange-900 dark:text-orange-100`}
+              >
+                {parsed.error}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
 
 /**
  * User message bubble with hover affordance to rewind/edit. Click the rewind
@@ -27,9 +262,11 @@ const COPY_FEEDBACK_RESET_MS = 1600
  * a fresh turn on the same thread (see chat-store `rewindAndResend`).
  */
 function UserMessageBubble({
-  block
+  block,
+  allowThreadActions = true
 }: {
   block: Extract<ChatBlock, { kind: 'user' }>
+  allowThreadActions?: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
   const busy = useChatStore((s) => s.busy)
@@ -54,7 +291,7 @@ function UserMessageBubble({
       ? block.meta.displayText.trim()
       : null
   const displayText = metaDisplayText ?? parsedWritePrompt?.userInput ?? parsedClawPrompt?.text ?? block.text
-  const canEdit = route === 'chat' || !metaDisplayText
+  const canEdit = allowThreadActions && (route === 'chat' || !metaDisplayText)
   const showClawInboundCard = route === 'claw' && parsedClawPrompt?.inbound === true
 
   useEffect(() => {
@@ -241,6 +478,20 @@ function metaStringArray(meta: Record<string, unknown> | undefined, key: string)
   return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
 }
 
+function metaInstructionSources(meta: Record<string, unknown> | undefined): Array<{ path: string; scope: string }> {
+  const value = meta?.injectedInstructionSources
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const path = typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : ''
+      const scope = typeof raw.scope === 'string' && raw.scope.trim() ? raw.scope.trim() : ''
+      return path ? { path, scope } : null
+    })
+    .filter((entry): entry is { path: string; scope: string } => entry !== null)
+}
+
 function metaString(meta: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = meta?.[key]
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
@@ -344,6 +595,11 @@ function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference
   if (!entry || typeof entry !== 'object') return null
   const raw = entry as Record<string, unknown>
   const id = readMediaString(raw, 'id', 'attachmentId')
+  const artifactId = readMediaString(raw, 'artifactId')
+  const mediaHandleId = readMediaString(raw, 'mediaHandleId')
+  const ownerExtensionId = readMediaString(raw, 'ownerExtensionId')
+  const ownerExtensionVersion = readMediaString(raw, 'ownerExtensionVersion')
+  const workspaceId = readMediaString(raw, 'workspaceId')
   const name = readMediaString(raw, 'name', 'fileName', 'filename')
   const mimeType = readMediaString(raw, 'mimeType', 'type', 'mediaType')
   const previewUrl = readMediaString(raw, 'previewUrl', 'dataUrl', 'url')
@@ -353,8 +609,17 @@ function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference
   const byteSize = typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? raw.byteSize : undefined
   const width = typeof raw.width === 'number' && Number.isFinite(raw.width) ? raw.width : undefined
   const height = typeof raw.height === 'number' && Number.isFinite(raw.height) ? raw.height : undefined
+  const availability = raw.availability === 'available' || raw.availability === 'unavailable'
+    ? raw.availability
+    : undefined
   const normalized: GeneratedFileReference = {
     ...(id ? { id } : {}),
+    ...(artifactId ? { artifactId } : {}),
+    ...(mediaHandleId ? { mediaHandleId } : {}),
+    ...(availability ? { availability } : {}),
+    ...(ownerExtensionId ? { ownerExtensionId } : {}),
+    ...(ownerExtensionVersion ? { ownerExtensionVersion } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
     ...(name ? { name } : {}),
     ...(mimeType ? { mimeType } : {}),
     ...(byteSize ? { byteSize } : {}),
@@ -469,22 +734,75 @@ type MediaPreviewRequest =
   | { key: string; id: string; mode: 'attachment' }
   | { key: string; path: string; mode: 'workspace-media' }
 
+type GeneratedMediaScrollAvailability = {
+  canScrollBackward: boolean
+  canScrollForward: boolean
+}
+
+export function generatedMediaScrollAvailability({
+  scrollLeft,
+  clientWidth,
+  scrollWidth
+}: {
+  scrollLeft: number
+  clientWidth: number
+  scrollWidth: number
+}): GeneratedMediaScrollAvailability {
+  const edgeTolerance = 2
+  return {
+    canScrollBackward: scrollLeft > edgeTolerance,
+    canScrollForward: scrollLeft + clientWidth < scrollWidth - edgeTolerance
+  }
+}
+
 function isMediaPreviewRequest(entry: MediaPreviewRequest | null): entry is MediaPreviewRequest {
   return entry !== null
 }
 
-function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, string> {
+function attachmentReferenceFromPreview(
+  attachment: AttachmentReference
+): AttachmentReference {
+  return {
+    id: attachment.id,
+    ...(attachment.kind ? { kind: attachment.kind } : {}),
+    ...(attachment.name ? { name: attachment.name } : {}),
+    ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+    ...(attachment.byteSize ? { byteSize: attachment.byteSize } : {}),
+    ...(attachment.width ? { width: attachment.width } : {}),
+    ...(attachment.height ? { height: attachment.height } : {})
+  }
+}
+
+function useMediaPreviews(
+  media: TimelineMediaReference[],
+  enabled: boolean
+): {
+  resolvedPreviews: Record<string, AttachmentPreview>
+  failedPreviewIds: Record<string, true>
+} {
   const activeThreadId = useChatStore((s) => s.activeThreadId)
-  const workspaceRoot = useChatStore((s) => s.workspaceRoot)
-  const [resolvedPreviewUrls, setResolvedPreviewUrls] = useState<Record<string, string>>({})
-  const [failedPreviewIds, setFailedPreviewIds] = useState<Record<string, true>>({})
+  const globalWorkspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const timelineWorkspaceRoot = useTimelineFilePreviewWorkspaceRoot()
+  const workspaceRoot = timelineWorkspaceRoot || globalWorkspaceRoot
+  const scopeKey = JSON.stringify([activeThreadId ?? '', workspaceRoot])
+  const [previewFailures, setPreviewFailures] = useState<AttachmentPreviewFailureState>(() => ({
+    scopeKey,
+    failedPreviewIds: {}
+  }))
+  const failedPreviewIds = useMemo(
+    () => previewFailures.scopeKey === scopeKey
+      ? previewFailures.failedPreviewIds
+      : {},
+    [previewFailures, scopeKey]
+  )
+  const [resolvedPreviews, setResolvedPreviews] = useState<Record<string, AttachmentPreview>>({})
   const previewRequests = useMemo(
     () =>
       media
         .map((item) => {
           const key = mediaKey(item)
-          if (item.previewUrl || resolvedPreviewUrls[key] || failedPreviewIds[key]) return null
-          if (item.id && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
+          if (item.previewUrl || resolvedPreviews[key] || failedPreviewIds[key]) return null
+          if (item.id && !item.artifactId && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
             return { key, id: item.id, mode: 'attachment' } satisfies MediaPreviewRequest
           }
           const path = mediaIsImage(item) || mediaIsVideo(item) ? mediaPath(item) : undefined
@@ -492,7 +810,7 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
           return null
         })
         .filter(isMediaPreviewRequest),
-    [failedPreviewIds, media, resolvedPreviewUrls]
+    [failedPreviewIds, media, resolvedPreviews]
   )
   const missingPreviewKey = previewRequests
     .map((request) =>
@@ -503,21 +821,50 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
     .join('\n')
 
   useEffect(() => {
-    if (!missingPreviewKey) return
+    if (!enabled || !missingPreviewKey) return
     const provider = getProvider()
     let cancelled = false
     void Promise.all(
       previewRequests.map(async (request) => {
         try {
           if (request.mode === 'attachment' && request.id && typeof provider.getAttachmentContent === 'function') {
-            const content = await provider.getAttachmentContent(request.id, {
+            const attachmentId = request.id
+            const getAttachmentContent = provider.getAttachmentContent.bind(provider)
+            const scope = {
               ...(activeThreadId ? { threadId: activeThreadId } : {}),
               ...(workspaceRoot ? { workspace: workspaceRoot } : {})
-            })
+            }
+            const preview = await attachmentPreviewLoader.load(
+              JSON.stringify(['attachment', attachmentId, activeThreadId ?? '', workspaceRoot]),
+              async () => {
+                const content = await getAttachmentContent(attachmentId, scope)
+                return {
+                  previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`,
+                  attachment: attachmentReferenceFromPreview(content.attachment)
+                }
+              }
+            )
             return {
               key: request.key,
-              previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`
+              preview
             }
+          }
+          if (request.mode === 'workspace-image' && request.path && typeof window.kunGui?.readWorkspaceImage === 'function') {
+            const imagePath = request.path
+            const readImage = window.kunGui.readWorkspaceImage
+            const preview = await attachmentPreviewLoader.load(
+              JSON.stringify(['workspace-image', imagePath, workspaceRoot]),
+              async () => {
+                const resolved = await readGeneratedWorkspaceImagePreview({
+                  path: imagePath,
+                  ...(workspaceRoot ? { workspaceRoot } : {}),
+                  readImage
+                })
+                if (!resolved) throw new Error(`workspace image preview is unavailable: ${imagePath}`)
+                return { previewUrl: resolved }
+              }
+            )
+            if (preview.previewUrl) return { key: request.key, preview }
           }
           if (request.mode === 'workspace-media' && request.path && typeof window.kunGui?.readWorkspaceMedia === 'function') {
             const result = await window.kunGui.readWorkspaceMedia({
@@ -533,60 +880,67 @@ function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, st
       })
     ).then((results) => {
       if (cancelled) return
-      setResolvedPreviewUrls((current) => {
+      setResolvedPreviews((current) => {
         const next = { ...current }
         for (const result of results) {
-          if ('previewUrl' in result && typeof result.previewUrl === 'string') {
-            next[result.key] = result.previewUrl
+          if ('preview' in result && result.preview?.previewUrl) {
+            next[result.key] = result.preview
           }
         }
         return next
       })
-      setFailedPreviewIds((current) => {
-        const next = { ...current }
+      setPreviewFailures((current) => {
+        const scoped = attachmentPreviewFailureStateForScope(current, scopeKey)
+        const next = { ...scoped.failedPreviewIds }
         for (const result of results) {
           if ('failed' in result) next[result.key] = true
         }
-        return next
+        return { scopeKey, failedPreviewIds: next }
       })
     })
     return () => {
       cancelled = true
     }
-  }, [activeThreadId, missingPreviewKey, previewRequests, workspaceRoot])
+  }, [activeThreadId, enabled, missingPreviewKey, previewRequests, scopeKey, workspaceRoot])
 
-  return resolvedPreviewUrls
+  return { resolvedPreviews, failedPreviewIds }
 }
 
 function MediaPreviewTile({
   media,
   previewUrl,
+  previewState,
   variant
 }: {
   media: TimelineMediaReference
   previewUrl?: string
+  previewState?: 'loading' | 'failed'
   variant: 'user' | 'tool' | 'conversation'
 }): ReactElement {
   const { t } = useTranslation('common')
-  const workspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const globalWorkspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const timelineWorkspaceRoot = useTimelineFilePreviewWorkspaceRoot()
+  const workspaceRoot = timelineWorkspaceRoot || globalWorkspaceRoot
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
+  const unavailable = 'availability' in media && media.availability === 'unavailable'
   const title = mediaName(media)
   const filePath = mediaPath(media)
   const mimeType = media.mimeType || (mediaIsImage(media) ? 'image' : mediaIsVideo(media) ? 'video' : '')
   const byteSize = formatByteSize(media.byteSize)
-  const hasRichPreview = !!previewUrl && (mediaIsImage(media) || mediaIsVideo(media))
   const tileClass =
     variant === 'conversation'
-      ? hasRichPreview
-        ? 'h-72 w-full overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm sm:h-80'
-        : 'min-h-44 w-full overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+      ? 'group aspect-square w-52 shrink-0 snap-start overflow-hidden rounded-xl border border-ds-border-muted bg-ds-card shadow-sm'
       : variant === 'tool'
         ? 'block h-32 w-40 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
         : 'block h-28 w-36 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
   const revealClass = variant === 'user' ? '' : ' ds-media-printer-reveal'
-  const mediaClass = 'h-full w-full object-contain'
-  const canSave = Boolean(filePath || dataUrlPayload(previewUrl))
+  const mediaClass = `h-full w-full ${variant === 'conversation' ? 'object-cover' : 'object-contain'}`
+  const canSave = !unavailable && Boolean(filePath || dataUrlPayload(previewUrl))
+  const canOpenArtifact = !unavailable && Boolean(
+    media.artifactId && media.ownerExtensionId && media.ownerExtensionVersion &&
+    media.workspaceId && workspaceRoot
+  )
   const saveLabel =
     saveState === 'saving'
       ? t('generatedFileSaving')
@@ -628,19 +982,40 @@ function MediaPreviewTile({
       }).catch(() => undefined)
     }
   }
+  const handleArtifactAction = async (action: 'open' | 'reveal'): Promise<void> => {
+    if (!canOpenArtifact || typeof window.kunGui?.openExtensionArtifact !== 'function') return
+    const result = await window.kunGui.openExtensionArtifact({
+      artifactId: media.artifactId!,
+      ownerExtensionId: media.ownerExtensionId!,
+      ownerExtensionVersion: media.ownerExtensionVersion!,
+      workspaceId: media.workspaceId!,
+      workspaceRoot: workspaceRoot!,
+      action
+    })
+    setSaveState(result.ok ? 'saved' : 'error')
+  }
   const saveButtonClass =
     'inline-flex h-7 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/90 px-2 text-[11.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50'
   const iconButtonClass =
-    'absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/92 text-ds-muted shadow-sm backdrop-blur transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50'
+    `absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/92 text-ds-muted shadow-sm backdrop-blur transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50 ${
+      variant === 'conversation'
+        ? 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
+        : ''
+    }`
   const saveIcon = saveState === 'saving'
     ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.9} />
     : saveState === 'saved'
       ? <Check className="h-3.5 w-3.5" strokeWidth={2} />
       : <Download className="h-3.5 w-3.5" strokeWidth={1.9} />
+  const extensionAttachmentContext = {
+    'data-extension-attachment-item': '',
+    'data-extension-attachment-id': media.id ?? '',
+    'data-extension-attachment-mime': media.mimeType ?? ''
+  }
 
   if (previewUrl && mediaIsImage(media)) {
     return (
-      <figure className={`${tileClass}${revealClass} relative`} title={title}>
+      <figure className={`${tileClass}${revealClass} relative`} title={title} {...extensionAttachmentContext}>
         <button
           type="button"
           onClick={() => setImagePreviewOpen(true)}
@@ -679,7 +1054,7 @@ function MediaPreviewTile({
 
   if (previewUrl && mediaIsVideo(media)) {
     return (
-      <figure className={`${tileClass} relative`} title={title}>
+      <figure className={`${tileClass} relative`} title={title} {...extensionAttachmentContext}>
         <video src={previewUrl} className={mediaClass} controls preload="metadata" />
         <button
           type="button"
@@ -697,7 +1072,12 @@ function MediaPreviewTile({
 
   const Icon = mediaIsVideo(media) ? Video : mediaIsImage(media) ? ImageIcon : File
   return (
-    <div className={`${tileClass} flex flex-col justify-between p-3`} title={title}>
+    <div
+      className={`${tileClass} flex flex-col justify-between p-3`}
+      title={title}
+      data-attachment-preview-state={previewState}
+      {...extensionAttachmentContext}
+    >
       <div className="flex min-w-0 items-start gap-2">
         <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-ds-border-muted bg-ds-subtle text-ds-muted">
           <Icon className="h-4 w-4" strokeWidth={1.8} />
@@ -707,7 +1087,11 @@ function MediaPreviewTile({
             {title}
           </div>
           <div className="mt-0.5 truncate text-[11px] text-ds-faint">
-            {[mimeType, byteSize].filter(Boolean).join(' · ') || t('generatedFilePreviewUnavailable')}
+            {unavailable || previewState === 'failed'
+              ? t('generatedFilePreviewUnavailable')
+              : previewState === 'loading'
+                ? t('filePreviewLoading')
+                : [mimeType, byteSize].filter(Boolean).join(' · ') || t('generatedFilePreviewUnavailable')}
           </div>
         </div>
       </div>
@@ -722,7 +1106,25 @@ function MediaPreviewTile({
           <span className="mr-1.5">{saveIcon}</span>
           {t('generatedFileDownload')}
         </button>
-      {filePath ? (
+      {canOpenArtifact ? (
+        <>
+          <button
+            type="button"
+            onClick={() => void handleArtifactAction('open')}
+            className={saveButtonClass}
+          >
+            {t('filePreviewOpenEditor')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleArtifactAction('reveal')}
+            className={saveButtonClass}
+          >
+            {t('fileTreeRevealInFileManager')}
+          </button>
+        </>
+      ) : null}
+      {filePath && !unavailable ? (
         <button
           type="button"
           onClick={() => void openWorkspacePathInEditor({ path: filePath }, workspaceRoot)}
@@ -743,50 +1145,175 @@ function MediaAttachmentGallery({
   media: TimelineMediaReference[]
   variant: 'user' | 'tool' | 'conversation'
 }): ReactElement | null {
-  const resolvedPreviewUrls = useMediaPreviewUrls(media)
+  const { t } = useTranslation('common')
+  const { ref: previewAdmissionRef, shouldRender: shouldLoadPreviews } = useDeferredRender<HTMLDivElement>({
+    enabled: media.length > 0,
+    rootMargin: '480px',
+    debounceMs: 50,
+    idleTimeoutMs: 250
+  })
+  const { resolvedPreviews, failedPreviewIds } = useMediaPreviews(media, shouldLoadPreviews)
+  const conversationScrollerRef = useRef<HTMLDivElement>(null)
+  const [scrollAvailability, setScrollAvailability] = useState<GeneratedMediaScrollAvailability>({
+    canScrollBackward: false,
+    canScrollForward: false
+  })
+
+  useEffect(() => {
+    if (variant !== 'conversation') return
+    const scroller = conversationScrollerRef.current
+    if (!scroller) return
+
+    const updateAvailability = (): void => {
+      const next = generatedMediaScrollAvailability(scroller)
+      setScrollAvailability((current) =>
+        current.canScrollBackward === next.canScrollBackward &&
+        current.canScrollForward === next.canScrollForward
+          ? current
+          : next
+      )
+    }
+    updateAvailability()
+    scroller.addEventListener('scroll', updateAvailability, { passive: true })
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateAvailability)
+      return () => {
+        scroller.removeEventListener('scroll', updateAvailability)
+        window.removeEventListener('resize', updateAvailability)
+      }
+    }
+
+    const resizeObserver = new ResizeObserver(updateAvailability)
+    resizeObserver.observe(scroller)
+    return () => {
+      scroller.removeEventListener('scroll', updateAvailability)
+      resizeObserver.disconnect()
+    }
+  }, [media.length, variant])
+
   if (media.length === 0) return null
   const wrapperClass =
-    variant === 'conversation'
-      ? `grid w-full max-w-2xl grid-cols-1 gap-2 ${media.length > 1 ? 'sm:grid-cols-2' : ''}`
-      : variant === 'tool'
+    variant === 'tool'
         ? 'flex min-w-0 flex-wrap gap-2 border-t border-ds-border-muted/60 px-4 py-3'
         : 'flex max-w-[80%] flex-wrap justify-end gap-2'
 
+  const tiles = media.map((item) => {
+    const key = mediaKey(item)
+    const resolved = resolvedPreviews[key]
+    const resolvedMedia = resolved?.attachment
+      ? { ...item, ...resolved.attachment }
+      : item
+    const previewUrl = item.previewUrl ?? resolved?.previewUrl
+    const expectsPreview = Boolean(
+      (item.id && !item.artifactId && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) ||
+      (mediaIsImage(item) && mediaPath(item))
+    )
+    return (
+      <MediaPreviewTile
+        key={key}
+        media={resolvedMedia}
+        previewUrl={previewUrl}
+        previewState={
+          previewUrl
+            ? undefined
+            : failedPreviewIds[key]
+              ? 'failed'
+              : expectsPreview
+                ? 'loading'
+                : undefined
+        }
+        variant={variant}
+      />
+    )
+  })
+
+  if (variant === 'conversation') {
+    const moveCarousel = (direction: -1 | 1): void => {
+      const scroller = conversationScrollerRef.current
+      if (!scroller) return
+      scroller.scrollBy({
+        left: direction * Math.max(220, scroller.clientWidth * 0.72),
+        behavior: 'smooth'
+      })
+    }
+    const showCarouselControls = scrollAvailability.canScrollBackward || scrollAvailability.canScrollForward
+
+    return (
+      <div ref={previewAdmissionRef} className="group/gallery relative min-w-0 w-full" data-extension-attachment-context data-generated-media-carousel>
+        <div
+          ref={conversationScrollerRef}
+          className="flex w-full snap-x snap-mandatory gap-2 overflow-x-auto px-0.5 pb-1 scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          data-generated-media-strip
+        >
+          {tiles}
+        </div>
+        {showCarouselControls ? (
+          <div className="absolute bottom-3 right-3 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => moveCarousel(-1)}
+              disabled={!scrollAvailability.canScrollBackward}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white shadow-md backdrop-blur-sm transition hover:bg-black/70 disabled:cursor-default disabled:opacity-35"
+              title={t('generatedFilesPreviousImages')}
+              aria-label={t('generatedFilesPreviousImages')}
+            >
+              <ChevronLeft className="h-5 w-5" strokeWidth={2} />
+            </button>
+            <button
+              type="button"
+              onClick={() => moveCarousel(1)}
+              disabled={!scrollAvailability.canScrollForward}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white shadow-md backdrop-blur-sm transition hover:bg-black/70 disabled:cursor-default disabled:opacity-35"
+              title={t('generatedFilesNextImages')}
+              aria-label={t('generatedFilesNextImages')}
+            >
+              <ChevronRight className="h-5 w-5" strokeWidth={2} />
+            </button>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
   return (
-    <div className={wrapperClass}>
-      {media.map((item) => {
-        const key = mediaKey(item)
-        return (
-          <MediaPreviewTile
-            key={key}
-            media={item}
-            previewUrl={item.previewUrl ?? resolvedPreviewUrls[key]}
-            variant={variant}
-          />
-        )
-      })}
+    <div ref={previewAdmissionRef} className={wrapperClass} data-extension-attachment-context>
+      {tiles}
     </div>
   )
 }
 
-export function GeneratedFilesPanel({ blocks }: { blocks: ToolBlock[] }): ReactElement | null {
+export function GeneratedFilesPanel({
+  blocks,
+  placement = 'turn'
+}: {
+  blocks: ToolBlock[]
+  placement?: 'timeline' | 'turn'
+}): ReactElement | null {
   const { t } = useTranslation('common')
-  const media = useMemo(
-    () =>
-      blocks.flatMap((block) =>
-        mergeMediaReferences(
-          metaAttachmentReferences(block.meta as RuntimeDisclosureMetadata | undefined),
-          metaGeneratedFileReferences(block.meta)
-        )
-      ),
-    [blocks]
-  )
+  const media = useMemo(() => {
+    const attachments: AttachmentReference[] = []
+    const generatedFiles: GeneratedFileReference[] = []
+    for (const block of blocks) {
+      attachments.push(...metaAttachmentReferences(block.meta as RuntimeDisclosureMetadata | undefined))
+      generatedFiles.push(...metaGeneratedFileReferences(block.meta))
+    }
+    return mergeMediaReferences(attachments, generatedFiles).filter(
+      (file) => !isPresentationArtifactPath(mediaPath(file))
+    )
+  }, [blocks])
 
   if (media.length === 0) return null
 
   return (
-    <div className="flex min-w-0 flex-col gap-2">
-      <div className="text-[12px] font-semibold text-ds-faint">{t('generatedFilesTitle')}</div>
+    <div
+      className="flex min-w-0 flex-col gap-2"
+      data-generated-files-placement={placement}
+    >
+      <div className="flex items-center gap-1.5 text-[12px] font-semibold text-ds-faint">
+        <ImageIcon className="h-3.5 w-3.5" strokeWidth={1.8} aria-hidden="true" />
+        <span>{t('generatedFilesTitle')}</span>
+      </div>
       <MediaAttachmentGallery media={media} variant="conversation" />
     </div>
   )
@@ -847,19 +1374,40 @@ function metaSources(meta: Record<string, unknown> | undefined): Array<{ title?:
     .filter((entry): entry is { title?: string; url?: string } => entry !== null)
 }
 
+function metaComposerContextLabels(meta: Record<string, unknown> | undefined): string[] {
+  const value = meta?.composerContexts
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return []
+    const record = entry as Record<string, unknown>
+    const title = typeof record.title === 'string' ? record.title.trim() : ''
+    const provenance = record.provenance && typeof record.provenance === 'object'
+      ? record.provenance as Record<string, unknown>
+      : undefined
+    const extensionId = typeof provenance?.extensionId === 'string'
+      ? provenance.extensionId.trim()
+      : ''
+    return title ? [`${title}${extensionId ? ` (${extensionId})` : ''}`] : []
+  })
+}
+
 function RuntimeMetaChips({
   meta,
   align = 'left',
-  hideAttachments = false
+  hideAttachments = false,
+  hideTurnDisclosure = false
 }: {
   meta?: Record<string, unknown>
   align?: 'left' | 'right'
   hideAttachments?: boolean
+  hideTurnDisclosure?: boolean
 }): ReactElement | null {
   const { t } = useTranslation('common')
-  const attachmentIds = metaStringArray(meta, 'attachmentIds')
-  const activeSkillIds = metaStringArray(meta, 'activeSkillIds')
-  const injectedMemoryIds = metaStringArray(meta, 'injectedMemoryIds')
+  const attachmentIds = hideTurnDisclosure || hideAttachments ? [] : metaStringArray(meta, 'attachmentIds')
+  const activeSkillIds = hideTurnDisclosure ? [] : metaStringArray(meta, 'activeSkillIds')
+  const injectedMemoryIds = hideTurnDisclosure ? [] : metaStringArray(meta, 'injectedMemoryIds')
+  const injectedInstructionSources = hideTurnDisclosure ? [] : metaInstructionSources(meta)
+  const composerContextLabels = hideTurnDisclosure ? [] : metaComposerContextLabels(meta)
   const sources = metaSources(meta)
   const child = meta?.child && typeof meta.child === 'object' ? meta.child as Record<string, unknown> : null
   const childLabel =
@@ -874,6 +1422,8 @@ function RuntimeMetaChips({
     (hideAttachments || attachmentIds.length === 0) &&
     activeSkillIds.length === 0 &&
     injectedMemoryIds.length === 0 &&
+    injectedInstructionSources.length === 0 &&
+    composerContextLabels.length === 0 &&
     sources.length === 0 &&
     !childLabel
   ) {
@@ -893,8 +1443,16 @@ function RuntimeMetaChips({
         </span>
       ) : null}
       {injectedMemoryIds.length > 0 ? (
-        <span className={chipClass} title={injectedMemoryIds.join(', ')}>
-          {t('toolInjectedMemories')} {injectedMemoryIds.length}
+        <InjectedMemoryMetaChip meta={meta} memoryIds={injectedMemoryIds} chipClass={chipClass} />
+      ) : null}
+      {injectedInstructionSources.length > 0 ? (
+        <span className={chipClass} title={injectedInstructionSources.map((source) => `${source.scope}: ${source.path}`).join('\n')}>
+          {t('toolInjectedInstructions')} {injectedInstructionSources.length}
+        </span>
+      ) : null}
+      {composerContextLabels.length > 0 ? (
+        <span className={chipClass} title={composerContextLabels.join('\n')}>
+          {t('toolExtensionContexts')} {composerContextLabels.length}
         </span>
       ) : null}
       {childLabel ? (
@@ -994,6 +1552,95 @@ function CopyFeedbackButton({
   )
 }
 
+function AssistantExportButton({
+  text,
+  createdAt
+}: {
+  text: string
+  createdAt?: string
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const workspaceRoot = useChatStore((state) => state.workspaceRoot)
+  const detailsRef = useRef<HTMLDetailsElement | null>(null)
+  const [exportingFormat, setExportingFormat] = useState<WriteExportFormat | null>(null)
+  const [error, setError] = useState('')
+
+  const handleExport = async (format: WriteExportFormat): Promise<void> => {
+    if (typeof window.kunGui?.exportWriteDocument !== 'function') {
+      setError(t('writeExportUnavailable'))
+      return
+    }
+
+    setError('')
+    setExportingFormat(format)
+    try {
+      const parsedDate = createdAt ? new Date(createdAt) : new Date()
+      const date = Number.isNaN(parsedDate.getTime()) ? new Date() : parsedDate
+      const title = `Kun-answer-${date.toISOString().replace(/[:.]/g, '-')}`
+      const result = await window.kunGui.exportWriteDocument({
+        title,
+        workspaceRoot: workspaceRoot || undefined,
+        format,
+        content: text
+      })
+      if (!result.ok && !result.canceled) {
+        setError(result.message)
+      } else if (result.ok) {
+        detailsRef.current?.removeAttribute('open')
+      }
+    } catch (exportError) {
+      setError(exportError instanceof Error ? exportError.message : String(exportError))
+    } finally {
+      setExportingFormat(null)
+    }
+  }
+
+  return (
+    <details ref={detailsRef} className="relative">
+      <summary
+        className="flex cursor-pointer list-none items-center gap-1 rounded-md px-1.5 py-0.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-muted"
+        title={error ? t('exportAnswerFailed', { message: error }) : t('exportAnswer')}
+        aria-label={t('exportAnswer')}
+      >
+        {exportingFormat ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.8} />
+        ) : (
+          <Download className="h-3.5 w-3.5" strokeWidth={1.8} />
+        )}
+        <span>{exportingFormat ? t('writeExporting') : t('exportAnswer')}</span>
+      </summary>
+      <div className="absolute bottom-full right-0 z-30 mb-1 min-w-36 rounded-xl border border-ds-border-muted bg-ds-card p-1.5 shadow-xl">
+        {ASSISTANT_EXPORT_FORMATS.map((format) => {
+          const label =
+            format === 'pdf'
+              ? t('writeExportPdf')
+              : format === 'png'
+                ? t('writeExportPng')
+                : format === 'html'
+                  ? t('writeExportHtml')
+                  : t('writeExportDocx')
+          return (
+            <button
+              key={format}
+              type="button"
+              disabled={exportingFormat !== null}
+              onClick={() => void handleExport(format)}
+              className="flex w-full items-center rounded-lg px-2.5 py-1.5 text-left text-[12px] text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:opacity-60"
+            >
+              {label}
+            </button>
+          )
+        })}
+        {error ? (
+          <p className="max-w-64 px-2.5 py-1 text-[11px] leading-4 text-rose-500">
+            {t('exportAnswerFailed', { message: error })}
+          </p>
+        ) : null}
+      </div>
+    </details>
+  )
+}
+
 function UserInputBubble({
   block,
   nested = false
@@ -1002,29 +1649,18 @@ function UserInputBubble({
   nested?: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
-  const resolveUserInput = useChatStore((s) => s.resolveUserInput)
   const [answers, setAnswers] = useState<Record<string, UserInputAnswer>>(() =>
     answersByQuestionId(block.answers)
   )
-  // A `pending` block is only actionable while the live runtime is awaiting it.
-  // One rehydrated from a finished thread keeps its stored `pending` status but
-  // is not live, so it renders as a read-only ended record rather than a live
-  // prompt — and crucially never offers cancel, which would hit a dead gate and
-  // raise "user input not found" (issue #606).
+  // The timeline is the durable record; answering lives in the composer panel.
+  // Only a live request appears active. A stale persisted `pending` block is
+  // rendered as ended so reopening history never advertises a dead action.
   const pending = block.status === 'pending' && block.live === true
   const done = block.status !== 'pending'
 
   useEffect(() => {
     setAnswers(answersByQuestionId(block.answers))
   }, [block.id, block.answers])
-
-  // Answering moved to the composer-docked panel (FloatingComposerUserInputPanel);
-  // this bubble is now the read-only record of what was asked and answered. It
-  // keeps only the cancel affordance while pending.
-  const cancel = (): void => {
-    if (!pending) return
-    void resolveUserInput(block.id, { kind: 'cancel' })
-  }
 
   const statusLabel =
     block.status === 'submitted'
@@ -1048,23 +1684,23 @@ function UserInputBubble({
             : 'muted'
   const questionCount = block.questions.length
   const containerClass = nested
-    ? `overflow-hidden rounded-[14px] border px-3.5 py-3 text-[13px] leading-5 shadow-[0_8px_22px_rgba(20,47,95,0.035)] ${
+    ? `overflow-hidden rounded-[14px] border px-3.5 py-3 text-[13px] leading-5 ${
         tone === 'error'
-          ? 'border-red-300/65 bg-ds-card/88 dark:border-red-800/55 dark:bg-red-950/20'
+          ? 'border-red-300/65 bg-red-500/[0.025] dark:border-red-800/55 dark:bg-red-950/20'
           : tone === 'success'
-            ? 'border-emerald-500/22 bg-ds-card/88 dark:border-emerald-600/30 dark:bg-ds-card/82'
+            ? 'border-emerald-500/22 bg-emerald-500/[0.025] dark:border-emerald-600/30'
             : tone === 'muted'
-              ? 'border-ds-border-muted bg-ds-card/78'
-              : 'border-accent/22 bg-ds-card/90'
+              ? 'border-ds-border-muted bg-ds-card/75'
+              : 'border-accent/25 bg-accent/[0.025]'
       }`
-    : `overflow-hidden rounded-[16px] border px-4 py-4 text-[13px] leading-6 shadow-[0_14px_36px_rgba(20,47,95,0.055)] ${
+    : `overflow-hidden rounded-[16px] border px-4 py-4 text-[13px] leading-6 shadow-[0_10px_28px_rgba(20,47,95,0.04)] ${
         tone === 'error'
-          ? 'border-red-300/70 bg-ds-card/90 dark:border-red-800/60 dark:bg-red-950/20'
+          ? 'border-red-300/70 bg-red-500/[0.025] dark:border-red-800/60 dark:bg-red-950/20'
           : tone === 'success'
-            ? 'border-emerald-500/24 bg-ds-card/90 dark:border-emerald-600/32 dark:bg-ds-card/84'
+            ? 'border-emerald-500/24 bg-emerald-500/[0.025] dark:border-emerald-600/32'
             : tone === 'muted'
               ? 'border-ds-border bg-ds-card/82'
-              : 'border-accent/24 bg-ds-card/95 text-ds-ink'
+              : 'border-accent/26 bg-ds-card text-ds-ink'
       }`
   const iconFrameClass =
     tone === 'error'
@@ -1097,117 +1733,65 @@ function UserInputBubble({
 
   return (
     <div className={containerClass}>
-      <div className="flex min-w-0 items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-2.5">
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
           <span
             className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] border ${iconFrameClass}`}
           >
             {statusIcon}
           </span>
-          <div className="min-w-0 pt-0.5">
+          <div className="min-w-0">
             <div className="font-semibold text-ds-ink">{t('userInputTitle')}</div>
-            <div className={`mt-0.5 text-[12px] font-medium ${statusClass}`}>{statusLabel}</div>
           </div>
         </div>
-        {questionCount > 1 ? (
-          <span className="shrink-0 rounded-full border border-ds-border-muted bg-ds-subtle px-2 py-0.5 text-[11.5px] font-medium text-ds-muted">
-            {questionCount}
-          </span>
-        ) : null}
+        <span className={`shrink-0 rounded-full border border-current/15 px-2 py-0.5 text-[11.5px] font-semibold ${statusClass}`}>
+          {statusLabel}
+        </span>
       </div>
 
-      <div className={nested ? 'mt-3 flex flex-col gap-2.5' : 'mt-3.5 flex flex-col gap-3'}>
-        {block.questions.map((question, index) => {
-          const answer = answers[question.id]
-          const hasOptions = question.options.length > 0
-          const submittedAnswer = done ? (answer?.value || answer?.label || '') : ''
-          const showProgress = questionCount > 1
-          const showHeader = shouldShowQuestionHeader(question, questionCount)
-          return (
-            <div
-              key={question.id}
-              className={`min-w-0 rounded-[12px] border px-3 py-3 ${
-                submittedAnswer
-                  ? 'border-ds-border-muted bg-ds-main/35'
-                  : 'border-ds-border-muted bg-ds-main/45'
-              }`}
-            >
-              {showHeader || showProgress ? (
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    {showHeader ? (
-                      <div className="min-w-0 text-[12px] font-semibold text-ds-muted">
-                        {question.header}
-                      </div>
-                    ) : null}
-                  </div>
-                  {showProgress ? (
-                    <div className="rounded-full bg-ds-card/70 px-2 py-0.5 text-[11.5px] font-medium text-ds-faint">
-                      {t('userInputQuestionProgress', {
-                        current: index + 1,
-                        total: block.questions.length
-                      })}
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-              <p
-                className={`whitespace-pre-wrap break-words text-[14px] font-semibold leading-6 text-ds-ink [overflow-wrap:anywhere] ${
-                  showHeader || showProgress ? 'mt-2' : ''
-                }`}
-              >
-                {question.question}
-              </p>
-
-              {submittedAnswer ? (
-                <div className="mt-3 flex min-w-0 items-start gap-2 rounded-[10px] border border-emerald-500/14 bg-ds-card/78 px-3 py-2.5">
-                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
-                    <Check className="h-3.5 w-3.5" strokeWidth={2.1} />
-                  </span>
-                  <span className="min-w-0 flex-1 break-words text-[13.5px] font-medium leading-5 text-ds-ink [overflow-wrap:anywhere]">
-                    {submittedAnswer}
-                  </span>
-                </div>
-              ) : done ? (
-                <div className="mt-3 rounded-[10px] border border-ds-border-muted bg-ds-card/70 px-3 py-2 text-[12.5px] font-medium text-ds-muted">
-                  {statusLabel}
-                </div>
-              ) : hasOptions ? (
-                <div className="mt-2.5 flex flex-wrap gap-1.5">
-                  {question.options.map((option) => (
-                    <span
-                      key={option.label}
-                      title={option.description || undefined}
-                      className="inline-flex min-w-0 max-w-full items-center rounded-full border border-ds-border-muted bg-ds-card/70 px-2.5 py-1 text-[12px] text-ds-muted"
-                    >
-                      <span className="truncate">{option.label}</span>
-                    </span>
-                  ))}
-                </div>
+      {block.status === 'pending' ? (
+        <div className="mt-3 border-t border-ds-border-muted pt-3">
+          {block.questions[0] ? (
+            <p className="line-clamp-2 whitespace-pre-wrap break-words text-[13px] font-medium leading-5 text-ds-ink [overflow-wrap:anywhere]">
+              {block.questions[0].question}
+            </p>
+          ) : null}
+          {pending ? (
+            <div className="mt-2 flex items-center justify-between gap-3 text-[11.5px] text-ds-faint">
+              <span>{t('userInputCompleteAboveComposer')}</span>
+              {questionCount > 1 ? (
+                <span className="shrink-0 font-semibold tabular-nums">
+                  {t('userInputQuestionCount', { count: questionCount })}
+                </span>
               ) : null}
             </div>
-          )
-        })}
-      </div>
+          ) : null}
+        </div>
+      ) : done && block.questions.length > 0 ? (
+        <div className="mt-3 overflow-hidden rounded-[11px] border border-ds-border-muted bg-ds-card/65">
+          {block.questions.map((question) => {
+            const submittedValues = answerDisplayValues(answers[question.id])
+            return (
+              <div
+                key={question.id}
+                className="grid min-w-0 gap-1 border-b border-ds-border-muted px-3 py-2.5 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,0.7fr)] sm:items-center sm:gap-4"
+              >
+                <span className="min-w-0 truncate text-[12px] text-ds-muted" title={question.question}>
+                  {question.question}
+                </span>
+                <span className={`min-w-0 break-words text-[12.5px] font-semibold [overflow-wrap:anywhere] ${
+                  submittedValues.length > 0 ? 'text-ds-ink' : 'text-ds-faint'
+                }`}>
+                  {submittedValues.length > 0 ? submittedValues.join(', ') : statusLabel}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      ) : null}
 
       {block.errorMessage ? (
         <p className="mt-3 text-[12px] text-red-700 dark:text-red-300">{block.errorMessage}</p>
-      ) : null}
-
-      {pending ? (
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-ds-border-muted pt-3">
-          <span className="inline-flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-accent">
-            <ArrowDown className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
-            <span className="min-w-0">{t('userInputAnswerBelowHint')}</span>
-          </span>
-          <button
-            type="button"
-            className="min-h-8 rounded-[9px] border border-ds-border-muted bg-ds-card/80 px-3 py-1.5 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
-            onClick={cancel}
-          >
-            {t('userInputCancel')}
-          </button>
-        </div>
       ) : null}
     </div>
   )
@@ -1238,7 +1822,8 @@ function MessageBubbleImpl({
   block,
   nested = false,
   forkAction,
-  rollbackAction
+  rollbackAction,
+  allowThreadActions = true
 }: {
   block: ChatBlock
   nested?: boolean
@@ -1250,11 +1835,18 @@ function MessageBubbleImpl({
     busy: boolean
     onRollback: () => void
   }
+  allowThreadActions?: boolean
 }): ReactElement {
   const { t, i18n } = useTranslation('common')
   const resolveApproval = useChatStore((s) => s.resolveApproval)
+  if (block.kind === 'user' && isBackgroundShellNoticeBlock(block)) {
+    return <BackgroundShellNoticeBubble block={block} nested={nested} />
+  }
+  if (block.kind === 'user' && isBackgroundSubagentNoticeBlock(block)) {
+    return <BackgroundSubagentNoticeBubble block={block} nested={nested} />
+  }
   if (block.kind === 'user') {
-    return <UserMessageBubble block={block} />
+    return <UserMessageBubble block={block} allowThreadActions={allowThreadActions} />
   }
   if (block.kind === 'assistant') {
     const streaming = block.id === 'live-assistant'
@@ -1296,6 +1888,7 @@ function MessageBubbleImpl({
                   <span>{forkAction.busy ? t('forkingThread') : t('forkResponse')}</span>
                 </button>
               ) : null}
+              <AssistantExportButton text={block.text} createdAt={block.createdAt} />
               <CopyFeedbackButton text={block.text} />
             </div>
           </div>
@@ -1307,7 +1900,7 @@ function MessageBubbleImpl({
     return (
       <div className="ds-card-soft rounded-[20px] px-4 py-3 text-[13.5px] leading-6 text-ds-muted">
         <div className="ds-markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
+          <AssistantMarkdown text={block.text} streaming={false} />
         </div>
       </div>
     )
@@ -1316,16 +1909,80 @@ function MessageBubbleImpl({
     return <ToolEntry block={block} nested={nested} />
   }
   if (block.kind === 'user_input') {
-    return <UserInputBubble block={block} nested={nested} />
+    return (
+      <UserInputBubble
+        block={block}
+        nested={nested}
+      />
+    )
+  }
+  if (block.kind === 'approval_review') {
+    const statusLabel =
+      block.status === 'approved'
+        ? t('approvalReviewApproved')
+        : block.status === 'denied'
+          ? t('approvalReviewDenied')
+          : block.status === 'timed-out'
+            ? t('approvalReviewTimedOut')
+            : block.status === 'failed-closed'
+              ? t('approvalReviewFailedClosed')
+              : block.status === 'aborted'
+                ? t('approvalReviewAborted')
+                : t('approvalReviewInProgress')
+    const errorTone =
+      block.status === 'denied' ||
+      block.status === 'timed-out' ||
+      block.status === 'failed-closed' ||
+      block.status === 'aborted'
+    return (
+      <div
+        className={`rounded-[20px] border px-4 py-3 text-[13px] leading-6 shadow-[0_12px_30px_rgba(86,103,136,0.04)] ${
+          errorTone
+            ? 'border-amber-300/80 bg-amber-500/10 dark:border-amber-800/60 dark:bg-amber-950/30'
+            : block.status === 'approved'
+              ? 'border-emerald-300/70 bg-emerald-500/10 dark:border-emerald-800/60 dark:bg-emerald-950/25'
+              : 'border-accent/35 bg-[linear-gradient(180deg,rgba(79,124,255,0.07),rgba(79,124,255,0.11))] text-ds-ink'
+        }`}
+        aria-live="polite"
+      >
+        <div className="flex items-center gap-2 font-semibold text-ds-ink">
+          {block.status === 'in-progress' ? (
+            <Loader2 className="h-4 w-4 animate-spin text-accent" aria-hidden="true" />
+          ) : (
+            <Check className="h-4 w-4 text-accent" aria-hidden="true" />
+          )}
+          <span>{t('approvalReviewTitle')}</span>
+        </div>
+        {block.toolName ? (
+          <div className="mt-1 text-[12px] text-ds-muted">
+            {t('approvalTool', { name: block.toolName })}
+          </div>
+        ) : null}
+        <p className="mt-1 whitespace-pre-wrap text-[13.5px] text-ds-ink">{block.summary}</p>
+        <p className="mt-2 text-[12px] font-medium text-ds-muted">{statusLabel}</p>
+        {block.riskLevel ? (
+          <p className="mt-1 text-[12px] text-ds-muted">
+            {t('approvalReviewRisk', { risk: block.riskLevel })}
+          </p>
+        ) : null}
+        {block.rationale ? (
+          <p className="mt-1 whitespace-pre-wrap text-[12.5px] text-ds-muted">
+            {t('approvalReviewRationale', { rationale: block.rationale })}
+          </p>
+        ) : null}
+      </div>
+    )
   }
   if (block.kind === 'approval') {
     const submitting = block.status === 'submitting'
-    const done = block.status !== 'pending' && !submitting
+    const done = !allowThreadActions || (block.status !== 'pending' && !submitting)
     const statusLabel =
       block.status === 'allowed'
         ? t('approvalAllowed')
         : block.status === 'denied'
           ? t('approvalDenied')
+          : block.status === 'expired'
+            ? t('approvalExpired')
           : block.status === 'error'
             ? t('approvalFailed')
             : submitting
@@ -1336,6 +1993,8 @@ function MessageBubbleImpl({
         className={`rounded-[22px] border px-4 py-4 text-[13px] leading-6 shadow-[0_12px_30px_rgba(86,103,136,0.04)] ${
           block.status === 'error'
             ? 'border-red-300/80 bg-red-500/10 dark:border-red-800/60 dark:bg-red-950/35'
+            : block.status === 'expired'
+              ? 'border-amber-300/80 bg-amber-500/10 dark:border-amber-800/60 dark:bg-amber-950/30'
             : 'border-accent/35 bg-[linear-gradient(180deg,rgba(79,124,255,0.08),rgba(79,124,255,0.12))] text-ds-ink'
         }`}
       >
@@ -1355,7 +2014,10 @@ function MessageBubbleImpl({
               type="button"
               disabled={submitting}
               className="rounded-lg bg-emerald-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-emerald-700 disabled:cursor-wait disabled:opacity-60"
-              onClick={() => void resolveApproval(block.id, 'allow')}
+              onClick={(event) => runTrustedUserActivation(
+                event,
+                () => void resolveApproval(block.id, 'allow')
+              )}
             >
               {t('approvalAllow')}
             </button>
@@ -1363,7 +2025,10 @@ function MessageBubbleImpl({
               type="button"
               disabled={submitting}
               className="rounded-lg border border-ds-border bg-ds-card px-3 py-1.5 text-[13px] font-medium text-ds-ink hover:bg-ds-hover disabled:cursor-wait disabled:opacity-60"
-              onClick={() => void resolveApproval(block.id, 'deny')}
+              onClick={(event) => runTrustedUserActivation(
+                event,
+                () => void resolveApproval(block.id, 'deny')
+              )}
             >
               {t('approvalDeny')}
             </button>
@@ -1435,13 +2100,21 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
         ? 'border-amber-300/80 bg-amber-500/10 text-amber-950 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-100'
         : 'border-ds-border bg-ds-subtle text-ds-ink'
 
+  const toolName = typeof block.meta?.toolName === 'string' ? block.meta.toolName.trim() : ''
+  const displaySummary =
+    toolName === 'background_shell'
+      ? summarizeBackgroundShellToolBlock(block, t)
+      : block.summary
+
   const Icon = block.toolKind === 'file_change' ? FileEdit : block.toolKind === 'command_execution' ? Terminal : Wrench
   const kindLabel =
-    block.toolKind === 'file_change'
-      ? t('toolKindFile')
-      : block.toolKind === 'command_execution'
-        ? t('toolKindCommand')
-        : t('toolKindTool')
+    toolName === 'background_shell'
+      ? t('toolBuiltinBackgroundShell', { defaultValue: 'Background shell' })
+      : block.toolKind === 'file_change'
+        ? t('toolKindFile')
+        : block.toolKind === 'command_execution'
+          ? t('toolKindCommand')
+          : t('toolKindTool')
 
   const exitCode = readNumber(block.meta, 'exit_code')
   const durationMs = readNumber(block.meta, 'duration_ms')
@@ -1501,9 +2174,9 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
             {block.filePath ? (
               <span className="font-mono text-[12px] opacity-90">{block.filePath} — </span>
             ) : null}
-            <span>{block.summary}</span>
+            <span>{displaySummary}</span>
           </div>
-          <RuntimeMetaChips meta={block.meta} />
+          <RuntimeMetaChips meta={block.meta} hideTurnDisclosure />
         </div>
         {canExpand ? (
           effectiveOpen ? (

@@ -1,7 +1,18 @@
 import { z } from 'zod'
-import { TurnItem, UserFileReferenceSchema } from './items.js'
+import { TurnItem, UserFileReferenceSchema, UserMessageSource } from './items.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
-import { ApprovalPolicySchema, SandboxModeSchema } from './policy.js'
+import {
+  ApprovalPolicySchema,
+  ApprovalReviewerSchema,
+  SandboxModeSchema
+} from './policy.js'
+import { MAX_TURN_ATTACHMENT_IDS } from './attachments.js'
+import {
+  ComposerContextAttachmentSchema,
+  MAX_COMPOSER_CONTEXT_ATTACHMENTS
+} from './composer-context.js'
+import { GraphOrchestrationStrategySchema } from './graph.js'
+import { GraphPlanningDraftStatusSchema } from './graph-planning.js'
 
 /**
  * Mode enum, inlined here (instead of importing `ThreadMode` from
@@ -12,6 +23,22 @@ import { ApprovalPolicySchema, SandboxModeSchema } from './policy.js'
 const TurnModeSchema = z.enum(['agent', 'plan'])
 export const TurnReasoningEffortSchema = z.enum(['auto', 'off', 'low', 'medium', 'high', 'max'])
 export type TurnReasoningEffort = z.infer<typeof TurnReasoningEffortSchema>
+/** Canonical Codex/API request value. The legacy UI label is "fast". */
+export const TurnServiceTierSchema = z.literal('priority')
+export type TurnServiceTier = z.infer<typeof TurnServiceTierSchema>
+export const TurnClientSurfaceSchema = z.enum(['gui', 'tui', 'cli', 'api', 'im', 'extension'])
+export type TurnClientSurface = z.infer<typeof TurnClientSurfaceSchema>
+
+/**
+ * Immutable transport route used by model-controlled approval review for one
+ * acting turn. It contains identifiers only; credentials remain host-owned.
+ */
+export const ActingTurnModelRouteSchema = z.object({
+  model: z.string().trim().min(1),
+  providerId: z.string().trim().min(1).optional(),
+  accountId: z.string().trim().min(1).optional()
+}).strict()
+export type ActingTurnModelRoute = Readonly<z.infer<typeof ActingTurnModelRouteSchema>>
 
 /**
  * Plan operation kinds the renderer can advertise on a plan turn.
@@ -41,6 +68,19 @@ export const GuiPlanContextSchema = z.object({
 })
 export type GuiPlanContextJson = z.infer<typeof GuiPlanContextSchema>
 
+export const GuiDesignArtifactContextSchema = z.object({
+  kind: z.literal('svg'),
+  artifactId: z.string().min(1),
+  relativePath: z.string().min(1).refine((value) => {
+    const normalized = value.replaceAll('\\', '/')
+    return normalized === value &&
+      normalized.startsWith('.kun-design/') &&
+      !normalized.split('/').includes('..') &&
+      /\/v\d+\.svg$/i.test(normalized)
+  }, { message: 'relativePath must be a versioned SVG file under .kun-design' })
+})
+export type GuiDesignArtifactContextJson = z.infer<typeof GuiDesignArtifactContextSchema>
+
 export const TurnStatus = z.enum([
   'queued',
   'running',
@@ -50,13 +90,79 @@ export const TurnStatus = z.enum([
 ])
 export type TurnStatus = z.infer<typeof TurnStatus>
 
+export const InjectedMemorySummarySchema = z.object({
+  id: z.string().min(1),
+  content: z.string()
+})
+export type InjectedMemorySummary = z.infer<typeof InjectedMemorySummarySchema>
+
+export const InjectedInstructionSourceSchema = z.object({
+  scope: z.enum(['global', 'workspace']),
+  path: z.string().min(1),
+  bytes: z.number().int().nonnegative(),
+  truncated: z.boolean().default(false)
+})
+export type InjectedInstructionSource = z.infer<typeof InjectedInstructionSourceSchema>
+
+/**
+ * Durable state for a hard named-tool gate. It is deliberately optional so
+ * legacy turns remain valid, while an interrupted Graph creation turn cannot
+ * restart its bounded retry window after a runtime restart.
+ */
+export const RequiredToolGateSchema = z.object({
+  toolName: z.string().min(1).max(256),
+  attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive(),
+  phase: z.enum(['preparing', 'retrying', 'succeeded', 'failed']),
+  lastError: z.string().min(1).max(2_048).optional()
+}).strict()
+export type RequiredToolGate = z.infer<typeof RequiredToolGateSchema>
+
+/**
+ * Durable ownership state for a Graph source Lead. The turn remains logically
+ * running while its process-local execution lease is suspended between
+ * material Graph events.
+ */
+export const GraphLeadLifecycleSchema = z.object({
+  version: z.literal(1),
+  runId: z.string().min(1),
+  state: z.enum(['supervising', 'awaiting_user', 'finalizing']),
+  lastDeliveredSeq: z.number().int().nonnegative().default(0),
+  suspendedAt: z.string().optional(),
+  resumedAt: z.string().optional()
+}).strict()
+export type GraphLeadLifecycle = z.infer<typeof GraphLeadLifecycleSchema>
+
+export const GraphPlanningLifecycleSchema = z.object({
+  version: z.literal(1),
+  draftId: z.string().min(1),
+  reservedRunId: z.string().min(1),
+  state: GraphPlanningDraftStatusSchema,
+  draftRevision: z.number().int().positive(),
+  /** Process shutdown parked execution without changing the durable draft state. */
+  suspendedAt: z.string().optional()
+}).strict()
+export type GraphPlanningLifecycle = z.infer<typeof GraphPlanningLifecycleSchema>
+
 export const TurnSchema = z.object({
   id: z.string().min(1),
   threadId: z.string().min(1),
   status: TurnStatus,
   prompt: z.string(),
+  messageSource: UserMessageSource.optional(),
   model: z.string().optional(),
+  providerId: z.string().optional(),
+  accountId: z.string().min(1).optional(),
+  /** First successfully resolved route; immutable for the remainder of this turn. */
+  actingModelRoute: ActingTurnModelRouteSchema.optional(),
   reasoningEffort: TurnReasoningEffortSchema.optional(),
+  serviceTier: TurnServiceTierSchema.optional(),
+  /** Client that initiated this turn. Used only for per-turn capability and prompt scoping. */
+  clientSurface: TurnClientSurfaceSchema.optional(),
+  /** Immutable execution-authority snapshot captured when this turn starts. */
+  approvalPolicy: ApprovalPolicySchema.optional(),
+  sandboxMode: SandboxModeSchema.optional(),
+  approvalReviewer: ApprovalReviewerSchema.optional(),
   /** Steered text queued by the user mid-turn. Cleared on completion. */
   steering: z.array(z.string()).default([]),
   createdAt: z.string(),
@@ -64,26 +170,62 @@ export const TurnSchema = z.object({
   finishedAt: z.string().optional(),
   items: z.array(TurnItem).default([]),
   attachmentIds: z.array(z.string().min(1)).default([]),
+  composerContexts: z.array(ComposerContextAttachmentSchema).max(MAX_COMPOSER_CONTEXT_ATTACHMENTS).optional(),
   activeSkillIds: z.array(z.string().min(1)).default([]),
   injectedMemoryIds: z.array(z.string().min(1)).default([]),
+  injectedMemorySummaries: z.array(InjectedMemorySummarySchema).default([]),
   skillInjectionBytes: z.number().int().nonnegative().optional(),
+  injectedInstructionSources: z.array(InjectedInstructionSourceSchema).default([]),
+  instructionInjectionBytes: z.number().int().nonnegative().optional(),
   workspaceCheckpointId: z.string().min(1).optional(),
+  /** Pending GUI checkpoint whose completion gates the first mutating tool. */
+  workspaceCheckpointRequestId: z.string().min(1).optional(),
   toolCatalogFingerprint: z.string().optional(),
   toolCatalogToolCount: z.number().int().nonnegative().optional(),
   toolCatalogDrift: z.boolean().optional(),
+  /** Optional persisted hard-tool gate. Missing legacy values mean inactive. */
+  requiredToolGate: RequiredToolGateSchema.optional(),
+  /** Optional durable ownership state for a suspended/resumable Graph Lead. */
+  graphLeadLifecycle: GraphLeadLifecycleSchema.optional(),
+  /** Durable pre-GraphRun planning ownership for Graph turns. */
+  graphPlanningLifecycle: GraphPlanningLifecycleSchema.optional(),
+  /** Extension-run budget accounting persisted across runtime restarts. */
+  extensionBudgetTokenBaseline: z.number().int().nonnegative().optional(),
+  extensionModelRequests: z.number().int().nonnegative().optional(),
+  extensionToolInvocations: z.number().int().nonnegative().optional(),
   guiPlan: GuiPlanContextSchema.optional(),
+  /**
+   * True for renderer-owned design canvas turns. Kun advertises the
+   * `design_canvas` tool only for these turns; the renderer applies the
+   * returned ops to its canvas store.
+   */
+  guiDesignCanvas: z.boolean().optional(),
+  /** True only for product Design-mode turns; Code canvas turns leave it unset. */
+  guiDesignMode: z.boolean().optional(),
+  /** Product surface that owns this turn. Missing legacy values behave as Code. */
+  agentSurface: z.enum(['code', 'write', 'design']).optional(),
+  /** Reserved first-class SVG artifact for structured SVG tools. */
+  guiDesignArtifact: GuiDesignArtifactContextSchema.optional(),
   /**
    * Optional per-turn mode override. When set, it takes precedence over
    * the thread mode for this turn (e.g. a Plan-mode turn inside an
    * otherwise agent thread, or a Build turn that runs as agent).
    */
   mode: TurnModeSchema.optional(),
+  /** Per-turn orchestration strategy. Missing legacy values behave as direct. */
+  orchestration: GraphOrchestrationStrategySchema.default('direct'),
   /**
    * True when no interactive user is attached to this turn (IM bridges,
    * headless runs). Kun hides `user_input`/`request_user_input` and
    * rejects calls to them instead of blocking on a GUI answer.
    */
   disableUserInput: z.boolean().optional(),
+  /**
+   * True when this turn originated from an IM bridge. Kun exposes
+   * IM-only tools such as outbound attachment delivery only for these
+   * turns.
+   */
+  imContext: z.boolean().optional(),
   error: z.string().optional()
 })
 export type Turn = z.infer<typeof TurnSchema>
@@ -91,16 +233,28 @@ export type Turn = z.infer<typeof TurnSchema>
 export const StartTurnRequest = z.object({
   prompt: z.string().min(1),
   displayText: z.string().optional(),
+  messageSource: UserMessageSource.optional(),
   model: z.string().optional(),
+  providerId: z.string().optional(),
+  accountId: z.string().min(1).optional(),
   reasoningEffort: TurnReasoningEffortSchema.optional(),
+  serviceTier: TurnServiceTierSchema.optional(),
+  /** Initiating client surface. It does not grant authority beyond the advertised tool policy. */
+  clientSurface: TurnClientSurfaceSchema.optional(),
   approvalPolicy: ApprovalPolicySchema.optional(),
   sandboxMode: SandboxModeSchema.optional(),
+  approvalReviewer: ApprovalReviewerSchema.optional(),
   /**
    * Optional per-turn mode. Overrides the thread mode for this turn so
    * the GUI can toggle Plan/agent without recreating the thread. In Plan
    * mode Kun advertises `create_plan` for the whole conversation.
    */
   mode: TurnModeSchema.optional(),
+  /**
+   * Explicitly selects host-owned Graph orchestration for this turn.
+   * Missing values preserve the existing direct agent loop.
+   */
+  orchestration: GraphOrchestrationStrategySchema.default('direct'),
   attachments: z
     .array(
       z.object({
@@ -109,9 +263,20 @@ export const StartTurnRequest = z.object({
       })
     )
     .optional(),
-  attachmentIds: z.array(z.string().min(1)).default([]),
+  attachmentIds: z.array(z.string().min(1)).max(MAX_TURN_ATTACHMENT_IDS).refine(
+    (ids) => new Set(ids).size === ids.length,
+    { message: 'attachmentIds must not contain duplicates' }
+  ).default([]),
+  composerContexts: z.array(ComposerContextAttachmentSchema)
+    .max(MAX_COMPOSER_CONTEXT_ATTACHMENTS)
+    .refine(
+      (attachments) => new Set(attachments.map((attachment) => attachment.attachmentId)).size === attachments.length,
+      { message: 'composerContexts must not contain duplicate attachmentId values' }
+    )
+    .default([]),
   fileReferences: z.array(UserFileReferenceSchema).default([]),
   workspaceCheckpointId: z.string().min(1).optional(),
+  workspaceCheckpointRequestId: z.string().min(1).optional(),
   /**
    * Optional GUI plan context. When set, Kun advertises the
    * `create_plan` tool for the turn and writes only to the reserved
@@ -119,11 +284,27 @@ export const StartTurnRequest = z.object({
    */
   guiPlan: GuiPlanContextSchema.optional(),
   /**
+   * True for renderer-owned design canvas turns. Enables the `design_canvas`
+   * tool for this turn only.
+   */
+  guiDesignCanvas: z.boolean().optional(),
+  /** True only for product Design-mode turns; Code canvas turns leave it unset. */
+  guiDesignMode: z.boolean().optional(),
+  /** Product surface used to scope subagent discovery and execution. */
+  agentSurface: z.enum(['code', 'write', 'design']).optional(),
+  /** Reserved first-class SVG artifact for structured SVG tools. */
+  guiDesignArtifact: GuiDesignArtifactContextSchema.optional(),
+  /**
    * True when the caller cannot relay structured input prompts to a
    * user (IM bridges such as WeChat/Feishu, headless runs). The turn
    * runs without the `user_input`/`request_user_input` tools.
    */
-  disableUserInput: z.boolean().optional()
+  disableUserInput: z.boolean().optional(),
+  /**
+   * True when the turn is handled through an IM bridge. This gates
+   * IM-only tool exposure separately from generic headless turns.
+   */
+  imContext: z.boolean().optional()
 })
 export type StartTurnRequest = z.input<typeof StartTurnRequest>
 
@@ -135,9 +316,30 @@ export const StartTurnResponse = z.object({
 export type StartTurnResponse = z.infer<typeof StartTurnResponse>
 
 export const SteerTurnRequest = z.object({
-  text: z.string().min(1)
+  text: z.string().min(1),
+  displayText: z.string().optional(),
+  messageSource: UserMessageSource.optional()
 })
 export type SteerTurnRequest = z.infer<typeof SteerTurnRequest>
+
+export const SteeringEntrySchema = z.object({
+  text: z.string().trim().min(1),
+  displayText: z.string().trim().min(1).optional(),
+  messageSource: UserMessageSource.optional()
+}).strict()
+export type SteeringEntry = z.infer<typeof SteeringEntrySchema>
+
+export const ReplaceSteeringRequest = z.object({
+  entries: z.array(SteeringEntrySchema).max(32)
+}).strict()
+export type ReplaceSteeringRequest = z.infer<typeof ReplaceSteeringRequest>
+
+export const SteeringQueueResponse = z.object({
+  threadId: z.string().min(1),
+  turnId: z.string().min(1),
+  entries: z.array(SteeringEntrySchema)
+}).strict()
+export type SteeringQueueResponse = z.infer<typeof SteeringQueueResponse>
 
 export const InterruptTurnRequest = z.object({
   /**

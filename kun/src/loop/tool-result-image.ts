@@ -36,13 +36,94 @@ export const IMAGE_TOOL_RESULT_TOKEN_ESTIMATE = 1_200
  * intentionally excluded to preserve their existing behaviour and token
  * cost.
  */
-const MODEL_VISIBLE_IMAGE_KINDS = new Set(['image', 'computer_screenshot'])
+const MODEL_VISIBLE_IMAGE_KINDS = new Set(['image', 'computer_screenshot', 'browser_screenshot'])
 
 const EVICTED_IMAGE_PLACEHOLDER =
   '[older screenshot omitted to save context; take another screenshot if you need the current view]'
+const BROWSER_USE_TRANSIENT_TTL_MS = 2 * 60_000
+const BROWSER_USE_TRANSIENT_MAX = 8
+
+type TransientBrowserUseOutput = {
+  threadId: string
+  output: unknown
+  expiresAt: number
+}
+
+const transientBrowserUseOutputs = new Map<string, TransientBrowserUseOutput>()
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function prepareBrowserUseToolResultForPersistence(item: TurnItem): TurnItem {
+  if (
+    item.kind !== 'tool_result' ||
+    item.toolName !== 'browser_use' ||
+    !isRecord(item.output)
+  ) {
+    return item
+  }
+  const sanitized = sanitizeBrowserUseOutput(item.output)
+  if (sanitized === item.output) return item
+  purgeTransientBrowserUseOutputs()
+  transientBrowserUseOutputs.set(item.id, {
+    threadId: item.threadId,
+    output: item.output,
+    expiresAt: Date.now() + BROWSER_USE_TRANSIENT_TTL_MS
+  })
+  while (transientBrowserUseOutputs.size > BROWSER_USE_TRANSIENT_MAX) {
+    const oldest = transientBrowserUseOutputs.keys().next().value
+    if (typeof oldest !== 'string') break
+    transientBrowserUseOutputs.delete(oldest)
+  }
+  return { ...item, output: sanitized }
+}
+
+export function rehydrateTransientBrowserUseOutputsForForward(history: TurnItem[]): TurnItem[] {
+  purgeTransientBrowserUseOutputs()
+  let changed = false
+  const output = history.map((item) => {
+    if (item.kind !== 'tool_result' || item.toolName !== 'browser_use') return item
+    const transient = transientBrowserUseOutputs.get(item.id)
+    if (!transient || transient.threadId !== item.threadId) return item
+    transientBrowserUseOutputs.delete(item.id)
+    changed = true
+    return { ...item, output: transient.output }
+  })
+  return changed ? output : history
+}
+
+export function clearTransientBrowserUseOutputsForTest(): void {
+  transientBrowserUseOutputs.clear()
+}
+
+function sanitizeBrowserUseOutput(output: Record<string, unknown>): Record<string, unknown> {
+  let changed = false
+  const sanitized: Record<string, unknown> = { ...output }
+  if (Array.isArray(output.images)) {
+    delete sanitized.images
+    sanitized.images_omitted = output.images.length
+    sanitized.note = 'Browser screenshot was forwarded transiently and was not persisted.'
+    changed = true
+  }
+  if (isRecord(output.snapshot) && Array.isArray(output.snapshot.nodes)) {
+    sanitized.snapshot = {
+      ...output.snapshot,
+      title: '[redacted]',
+      nodes: [],
+      truncated: true
+    }
+    sanitized.snapshot_nodes_omitted = output.snapshot.nodes.length
+    changed = true
+  }
+  return changed ? sanitized : output
+}
+
+function purgeTransientBrowserUseOutputs(): void {
+  const now = Date.now()
+  for (const [id, entry] of transientBrowserUseOutputs) {
+    if (entry.expiresAt <= now) transientBrowserUseOutputs.delete(id)
+  }
 }
 
 function toImage(value: unknown): ToolResultImage | null {
@@ -120,7 +201,9 @@ function stripImagesFromOutput(output: unknown): unknown {
   const clone: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(output)) {
     if (key === 'data_base64') {
-      clone[key] = EVICTED_IMAGE_PLACEHOLDER
+      // Removing the transport field is required: leaving any non-empty
+      // string here makes extractToolResultImages() treat the placeholder as
+      // real base64 and forwards the supposedly-evicted image again.
       continue
     }
     if (key === 'images') {
@@ -141,6 +224,71 @@ function stripImagesFromOutput(output: unknown): unknown {
  * cheap (they only ever see a handful of base64 payloads). Operates on a
  * copy — the persisted session log is untouched.
  */
+/**
+ * How many of the most recent generated images to forward back to the model so a
+ * vision-capable design agent can SEE what it produced and self-review/regenerate.
+ * Small on purpose — the just-generated one for the current turn is the priority.
+ */
+export const MAX_FORWARDED_GENERATED_IMAGES = 1
+
+/** True for a successful generate_image tool result (no base64 persisted on it). */
+export function isGeneratedImageToolResult(item: TurnItem | undefined): boolean {
+  return Boolean(item) && item!.kind === 'tool_result' && item!.toolName === 'generate_image' && item!.isError !== true
+}
+
+/**
+ * Return a COPY of `history` where the most recent N successful generate_image
+ * results are augmented — IN MEMORY ONLY — into the model-visible image shape
+ * (`kind:'image'` + base64), reading the bytes via `resolve` (the caller wires it
+ * to the already-persisted attachment store / disk file). The persisted tool
+ * output is NEVER mutated, so the deliberate "no base64 in generate_image output"
+ * guard stays intact; the base64 lives only in this transient request copy.
+ * Reusing `kind:'image'` means the four downstream layers (model client vision
+ * forwarding, token estimate, economy, hygiene) handle it with zero extra wiring.
+ */
+export async function rehydrateGeneratedImagesForForward(
+  history: TurnItem[],
+  resolve: (output: Record<string, unknown>) => Promise<ToolResultImage | null>,
+  maxForwarded: number = MAX_FORWARDED_GENERATED_IMAGES
+): Promise<TurnItem[]> {
+  const keep = Math.max(0, Math.floor(maxForwarded))
+  if (keep === 0) return history
+  const targets: number[] = []
+  for (let index = history.length - 1; index >= 0 && targets.length < keep; index -= 1) {
+    if (isGeneratedImageToolResult(history[index])) targets.push(index)
+  }
+  if (targets.length === 0) return history
+  const resolved = new Map<number, ToolResultImage>()
+  await Promise.all(
+    targets.map(async (index) => {
+      const item = history[index]
+      if (item.kind !== 'tool_result' || !isRecord(item.output)) return
+      try {
+        const image = await resolve(item.output)
+        if (image) resolved.set(index, image)
+      } catch {
+        // graceful: a scope miss / missing file just means "no image forwarded"
+      }
+    })
+  )
+  if (resolved.size === 0) return history
+  return history.map((item, index) => {
+    const image = resolved.get(index)
+    if (!image || item.kind !== 'tool_result' || !isRecord(item.output)) return item
+    return {
+      ...item,
+      output: {
+        ...item.output,
+        kind: 'image',
+        mime_type: image.mimeType,
+        data_base64: image.dataBase64,
+        ...(image.width !== undefined ? { width: image.width } : {}),
+        ...(image.height !== undefined ? { height: image.height } : {})
+      }
+    }
+  })
+}
+
 export function capToolResultImages(history: TurnItem[], maxKept: number): TurnItem[] {
   const keep = Math.max(0, Math.floor(maxKept))
   const imageIndexes: number[] = []

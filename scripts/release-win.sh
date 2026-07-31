@@ -53,6 +53,10 @@ case "$(uname -s)" in
     ;;
 esac
 
+if $PUBLISH && [[ "${R2_PROMOTE}" != "true" ]]; then
+  die "Manual publication must also pass joint R2 promotion; use --r2-promote --publish."
+fi
+
 release_check_prerequisites
 release_acquire_lock
 
@@ -72,13 +76,48 @@ fi
 RELEASE_ALLOW_EXISTING_TAG=1
 release_ensure_tag_available
 release_ensure_github_release_exists
+
+cyan "Verifying clean release checkout..."
+npm run verify:manual-extension-release -- --clean-only \
+  || die "Release checkout contains tracked or untracked changes"
+
+cyan "Verifying remote release tag matches local HEAD..."
+npm run verify:manual-extension-release -- --tag "${TAG_NAME}" --version "${RELEASE_VERSION}" --tag-only \
+  || die "Release tag does not match the local checkout"
+
 release_prepare_builder_cache
 release_export_update_channel
 release_export_app_version
+
+cyan "Checking Extension public release gate..."
+npm run check:extension-release-gate || die "Extension public release gate failed"
+
 release_clean_dist_artifacts
 
 cyan "Building Windows (tag ${TAG_NAME}, channel ${RELEASE_CHANNEL})..."
 npm run dist:win || die "Windows build failed"
+
+cyan "Smoking GUI-bundled Kun terminal command and shared version..."
+npm run smoke:packaged-cli -- \
+  --resources dist/win-unpacked/resources \
+  --expected-version "${RELEASE_VERSION}" \
+  || die "Windows packaged Kun terminal command smoke failed"
+
+cyan "Smoking packaged Extension Node runtime..."
+npm run smoke:packaged-extensions -- --resources dist/win-unpacked/resources \
+  || die "Windows packaged Extension Node runtime smoke failed"
+
+cyan "Smoking packaged Extension desktop Chromium..."
+npm run smoke:packaged-extension-desktop \
+  || die "Windows packaged Extension desktop Chromium smoke failed"
+
+cyan "Smoking host-native FFmpeg broker..."
+KUN_RUN_MEDIA_SMOKE=1 npm run smoke:extension-native-media \
+  || die "Windows host-native FFmpeg broker smoke failed"
+
+cyan "Recording commit-bound Windows native evidence..."
+npm run evidence:extension-native \
+  || die "Windows native evidence generation failed"
 
 ASSETS=()
 collect() {
@@ -109,6 +148,7 @@ collect() {
 
 collect "Windows exe" "dist/Kun-*-win-*.exe"
 collect "Windows blockmap" "dist/Kun-*-win-*.exe.blockmap"
+collect "Windows native evidence" "dist/extension-native-evidence-win32.json"
 
 cyan "Uploading ${#ASSETS[@]} Windows asset(s) to ${TAG_NAME}..."
 for asset in "${ASSETS[@]}"; do
@@ -116,6 +156,30 @@ for asset in "${ASSETS[@]}"; do
   gh release upload "${TAG_NAME}" "${asset}" --clobber \
     || die "gh release upload failed for ${asset}"
 done
+
+verify_tui_github_assets() {
+  local names
+  local expected
+  names="$(gh release view "${TAG_NAME}" --json assets --jq '.assets[].name')" \
+    || die "Could not inspect GitHub release assets for ${TAG_NAME}"
+  for expected in \
+    "Kun-TUI-${RELEASE_VERSION}-mac-arm64.tar.gz" \
+    "Kun-TUI-${RELEASE_VERSION}-mac-x64.tar.gz" \
+    "Kun-TUI-${RELEASE_VERSION}-win-x64.zip" \
+    "Kun-TUI-${RELEASE_VERSION}-linux-x64.tar.gz" \
+    "release-tui.json" \
+    "SHA256SUMS-tui.txt"; do
+    grep -Fxq "${expected}" <<<"${names}" \
+      || die "Joint release is missing GitHub TUI asset: ${expected}"
+  done
+}
+
+if $PUBLISH || [[ "${R2_PROMOTE}" == "true" ]]; then
+  cyan "Downloading and verifying the complete three-platform release bundle before publication or R2 promotion..."
+  npm run verify:manual-extension-release -- --tag "${TAG_NAME}" --version "${RELEASE_VERSION}" \
+    || die "Complete three-platform release verification failed"
+  verify_tui_github_assets
+fi
 
 if [[ "${R2_UPLOAD}" == "true" ]]; then
   cyan "Uploading Windows asset metadata to R2 (${TAG_NAME})..."
@@ -125,7 +189,7 @@ fi
 
 if [[ "${R2_PROMOTE}" == "true" ]]; then
   cyan "Promoting ${TAG_NAME} as R2 latest..."
-  node "${ROOT}/scripts/publish-r2.mjs" promote --tag "${TAG_NAME}" --channel "${RELEASE_CHANNEL}" \
+  node "${ROOT}/scripts/publish-r2.mjs" promote --tag "${TAG_NAME}" --channel "${RELEASE_CHANNEL}" --platforms mac,win,linux --require-tui \
     || die "R2 promote failed"
 fi
 
@@ -135,7 +199,7 @@ if $PUBLISH; then
     || die "gh release edit --draft=false failed"
   verify_release_state 1 false "published"
 else
-  cyan "Release remains draft — run with --publish when macOS + Windows assets are ready."
+  cyan "Release remains draft — publish only after macOS, Windows, Linux, evidence, and .kunx assets are ready."
 fi
 
 echo

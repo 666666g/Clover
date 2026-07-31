@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,10 +7,18 @@ import { CapabilityRegistry } from '../src/adapters/tool/capability-registry.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import {
   buildImageGenToolProviders,
+  CodexResponsesImageClient,
+  codexResponsesImageUrl,
+  createImageGenClient,
   mapImageSize,
+  GrokImagineImageClient,
   MiniMaxImageClient,
   minimaxImageDimensionFields,
+  OpenAiCompatImageClient,
   openAiCompatImageUrl,
+  protocolSupportsImageEdit,
+  VolcengineArkImageClient,
+  volcengineArkImageUrl,
   type ImageGenClient
 } from '../src/adapters/tool/image-gen-tool-provider.js'
 import { FileAttachmentStore } from '../src/attachments/attachment-store.js'
@@ -115,18 +123,93 @@ describe('Image gen tool provider', () => {
   })
 
   it('maps aspect ratio and size tier to provider sizes', () => {
-    expect(mapImageSize(undefined, undefined, undefined)).toBeUndefined()
-    expect(mapImageSize(undefined, undefined, '1536x1024')).toBe('1536x1024')
-    expect(mapImageSize(undefined, undefined, 'auto')).toBe('auto')
-    expect(mapImageSize('1:1', undefined, undefined)).toBe('1024x1024')
-    expect(mapImageSize('1:1', '2K', undefined)).toBe('2048x2048')
-    expect(mapImageSize('16:9', '1K', undefined)).toBe('1024x576')
-    expect(mapImageSize('9:16', '2K', undefined)).toBe('1152x2048')
-    expect(mapImageSize('21:9', '1K', undefined)).toBe('1024x448')
-    expect(mapImageSize('3:2', '1K', undefined)).toBe('1024x704')
+    expect(mapImageSize(undefined, undefined, undefined, '1K')).toBe('1024x1024')
+    expect(mapImageSize(undefined, undefined, undefined, '2K')).toBe('2048x2048')
+    expect(mapImageSize('16:9', undefined, undefined, '3K')).toBe('3072x1728')
+    expect(mapImageSize('9:16', undefined, undefined, '4K')).toBe('2304x4096')
+    expect(mapImageSize(undefined, undefined, undefined, 'auto')).toBe('auto')
+    expect(mapImageSize('16:9', undefined, undefined, 'auto')).toBe('1024x576')
+    expect(mapImageSize(undefined, undefined, '1536x1024', '2K')).toBe('1536x1024')
+    expect(mapImageSize('3:2', undefined, '1536x1024', '2K')).toBe('1536x1024')
+    expect(mapImageSize(undefined, undefined, 'auto', '2K')).toBe('auto')
+    expect(mapImageSize('16:9', undefined, 'auto', '2K')).toBe('2048x1152')
+    expect(mapImageSize('1:1', undefined, undefined, '1K')).toBe('1024x1024')
+    expect(mapImageSize('1:1', '2K', undefined, '1K')).toBe('2048x2048')
+    expect(mapImageSize('16:9', '1K', undefined, '2K')).toBe('1024x576')
+    expect(mapImageSize('9:16', '2K', undefined, '1K')).toBe('1152x2048')
+    expect(mapImageSize('21:9', '1K', undefined, '2K')).toBe('1024x448')
+    expect(mapImageSize('3:2', '1K', undefined, '2K')).toBe('1024x704')
+    // An explicit tool override wins over both configured size fields.
+    expect(mapImageSize('16:9', '2K', '1536x1024', '1K')).toBe('2048x1152')
     // Unknown ratios fall back to a square at the requested tier.
-    expect(mapImageSize('7:5', '2K', undefined)).toBe('2048x2048')
-    expect(mapImageSize(undefined, '2K', undefined)).toBe('2048x2048')
+    expect(mapImageSize('7:5', '2K', undefined, '1K')).toBe('2048x2048')
+    expect(mapImageSize(undefined, '2K', undefined, '1K')).toBe('2048x2048')
+  })
+
+  it('defaults image resolution to 1K and validates configured tiers', () => {
+    expect(imageGenConfig().defaultResolution).toBe('1K')
+    expect(imageGenConfig({ defaultResolution: 'auto' }).defaultResolution).toBe('auto')
+    expect(imageGenConfig({ defaultResolution: '2K' }).defaultResolution).toBe('2K')
+    expect(imageGenConfig({ defaultResolution: '3K' }).defaultResolution).toBe('3K')
+    expect(imageGenConfig({ defaultResolution: '4K' }).defaultResolution).toBe('4K')
+    expect(() => imageGenConfig({ defaultResolution: '8K' })).toThrow()
+  })
+
+  it('advertises settings-backed quality and resolution semantics without dynamic values', () => {
+    const oneKTool = buildImageGenToolProviders(imageGenConfig({
+      defaultResolution: '1K',
+      quality: 'low'
+    }), { client: fakeClient() }).providers[0].tools[0]
+    const twoKTool = buildImageGenToolProviders(imageGenConfig({
+      defaultResolution: '2K',
+      quality: 'high'
+    }), { client: fakeClient() }).providers[0].tools[0]
+
+    expect(oneKTool.description).toContain('Image quality is applied automatically from Settings')
+    const properties = oneKTool.inputSchema.properties as Record<string, { description?: string }>
+    expect(properties.aspect_ratio.description).toContain('preserving the selected or default resolution')
+    expect(properties.image_size.description).toContain('only when the user explicitly requests 1K or 2K')
+    expect(properties.image_size.description).toContain('Settings default resolution')
+    expect(properties.image_size.description).toContain('independent of image quality')
+    expect(properties.image_size.description).not.toContain('defaults to 1K')
+    expect(twoKTool.description).toBe(oneKTool.description)
+    expect(twoKTool.inputSchema).toEqual(oneKTool.inputSchema)
+  })
+
+  it('advertises the verified Grok aspect ratios and both resolution tiers', () => {
+    const tool = buildImageGenToolProviders(imageGenConfig({
+      protocol: 'grok-imagine-image'
+    }), { client: fakeClient() }).providers[0].tools[0]
+    const properties = tool.inputSchema.properties as Record<string, { enum?: string[] }>
+
+    expect(properties.aspect_ratio.enum).toEqual([
+      '1:1',
+      '16:9',
+      '9:16',
+      '4:3',
+      '3:4',
+      '3:2',
+      '2:3',
+      '2:1',
+      '1:2',
+      '19.5:9',
+      '9:19.5',
+      '20:9',
+      '9:20'
+    ])
+    expect(properties.image_size.enum).toEqual(['1K', '2K'])
+  })
+
+  it('advertises only the native Seedream resolution tiers', () => {
+    const tool = buildImageGenToolProviders(imageGenConfig({
+      protocol: 'volcengine-ark-image',
+      defaultResolution: '3K'
+    }), { client: fakeClient() }).providers[0].tools[0]
+    const properties = tool.inputSchema.properties as Record<string, { enum?: string[]; description?: string }>
+
+    expect(properties.image_size.enum).toEqual(['2K', '3K', '4K'])
+    expect(properties.image_size.description).toContain('2K, 3K, or 4K')
+    expect(properties.reference_image_paths).toBeDefined()
   })
 
   it('keeps explicit width/height for MiniMax image-01 only', () => {
@@ -208,6 +291,417 @@ describe('Image gen tool provider', () => {
       .toBe('https://x.test/v1/images/edits')
   })
 
+  it('builds Volcano Ark image endpoints from API and Agent Plan roots', () => {
+    expect(volcengineArkImageUrl('https://ark.cn-beijing.volces.com/api/v3'))
+      .toBe('https://ark.cn-beijing.volces.com/api/v3/images/generations')
+    expect(volcengineArkImageUrl('https://ark.cn-beijing.volces.com/api/plan/v3/'))
+      .toBe('https://ark.cn-beijing.volces.com/api/plan/v3/images/generations')
+    expect(volcengineArkImageUrl(
+      'https://ark.cn-beijing.volces.com/api/plan/v3/images/generations'
+    )).toBe('https://ark.cn-beijing.volces.com/api/plan/v3/images/generations')
+    expect(createImageGenClient({
+      protocol: 'volcengine-ark-image',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      apiKey: 'ark-access'
+    }).id).toBe('volcengine-ark-image')
+  })
+
+  it('posts native Seedream generation and reference-image requests', async () => {
+    const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = []
+    const generated = png(8, 8)
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        headers: new Headers(init?.headers),
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>
+      })
+      return new Response(JSON.stringify({
+        data: [{ b64_json: generated.toString('base64') }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    const client = new VolcengineArkImageClient(
+      'https://ark.cn-beijing.volces.com/api/plan/v3',
+      'agent-plan-key'
+    )
+    const signal = new AbortController().signal
+
+    const generatedImage = await client.generate({
+      prompt: '一只站在山顶的雪豹',
+      model: 'doubao-seedream-5.0-lite',
+      size: '3072x1728',
+      timeoutMs: 1_000,
+      signal
+    })
+    const editedImage = await client.edit({
+      prompt: '把天空改成日落',
+      model: 'doubao-seedream-5.0-lite',
+      images: [
+        { name: 'first.png', mimeType: 'image/png', data: Buffer.from('first') },
+        { name: 'second.webp', mimeType: 'image/webp', data: Buffer.from('second') }
+      ],
+      timeoutMs: 1_000,
+      signal
+    })
+
+    expect(generatedImage.data).toEqual(generated)
+    expect(editedImage.data).toEqual(generated)
+    expect(requests).toHaveLength(2)
+    expect(requests[0].url).toBe(
+      'https://ark.cn-beijing.volces.com/api/plan/v3/images/generations'
+    )
+    expect(requests[0].headers.get('authorization')).toBe('Bearer agent-plan-key')
+    expect(requests[0].body).toEqual({
+      model: 'doubao-seedream-5.0-lite',
+      prompt: '一只站在山顶的雪豹',
+      size: '3072x1728',
+      output_format: 'png',
+      response_format: 'b64_json',
+      sequential_image_generation: 'disabled',
+      stream: false,
+      watermark: false
+    })
+    expect(requests[1].body).toMatchObject({
+      model: 'doubao-seedream-5.0-lite',
+      prompt: '把天空改成日落',
+      size: '2K',
+      image: [
+        `data:image/png;base64,${Buffer.from('first').toString('base64')}`,
+        `data:image/webp;base64,${Buffer.from('second').toString('base64')}`
+      ]
+    })
+  })
+
+  it('downloads a URL result from Seedream and surfaces provider errors', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      if (String(url).endsWith('/images/generations')) {
+        return new Response(JSON.stringify({
+          data: [{ url: 'https://cdn.example.test/seedream.png' }]
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(new Uint8Array(Buffer.from('seedream-image')), {
+        status: 200,
+        headers: { 'content-type': 'image/png' }
+      })
+    }))
+    const client = new VolcengineArkImageClient(
+      'https://ark.cn-beijing.volces.com/api/v3',
+      'ark-key'
+    )
+    const request = {
+      prompt: 'a paper sculpture',
+      model: 'doubao-seedream-5-0-lite-260128',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    }
+
+    await expect(client.generate(request)).resolves.toMatchObject({
+      data: Buffer.from('seedream-image'),
+      mimeType: 'image/png'
+    })
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: { code: 'InvalidParameter', message: 'unsupported size' }
+    }), { status: 200, headers: { 'content-type': 'application/json' } })))
+    await expect(client.generate(request)).rejects.toThrow(
+      /Volcano Ark image provider returned no image data: unsupported size/
+    )
+  })
+
+  it('posts Codex subscription image requests through responses image_generation SSE', async () => {
+    expect(codexResponsesImageUrl('https://chatgpt.com/backend-api/codex'))
+      .toBe('https://chatgpt.com/backend-api/codex/responses')
+    expect(codexResponsesImageUrl('https://chatgpt.com/backend-api/codex/responses'))
+      .toBe('https://chatgpt.com/backend-api/codex/responses')
+    expect(createImageGenClient({
+      protocol: 'codex-responses-image',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: 'codex-access'
+    }).id).toBe('codex-responses-image')
+
+    const requests: Array<{ url: string; headers: Record<string, string>; body: string }> = []
+    const resultBase64 = png(8, 8).toString('base64')
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        headers: init?.headers as Record<string, string>,
+        body: String(init?.body)
+      })
+      return new Response([
+        `data: ${JSON.stringify({
+          type: 'response.output_item.done',
+          item: { type: 'image_generation_call', result: resultBase64 }
+        })}`,
+        'data: [DONE]'
+      ].join('\n\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })
+    }))
+    const client = new CodexResponsesImageClient('https://chatgpt.com/backend-api/codex', 'codex-access', {
+      'ChatGPT-Account-Id': 'acct_123',
+      originator: 'codex_cli_rs'
+    })
+
+    const image = await client.generate({
+      prompt: 'tiny square',
+      model: 'gpt-image-2',
+      size: '1024x1024',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(image).toMatchObject({ mimeType: 'image/png' })
+    expect(image.data.byteLength).toBeGreaterThan(0)
+    expect(requests).toHaveLength(1)
+    expect(requests[0].url).toBe('https://chatgpt.com/backend-api/codex/responses')
+    expect(requests[0].headers).toMatchObject({
+      Authorization: 'Bearer codex-access',
+      Accept: 'text/event-stream',
+      'Content-Type': 'application/json',
+      'ChatGPT-Account-Id': 'acct_123',
+      originator: 'codex_cli_rs'
+    })
+    expect(JSON.parse(requests[0].body)).toMatchObject({
+      model: 'gpt-5.5',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'tiny square' }] }],
+      instructions: 'You must fulfill image generation requests by using the image_generation tool.',
+      tools: [{
+        type: 'image_generation',
+        action: 'generate',
+        model: 'gpt-image-2',
+        quality: 'auto',
+        output_format: 'png',
+        background: 'opaque',
+        partial_images: 1,
+        size: '1024x1024'
+      }],
+      tool_choice: {
+        type: 'allowed_tools',
+        mode: 'required',
+        tools: [{ type: 'image_generation' }]
+      },
+      stream: true,
+      store: false
+    })
+  })
+
+  it('posts Grok subscription image requests with native ratios and 1K/2K resolutions', async () => {
+    expect(createImageGenClient({
+      protocol: 'grok-imagine-image',
+      baseUrl: 'https://api.x.ai/v1',
+      apiKey: 'grok-access'
+    }).id).toBe('grok-imagine-image')
+
+    const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      requests.push({
+        url: String(url),
+        headers: new Headers(init?.headers),
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>
+      })
+      return new Response(JSON.stringify({
+        data: [{ b64_json: png(8, 8).toString('base64') }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    const client = new GrokImagineImageClient('https://api.x.ai/v1', 'grok-access', {
+      'x-grok-client-version': '0.2.112',
+      'x-grok-client-identifier': 'grok-shell'
+    })
+
+    const oneKImage = await client.generate({
+      prompt: 'cinematic mountain lake',
+      model: 'grok-imagine-image-quality',
+      aspectRatio: '16:9',
+      size: '1024x576',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+    const twoKImage = await client.generate({
+      prompt: 'ultra-wide city skyline',
+      model: 'grok-imagine-image-quality',
+      aspectRatio: '20:9',
+      size: '2048x896',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(oneKImage.data.byteLength).toBeGreaterThan(0)
+    expect(twoKImage.data.byteLength).toBeGreaterThan(0)
+    expect(requests).toHaveLength(2)
+    expect(requests[0].url).toBe('https://api.x.ai/v1/images/generations')
+    expect(requests[0].headers.get('authorization')).toBe('Bearer grok-access')
+    expect(requests[0].headers.get('x-grok-client-version')).toBe('0.2.112')
+    expect(requests[0].headers.get('x-grok-client-identifier')).toBe('grok-shell')
+    expect(requests[0].body).toEqual({
+      model: 'grok-imagine-image-quality',
+      prompt: 'cinematic mountain lake',
+      n: 1,
+      aspect_ratio: '16:9',
+      resolution: '1k',
+      response_format: 'b64_json'
+    })
+    expect(requests[0].body).not.toHaveProperty('size')
+    expect(requests[1].body).toEqual({
+      model: 'grok-imagine-image-quality',
+      prompt: 'ultra-wide city skyline',
+      n: 1,
+      aspect_ratio: '20:9',
+      resolution: '2k',
+      response_format: 'b64_json'
+    })
+    expect(requests[1].body).not.toHaveProperty('size')
+  })
+
+  it('posts Codex subscription image edits with input images and edit action', async () => {
+    const requests: Array<{ body: string }> = []
+    const resultBase64 = png(8, 8).toString('base64')
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      requests.push({ body: String(init?.body) })
+      return new Response([
+        `data: ${JSON.stringify({
+          type: 'response.output_item.done',
+          item: { type: 'image_generation_call', result: resultBase64 }
+        })}`,
+        'data: [DONE]'
+      ].join('\n\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })
+    }))
+    const client = new CodexResponsesImageClient('https://chatgpt.com/backend-api/codex', 'codex-access')
+
+    const image = await client.edit({
+      prompt: 'put basketball shoes on the character',
+      model: 'gpt-image-2',
+      images: [{ name: 'annotated.png', mimeType: 'image/png', data: png(16, 16) }],
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(image).toMatchObject({ mimeType: 'image/png' })
+    expect(requests).toHaveLength(1)
+    const body = JSON.parse(requests[0].body)
+    expect(body.input[0].content).toEqual([
+      { type: 'input_text', text: 'put basketball shoes on the character' },
+      {
+        type: 'input_image',
+        image_url: expect.stringMatching(/^data:image\/png;base64,/),
+        detail: 'auto'
+      }
+    ])
+    expect(body.tools[0]).toMatchObject({
+      type: 'image_generation',
+      action: 'edit',
+      model: 'gpt-image-2'
+    })
+  })
+
+  it('uses the latest Codex partial image when the final image item is absent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      `data: ${JSON.stringify({
+        type: 'response.image_generation_call.partial_image',
+        partial_image_b64: png(8, 8).toString('base64')
+      })}`,
+      `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: { status: 'completed', output: [] }
+      })}`,
+      'data: [DONE]'
+    ].join('\n\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    })))
+    const client = new CodexResponsesImageClient('https://chatgpt.com/backend-api/codex', 'codex-access')
+
+    const image = await client.generate({
+      prompt: 'tiny square',
+      model: 'gpt-image-2',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(image).toMatchObject({ mimeType: 'image/png' })
+    expect(image.data.byteLength).toBeGreaterThan(0)
+  })
+
+  it('retries Codex image requests when a deployment rejects preferred tool_choice shapes', async () => {
+    const requests: string[] = []
+    const resultBase64 = png(8, 8).toString('base64')
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      requests.push(String(init?.body))
+      if (requests.length === 1) {
+        return new Response('Tool choice allowed_tools not found in tools parameter.', { status: 400 })
+      }
+      if (requests.length === 2) {
+        return new Response([
+          `data: ${JSON.stringify({
+            type: 'response.completed',
+            response: { status: 'completed', output: [{ type: 'message', content: [] }] }
+          })}`,
+          'data: [DONE]'
+        ].join('\n\n'), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' }
+        })
+      }
+      return new Response([
+        `data: ${JSON.stringify({
+          type: 'response.output_item.done',
+          item: { type: 'image_generation_call', result: resultBase64 }
+        })}`,
+        'data: [DONE]'
+      ].join('\n\n'), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' }
+      })
+    }))
+    const client = new CodexResponsesImageClient('https://chatgpt.com/backend-api/codex', 'codex-access')
+
+    const image = await client.generate({
+      prompt: 'tiny square',
+      model: 'gpt-image-2',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(image.data.byteLength).toBeGreaterThan(0)
+    expect(requests).toHaveLength(3)
+    expect(JSON.parse(requests[0]).tool_choice).toMatchObject({ type: 'allowed_tools' })
+    expect(JSON.parse(requests[1]).tool_choice).toBe('required')
+    expect(JSON.parse(requests[2]).tool_choice).toBeUndefined()
+  })
+
+  it('summarizes Codex responses that complete without image data', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      `data: ${JSON.stringify({
+        type: 'response.output_text.delta',
+        delta: 'I can help with that.'
+      })}`,
+      `data: ${JSON.stringify({
+        type: 'response.completed',
+        response: {
+          status: 'completed',
+          output: [{
+            type: 'message',
+            content: [{ type: 'output_text', text: 'I can help with that.' }]
+          }]
+        }
+      })}`,
+      'data: [DONE]'
+    ].join('\n\n'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    })))
+    const client = new CodexResponsesImageClient('https://chatgpt.com/backend-api/codex', 'codex-access')
+
+    await expect(client.generate({
+      prompt: 'tiny square',
+      model: 'gpt-image-2',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })).rejects.toThrow(/events: response\.output_text\.delta, response\.completed; output: message; text: I can help with that/)
+  })
+
   it('generates an image, saves it to the workspace, and scopes the attachment', async () => {
     const client = fakeClient()
     const store = attachmentStore(join(workspace, 'attachments'))
@@ -230,22 +724,178 @@ describe('Image gen tool provider', () => {
       model: string
       size: string
       endpoint: string
+      quality: string
       warnings: string[]
     }
     expect(output.endpoint).toBe('generations')
     expect(output.model).toBe('test-image-model')
     expect(output.size).toBe('1024x576')
+    expect(output.quality).toBe('auto')
     expect(output.warnings).toEqual([])
     expect(output.files[0]).toMatchObject({ mimeType: 'image/png', width: 1024, height: 576 })
     expect(output.files[0].relativePath.startsWith('.deepseekgui-images/')).toBe(true)
     expect(existsSync(output.files[0].absolutePath)).toBe(true)
     expect(JSON.stringify(output)).not.toMatch(/base64|b64_json/)
-    expect(client.generateCalls[0]).toMatchObject({ prompt: 'a sunset over the sea', size: '1024x576' })
+    expect(client.generateCalls[0]).toMatchObject({
+      prompt: 'a sunset over the sea',
+      quality: 'auto',
+      size: '1024x576'
+    })
 
     expect(output.attachments).toHaveLength(1)
     const id = output.attachments[0].id
     await expect(store.resolveContent(id, { threadId: 'thr_1' })).resolves.toMatchObject({ mimeType: 'image/png' })
     await expect(store.resolveContent(id, { threadId: 'thr_other' })).rejects.toThrow(/not authorized/)
+  })
+
+  it('uses the configured default resolution unless the user explicitly overrides it', async () => {
+    const client = fakeClient()
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({ defaultResolution: '2K' }), {
+          client,
+          nowIso: () => '2026-06-10T00:00:00.000Z'
+        }).providers
+      )
+    })
+
+    await host.execute({
+      callId: 'call_default_resolution',
+      toolName: 'generate_image',
+      arguments: { prompt: 'wide landscape', aspect_ratio: '16:9' }
+    }, buildContext())
+    await host.execute({
+      callId: 'call_explicit_resolution',
+      toolName: 'generate_image',
+      arguments: { prompt: 'smaller wide landscape', aspect_ratio: '16:9', image_size: '1K' }
+    }, buildContext())
+
+    expect(client.generateCalls[0]).toMatchObject({ size: '2048x1152' })
+    expect(client.generateCalls[1]).toMatchObject({ size: '1024x576' })
+  })
+
+  it('keeps Seedream-only resolution defaults from leaking across protocols', async () => {
+    const genericClient = fakeClient()
+    const seedreamClient = fakeClient()
+    const genericHost = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({
+          protocol: 'openai-images',
+          defaultResolution: '4K'
+        }), { client: genericClient }).providers
+      )
+    })
+    const seedreamHost = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({
+          protocol: 'volcengine-ark-image',
+          defaultResolution: '1K'
+        }), { client: seedreamClient }).providers
+      )
+    })
+
+    await genericHost.execute({
+      callId: 'call_generic_stale_4k',
+      toolName: 'generate_image',
+      arguments: { prompt: 'generic image' }
+    }, buildContext())
+    await seedreamHost.execute({
+      callId: 'call_seedream_stale_1k',
+      toolName: 'generate_image',
+      arguments: { prompt: 'Seedream image' }
+    }, buildContext())
+
+    expect(genericClient.generateCalls[0]).toMatchObject({ size: '1024x1024' })
+    expect(seedreamClient.generateCalls[0]).toMatchObject({ size: '2048x2048' })
+  })
+
+  it('lets the provider choose dimensions when default resolution is auto and no ratio is requested', async () => {
+    const client = fakeClient()
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({ defaultResolution: 'auto' }), {
+          client,
+          nowIso: () => '2026-06-10T00:00:00.000Z'
+        }).providers
+      )
+    })
+
+    await host.execute({
+      callId: 'call_auto_resolution',
+      toolName: 'generate_image',
+      arguments: { prompt: 'provider-sized image' }
+    }, buildContext())
+
+    expect(client.generateCalls[0]).not.toHaveProperty('size')
+  })
+
+  it('rejects generated-image writes through an escaping workspace symlink', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'kun-imagegen-outside-'))
+    try {
+      await symlink(outside, join(workspace, '.deepseekgui-images'), process.platform === 'win32' ? 'junction' : 'dir')
+      const client = fakeClient()
+      const host = hostFor(client)
+
+      const result = await host.execute({
+        callId: 'call_escape',
+        toolName: 'generate_image',
+        arguments: { prompt: 'must stay in workspace' }
+      }, { ...buildContext(), sandboxMode: 'workspace-write' })
+
+      expect(result.item).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(JSON.stringify(result.item)).toContain('workspace_path_escape')
+      expect(client.generateCalls).toHaveLength(1)
+      await expect(readdir(outside)).resolves.toEqual([])
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('does not read a reference image through an escaping workspace symlink', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'kun-imagegen-reference-outside-'))
+    try {
+      await mkdir(join(workspace, 'refs'))
+      await writeFile(join(outside, 'secret.png'), png(8, 8))
+      await symlink(join(outside, 'secret.png'), join(workspace, 'refs', 'linked.png'), 'file')
+      const client = fakeClient()
+      const host = hostFor(client)
+
+      const result = await host.execute({
+        callId: 'call_reference_escape',
+        toolName: 'generate_image',
+        arguments: { prompt: 'use reference', reference_image_paths: ['refs/linked.png'] }
+      }, { ...buildContext(), sandboxMode: 'workspace-write' })
+
+      expect(result.item).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(JSON.stringify(result.item)).toContain('invalid_reference_path')
+      expect(client.generateCalls).toHaveLength(0)
+      expect(client.editCalls).toHaveLength(0)
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('passes configured image quality through tool execution', async () => {
+    const client = fakeClient()
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({ quality: 'high', defaultResolution: '2K' }), {
+          client,
+          nowIso: () => '2026-06-10T00:00:00.000Z'
+        }).providers
+      )
+    })
+
+    const result = await host.execute({
+      callId: 'call_1',
+      toolName: 'generate_image',
+      arguments: { prompt: 'a detailed product render' }
+    }, buildContext())
+
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: false })
+    if (result.item.kind !== 'tool_result') return
+    expect(result.item.output).toMatchObject({ quality: 'high' })
+    expect(client.generateCalls[0]).toMatchObject({ quality: 'high', size: '2048x2048' })
   })
 
   it('posts generations as JSON and decodes b64_json responses', async () => {
@@ -276,6 +926,41 @@ describe('Image gen tool provider', () => {
       n: 1,
       response_format: 'b64_json'
     })
+    expect(JSON.parse(requests[0].body).quality).toBeUndefined()
+  })
+
+  it('sends OpenAI-compatible quality when configured and retries without it if rejected', async () => {
+    const requests: Array<{ url: string; body: string }> = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
+      requests.push({ url: String(url), body: String(init?.body) })
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'Unknown parameter: quality' } }), { status: 400 })
+      }
+      return new Response(JSON.stringify({ data: [{ b64_json: png(8, 8).toString('base64') }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }))
+    const client = new OpenAiCompatImageClient('https://images.example.test/v1', 'sk-test')
+
+    const image = await client.generate({
+      prompt: 'high fidelity icon',
+      model: 'gpt-image-2',
+      quality: 'high',
+      timeoutMs: 1_000,
+      signal: new AbortController().signal
+    })
+
+    expect(image).toMatchObject({ mimeType: 'image/png' })
+    expect(requests).toHaveLength(2)
+    expect(JSON.parse(requests[0].body)).toMatchObject({
+      model: 'gpt-image-2',
+      prompt: 'high fidelity icon',
+      quality: 'high',
+      response_format: 'b64_json'
+    })
+    expect(JSON.parse(requests[1].body).quality).toBeUndefined()
+    expect(JSON.parse(requests[1].body).response_format).toBe('b64_json')
   })
 
   it('downloads url responses and retries once without response_format when rejected', async () => {
@@ -352,6 +1037,60 @@ describe('Image gen tool provider', () => {
     expect(captured[1].body.getAll('image[]')).toHaveLength(2)
   })
 
+  it('allowlists only real-edit protocols in protocolSupportsImageEdit', () => {
+    expect(protocolSupportsImageEdit('openai-images')).toBe(true)
+    expect(protocolSupportsImageEdit('codex-responses-image')).toBe(true)
+    expect(protocolSupportsImageEdit('volcengine-ark-image')).toBe(true)
+    expect(protocolSupportsImageEdit(undefined)).toBe(true)
+    expect(protocolSupportsImageEdit('minimax-image')).toBe(false)
+    expect(protocolSupportsImageEdit('grok-imagine-image')).toBe(false)
+  })
+
+  it('returns edits_unsupported BEFORE any network call when references are passed on a non-edit protocol (MiniMax)', async () => {
+    await writeFile(join(workspace, 'ref.png'), png(16, 16))
+    const client = fakeClient()
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({ protocol: 'minimax-image' }), { client }).providers
+      )
+    })
+    const result = await host.execute({
+      callId: 'call_edit',
+      toolName: 'generate_image',
+      arguments: { prompt: 'restyle this', reference_image_paths: ['ref.png'] }
+    }, buildContext())
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: true })
+    if (result.item.kind === 'tool_result') {
+      expect((result.item.output as { error?: { code?: string } }).error?.code).toBe('edits_unsupported')
+    }
+    expect(client.editCalls).toHaveLength(0) // never reached the provider
+  })
+
+  it('does not advertise image-to-image (reference_image_paths) on a non-edit protocol', async () => {
+    const minimaxTools = await new LocalToolHost({
+      registry: new CapabilityRegistry(buildImageGenToolProviders(imageGenConfig({ protocol: 'minimax-image' })).providers)
+    }).listTools(buildContext())
+    const minimaxTool = minimaxTools.find((tool) => tool.name === 'generate_image')!
+    expect(minimaxTool.description).not.toContain('image-to-image')
+    expect((minimaxTool.inputSchema.properties as Record<string, unknown>)).not.toHaveProperty('reference_image_paths')
+
+    const openaiTools = await new LocalToolHost({
+      registry: new CapabilityRegistry(buildImageGenToolProviders(imageGenConfig()).providers)
+    }).listTools(buildContext())
+    const openaiTool = openaiTools.find((tool) => tool.name === 'generate_image')!
+    expect(openaiTool.description).toContain('image-to-image')
+    expect((openaiTool.inputSchema.properties as Record<string, unknown>)).toHaveProperty('reference_image_paths')
+
+    const codexTools = await new LocalToolHost({
+      registry: new CapabilityRegistry(
+        buildImageGenToolProviders(imageGenConfig({ protocol: 'codex-responses-image' })).providers
+      )
+    }).listTools(buildContext())
+    const codexTool = codexTools.find((tool) => tool.name === 'generate_image')!
+    expect(codexTool.description).toContain('image-to-image')
+    expect((codexTool.inputSchema.properties as Record<string, unknown>)).toHaveProperty('reference_image_paths')
+  })
+
   it('rejects reference paths that escape the workspace or are not images', async () => {
     const client = fakeClient()
     const host = hostFor(client)
@@ -408,7 +1147,7 @@ describe('Image gen tool provider', () => {
       expect(result.item.output).toMatchObject({
         error: {
           code: 'edits_unsupported',
-          message: expect.stringContaining('retry generate_image without reference_image_paths')
+          message: expect.stringContaining('reference image edits; retry generate_image without reference_image_paths')
         }
       })
     }

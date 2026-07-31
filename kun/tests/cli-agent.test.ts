@@ -120,10 +120,10 @@ describe('Kun agent CLI commands', () => {
     await rm(dataDir, { recursive: true, force: true })
   })
 
-  it('splits explicit commands and keeps legacy serve flags compatible', () => {
+  it('splits explicit commands and uses flags for the default TUI', () => {
     expect(splitKunCliCommand(['run', 'hello'])).toEqual({ command: 'run', args: ['hello'] })
     expect(splitKunCliCommand(['--port', '9999'])).toEqual({
-      command: 'serve',
+      command: 'tui',
       args: ['--port', '9999']
     })
     expect(splitKunCliCommand(['nope']).error).toMatch(/unknown command/)
@@ -238,6 +238,31 @@ describe('Kun agent CLI commands', () => {
     const parsed = JSON.parse(c.stdout) as { status: string; items: TurnItem[] }
     expect(parsed.status).toBe('completed')
     expect(parsed.items.some((item) => item.kind === 'assistant_text')).toBe(true)
+  })
+
+  it('streams a stable JSONL envelope for headless runs', async () => {
+    const c = capture({ createRuntime: fakeRuntime() })
+    const code = await runAgentCommand('run', [
+      '--data-dir',
+      dataDir,
+      '--prompt',
+      'hello',
+      '--jsonl'
+    ], c.io)
+
+    expect(code).toBe(ServeExitCode.ok)
+    const lines = c.stdout.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+    expect(lines[0]).toMatchObject({ type: 'run_started' })
+    expect(lines.at(-1)).toMatchObject({ type: 'run_finished', status: 'completed' })
+  })
+
+  it('rejects combining JSON and JSONL output modes', async () => {
+    const c = capture({ createRuntime: fakeRuntime() })
+    const code = await runAgentCommand('run', [
+      '--data-dir', dataDir, '--prompt', 'hello', '--json', '--jsonl'
+    ], c.io)
+    expect(code).toBe(ServeExitCode.usage)
+    expect(c.stderr).toContain('mutually exclusive')
   })
 
   it('returns runtime failures from one-shot runs', async () => {

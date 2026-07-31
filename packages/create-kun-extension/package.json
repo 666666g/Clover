@@ -1,0 +1,26 @@
+{
+  "name": "create-kun-extension",
+  "version": "1.0.0",
+  "description": "Scaffold a Kun extension project",
+  "type": "module",
+  "bin": {
+    "create-kun-extension": "./src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/scaffold.mjs"
+  },
+  "files": ["src", "templates", "README.md"],
+  "scripts": {
+    "build": "node --check src/cli.mjs && node --check src/scaffold.mjs",
+    "test": "vitest run --root .",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@kun/extension-api": "1.2.0",
+    "vitest": "^4.1.7"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

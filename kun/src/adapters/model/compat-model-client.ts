@@ -1,14 +1,14 @@
-import type { ModelClient, ModelRequest, ModelStreamChunk, ModelToolSpec } from '../../ports/model-client.js'
-import type { TurnItem } from '../../contracts/items.js'
-import { emptyUsageSnapshot, type UsageSnapshot } from '../../contracts/usage.js'
+import { randomUUID } from 'node:crypto'
+import type { ModelClient, ModelRequest, ModelStreamChunk } from '../../ports/model-client.js'
+import type { UsageSnapshot } from '../../contracts/usage.js'
 import type { ModelCapabilityMetadata } from '../../contracts/capabilities.js'
-import type { LlmDebugRound, LlmDebugSink } from '../../services/llm-debug-recorder.js'
-import { estimateDeepseekCost } from './deepseek-pricing.js'
-import { estimateMiniMaxCost } from './minimax-pricing.js'
-import { isToolResultBridgeItem, repairModelHistoryItems } from '../../domain/model-history-repair.js'
-import { extractToolResultImages, toolResultTextWithoutImages } from '../../loop/tool-result-image.js'
+import {
+  startLlmDebugRoundIfEnabled,
+  type LlmDebugRound,
+  type LlmDebugSink
+} from '../../services/llm-debug-recorder.js'
 import { repairToolArguments } from './tool-argument-repair.js'
-import { isDeepSeekHost, probeDeepSeekReachable } from './model-error-probe.js'
+import type { ModelRequestRetryConfig } from '../../config/kun-config.js'
 import {
   DEFAULT_MODEL_ENDPOINT_FORMAT,
   isCustomModelEndpointFormat,
@@ -19,6 +19,50 @@ import {
   type ModelEndpointFormat
 } from '../../contracts/model-endpoint-format.js'
 import { createProxyFetch } from './proxy-fetch.js'
+import { resolveCompatModelCapabilities } from './compat-capabilities.js'
+import {
+  DEFAULT_MODEL_STREAM_LIMITS,
+  ModelStreamResourceBudget,
+  ModelStreamResourceLimitError,
+  type ModelStreamLimits,
+  type PendingToolCall
+} from './model-stream-resource-budget.js'
+import { normalizeCompatUsage } from './compat-usage-normalizer.js'
+import {
+  exponentialRetryDelayMs,
+  normalizeModelRequestRetryConfig,
+  retryDelayMs,
+  sleepWithAbort
+} from './compat-retry-policy.js'
+import {
+  buildCompatRequestHeaders,
+  classifyCompatHttpError,
+  compatHttpFailureLog,
+  redactUrlForLog
+} from './compat-http-diagnostics.js'
+import type { CompatChatMessage } from './compat-request-codecs.js'
+import { projectCompatMessages } from './compat-message-projector.js'
+import {
+  codexModelSupportsNativeImageGeneration,
+  createCompatRequestCodecs,
+  normalizeToolSpecs,
+  requiresReasoningRoundTrip
+} from './compat-request-builder.js'
+import { decodeChatCompletionsStreamPayload } from './chat-completions-stream-decoder.js'
+import {
+  createResponsesContentTracker,
+  decodeResponsesStreamPayload
+} from './responses-stream-decoder.js'
+import { decodeAnthropicMessagesStreamPayload } from './anthropic-messages-stream-decoder.js'
+import { decodeCompatNonStreamingResponse } from './compat-non-streaming-decoder.js'
+import { IncrementalSseFrameBuffer } from './incremental-sse-frame-buffer.js'
+
+export { redactUrlForLog } from './compat-http-diagnostics.js'
+
+export {
+  DEFAULT_MODEL_STREAM_LIMITS,
+  type ModelStreamLimits
+} from './model-stream-resource-budget.js'
 
 /**
  * Configuration for the compatible HTTP model client. Chat
@@ -33,6 +77,14 @@ export type CompatModelClientConfig = {
   endpointFormat?: ModelEndpointFormat
   /** Optional extra headers, e.g. project or session ids. */
   headers?: Record<string, string>
+  /**
+   * Resolves protected request credentials immediately before each HTTP call.
+   * Passing the rejected access token after a 401 lets OAuth implementations
+   * rotate it once without racing concurrent requests.
+   */
+  resolveCredentials?: (
+    rejectedAccessToken?: string
+  ) => Promise<{ apiKey: string; headers?: Record<string, string>; refreshable: boolean }>
   /** HTTP fetch implementation. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch
   /** Optional proxy URL used only for model HTTP requests. */
@@ -43,44 +95,22 @@ export type CompatModelClientConfig = {
   nonStreaming?: boolean
   /** Maximum idle time between streaming chunks before the turn fails. */
   streamIdleTimeoutMs?: number
+  /** Resource ceilings for one provider SSE response. */
+  streamLimits?: Partial<ModelStreamLimits>
+  /** 流式响应开始前,遇到临时失败或限流响应时使用的 HTTP 重试策略。 */
+  retry?: ModelRequestRetryConfig
   /** Optional model capability resolver used for provider-specific reasoning translation. */
   modelCapabilities?: (model: string) => ModelCapabilityMetadata
   /** Optional troubleshooting sink that captures each request body + raw output. */
   debugSink?: LlmDebugSink
 }
 
-type ChatMessage = {
-  role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string | ChatMessageContentPart[] | null
-  name?: string
-  tool_call_id?: string
-  reasoning_content?: string
-  tool_calls?: {
-    id: string
-    type: 'function'
-    function: { name: string; arguments: string }
-  }[]
-}
+type ChatMessage = CompatChatMessage
+type ModelStopReason = Extract<ModelStreamChunk, { kind: 'completed' }>['stopReason']
 
-type ChatMessageContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } }
-
-type AnthropicCacheControl = { type: 'ephemeral' }
-
-type AnthropicImageSource = { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string }
-
-type AnthropicContentBlock = (
-  | { type: 'text'; text: string }
-  | { type: 'image'; source: AnthropicImageSource }
-  | { type: 'thinking'; thinking: string }
-  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; tool_use_id: string; content: string }
-) & { cache_control?: AnthropicCacheControl }
-
-type AnthropicMessage = {
-  role: 'user' | 'assistant'
-  content: string | AnthropicContentBlock[]
+function mergeStreamFinishReason(current: string | null, next: string): string {
+  if (current && current !== 'stop' && next === 'stop') return current
+  return next
 }
 
 type ChatCompletionResponse = {
@@ -111,46 +141,43 @@ type ChatCompletionResponse = {
   }
 }
 
-type ResponsesApiResponse = {
-  id?: string
-  status?: string
-  output_text?: string
-  output?: Array<Record<string, unknown>>
-  usage?: Record<string, unknown>
-  error?: { message?: string; type?: string } | null
-  incomplete_details?: { reason?: string } | null
-}
-
-type AnthropicMessageResponse = {
-  id?: string
-  type?: string
-  role?: string
-  content?: Array<Record<string, unknown>>
-  stop_reason?: string | null
-  usage?: Record<string, unknown>
-}
-
-type ModelStopReason = Extract<ModelStreamChunk, { kind: 'completed' }>['stopReason']
-type PendingToolCall = {
-  index?: number
-  name?: string
-  arguments: string
-}
 type StreamReadResult =
   | { kind: 'chunk'; value?: Uint8Array; done: boolean }
   | { kind: 'timeout' }
   | { kind: 'aborted' }
   | { kind: 'error'; message: string }
+type StreamPayloadResult = {
+  chunks: ModelStreamChunk[]
+  sawTextDelta: boolean
+  finishReason: string | null
+  usage: UsageSnapshot | null
+}
+type CompatPostResult =
+  | { kind: 'response'; response: Response }
+  | {
+      kind: 'error'
+      message: string
+      failure: import('../../contracts/model-route-pool.js').ModelFailureMetadata
+    }
 
-const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 45_000
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 450_000
+const MIN_SAFE_STREAM_RECOVERY_ATTEMPTS = 1
 const DEFAULT_MESSAGES_MAX_TOKENS = 4096
 const REASONING_MESSAGES_MAX_TOKENS = 8_192
 const MAX_REASONING_MESSAGES_MAX_TOKENS = 32_768
 
+/**
+ * 根据 reasoning 强度选择默认 max_tokens：非推理/off 为 4096，
+ * 'max' 为 32768，其余推理等级为 8192。
+ */
 function defaultMessagesMaxTokens(reasoningEffort?: string): number {
   if (!reasoningEffort || reasoningEffort === 'off') return DEFAULT_MESSAGES_MAX_TOKENS
   if (reasoningEffort === 'max') return MAX_REASONING_MESSAGES_MAX_TOKENS
   return REASONING_MESSAGES_MAX_TOKENS
+}
+
+function isCodexEndpoint(baseUrl: string): boolean {
+  return baseUrl.includes('chatgpt.com/backend-api/codex')
 }
 
 /**
@@ -169,11 +196,15 @@ export class CompatModelClient implements ModelClient {
 
   private readonly config: CompatModelClientConfig
   private readonly fetchImpl: typeof fetch
+  private readonly codexSessionId: string | undefined
 
   constructor(config: CompatModelClientConfig) {
     this.config = config
     this.model = config.model
     this.fetchImpl = config.fetchImpl ?? createProxyFetch(config.modelProxyUrl ?? '') ?? fetch
+    this.codexSessionId = isCodexEndpoint(config.baseUrl)
+      ? config.headers?.session_id?.trim() || randomUUID()
+      : undefined
   }
 
   /**
@@ -192,47 +223,32 @@ export class CompatModelClient implements ModelClient {
       yield* this.streamInner(request, null)
       return
     }
-    const round = sink.start({
+    const round = await startLlmDebugRoundIfEnabled(sink, {
       threadId: request.threadId,
       turnId: request.turnId,
       provider: this.provider,
-      model: request.model?.trim() || this.config.model
-    })
+      model: request.model?.trim() || this.config.model,
+      toolCatalog: request.tools.map((tool) => ({
+        name: tool.name,
+        ...(tool.providerKind ? { providerKind: tool.providerKind } : {}),
+        ...(tool.providerId ? { providerId: tool.providerId } : {})
+      }))
+    }, warnModelTraceFailure)
+    if (!round) {
+      yield* this.streamInner(request, null)
+      return
+    }
     try {
       for await (const chunk of this.streamInner(request, round)) {
-        this.captureChunk(round, chunk)
+        ignoreModelTraceFailure(() => sink.captureChunk(round, chunk))
         yield chunk
       }
     } finally {
-      sink.finish(round)
-    }
-  }
-
-  private captureChunk(round: LlmDebugRound, chunk: ModelStreamChunk): void {
-    const out = round.output
-    switch (chunk.kind) {
-      case 'assistant_text_delta':
-        out.text += chunk.text
-        break
-      case 'assistant_reasoning_delta':
-        out.reasoning += chunk.text
-        break
-      case 'tool_call_complete':
-        out.toolCalls.push({
-          callId: chunk.callId,
-          toolName: chunk.toolName,
-          arguments: chunk.arguments
-        })
-        break
-      case 'usage':
-        out.usage = chunk.usage
-        break
-      case 'completed':
-        out.stopReason = chunk.stopReason
-        break
-      case 'error':
-        out.error = chunk.message
-        break
+      try {
+        await sink.finish(round)
+      } catch {
+        warnModelTraceFailure()
+      }
     }
   }
 
@@ -260,59 +276,186 @@ export class CompatModelClient implements ModelClient {
     const url = buildModelEndpointUrl(this.config.baseUrl, configuredEndpointFormat)
     const stream = request.stream ?? !this.config.nonStreaming
     const body = this.buildRequestBody(request, stream, { endpointFormat })
-    if (round) {
-      round.requestBody = body
-      round.url = redactUrlForLog(url)
+    let credentials: { apiKey: string; headers?: Record<string, string>; refreshable: boolean }
+    try {
+      credentials = this.config.resolveCredentials
+        ? await this.config.resolveCredentials()
+        : { apiKey: this.config.apiKey, headers: this.config.headers, refreshable: false }
+    } catch (error) {
+      yield {
+        kind: 'error',
+        code: 'credential_refresh_failed',
+        message: error instanceof Error ? error.message : String(error)
+      }
+      return
     }
-    const headers = this.buildHeaders(stream, endpointFormat)
-    let result = await this.postChatCompletion(url, headers, body, request.abortSignal)
-    // Retry transient gateway failures (502/503/504) a few times before giving
-    // up. These are upstream load-balancer hiccups (e.g. an ALB returning
-    // "502 Bad Gateway"), not request errors — failing the whole turn on the
-    // first blip is needlessly fragile, especially for flaky providers. No
-    // response body has been streamed yet, so re-POSTing the same request is
-    // safe. Aborts short-circuit the backoff.
-    for (let attempt = 0; attempt < MAX_TRANSIENT_RETRIES; attempt += 1) {
-      if (result.kind === 'error') break
-      if (result.response.ok || !TRANSIENT_RETRY_STATUSES.has(result.response.status)) break
+    const responsesLite = isCodexEndpoint(this.config.baseUrl) &&
+      this.capabilitiesForModel(requestModel).responsesMode === 'lite'
+    let headers = this.buildHeaders(stream, endpointFormat, responsesLite, credentials)
+    const retry = normalizeModelRequestRetryConfig(this.config.retry)
+    const modelStreamLimits = normalizeModelStreamLimits(this.config.streamLimits)
+    const maxErrorBodyBytes = Math.min(modelStreamLimits.maxTotalBytes, 1 * 1024 * 1024)
+    const retryStatuses = new Set(retry.httpStatusCodes)
+    let attemptOrdinal = 0
+    const post = (
+      requestBody: Record<string, unknown>,
+      reason: 'initial' | 'transport_retry' | 'credential_refresh' | 'stream_options_fallback'
+    ) => this.postChatCompletion(url, headers, requestBody, request.abortSignal, {
+      round,
+      endpointFormat,
+      attempt: ++attemptOrdinal,
+      reason,
+      apiKey: credentials.apiKey
+    })
+    let result = await post(body, 'initial')
+    let transportRetryAttempt = 0
+    let credentialRefreshAttempted = false
+    while (true) {
+      if (result.kind === 'error') {
+        if (
+          request.abortSignal.aborted ||
+          result.failure.failoverAllowed === false ||
+          transportRetryAttempt >= retry.maxAttempts
+        ) break
+        const nextAttempt = transportRetryAttempt + 1
+        const delayMs = exponentialRetryDelayMs(retry.initialDelayMs, transportRetryAttempt)
+        yield {
+          kind: 'retrying',
+          attempt: nextAttempt,
+          maxAttempts: retry.maxAttempts,
+          delayMs,
+          reason: 'network'
+        }
+        const aborted = await sleepWithAbort(delayMs, request.abortSignal)
+        if (aborted || request.abortSignal.aborted) {
+          yield { kind: 'error', message: 'request was aborted during retry backoff' }
+          return
+        }
+        transportRetryAttempt = nextAttempt
+        result = await post(body, 'transport_retry')
+        continue
+      }
+      if (result.response.ok) break
+      if (
+        result.response.status === 401 &&
+        credentials.refreshable &&
+        this.config.resolveCredentials &&
+        !credentialRefreshAttempted
+      ) {
+        credentialRefreshAttempted = true
+        await result.response.body?.cancel().catch(() => {})
+        try {
+          credentials = await this.config.resolveCredentials(credentials.apiKey)
+        } catch (error) {
+          yield {
+            kind: 'error',
+            code: 'credential_refresh_failed',
+            message: error instanceof Error ? error.message : String(error)
+          }
+          return
+        }
+        headers = this.buildHeaders(stream, endpointFormat, responsesLite, credentials)
+        result = await post(body, 'credential_refresh')
+        continue
+      }
+      if (
+        transportRetryAttempt >= retry.maxAttempts ||
+        !retryStatuses.has(result.response.status)
+      ) break
+      const delayMs = retryDelayMs(result.response, retry.initialDelayMs, transportRetryAttempt)
+      const status = result.response.status
       await result.response.body?.cancel().catch(() => {})
-      const aborted = await sleepWithAbort(TRANSIENT_RETRY_BASE_MS * 2 ** attempt, request.abortSignal)
+      yield {
+        kind: 'retrying',
+        status,
+        attempt: transportRetryAttempt + 1,
+        maxAttempts: retry.maxAttempts,
+        delayMs
+      }
+      const aborted = await sleepWithAbort(delayMs, request.abortSignal)
       if (aborted || request.abortSignal.aborted) {
         yield { kind: 'error', message: 'request was aborted during retry backoff' }
         return
       }
-      result = await this.postChatCompletion(url, headers, body, request.abortSignal)
+      transportRetryAttempt += 1
+      result = await post(body, 'transport_retry')
     }
     if (result.kind === 'error') {
-      yield { kind: 'error', message: result.message }
+      yield { kind: 'error', message: result.message, failure: result.failure }
       return
     }
     let response = result.response
     if (!response.ok) {
-      const text = await response.text()
+      const errorBody = await readLimitedResponseText(response, maxErrorBodyBytes)
+      if (errorBody.exceeded) {
+        yield {
+          kind: 'error',
+          message: `model error response exceeded ${maxErrorBodyBytes} bytes`,
+          code: 'response_body_too_large'
+        }
+        return
+      }
+      const text = errorBody.text
       if (usesChatCompletionsShape(endpointFormat) && shouldRetryWithoutStreamUsage(response.status, text, body)) {
         const retryBody = this.buildRequestBody(request, stream, { endpointFormat, includeStreamUsage: false })
-        if (round) round.requestBody = retryBody
-        const retry = await this.postChatCompletion(url, headers, retryBody, request.abortSignal)
-        if (retry.kind === 'error') {
-          yield { kind: 'error', message: retry.message }
+        const fallbackResult = await post(retryBody, 'stream_options_fallback')
+        if (fallbackResult.kind === 'error') {
+          yield { kind: 'error', message: fallbackResult.message, failure: fallbackResult.failure }
           return
         }
-        response = retry.response
+        response = fallbackResult.response
         if (response.ok) {
           if (this.config.nonStreaming || response.headers.get('content-type')?.includes('application/json')) {
-            const json = (await response.json()) as ChatCompletionResponse
-            yield* this.materializeNonStreaming(json, endpointFormat, requestModel)
+            const json = await readLimitedResponseJson(response, modelStreamLimits.maxTotalBytes)
+            if (json.kind === 'limit') {
+              yield {
+                kind: 'error',
+                message: `model response exceeded ${json.maxBytes} bytes`,
+                code: 'stream_resource_limit'
+              }
+              return
+            }
+            if (json.kind === 'invalid_json') {
+              yield { kind: 'error', message: `model response contained invalid JSON: ${json.message}` }
+              return
+            }
+            yield* this.materializeNonStreaming(
+              json.value as ChatCompletionResponse,
+              endpointFormat,
+              requestModel,
+              modelStreamLimits
+            )
             return
           }
           if (!response.body) {
             yield { kind: 'error', message: 'model response had no body' }
             return
           }
-          yield* this.streamSse(response.body, request.abortSignal, endpointFormat, requestModel)
+          yield* this.streamSseWithRecovery({
+            response,
+            request,
+            endpointFormat,
+            configuredEndpointFormat,
+            model: requestModel,
+            retry,
+            usedRetryAttempts: transportRetryAttempt,
+            post: () => post(retryBody, 'transport_retry'),
+            url,
+            maxErrorBodyBytes,
+            streamLimits: modelStreamLimits
+          })
           return
         }
-        const retryText = await response.text()
+        const retryErrorBody = await readLimitedResponseText(response, maxErrorBodyBytes)
+        if (retryErrorBody.exceeded) {
+          yield {
+            kind: 'error',
+            message: `model error response exceeded ${maxErrorBodyBytes} bytes`,
+            code: 'response_body_too_large'
+          }
+          return
+        }
+        const retryText = retryErrorBody.text
         this.logHttpFailure({
           url,
           status: response.status,
@@ -321,11 +464,12 @@ export class CompatModelClient implements ModelClient {
           configuredEndpointFormat,
           model: requestModel
         })
-        const retryClassified = await this.classifyHttpError(response.status, retryText)
+        const retryClassified = await this.classifyHttpError(response.status, retryText, response.headers.get('retry-after'))
         yield {
           kind: 'error',
           message: retryClassified.message,
-          code: retryClassified.code
+          code: retryClassified.code,
+          failure: retryClassified.failure
         }
         return
       }
@@ -337,24 +481,54 @@ export class CompatModelClient implements ModelClient {
         configuredEndpointFormat,
         model: requestModel
       })
-      const classified = await this.classifyHttpError(response.status, text)
+      const classified = await this.classifyHttpError(response.status, text, response.headers.get('retry-after'))
       yield {
         kind: 'error',
         message: classified.message,
-        code: classified.code
+        code: classified.code,
+        failure: classified.failure
       }
       return
     }
     if (this.config.nonStreaming || response.headers.get('content-type')?.includes('application/json')) {
-      const json = (await response.json()) as ChatCompletionResponse
-      yield* this.materializeNonStreaming(json, endpointFormat, requestModel)
+      const json = await readLimitedResponseJson(response, modelStreamLimits.maxTotalBytes)
+      if (json.kind === 'limit') {
+        yield {
+          kind: 'error',
+          message: `model response exceeded ${json.maxBytes} bytes`,
+          code: 'stream_resource_limit'
+        }
+        return
+      }
+      if (json.kind === 'invalid_json') {
+        yield { kind: 'error', message: `model response contained invalid JSON: ${json.message}` }
+        return
+      }
+      yield* this.materializeNonStreaming(
+        json.value as ChatCompletionResponse,
+        endpointFormat,
+        requestModel,
+        modelStreamLimits
+      )
       return
     }
     if (!response.body) {
       yield { kind: 'error', message: 'model response had no body' }
       return
     }
-    yield* this.streamSse(response.body, request.abortSignal, endpointFormat, requestModel)
+    yield* this.streamSseWithRecovery({
+      response,
+      request,
+      endpointFormat,
+      configuredEndpointFormat,
+      model: requestModel,
+      retry,
+      usedRetryAttempts: transportRetryAttempt,
+      post: () => post(body, 'transport_retry'),
+      url,
+      maxErrorBodyBytes,
+      streamLimits: modelStreamLimits
+    })
   }
 
   private endpointFormat(): ModelEndpointFormat {
@@ -368,17 +542,24 @@ export class CompatModelClient implements ModelClient {
    * Anthropic Messages models (e.g. OpenCode Go's minimax/qwen entries).
    */
   private endpointFormatForModel(model: string): ModelEndpointFormat {
-    const perModel = this.config.modelCapabilities?.(model).endpointFormat
-    return normalizeModelEndpointFormat(perModel ?? this.config.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT)
+    return this.capabilitiesForModel(model).endpointFormat
   }
 
   private modelReasoningFor(model: string): ModelCapabilityMetadata['reasoning'] | undefined {
-    return this.config.modelCapabilities?.(model).reasoning
+    return this.capabilitiesForModel(model).reasoning
   }
 
   /** Per-model output-token cap from capability metadata, if declared. */
   private maxOutputTokensFor(model: string): number | undefined {
-    return this.config.modelCapabilities?.(model).maxOutputTokens
+    return this.capabilitiesForModel(model).maxOutputTokens
+  }
+
+  private capabilitiesForModel(model: string) {
+    return resolveCompatModelCapabilities({
+      model,
+      providerEndpointFormat: this.config.endpointFormat,
+      modelCapabilities: this.config.modelCapabilities
+    })
   }
 
   /**
@@ -397,17 +578,46 @@ export class CompatModelClient implements ModelClient {
     url: string,
     headers: Record<string, string>,
     body: Record<string, unknown>,
-    signal: AbortSignal
-  ): Promise<{ kind: 'response'; response: Response } | { kind: 'error'; message: string }> {
+    signal: AbortSignal,
+    trace: {
+      round: LlmDebugRound | null
+      endpointFormat: ModelEndpointFormat
+      attempt: number
+      reason: 'initial' | 'transport_retry' | 'credential_refresh' | 'stream_options_fallback'
+      apiKey: string
+    }
+  ): Promise<CompatPostResult> {
+    const bodyText = JSON.stringify(body)
+    const traceRound = trace.round
+    const traceSink = this.config.debugSink
+    const traceRecord = traceRound && traceSink
+      ? ignoreModelTraceFailure(() => traceSink.beginHttpAttempt(traceRound, {
+          endpointFormat: trace.endpointFormat,
+          attempt: trace.attempt,
+          reason: trace.reason,
+          url,
+          headers,
+          bodyText,
+          secretValues: [trace.apiKey]
+        }))
+      : undefined
     try {
       const response = await this.fetchImpl(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body: bodyText,
         signal
       })
+      if (traceRound && traceSink && traceRecord) {
+        ignoreModelTraceFailure(() => {
+          traceSink.captureHttpResponse(traceRound, traceRecord, response)
+        })
+      }
       return { kind: 'response', response }
     } catch (error) {
+      if (traceRecord) {
+        ignoreModelTraceFailure(() => traceSink?.captureHttpError(traceRecord, error))
+      }
       const message = error instanceof Error ? error.message : String(error)
       // Only blame the proxy for genuine transport failures. A user-initiated
       // abort (turn cancelled, idle-timeout watchdog) also surfaces here as an
@@ -417,59 +627,52 @@ export class CompatModelClient implements ModelClient {
       const proxyHint = !aborted && this.config.modelProxyUrl?.trim()
         ? '. Check the configured model-request proxy in Settings > Providers.'
         : ''
-      return { kind: 'error', message: `model request failed: ${message}${proxyHint}` }
+      const timeout = /timeout|timed out/i.test(message)
+      return {
+        kind: 'error',
+        message: `model request failed: ${message}${proxyHint}`,
+        failure: { category: timeout ? 'timeout' : 'network', failoverAllowed: !aborted }
+      }
     }
   }
 
-  private buildHeaders(stream: boolean, endpointFormat: ModelEndpointFormat): Record<string, string> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
+  private buildHeaders(
+    stream: boolean,
+    endpointFormat: ModelEndpointFormat,
+    responsesLite = false,
+    credentials: {
+      apiKey: string
+      headers?: Record<string, string>
+    } = {
+      apiKey: this.config.apiKey,
+      headers: this.config.headers
     }
-    // `stream: true` is enough for OpenAI-compatible providers to return SSE.
-    // Some Windows Node/Electron paths time out when routing requests with
-    // `Accept: text/event-stream`, while the same stream works without it.
-    if (!stream) headers.Accept = 'application/json'
-    if (this.config.apiKey) {
-      if (endpointFormat === 'messages') {
-        headers.Authorization = `Bearer ${this.config.apiKey}`
-        headers['x-api-key'] = this.config.apiKey
-        headers['anthropic-version'] = '2023-06-01'
-      } else {
-        headers.Authorization = `Bearer ${this.config.apiKey}`
-      }
+  ): Record<string, string> {
+    const configuredHeaders = {
+      ...(this.config.headers ?? {}),
+      ...(credentials.headers ?? {})
     }
-    return { ...headers, ...(this.config.headers ?? {}) }
+    // Protected credentials are resolved before every request and may
+    // materialize a fresh session_id. Keep transport identity owned by this
+    // client so credential refresh cannot invalidate Codex prompt routing.
+    if (this.codexSessionId) configuredHeaders.session_id = this.codexSessionId
+    return buildCompatRequestHeaders({
+      apiKey: credentials.apiKey,
+      configuredHeaders,
+      stream,
+      endpointFormat,
+      responsesLite
+    })
   }
 
-  private async classifyHttpError(status: number, text: string): Promise<{ message: string; code: string }> {
-    const body = text
-    if (status === 404) {
-      const prefix = body ? `${body} ` : ''
-      return {
-        message: `model request failed with status 404: ${prefix}Check your model provider configuration, especially Base URL and Endpoint format.`,
-        code: 'http_404'
-      }
-    }
-    if (status === 429) {
-      return {
-        message: `model request was rate limited (HTTP 429): ${body}`,
-        code: 'rate_limited'
-      }
-    }
-    if (status >= 500 && isDeepSeekHost(this.config.baseUrl)) {
-      const probe = await probeDeepSeekReachable({
-        baseUrl: this.config.baseUrl,
-        fetchImpl: this.fetchImpl
-      })
-      return {
-        message: `model request failed with DeepSeek HTTP ${status}: ${body} ${probe.message}`,
-        code: probe.reachable ? `deepseek_http_${status}` : 'deepseek_unreachable'
-      }
-    }
-    return {
-      message: `model request failed with status ${status}: ${body}`,
-      code: `http_${status}`
-    }
+  private async classifyHttpError(status: number, text: string, retryAfter?: string | null) {
+    return classifyCompatHttpError({
+      status,
+      text,
+      baseUrl: this.config.baseUrl,
+      fetchImpl: this.fetchImpl,
+      retryAfter
+    })
   }
 
   private logHttpFailure(input: {
@@ -480,17 +683,17 @@ export class CompatModelClient implements ModelClient {
     configuredEndpointFormat: ModelEndpointFormat
     model: string
   }): void {
-    console.warn('[kun:model] model HTTP request failed', {
+    console.warn('[kun:model] model HTTP request failed', compatHttpFailureLog({
       provider: this.provider,
       status: input.status,
       model: input.model,
       configuredModel: this.config.model,
-      baseUrl: redactUrlForLog(this.config.baseUrl),
-      requestUrl: redactUrlForLog(input.url),
+      baseUrl: this.config.baseUrl,
+      requestUrl: input.url,
       endpointFormat: input.endpointFormat,
       configuredEndpointFormat: input.configuredEndpointFormat,
-      responseBody: summarizeForLog(input.body)
-    })
+      body: input.body
+    }))
   }
 
   private buildRequestBody(
@@ -502,348 +705,40 @@ export class CompatModelClient implements ModelClient {
     const model = requestModel || this.config.model
     const messages = this.collectMessages(request, model)
     const endpointFormat = options.endpointFormat ?? this.endpointFormat()
-    if (endpointFormat === 'responses') {
-      return this.buildResponsesRequestBody(request, model, messages, stream)
-    }
-    if (endpointFormat === 'messages') {
-      return this.buildAnthropicMessagesRequestBody(request, model, messages, stream)
-    }
-    const body: Record<string, unknown> = {
-      model,
-      stream,
-      messages: splitToolImageMessagesForOpenAi(messages)
-    }
-    const maxTokens = this.resolveMaxTokens(request, model)
-    if (maxTokens !== undefined) {
-      body.max_tokens = maxTokens
-    }
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature
-    }
-    if (request.topP !== undefined) {
-      body.top_p = request.topP
-    }
-    if (request.responseFormat === 'json_object') {
-      body.response_format = { type: 'json_object' }
-    }
-    if (stream && options.includeStreamUsage !== false) {
-      body.stream_options = { include_usage: true }
-    }
-    const isNativeDeepSeek = isDeepSeekHost(this.config.baseUrl)
-    const includeThinking = !isAzureOpenAiEndpoint(this.config.baseUrl)
-    applyReasoningEffort(body, request.reasoningEffort, {
-      includeThinking,
-      nativeDeepSeekHost: isNativeDeepSeek,
-      reasoning: this.modelReasoningFor(model),
-      maxReasoningEffort: isNativeDeepSeek ? 'max' : 'high'
-    })
-    if (
-      includeThinking &&
-      isDeepSeekHost(this.config.baseUrl) &&
-      !Object.prototype.hasOwnProperty.call(body, 'thinking') &&
-      isThinkingProducerModel(model)
-    ) {
-      body.thinking = { type: 'enabled' }
-    }
     const tools = normalizeToolSpecs(request.tools)
-    if (tools.length > 0) {
-      body.tools = tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.inputSchema
-        }
-      }))
-    }
-    return body
-  }
-
-  private buildResponsesRequestBody(
-    request: ModelRequest,
-    model: string,
-    messages: ChatMessage[],
-    stream: boolean
-  ): Record<string, unknown> {
-    const body: Record<string, unknown> = {
-      model,
-      stream,
-      input: messagesToResponsesInput(splitToolImageMessagesForOpenAi(messages))
-    }
-    const maxTokens = this.resolveMaxTokens(request, model)
-    if (maxTokens !== undefined) {
-      body.max_output_tokens = maxTokens
-    }
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature
-    }
-    if (request.topP !== undefined) {
-      body.top_p = request.topP
-    }
-    if (request.responseFormat === 'json_object') {
-      body.text = { format: { type: 'json_object' } }
-    }
-    const reasoning = responsesReasoningForEffort(
-      request.reasoningEffort,
-      this.modelReasoningFor(model)
-    )
-    if (reasoning) body.reasoning = reasoning
-    const tools = normalizeToolSpecs(request.tools)
-    if (tools.length > 0) {
-      body.tools = tools.map((tool) => ({
-        type: 'function',
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.inputSchema
-      }))
-    }
-    return body
-  }
-
-  private buildAnthropicMessagesRequestBody(
-    request: ModelRequest,
-    model: string,
-    messages: ChatMessage[],
-    stream: boolean
-  ): Record<string, unknown> {
-    const converted = messagesToAnthropic(
-      messages,
-      this.modelReasoningFor(model)?.requestProtocol === 'anthropic-thinking'
-    )
-    applyAnthropicCacheControl(converted.messages)
-    // Thinking tokens are billed against the same output budget, so reasoning
-    // models need a much larger default cap or their tool-call arguments get
-    // truncated. A per-model `maxOutputTokens` (or an explicit request value)
-    // still wins over these defaults.
     const reasoning = this.modelReasoningFor(model)
-    const resolvedEffort =
-      reasoning?.requestProtocol === 'anthropic-thinking'
-        ? resolveReasoningEffort(request.reasoningEffort, reasoning)
-        : undefined
-    const thinkingEnabled = resolvedEffort !== undefined && resolvedEffort !== 'off'
-    const body: Record<string, unknown> = {
+    const isCodex = isCodexEndpoint(this.config.baseUrl)
+    const isCodexLite = isCodex && this.capabilitiesForModel(model).responsesMode === 'lite'
+    const codecs = createCompatRequestCodecs()
+    return codecs.build({
+      request,
       model,
+      messages,
+      tools,
       stream,
-      max_tokens: request.maxTokens ?? defaultMessagesMaxTokens(request.reasoningEffort),
-      messages: converted.messages
-    }
-    const systemText = request.responseFormat === 'json_object'
-      ? [converted.system, 'Return a valid JSON object only.']
-          .filter((item) => item.trim().length > 0)
-          .join('\n\n')
-      : converted.system
-    if (systemText) {
-      body.system = [
-        { type: 'text', text: systemText, cache_control: { type: 'ephemeral' } }
-      ] satisfies AnthropicContentBlock[]
-    }
-    if (request.temperature !== undefined) {
-      body.temperature = request.temperature
-    }
-    if (request.topP !== undefined) {
-      body.top_p = request.topP
-    }
-    applyAnthropicReasoningEffort(body, request.reasoningEffort, this.modelReasoningFor(model))
-    const tools = normalizeToolSpecs(request.tools)
-    if (tools.length > 0) {
-      body.tools = tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.inputSchema
-      }))
-    }
-    return body
+      endpointFormat,
+      includeStreamUsage: options.includeStreamUsage,
+      baseUrl: this.config.baseUrl,
+      reasoning,
+      maxTokens: this.resolveMaxTokens(request, model, defaultMessagesMaxTokens(request.reasoningEffort)),
+      isCodex,
+      isCodexLite,
+      serviceTiers: this.capabilitiesForModel(model).serviceTiers,
+      codexNativeImageGeneration: codexModelSupportsNativeImageGeneration(model)
+    })
   }
 
   private collectMessages(request: ModelRequest, model: string): ChatMessage[] {
-    const out: ChatMessage[] = []
-    if (request.systemPrompt) {
-      out.push({ role: 'system', content: request.systemPrompt })
-    }
-    if (request.modeInstruction) {
-      out.push({ role: 'system', content: request.modeInstruction })
-    }
-    const windowSize = this.config.historyLimit
-    const history = windowSize
-      ? limitHistoryPreservingCompaction(request.history, windowSize)
-      : request.history
-    const thinkingMode = requiresReasoningRoundTrip(
-      request.reasoningEffort,
-      model,
-      this.config.baseUrl,
-      this.modelReasoningFor(model)
-    )
-    const supportsImages = this.modelSupportsImageInput(model)
-    out.push(...this.itemsToMessages(
-      repairModelHistoryItems([...request.prefix, ...history]),
-      thinkingMode,
-      supportsImages
-    ))
-    // Per-turn context (goal budgets, todo state, memories, skill notes,
-    // drift warnings) is volatile — the goal instruction alone embeds a
-    // tokens-used counter that changes every step. It must trail the
-    // stable history: placed before it, every counter tick invalidated
-    // the provider prompt cache for the entire conversation.
-    for (const instruction of request.contextInstructions ?? []) {
-      if (instruction.trim()) out.push({ role: 'system', content: instruction })
-    }
-    if (request.attachments?.length) {
-      attachImagesToLatestUserMessage(out, request.attachments)
-    }
-    if (request.attachmentTextFallbacks?.length) {
-      attachTextFallbacksToLatestUserMessage(out, request.attachmentTextFallbacks)
-    }
-    return normalizeThinkingAssistantMessages(healToolMessagePairs(out), thinkingMode)
-  }
-
-  private itemsToMessages(items: TurnItem[], thinkingMode: boolean, supportsImages: boolean): ChatMessage[] {
-    const out: ChatMessage[] = []
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index]
-      if (isBridgeItemBeforeToolCall(items, index)) {
-        continue
-      }
-      if (thinkingMode && item?.kind === 'assistant_reasoning') {
-        const next = items[index + 1]
-        if (next?.kind === 'assistant_text' && next.turnId === item.turnId) {
-          out.push({
-            role: 'assistant',
-            content: next.text,
-            reasoning_content: reasoningContentOrSpace(item.text)
-          })
-          index += 1
-        }
-        continue
-      }
-      if (item?.kind === 'tool_call') {
-        const block = this.toolCallBlockToMessages(items, index, thinkingMode, supportsImages)
-        if (block) {
-          out.push(...block.messages)
-          index = block.nextIndex - 1
-        }
-        continue
-      }
-      if (item?.kind === 'tool_result') continue
-      const message = this.itemToMessage(item, thinkingMode, supportsImages)
-      if (message) out.push(message)
-    }
-    return out
-  }
-
-  private toolCallBlockToMessages(
-    items: TurnItem[],
-    startIndex: number,
-    thinkingMode: boolean,
-    supportsImages: boolean
-  ): { messages: ChatMessage[]; nextIndex: number } | null {
-    const calls: Extract<TurnItem, { kind: 'tool_call' }>[] = []
-    let index = startIndex
-    while (index < items.length && items[index]?.kind === 'tool_call') {
-      calls.push(items[index] as Extract<TurnItem, { kind: 'tool_call' }>)
-      index += 1
-    }
-    if (calls.length === 0) return null
-
-    const turnId = calls[0]?.turnId ?? ''
-    const expectedCallIds = new Set(calls.map((call) => call.callId))
-    const seenResultIds = new Set<string>()
-    const resultMessages: ChatMessage[] = []
-    const assistantText: string[] = []
-    const reasoningText: string[] = []
-    let bridgeIndex = startIndex - 1
-    while (bridgeIndex >= 0) {
-      const item = items[bridgeIndex]
-      if (!item || !isPreToolCallBridgeItem(item, turnId)) break
-      if (item.kind === 'assistant_text' && item.text.trim()) {
-        assistantText.unshift(item.text)
-      } else if (item.kind === 'assistant_reasoning' && item.text.trim()) {
-        reasoningText.unshift(item.text)
-      }
-      bridgeIndex -= 1
-    }
-    let sawResult = false
-    while (index < items.length) {
-      const item = items[index]
-      if (!item) break
-      if (item.kind === 'tool_result') {
-        sawResult = true
-        if (expectedCallIds.has(item.callId) && !seenResultIds.has(item.callId)) {
-          seenResultIds.add(item.callId)
-          resultMessages.push(this.toolResultToMessage(item, supportsImages))
-        }
-        index += 1
-        continue
-      }
-      if (isToolResultBridgeItem(item, { turnId, sawResult })) {
-        if (!sawResult) {
-          if (item.kind === 'assistant_text' && item.text.trim()) {
-            assistantText.push(item.text)
-          } else if (item.kind === 'assistant_reasoning' && item.text.trim()) {
-            reasoningText.push(item.text)
-          }
-        }
-        index += 1
-        continue
-      }
-      break
-    }
-
-    if (![...expectedCallIds].every((callId) => seenResultIds.has(callId))) {
-      return null
-    }
-    return {
-      messages: [
-        {
-          role: 'assistant',
-          content: assistantText.length > 0 ? assistantText.join('\n') : '',
-          ...(thinkingMode ? { reasoning_content: reasoningContentOrSpace(reasoningText.join('\n')) } : {}),
-          tool_calls: calls.map((call) => this.toolCallToWire(call))
-        },
-        ...resultMessages
-      ],
-      nextIndex: index
-    }
-  }
-
-  private toolCallToWire(item: Extract<TurnItem, { kind: 'tool_call' }>): NonNullable<ChatMessage['tool_calls']>[number] {
-    return {
-      id: item.callId,
-      type: 'function',
-      function: { name: item.toolName, arguments: JSON.stringify(item.arguments) }
-    }
-  }
-
-  private toolResultToMessage(
-    item: Extract<TurnItem, { kind: 'tool_result' }>,
-    supportsImages: boolean
-  ): ChatMessage {
-    const images = extractToolResultImages(item.output)
-    if (images.length > 0) {
-      const text = toolResultTextWithoutImages(item.output)
-      // A non-vision model/provider rejects image parts; send the metadata
-      // as text and drop the base64 (it is useless to a text-only model).
-      if (!supportsImages) {
-        return {
-          role: 'tool',
-          content: text || '(image omitted: the active model has no image input)',
-          tool_call_id: item.callId
-        }
-      }
-      const parts: ChatMessageContentPart[] = []
-      if (text) parts.push({ type: 'text', text })
-      for (const image of images) {
-        parts.push({
-          type: 'image_url',
-          image_url: { url: `data:${image.mimeType};base64,${image.dataBase64}` }
-        })
-      }
-      return { role: 'tool', content: parts, tool_call_id: item.callId }
-    }
-    return {
-      role: 'tool',
-      content: toolResultContent(item.output),
-      tool_call_id: item.callId
-    }
+    return projectCompatMessages(request, {
+      historyLimit: this.config.historyLimit,
+      thinkingMode: requiresReasoningRoundTrip(
+        request.reasoningEffort,
+        model,
+        this.config.baseUrl,
+        this.modelReasoningFor(model)
+      ),
+      supportsImages: this.modelSupportsImageInput(model)
+    })
   }
 
   /**
@@ -853,44 +748,212 @@ export class CompatModelClient implements ModelClient {
    * resolver is configured (the runtime always sets one).
    */
   private modelSupportsImageInput(model: string): boolean {
-    const capabilities = this.config.modelCapabilities?.(model)
-    if (!capabilities) return true
-    return capabilities.inputModalities.includes('image')
+    if (!this.config.modelCapabilities) return true
+    return this.capabilitiesForModel(model).supportsVision
   }
 
-  private itemToMessage(item: TurnItem, thinkingMode: boolean, supportsImages: boolean): ChatMessage | null {
-    switch (item.kind) {
-      case 'user_message':
-        return { role: 'user', content: item.text }
-      case 'assistant_text':
-        return {
-          role: 'assistant',
-          content: item.text,
-          ...(thinkingMode ? { reasoning_content: ' ' } : {})
+  /**
+   * Replays a response only while doing so is transactionally safe. Reasoning
+   * may already be visible, but final assistant text, tool calls, and generated
+   * images are commit points: once any of those arrive, replaying the request
+   * could append a different answer or duplicate an action.
+   *
+   * A retry suppresses reasoning from later attempts when an earlier attempt
+   * already emitted reasoning. The final answer still streams normally, while
+   * the workbench avoids showing the same thought prefix more than once.
+   */
+  private async *streamSseWithRecovery(input: {
+    response: Response
+    request: ModelRequest
+    endpointFormat: ModelEndpointFormat
+    configuredEndpointFormat: ModelEndpointFormat
+    model: string
+    retry: ReturnType<typeof normalizeModelRequestRetryConfig>
+    usedRetryAttempts: number
+    post: () => Promise<CompatPostResult>
+    url: string
+    maxErrorBodyBytes: number
+    streamLimits: ModelStreamLimits
+  }): AsyncIterable<ModelStreamChunk> {
+    let response = input.response
+    let usedRetryAttempts = input.usedRetryAttempts
+    let emittedReasoning = false
+    let committedOutput = false
+    const maxRetryAttempts = Math.max(
+      MIN_SAFE_STREAM_RECOVERY_ATTEMPTS,
+      input.retry.maxAttempts
+    )
+
+    while (true) {
+      if (!response.body) {
+        yield { kind: 'error', message: 'model response had no body' }
+        return
+      }
+
+      let recoverableError: Extract<ModelStreamChunk, { kind: 'error' }> | null = null
+      const suppressReasoning = emittedReasoning
+      for await (const chunk of this.streamSse(
+        response.body,
+        input.request.abortSignal,
+        input.endpointFormat,
+        input.model
+      )) {
+        if (isRecoverableStreamTransportError(chunk)) {
+          recoverableError = chunk
+          continue
         }
-      case 'assistant_reasoning':
-        return null
-      case 'tool_call':
-        return {
-          role: 'assistant',
-          content: '',
-          ...(thinkingMode ? { reasoning_content: ' ' } : {}),
-          tool_calls: [this.toolCallToWire(item)]
+        if (chunk.kind === 'assistant_reasoning_delta') {
+          if (suppressReasoning) continue
+          emittedReasoning = true
         }
-      case 'tool_result':
-        return this.toolResultToMessage(item, supportsImages)
-      case 'compaction':
-        return item.replacedTokens > 0
-          ? { role: 'system', content: `Conversation summary from earlier turns:\n${item.summary}` }
-          : null
-      case 'review':
-        return item.status === 'completed' && item.reviewText?.trim()
-          ? { role: 'system', content: `Code review result from an earlier turn:\n${item.reviewText}` }
-          : null
-      case 'approval':
-      case 'user_input':
-      case 'error':
-        return null
+        if (isCommittedStreamOutput(chunk)) committedOutput = true
+        yield chunk
+      }
+
+      if (!recoverableError) return
+      if (
+        input.request.abortSignal.aborted ||
+        committedOutput ||
+        usedRetryAttempts >= maxRetryAttempts
+      ) {
+        yield recoverableError
+        return
+      }
+
+      const nextAttempt = usedRetryAttempts + 1
+      const delayMs = retryDelayMs(response, input.retry.initialDelayMs, usedRetryAttempts)
+      yield {
+        kind: 'retrying',
+        status: response.status,
+        attempt: nextAttempt,
+        maxAttempts: maxRetryAttempts,
+        delayMs,
+        reason: 'stream_transport'
+      }
+      const aborted = await sleepWithAbort(delayMs, input.request.abortSignal)
+      if (aborted || input.request.abortSignal.aborted) {
+        yield { kind: 'error', message: 'request was aborted during stream retry backoff' }
+        return
+      }
+      usedRetryAttempts = nextAttempt
+
+      while (true) {
+        const retried = await input.post()
+        if (retried.kind === 'error') {
+          if (
+            input.request.abortSignal.aborted ||
+            retried.failure.failoverAllowed === false ||
+            usedRetryAttempts >= maxRetryAttempts
+          ) {
+            yield { kind: 'error', message: retried.message, failure: retried.failure }
+            return
+          }
+          const networkRetryAttempt = usedRetryAttempts + 1
+          const networkDelayMs = exponentialRetryDelayMs(
+            input.retry.initialDelayMs,
+            usedRetryAttempts
+          )
+          yield {
+            kind: 'retrying',
+            attempt: networkRetryAttempt,
+            maxAttempts: maxRetryAttempts,
+            delayMs: networkDelayMs,
+            reason: 'network'
+          }
+          const networkRetryAborted = await sleepWithAbort(
+            networkDelayMs,
+            input.request.abortSignal
+          )
+          if (networkRetryAborted || input.request.abortSignal.aborted) {
+            yield { kind: 'error', message: 'request was aborted during stream retry backoff' }
+            return
+          }
+          usedRetryAttempts = networkRetryAttempt
+          continue
+        }
+        response = retried.response
+        if (response.ok) break
+
+        if (
+          usedRetryAttempts < maxRetryAttempts &&
+          input.retry.httpStatusCodes.includes(response.status)
+        ) {
+          const httpRetryAttempt = usedRetryAttempts + 1
+          const httpDelayMs = retryDelayMs(response, input.retry.initialDelayMs, usedRetryAttempts)
+          const status = response.status
+          await response.body?.cancel().catch(() => {})
+          yield {
+            kind: 'retrying',
+            status,
+            attempt: httpRetryAttempt,
+            maxAttempts: maxRetryAttempts,
+            delayMs: httpDelayMs
+          }
+          const httpRetryAborted = await sleepWithAbort(httpDelayMs, input.request.abortSignal)
+          if (httpRetryAborted || input.request.abortSignal.aborted) {
+            yield { kind: 'error', message: 'request was aborted during retry backoff' }
+            return
+          }
+          usedRetryAttempts = httpRetryAttempt
+          continue
+        }
+
+        const errorBody = await readLimitedResponseText(response, input.maxErrorBodyBytes)
+        if (errorBody.exceeded) {
+          yield {
+            kind: 'error',
+            message: `model error response exceeded ${input.maxErrorBodyBytes} bytes`,
+            code: 'response_body_too_large'
+          }
+          return
+        }
+        this.logHttpFailure({
+          url: input.url,
+          status: response.status,
+          body: errorBody.text,
+          endpointFormat: input.endpointFormat,
+          configuredEndpointFormat: input.configuredEndpointFormat,
+          model: input.model
+        })
+        const classified = await this.classifyHttpError(
+          response.status,
+          errorBody.text,
+          response.headers.get('retry-after')
+        )
+        yield {
+          kind: 'error',
+          message: classified.message,
+          code: classified.code,
+          failure: classified.failure
+        }
+        return
+      }
+
+      if (
+        this.config.nonStreaming ||
+        response.headers.get('content-type')?.includes('application/json')
+      ) {
+        const json = await readLimitedResponseJson(response, input.streamLimits.maxTotalBytes)
+        if (json.kind === 'limit') {
+          yield {
+            kind: 'error',
+            message: `model response exceeded ${json.maxBytes} bytes`,
+            code: 'stream_resource_limit'
+          }
+          return
+        }
+        if (json.kind === 'invalid_json') {
+          yield { kind: 'error', message: `model response contained invalid JSON: ${json.message}` }
+          return
+        }
+        yield* this.materializeNonStreaming(
+          json.value as ChatCompletionResponse,
+          input.endpointFormat,
+          input.model,
+          input.streamLimits
+        )
+        return
+      }
     }
   }
 
@@ -902,17 +965,31 @@ export class CompatModelClient implements ModelClient {
   ): AsyncIterable<ModelStreamChunk> {
     const decoder = new TextDecoder('utf-8')
     const reader = body.getReader()
-    let buffer = ''
+    const frameBuffer = new IncrementalSseFrameBuffer()
     const pendingArguments = new Map<string, PendingToolCall>()
     const pendingByIndex = new Map<number, string>()
     const completedToolCalls = new Set<string>()
+    const responsesContentTracker = createResponsesContentTracker()
     let usage: UsageSnapshot | null = null
-    let textAccumulator = ''
-    let reasoningAccumulator = ''
+    // The Responses protocol may repeat final output in response.completed;
+    // a boolean is sufficient to suppress that duplicate. Retaining the full
+    // streamed text/reasoning here used quadratic concatenation and a second
+    // unbounded copy of an already-emitted response.
+    let sawTextDelta = false
     let stopReason: ModelStopReason = 'stop'
     let finishReason: string | null = null
     let sawDone = false
+    let readerFinished = false
+    let bufferBytes = 0
     const idleTimeoutMs = normalizeStreamIdleTimeoutMs(this.config.streamIdleTimeoutMs)
+    const limits = normalizeModelStreamLimits(this.config.streamLimits)
+    const budget = new ModelStreamResourceBudget(limits)
+    const cancelReader = (reason: string): void => {
+      // Never await cancellation here: a broken/custom ReadableStream can
+      // make its cancel promise hang, defeating the very timeout/limit that
+      // is trying to stop it.
+      void reader.cancel(reason).catch(() => {})
+    }
     try {
       while (!signal.aborted) {
         const read = await readStreamChunk(reader, signal, idleTimeoutMs)
@@ -920,24 +997,45 @@ export class CompatModelClient implements ModelClient {
           yield {
             kind: 'error',
             message: `model stream stalled for ${idleTimeoutMs}ms without data`,
-            code: 'stream_idle_timeout'
+            code: 'stream_idle_timeout',
+            failure: { category: 'timeout', failoverAllowed: true }
           }
           return
         }
         if (read.kind === 'aborted') break
         if (read.kind === 'error') {
-          yield { kind: 'error', message: read.message, code: 'stream_read_error' }
+          yield {
+            kind: 'error',
+            message: read.message,
+            code: 'stream_read_error',
+            failure: { category: 'network', failoverAllowed: true }
+          }
           return
         }
         const { value, done } = read
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let boundary: number
-        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-          const frame = buffer.slice(0, boundary)
-          buffer = buffer.slice(boundary + 2)
+        if (done) {
+          readerFinished = true
+          break
+        }
+        if (!value) {
+          readerFinished = true
+          break
+        }
+        budget.addInboundBytes(value.byteLength)
+        bufferBytes += value.byteLength
+        if (bufferBytes > limits.maxBufferBytes) {
+          throw budget.exceeded(`${limits.maxBufferBytes} buffered SSE bytes`)
+        }
+        frameBuffer.append(decoder.decode(value, { stream: true }))
+        while (true) {
+          const parsedFrame = frameBuffer.takeFrame()
+          if (parsedFrame === null) break
+          const frame = parsedFrame.data
+          const consumedBytes = Buffer.byteLength(frame, 'utf8') + Buffer.byteLength(parsedFrame.delimiter, 'utf8')
+          bufferBytes = Math.max(0, bufferBytes - consumedBytes)
+          budget.addFrame(Buffer.byteLength(frame, 'utf8'))
           const dataLines = frame
-            .split('\n')
+            .split(/\r?\n/)
             .filter((line) => line.startsWith('data:'))
             .map((line) => line.slice(5).trim())
             .join('')
@@ -951,27 +1049,46 @@ export class CompatModelClient implements ModelClient {
           try {
             payload = JSON.parse(dataLines)
           } catch {
-            continue
+            yield { kind: 'error', message: 'model stream contained invalid SSE JSON', code: 'stream_invalid_frame' }
+            return
           }
           const result = this.consumeStreamPayload(
             payload as Record<string, unknown>,
             pendingArguments,
             pendingByIndex,
             completedToolCalls,
-            textAccumulator,
-            reasoningAccumulator,
+            sawTextDelta,
+            responsesContentTracker,
             endpointFormat,
-            model
+            model,
+            budget
           )
-          textAccumulator = result.text
-          reasoningAccumulator = result.reasoning
+          budget.addOutput(result.chunks)
+          sawTextDelta = result.sawTextDelta
           if (result.usage) usage = mergeUsageSnapshots(usage, result.usage)
-          if (result.finishReason) finishReason = result.finishReason
+          if (result.finishReason) {
+            // Some protocols emit a semantic terminal reason followed by a
+            // generic stop frame. Do not let that trailing frame downgrade
+            // `length`, `tool_calls`, or `error` to a successful stop.
+            finishReason = mergeStreamFinishReason(finishReason, result.finishReason)
+          }
           for (const chunk of result.chunks) yield chunk
         }
         if (sawDone) break
       }
+    } catch (error) {
+      if (error instanceof ModelStreamResourceLimitError) {
+        frameBuffer.clear()
+        budget.clearPendingCalls(pendingArguments)
+        pendingByIndex.clear()
+        completedToolCalls.clear()
+        cancelReader('model stream resource limit exceeded')
+        yield { kind: 'error', message: error.message, code: 'stream_resource_limit' }
+        return
+      }
+      throw error
     } finally {
+      if (!readerFinished) cancelReader('model stream closed before body completion')
       try {
         reader.releaseLock()
       } catch {
@@ -982,6 +1099,15 @@ export class CompatModelClient implements ModelClient {
       yield { kind: 'error', message: 'request was aborted' }
       return
     }
+    if (!sawDone && !finishReason) {
+      yield {
+        kind: 'error',
+        message: 'model stream ended before a terminal frame',
+        code: 'stream_truncated',
+        failure: { category: 'network', failoverAllowed: true }
+      }
+      return
+    }
     // Safety net: finalize any tool call whose arguments finished streaming but
     // was never emitted because the stream ended without a per-call "done"
     // signal. The chat_completions branch only finalizes on
@@ -990,19 +1116,29 @@ export class CompatModelClient implements ModelClient {
     // otherwise DROP the call silently. Truncated arguments surface here as
     // `{ __raw }` (a tool error the model can react to) instead of vanishing.
     let flushedPendingToolCall = false
-    for (const [callId, pending] of pendingArguments) {
-      if (!pending.name) continue
-      if (completedToolCalls.has(callId)) continue
-      flushedPendingToolCall = true
-      completedToolCalls.add(callId)
-      yield {
-        kind: 'tool_call_complete',
-        callId,
-        toolName: pending.name,
-        arguments: this.parseToolArguments(pending.arguments || '{}')
+    try {
+      for (const [callId, pending] of pendingArguments) {
+        if (!pending.name) continue
+        if (completedToolCalls.has(callId)) continue
+        const argumentsRaw = budget.pendingArguments(pending)
+        budget.completeToolCall(argumentsRaw)
+        flushedPendingToolCall = true
+        completedToolCalls.add(callId)
+        yield {
+          kind: 'tool_call_complete',
+          callId,
+          toolName: pending.name,
+          arguments: this.parseToolArguments(argumentsRaw || '{}')
+        }
       }
+    } catch (error) {
+      if (error instanceof ModelStreamResourceLimitError) {
+        yield { kind: 'error', message: error.message, code: 'stream_resource_limit' }
+        return
+      }
+      throw error
     }
-    pendingArguments.clear()
+    budget.clearPendingCalls(pendingArguments)
     if (usage) yield { kind: 'usage', usage }
     stopReason = ((): ModelStopReason => {
       switch (finishReason) {
@@ -1013,9 +1149,9 @@ export class CompatModelClient implements ModelClient {
         case 'error':
           return 'error'
         default:
-          // A recovered tool call means this was really a tool-call turn the
-          // provider mislabeled (e.g. finish_reason 'stop' or bare `[DONE]`).
-          return flushedPendingToolCall ? 'tool_calls' : 'stop'
+          // A completed or recovered tool call means this was really a
+          // tool-call turn even if the provider emitted only a generic stop.
+          return flushedPendingToolCall || completedToolCalls.size > 0 ? 'tool_calls' : 'stop'
       }
     })()
     yield { kind: 'completed', stopReason }
@@ -1026,17 +1162,12 @@ export class CompatModelClient implements ModelClient {
     pendingArguments: Map<string, PendingToolCall>,
     pendingByIndex: Map<number, string>,
     completedToolCalls: Set<string>,
-    textAccumulator: string,
-    reasoningAccumulator: string,
+    sawTextDelta: boolean,
+    responsesContentTracker: import('./responses-stream-decoder.js').ResponsesContentTracker,
     endpointFormat: ModelEndpointFormat,
-    model: string
-  ): {
-    chunks: ModelStreamChunk[]
-    text: string
-    reasoning: string
-    finishReason: string | null
-    usage: UsageSnapshot | null
-  } {
+    model: string,
+    budget: ModelStreamResourceBudget
+  ): StreamPayloadResult {
     const payloadError = modelPayloadError(payload)
     if (payloadError) {
       return {
@@ -1045,8 +1176,7 @@ export class CompatModelClient implements ModelClient {
           message: payloadError.message,
           ...(payloadError.code ? { code: payloadError.code } : {})
         }],
-        text: textAccumulator,
-        reasoning: reasoningAccumulator,
+        sawTextDelta,
         finishReason: 'error',
         usage: null
       }
@@ -1057,9 +1187,10 @@ export class CompatModelClient implements ModelClient {
         pendingArguments,
         pendingByIndex,
         completedToolCalls,
-        textAccumulator,
-        reasoningAccumulator,
-        model
+        sawTextDelta,
+        responsesContentTracker,
+        model,
+        budget
       )
     }
     if (endpointFormat === 'messages') {
@@ -1068,79 +1199,20 @@ export class CompatModelClient implements ModelClient {
         pendingArguments,
         pendingByIndex,
         completedToolCalls,
-        textAccumulator,
-        reasoningAccumulator,
-        model
+        sawTextDelta,
+        model,
+        budget
       )
     }
-    const chunks: ModelStreamChunk[] = []
-    let text = textAccumulator
-    let reasoning = reasoningAccumulator
-    let finishReason: string | null = null
-    let usage: UsageSnapshot | null = null
-    const choice = (payload.choices as Record<string, unknown>[] | undefined)?.[0]
-    if (choice && typeof choice === 'object') {
-      const delta = choice.delta as Record<string, unknown> | undefined
-      if (delta && typeof delta === 'object') {
-        const content = delta.content
-        if (typeof content === 'string' && content.length > 0) {
-          text += content
-          chunks.push({ kind: 'assistant_text_delta', text: content })
-        }
-        const reasoningContent = delta.reasoning_content ?? delta.reasoning
-        if (typeof reasoningContent === 'string' && reasoningContent.length > 0) {
-          reasoning += reasoningContent
-          chunks.push({ kind: 'assistant_reasoning_delta', text: reasoningContent })
-        }
-        const toolCalls = delta.tool_calls as
-          | {
-              index?: number
-              id?: string
-              function?: { name?: string; arguments?: string }
-            }[]
-          | undefined
-        if (Array.isArray(toolCalls)) {
-          for (const call of toolCalls) {
-            const id = resolveToolCallDeltaId(call, pendingArguments)
-            const existing = pendingArguments.get(id) ?? { index: numericIndex(call.index), name: undefined, arguments: '' }
-            const resolvedIndex = numericIndex(call.index)
-            if (resolvedIndex !== undefined) existing.index = resolvedIndex
-            if (call.function?.name) existing.name = call.function.name
-            if (typeof call.function?.arguments === 'string') {
-              existing.arguments += call.function.arguments
-              chunks.push({
-                kind: 'tool_call_delta',
-                callId: id,
-                toolName: existing.name,
-                argumentsDelta: call.function.arguments
-              })
-            }
-            pendingArguments.set(id, existing)
-          }
-        }
-      }
-      if (typeof choice.finish_reason === 'string') {
-        finishReason = choice.finish_reason
-      }
-    }
-    const usagePayload = payload.usage as Record<string, unknown> | undefined
-    if (usagePayload) {
-      usage = this.mapUsage(usagePayload, model)
-    }
-    if (finishReason === 'tool_calls' && pendingArguments.size > 0) {
-      for (const [callId, value] of pendingArguments) {
-        if (!value.name) continue
-        const args = this.parseToolArguments(value.arguments)
-        chunks.push({
-          kind: 'tool_call_complete',
-          callId,
-          toolName: value.name,
-          arguments: args
-        })
-      }
-      pendingArguments.clear()
-    }
-    return { chunks, text, reasoning, finishReason, usage }
+    return decodeChatCompletionsStreamPayload({
+      payload,
+      pendingArguments,
+      pendingByIndex,
+      sawTextDelta,
+      budget,
+      normalizeUsage: (usage) => this.mapUsage(usage, model),
+      parseToolArguments: (raw) => this.parseToolArguments(raw)
+    })
   }
 
   private consumeResponsesStreamPayload(
@@ -1148,772 +1220,74 @@ export class CompatModelClient implements ModelClient {
     pendingArguments: Map<string, PendingToolCall>,
     pendingByIndex: Map<number, string>,
     completedToolCalls: Set<string>,
-    textAccumulator: string,
-    reasoningAccumulator: string,
-    model: string
-  ): {
-    chunks: ModelStreamChunk[]
-    text: string
-    reasoning: string
-    finishReason: string | null
-    usage: UsageSnapshot | null
-  } {
-    const chunks: ModelStreamChunk[] = []
-    let text = textAccumulator
-    let reasoning = reasoningAccumulator
-    let finishReason: string | null = null
-    let usage: UsageSnapshot | null = null
-    const type = recordString(payload, 'type')
-
-    const outputIndex = numericIndex(payload.output_index)
-    const item = recordValue(payload, 'item') ?? recordValue(payload, 'output_item')
-    if (item) {
-      const itemType = recordString(item, 'type')
-      if (itemType === 'function_call' || itemType === 'custom_tool_call') {
-        const callId = recordString(item, 'call_id') || recordString(item, 'id') || indexFallbackCallId(outputIndex, pendingArguments)
-        const existing = pendingArguments.get(callId) ?? { index: outputIndex, name: undefined, arguments: '' }
-        if (outputIndex !== undefined) {
-          existing.index = outputIndex
-          pendingByIndex.set(outputIndex, callId)
-        }
-        const name = recordString(item, 'name')
-        if (name) existing.name = name
-        const initialArguments = recordString(item, 'arguments') || recordString(item, 'input')
-        if (initialArguments && !existing.arguments) existing.arguments = initialArguments
-        pendingArguments.set(callId, existing)
-        if (type === 'response.output_item.done' && existing.name) {
-          chunks.push({
-            kind: 'tool_call_complete',
-            callId,
-            toolName: existing.name,
-            arguments: this.parseToolArguments(existing.arguments || '{}')
-          })
-          completedToolCalls.add(callId)
-          pendingArguments.delete(callId)
-        }
-      }
-    }
-
-    if (type === 'response.output_text.delta') {
-      const delta = recordString(payload, 'delta')
-      if (delta) {
-        text += delta
-        chunks.push({ kind: 'assistant_text_delta', text: delta })
-      }
-    } else if (
-      type === 'response.reasoning_text.delta' ||
-      type === 'response.reasoning_summary_text.delta' ||
-      type === 'response.reasoning.delta'
-    ) {
-      const delta = recordString(payload, 'delta')
-      if (delta) {
-        reasoning += delta
-        chunks.push({ kind: 'assistant_reasoning_delta', text: delta })
-      }
-    } else if (type === 'response.function_call_arguments.delta') {
-      const callId = responseStreamCallId(payload, pendingArguments, pendingByIndex)
-      const existing = pendingArguments.get(callId) ?? { index: outputIndex, name: undefined, arguments: '' }
-      const delta = recordString(payload, 'delta')
-      if (outputIndex !== undefined) {
-        existing.index = outputIndex
-        pendingByIndex.set(outputIndex, callId)
-      }
-      if (delta) {
-        existing.arguments += delta
-        chunks.push({
-          kind: 'tool_call_delta',
-          callId,
-          toolName: existing.name,
-          argumentsDelta: delta
-        })
-      }
-      pendingArguments.set(callId, existing)
-    } else if (type === 'response.function_call_arguments.done') {
-      const callId = responseStreamCallId(payload, pendingArguments, pendingByIndex)
-      const existing = pendingArguments.get(callId) ?? { index: outputIndex, name: undefined, arguments: '' }
-      const args = recordString(payload, 'arguments')
-      if (args) existing.arguments = args
-      if (existing.name) {
-        pendingArguments.set(callId, existing)
-      } else {
-        pendingArguments.set(callId, existing)
-      }
-    } else if (type === 'response.completed') {
-      const response = recordValue(payload, 'response') as ResponsesApiResponse | null
-      const materialized = this.materializeResponsesOutput(response ?? (payload as ResponsesApiResponse), {
-        skipText: Boolean(text),
-        pendingArguments,
-        completedToolCalls
-      }, model)
-      chunks.push(...materialized.chunks)
-      if (materialized.usage) usage = materialized.usage
-      finishReason = materialized.finishReason
-    } else if (type === 'response.failed' || type === 'error') {
-      const message = responseErrorMessage(payload)
-      chunks.push({ kind: 'error', message, code: 'response_stream_error' })
-      finishReason = 'error'
-    }
-    return { chunks, text, reasoning, finishReason, usage }
+    sawTextDelta: boolean,
+    responsesContentTracker: import('./responses-stream-decoder.js').ResponsesContentTracker,
+    model: string,
+    budget: ModelStreamResourceBudget
+  ): StreamPayloadResult {
+    return decodeResponsesStreamPayload({
+      payload,
+      pendingArguments,
+      pendingByIndex,
+      completedToolCalls,
+      sawTextDelta,
+      contentTracker: responsesContentTracker,
+      budget,
+      parseToolArguments: (raw) => this.parseToolArguments(raw),
+      normalizeUsage: (usage) => this.mapUsage(usage, model)
+    })
   }
-
   private consumeAnthropicMessagesStreamPayload(
     payload: Record<string, unknown>,
     pendingArguments: Map<string, PendingToolCall>,
     pendingByIndex: Map<number, string>,
     completedToolCalls: Set<string>,
-    textAccumulator: string,
-    reasoningAccumulator: string,
-    model: string
-  ): {
-    chunks: ModelStreamChunk[]
-    text: string
-    reasoning: string
-    finishReason: string | null
-    usage: UsageSnapshot | null
-  } {
-    const chunks: ModelStreamChunk[] = []
-    let text = textAccumulator
-    let reasoning = reasoningAccumulator
-    let finishReason: string | null = null
-    let usage: UsageSnapshot | null = null
-    const type = recordString(payload, 'type')
-    const index = numericIndex(payload.index)
-
-    if (type === 'message_start') {
-      const message = recordValue(payload, 'message')
-      const usagePayload = message ? recordValue(message, 'usage') : null
-      if (usagePayload) usage = this.mapUsage(usagePayload, model)
-    } else if (type === 'content_block_start') {
-      const block = recordValue(payload, 'content_block')
-      if (block && recordString(block, 'type') === 'tool_use') {
-        const callId = recordString(block, 'id') || indexFallbackCallId(index, pendingArguments)
-        const existing = pendingArguments.get(callId) ?? { index, name: undefined, arguments: '' }
-        if (index !== undefined) {
-          existing.index = index
-          pendingByIndex.set(index, callId)
-        }
-        const name = recordString(block, 'name')
-        if (name) existing.name = name
-        const input = recordValue(block, 'input')
-        if (input && Object.keys(input).length > 0) existing.arguments = JSON.stringify(input)
-        pendingArguments.set(callId, existing)
-      }
-    } else if (type === 'content_block_delta') {
-      const delta = recordValue(payload, 'delta')
-      const deltaType = delta ? recordString(delta, 'type') : ''
-      if (deltaType === 'text_delta') {
-        const value = recordString(delta, 'text')
-        if (value) {
-          text += value
-          chunks.push({ kind: 'assistant_text_delta', text: value })
-        }
-      } else if (deltaType === 'thinking_delta') {
-        const value = recordString(delta, 'thinking')
-        if (value) {
-          reasoning += value
-          chunks.push({ kind: 'assistant_reasoning_delta', text: value })
-        }
-      } else if (deltaType === 'input_json_delta') {
-        const callId = anthropicStreamCallId(index, pendingArguments, pendingByIndex)
-        const existing = pendingArguments.get(callId) ?? { index, name: undefined, arguments: '' }
-        const value = recordString(delta, 'partial_json')
-        if (index !== undefined) {
-          existing.index = index
-          pendingByIndex.set(index, callId)
-        }
-        if (value) {
-          existing.arguments += value
-          chunks.push({
-            kind: 'tool_call_delta',
-            callId,
-            toolName: existing.name,
-            argumentsDelta: value
-          })
-        }
-        pendingArguments.set(callId, existing)
-      }
-    } else if (type === 'content_block_stop') {
-      const callId = index === undefined ? undefined : pendingByIndex.get(index)
-      const pending = callId ? pendingArguments.get(callId) : undefined
-      if (callId && pending?.name) {
-        chunks.push({
-          kind: 'tool_call_complete',
-          callId,
-          toolName: pending.name,
-          arguments: this.parseToolArguments(pending.arguments || '{}')
-        })
-        completedToolCalls.add(callId)
-        pendingArguments.delete(callId)
-        if (index !== undefined) pendingByIndex.delete(index)
-      }
-    } else if (type === 'message_delta') {
-      const delta = recordValue(payload, 'delta')
-      const stopReason = delta ? recordString(delta, 'stop_reason') : ''
-      const mappedStopReason = anthropicStopReason(stopReason)
-      if (mappedStopReason) finishReason = mappedStopReason
-      const usagePayload = recordValue(payload, 'usage')
-      if (usagePayload) usage = this.mapUsage(usagePayload, model)
-    } else if (type === 'message_stop') {
-      finishReason = finishReason ?? 'stop'
-    } else if (type === 'error') {
-      chunks.push({ kind: 'error', message: responseErrorMessage(payload), code: 'messages_stream_error' })
-      finishReason = 'error'
-    }
-    return { chunks, text, reasoning, finishReason, usage }
+    sawTextDelta: boolean,
+    model: string,
+    budget: ModelStreamResourceBudget
+  ): StreamPayloadResult {
+    return decodeAnthropicMessagesStreamPayload({
+      payload,
+      pendingArguments,
+      pendingByIndex,
+      completedToolCalls,
+      sawTextDelta,
+      budget,
+      normalizeUsage: (usage) => this.mapUsage(usage, model),
+      parseToolArguments: (raw) => this.parseToolArguments(raw)
+    })
   }
 
   private *materializeNonStreaming(
     payload: ChatCompletionResponse,
     endpointFormat: ModelEndpointFormat,
-    model: string
+    model: string,
+    limits: ModelStreamLimits
   ): Generator<ModelStreamChunk> {
-    const payloadError = modelPayloadError(payload as unknown as Record<string, unknown>)
-    if (payloadError) {
-      yield {
-        kind: 'error',
-        message: payloadError.message,
-        ...(payloadError.code ? { code: payloadError.code } : {})
-      }
-      return
-    }
-    if (endpointFormat === 'responses') {
-      yield* this.materializeResponsesNonStreaming(payload as unknown as ResponsesApiResponse, model)
-      return
-    }
-    if (endpointFormat === 'messages') {
-      yield* this.materializeAnthropicMessagesNonStreaming(payload as unknown as AnthropicMessageResponse, model)
-      return
-    }
-    const choice = payload.choices?.[0]
-    if (!choice) {
-      yield { kind: 'error', message: 'model response contained no choices' }
-      return
-    }
-    const text = typeof choice.message?.content === 'string' ? choice.message.content : ''
-    const reasoning = reasoningFromMessage(choice.message)
-    if (reasoning) {
-      yield { kind: 'assistant_reasoning_delta', text: reasoning }
-    }
-    if (text) {
-      yield { kind: 'assistant_text_delta', text }
-    }
-    if (Array.isArray(choice.message?.tool_calls)) {
-      for (const call of choice.message.tool_calls) {
-        const args = this.parseToolArguments(call.function?.arguments ?? '{}')
-        yield {
-          kind: 'tool_call_complete',
-          callId: call.id,
-          toolName: call.function.name,
-          arguments: args
+    yield* enforceNonStreamingLimits(
+      decodeCompatNonStreamingResponse(
+        payload as unknown as Record<string, unknown>,
+        endpointFormat,
+        {
+          normalizeUsage: (usage) => this.mapUsage(usage, model),
+          parseToolArguments: (raw) => this.parseToolArguments(raw),
+          payloadError: modelPayloadError
         }
-      }
-    }
-    if (payload.usage) {
-      yield { kind: 'usage', usage: this.mapUsage(payload.usage, model) }
-    }
-    let stopReason: 'stop' | 'tool_calls' | 'length' | 'error' = 'stop'
-    if (choice.finish_reason === 'tool_calls') stopReason = 'tool_calls'
-    else if (choice.finish_reason === 'length') stopReason = 'length'
-    else if (choice.finish_reason === 'error') stopReason = 'error'
-    yield { kind: 'completed', stopReason }
-  }
-
-  private *materializeResponsesNonStreaming(
-    payload: ResponsesApiResponse,
-    model: string
-  ): Generator<ModelStreamChunk> {
-    if (payload.error?.message) {
-      yield { kind: 'error', message: payload.error.message, code: payload.error.type }
-      return
-    }
-    const materialized = this.materializeResponsesOutput(payload, {}, model)
-    yield* materialized.chunks
-    if (materialized.usage) {
-      yield { kind: 'usage', usage: materialized.usage }
-    }
-    yield { kind: 'completed', stopReason: materialized.finishReason }
-  }
-
-  private materializeResponsesOutput(
-    payload: ResponsesApiResponse,
-    options: {
-      skipText?: boolean
-      pendingArguments?: Map<string, PendingToolCall>
-      completedToolCalls?: Set<string>
-    } = {},
-    model = this.config.model
-  ): {
-    chunks: ModelStreamChunk[]
-    finishReason: ModelStopReason
-    usage: UsageSnapshot | null
-  } {
-    const chunks: ModelStreamChunk[] = []
-    let sawToolCall = (options.completedToolCalls?.size ?? 0) > 0
-    if (!options.skipText) {
-      const outputText = typeof payload.output_text === 'string'
-        ? payload.output_text
-        : responsesOutputText(payload.output)
-      if (outputText) {
-        chunks.push({ kind: 'assistant_text_delta', text: outputText })
-      }
-    }
-    for (const item of payload.output ?? []) {
-      const itemType = recordString(item, 'type')
-      if (itemType !== 'function_call' && itemType !== 'custom_tool_call') continue
-      const callId = recordString(item, 'call_id') || recordString(item, 'id')
-      const toolName = recordString(item, 'name')
-      if (!callId || !toolName) continue
-      if (options.completedToolCalls?.has(callId)) continue
-      sawToolCall = true
-      const argsRaw = recordString(item, 'arguments') || recordString(item, 'input') || '{}'
-      if (options.pendingArguments?.has(callId)) {
-        options.pendingArguments.delete(callId)
-      }
-      chunks.push({
-        kind: 'tool_call_complete',
-        callId,
-        toolName,
-        arguments: this.parseToolArguments(argsRaw)
-      })
-    }
-    const usage = payload.usage ? this.mapUsage(payload.usage, model) : null
-    let finishReason: ModelStopReason = sawToolCall ? 'tool_calls' : 'stop'
-    if (payload.status === 'incomplete') {
-      finishReason = payload.incomplete_details?.reason === 'max_output_tokens' ? 'length' : 'error'
-    } else if (payload.status === 'failed') {
-      finishReason = 'error'
-    }
-    return { chunks, finishReason, usage }
-  }
-
-  private *materializeAnthropicMessagesNonStreaming(
-    payload: AnthropicMessageResponse,
-    model: string
-  ): Generator<ModelStreamChunk> {
-    let sawToolCall = false
-    for (const block of payload.content ?? []) {
-      const type = recordString(block, 'type')
-      if (type === 'text') {
-        const text = recordString(block, 'text')
-        if (text) yield { kind: 'assistant_text_delta', text }
-      } else if (type === 'thinking') {
-        const thinking = recordString(block, 'thinking')
-        if (thinking) yield { kind: 'assistant_reasoning_delta', text: thinking }
-      } else if (type === 'tool_use') {
-        const callId = recordString(block, 'id')
-        const toolName = recordString(block, 'name')
-        const input = recordValue(block, 'input') ?? {}
-        if (callId && toolName) {
-          sawToolCall = true
-          yield {
-            kind: 'tool_call_complete',
-            callId,
-            toolName,
-            arguments: input
-          }
-        }
-      }
-    }
-    if (payload.usage) {
-      yield { kind: 'usage', usage: this.mapUsage(payload.usage, model) }
-    }
-    yield { kind: 'completed', stopReason: anthropicStopReason(payload.stop_reason) ?? (sawToolCall ? 'tool_calls' : 'stop') }
+      ),
+      limits
+    )
   }
 
   private mapUsage(usage: Record<string, unknown>, model = this.config.model): UsageSnapshot {
-    const completionTokens = Number(usage.completion_tokens ?? usage.eval_count ?? usage.output_tokens ?? 0) || 0
-    const promptDetails = usage.prompt_tokens_details as
-      | { cached_tokens?: number }
-      | undefined
-    const inputDetails = usage.input_tokens_details as
-      | { cached_tokens?: number }
-      | undefined
-    const nativeHit = Number(usage.prompt_cache_hit_tokens ?? 0) || 0
-    const nativeMiss = Number(usage.prompt_cache_miss_tokens ?? 0) || 0
-    const hasNativeCache = nativeHit > 0 || nativeMiss > 0
-    const cachedTokens = Number(promptDetails?.cached_tokens ?? inputDetails?.cached_tokens ?? 0) || 0
-    const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0
-    const cacheCreation = Number(usage.cache_creation_input_tokens ?? 0) || 0
-    // Anthropic-protocol usage (MiniMax et al.) reports input_tokens
-    // EXCLUDING cache reads/writes; OpenAI-style prompt_tokens includes
-    // everything and marks the cached subset in prompt_tokens_details or
-    // Responses API input_tokens_details.
-    const anthropicUsage = usage.prompt_tokens === undefined &&
-      usage.prompt_eval_count === undefined &&
-      usage.input_tokens !== undefined &&
-      inputDetails?.cached_tokens === undefined
-    const reportedPromptTokens = Number(usage.prompt_tokens ?? usage.prompt_eval_count ?? usage.input_tokens ?? 0) || 0
-    const promptTokens = anthropicUsage
-      ? reportedPromptTokens + cacheRead + cacheCreation
-      : reportedPromptTokens
-    const cacheHit = hasNativeCache ? nativeHit : (cachedTokens > 0 ? cachedTokens : cacheRead)
-    const cacheMiss = hasNativeCache ? nativeMiss : Math.max(promptTokens - cacheHit, 0)
-    const cacheTotal = cacheHit + cacheMiss
-    const cacheHitRate = cacheTotal === 0 ? null : cacheHit / cacheTotal
-    const totalTokens = anthropicUsage
-      ? promptTokens + completionTokens
-      : Number(usage.total_tokens ?? promptTokens + completionTokens) || 0
-    const pricingCacheRead = cacheRead || cacheHit
-    const pricingCacheWrite = cacheCreation
-    const pricingInputTokens = anthropicUsage
-      ? reportedPromptTokens
-      : Math.max(promptTokens - pricingCacheRead - pricingCacheWrite, 0)
-    const estimatedCost = estimateDeepseekCost({
+    return normalizeCompatUsage({
+      usage,
       model,
-      providerHost: this.config.baseUrl,
-      cacheHitTokens: cacheHit,
-      cacheMissTokens: cacheMiss,
-      outputTokens: completionTokens
-    }) ?? estimateMiniMaxCost({
-      model,
-      providerHost: this.config.baseUrl,
-      inputTokens: pricingInputTokens,
-      cacheReadTokens: pricingCacheRead,
-      cacheWriteTokens: pricingCacheWrite,
-      outputTokens: completionTokens
+      providerBaseUrl: this.config.baseUrl
     })
-    const reportedCostUsd = Number(usage.cost_usd ?? usage.costUsd)
-    const reportedCostCny = Number(usage.cost_cny ?? usage.costCny)
-    return {
-      ...emptyUsageSnapshot(),
-      promptTokens,
-      completionTokens,
-      totalTokens,
-      cachedTokens: cacheHit || cachedTokens || cacheRead || 0,
-      cacheHitTokens: cacheHit,
-      cacheMissTokens: cacheMiss,
-      cacheHitRate,
-      turns: 1,
-      costUsd: Number.isFinite(reportedCostUsd) ? reportedCostUsd : estimatedCost?.costUsd,
-      costCny: Number.isFinite(reportedCostCny) ? reportedCostCny : estimatedCost?.costCny
-    }
   }
 
   private parseToolArguments(raw: string): Record<string, unknown> {
     return repairToolArguments(raw).arguments
-  }
-}
-
-function normalizeToolSpecs(tools: ModelToolSpec[]): ModelToolSpec[] {
-  return [...tools]
-    .map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: canonicalizeSchema(tool.inputSchema)
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name))
-}
-
-function messagesToResponsesInput(messages: ChatMessage[]): Array<Record<string, unknown>> {
-  const input: Array<Record<string, unknown>> = []
-  for (const message of messages) {
-    if (message.role === 'tool') {
-      if (message.tool_call_id) {
-        input.push({
-          type: 'function_call_output',
-          call_id: message.tool_call_id,
-          output: chatContentToPlainText(message.content)
-        })
-      }
-      continue
-    }
-    const content = chatContentToResponsesContent(message.content)
-    if (content !== undefined && !(Array.isArray(content) && content.length === 0)) {
-      input.push({
-        role: message.role,
-        content
-      })
-    }
-    for (const call of message.tool_calls ?? []) {
-      input.push({
-        type: 'function_call',
-        call_id: call.id,
-        name: call.function.name,
-        arguments: call.function.arguments,
-        status: 'completed'
-      })
-    }
-  }
-  return input
-}
-
-function isToolResultUserContent(content: string | AnthropicContentBlock[]): boolean {
-  if (typeof content === 'string') return false
-  return content.every((block) => block.type === 'tool_result' || block.type === 'image')
-}
-
-function messagesToAnthropic(
-  messages: ChatMessage[],
-  includeThinkingBlocks = false
-): { system: string; messages: AnthropicMessage[] } {
-  const system: string[] = []
-  const out: AnthropicMessage[] = []
-  for (const message of messages) {
-    if (message.role === 'system') {
-      const text = chatContentToPlainText(message.content).trim()
-      if (!text) continue
-      // System messages that arrive after conversation turns are the
-      // volatile per-turn context (goal budgets, memories, drift
-      // warnings). Hoisting them into the top-level `system` block
-      // would invalidate the provider's prompt cache for the whole
-      // conversation on every counter tick, so they trail the history
-      // inside a user turn instead — mirroring the chat_completions
-      // ordering in collectMessages.
-      if (out.length > 0) {
-        appendTrailingInstruction(out, text)
-        continue
-      }
-      system.push(text)
-      continue
-    }
-    if (message.role === 'tool') {
-      if (!message.tool_call_id) continue
-      // Keep `tool_result` content as plain text. Anthropic's own API also
-      // accepts an `image` block INSIDE tool_result (the computer-use beta
-      // shape), but third-party Anthropic-compat providers (MiniMax, etc.)
-      // often have not implemented that newer shape and return 502 / 4xx
-      // when they see it. The image rides instead as a sibling `image`
-      // block in the same user message — the older shape that every
-      // compat layer accepts.
-      const blocks: AnthropicContentBlock[] = [{
-        type: 'tool_result',
-        tool_use_id: message.tool_call_id,
-        content: chatContentToTextOnly(message.content)
-      }]
-      if (Array.isArray(message.content)) {
-        for (const part of message.content) {
-          if (part.type !== 'image_url') continue
-          const image = anthropicImageSource(part.image_url.url)
-          if (image) blocks.push({ type: 'image', source: image })
-        }
-      }
-      // 多个并行工具调用的结果必须合并到同一个 user 消息中，否则 Anthropic
-      // API 会报 "tool_use ids were found without tool_result blocks immediately after"。
-      const last = out[out.length - 1]
-      if (last && last.role === 'user' && isToolResultUserContent(last.content)) {
-        last.content = [...(last.content as AnthropicContentBlock[]), ...blocks]
-      } else {
-        out.push({ role: 'user', content: blocks })
-      }
-      continue
-    }
-    const content = chatContentToAnthropicContent(message.content)
-    const blocks = Array.isArray(content)
-      ? [...content]
-      : content.trim()
-        ? [{ type: 'text' as const, text: content }]
-        : []
-    if (includeThinkingBlocks && message.role === 'assistant') {
-      const thinking = message.reasoning_content?.trim()
-      if (thinking) blocks.unshift({ type: 'thinking', thinking })
-    }
-    for (const call of message.tool_calls ?? []) {
-      blocks.push({
-        type: 'tool_use',
-        id: call.id,
-        name: call.function.name,
-        input: repairToolArguments(call.function.arguments).arguments
-      })
-    }
-    if (blocks.length > 0) {
-      out.push({ role: message.role, content: blocks })
-      continue
-    }
-  }
-  return { system: system.join('\n\n'), messages: out }
-}
-
-/**
- * Folds a trailing system instruction into the conversation as user
- * content. Appends to the final user message when one exists so the
- * request keeps strict user/assistant alternation.
- */
-function appendTrailingInstruction(out: AnthropicMessage[], text: string): void {
-  const block: AnthropicContentBlock = { type: 'text', text }
-  const last = out[out.length - 1]
-  if (last && last.role === 'user') {
-    if (typeof last.content === 'string') {
-      last.content = last.content.trim()
-        ? [{ type: 'text', text: last.content }, block]
-        : [block]
-      return
-    }
-    last.content.push(block)
-    return
-  }
-  out.push({ role: 'user', content: [block] })
-}
-
-/**
- * Marks the stable prefix for provider-side prompt caching. Anthropic
- * protocol caching is explicit: providers such as MiniMax only cache
- * content before `cache_control` breakpoints (up to 4 per request).
- * One breakpoint goes on the system block (which also covers the tool
- * definitions that precede it) and one on the final content block of
- * each of the last two messages, so consecutive agent steps re-hit the
- * prefix cached by the previous request.
- */
-function applyAnthropicCacheControl(messages: AnthropicMessage[]): void {
-  let breakpoints = 0
-  for (let i = messages.length - 1; i >= 0 && breakpoints < 2; i -= 1) {
-    const content = messages[i].content
-    if (typeof content === 'string' || content.length === 0) continue
-    content[content.length - 1].cache_control = { type: 'ephemeral' }
-    breakpoints += 1
-  }
-}
-
-function chatContentToResponsesContent(
-  content: ChatMessage['content']
-): string | Array<Record<string, unknown>> | undefined {
-  if (content === null || content === undefined) return undefined
-  if (typeof content === 'string') return content
-  const parts: Array<Record<string, unknown>> = []
-  for (const part of content) {
-    if (part.type === 'text') {
-      parts.push({ type: 'input_text', text: part.text })
-    } else if (part.type === 'image_url') {
-      parts.push({ type: 'input_image', image_url: part.image_url.url })
-    }
-  }
-  return parts
-}
-
-/**
- * OpenAI chat-completions and Responses APIs do not accept image parts
- * inside a `tool`/`function_call_output` message. When a tool result
- * carries images, keep the tool message text-only and re-emit the
- * image(s) in a following synthetic user message so vision models still
- * see them. Anthropic Messages handles images inline and skips this.
- */
-function splitToolImageMessagesForOpenAi(messages: ChatMessage[]): ChatMessage[] {
-  const hasToolImages = messages.some(
-    (message) =>
-      message.role === 'tool' &&
-      Array.isArray(message.content) &&
-      message.content.some((part) => part.type === 'image_url')
-  )
-  if (!hasToolImages) return messages
-  const out: ChatMessage[] = []
-  let pendingImages: ChatMessageContentPart[] = []
-  const flushImages = (): void => {
-    if (pendingImages.length === 0) return
-    out.push({
-      role: 'user',
-      content: [
-        { type: 'text', text: '(Automated) The tool call(s) above returned the following image(s):' },
-        ...pendingImages
-      ]
-    })
-    pendingImages = []
-  }
-  for (const message of messages) {
-    if (message.role === 'tool' && Array.isArray(message.content)) {
-      const textParts: string[] = []
-      const imageParts: ChatMessageContentPart[] = []
-      for (const part of message.content) {
-        if (part.type === 'text') textParts.push(part.text)
-        else imageParts.push(part)
-      }
-      out.push({
-        ...message,
-        content: textParts.join('\n') || '(image returned; see the following message)'
-      })
-      pendingImages.push(...imageParts)
-      continue
-    }
-    // Flush queued images once the run of tool results ends, so they land
-    // after the whole tool batch but before the next assistant turn.
-    if (message.role !== 'tool') flushImages()
-    out.push(message)
-  }
-  flushImages()
-  return out
-}
-
-function chatContentToAnthropicContent(content: ChatMessage['content']): string | AnthropicContentBlock[] {
-  if (content === null || content === undefined) return ''
-  if (typeof content === 'string') return content
-  const parts: AnthropicContentBlock[] = []
-  for (const part of content) {
-    if (part.type === 'text') {
-      if (part.text) parts.push({ type: 'text', text: part.text })
-      continue
-    }
-    const image = anthropicImageSource(part.image_url.url)
-    if (image) parts.push({ type: 'image', source: image })
-  }
-  return parts
-}
-
-function anthropicImageSource(value: string): AnthropicImageSource | null {
-  const data = parseDataUri(value)
-  if (data) {
-    return {
-      type: 'base64',
-      media_type: data.mimeType,
-      data: data.base64
-    }
-  }
-  if (/^https?:\/\//i.test(value)) {
-    return { type: 'url', url: value }
-  }
-  return null
-}
-
-function parseDataUri(value: string): { mimeType: string; base64: string } | null {
-  const match = /^data:([^;,]+);base64,(.*)$/is.exec(value)
-  if (!match) return null
-  return { mimeType: match[1], base64: match[2] }
-}
-
-function chatContentToPlainText(content: ChatMessage['content']): string {
-  if (content === null || content === undefined) return ''
-  if (typeof content === 'string') return content
-  return content.map((part) => {
-    if (part.type === 'text') return part.text
-    return `[image: ${part.image_url.url}]`
-  }).join('\n')
-}
-
-/**
- * Extract ONLY text parts from a chat-message content array — image parts
- * are dropped entirely (no `[image: data:...]` placeholder). Used when the
- * image rides separately (as a sibling block in the user message) so the
- * raw base64 does not leak back into the text channel.
- */
-function chatContentToTextOnly(content: ChatMessage['content']): string {
-  if (content === null || content === undefined) return ''
-  if (typeof content === 'string') return content
-  return content
-    .filter((part): part is Extract<ChatMessageContentPart, { type: 'text' }> => part.type === 'text')
-    .map((part) => part.text)
-    .join('\n')
-}
-
-type ModelReasoningCapability = NonNullable<ModelCapabilityMetadata['reasoning']>
-type NormalizedReasoningEffort = ModelReasoningCapability['defaultEffort']
-
-function responsesReasoningForEffort(
-  effort: string | undefined,
-  reasoning?: ModelReasoningCapability
-): Record<string, unknown> | null {
-  if (reasoning && reasoning.requestProtocol !== 'openai-responses') return null
-  const resolved = reasoning
-    ? resolveReasoningEffort(effort, reasoning)
-    : normalizeReasoningEffortValue(effort)
-  if (resolved === 'auto' || resolved === 'off' || !resolved) return null
-  const normalized = resolved
-  switch (normalized) {
-    case 'low':
-      return { effort: 'low' }
-    case 'medium':
-      return { effort: 'medium' }
-    case 'high':
-    case 'max':
-      return { effort: 'high' }
-    default:
-      return null
   }
 }
 
@@ -1939,87 +1313,9 @@ function exactModelEndpointUrl(baseUrl: string): string {
   return `${trimmed.slice(0, query).replace(/\/+$/, '')}${trimmed.slice(query)}`
 }
 
-function redactUrlForLog(url: string): string {
-  const trimmed = url.trim()
-  if (!trimmed) return ''
-  try {
-    const parsed = new URL(trimmed)
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (/(key|token|secret|signature|auth|password)/i.test(key)) {
-        parsed.searchParams.set(key, '[redacted]')
-      }
-    }
-    return parsed.toString()
-  } catch {
-    return trimmed.replace(/([?&][^=&]*(?:key|token|secret|signature|auth|password)[^=]*=)[^&#]*/gi, '$1[redacted]')
-  }
-}
-
-function summarizeForLog(text: string): string {
-  const normalized = text.replace(/\s+/g, ' ').trim()
-  return normalized.length > 1_000 ? `${normalized.slice(0, 1_000)}...` : normalized
-}
 
 function buildChatCompletionsUrl(baseUrl: string): string {
   return buildModelEndpointUrl(baseUrl, 'chat_completions')
-}
-
-function responsesOutputText(output: ResponsesApiResponse['output']): string {
-  const parts: string[] = []
-  for (const item of output ?? []) {
-    if (recordString(item, 'type') !== 'message') continue
-    const content = item.content
-    if (!Array.isArray(content)) continue
-    for (const block of content) {
-      if (!block || typeof block !== 'object') continue
-      const record = block as Record<string, unknown>
-      const type = recordString(record, 'type')
-      if (type === 'output_text' || type === 'text') {
-        const text = recordString(record, 'text')
-        if (text) parts.push(text)
-      }
-    }
-  }
-  return parts.join('')
-}
-
-function responseStreamCallId(
-  payload: Record<string, unknown>,
-  pendingArguments: Map<string, PendingToolCall>,
-  pendingByIndex: Map<number, string>
-): string {
-  const explicit = recordString(payload, 'call_id')
-  if (explicit) return explicit
-  const itemId = recordString(payload, 'item_id')
-  if (itemId && pendingArguments.has(itemId)) return itemId
-  const index = numericIndex(payload.output_index)
-  if (index !== undefined) {
-    return pendingByIndex.get(index) ?? indexFallbackCallId(index, pendingArguments)
-  }
-  if (pendingArguments.size === 1) return [...pendingArguments.keys()][0]
-  return indexFallbackCallId(undefined, pendingArguments)
-}
-
-function anthropicStreamCallId(
-  index: number | undefined,
-  pendingArguments: Map<string, PendingToolCall>,
-  pendingByIndex: Map<number, string>
-): string {
-  if (index !== undefined) {
-    return pendingByIndex.get(index) ?? indexFallbackCallId(index, pendingArguments)
-  }
-  if (pendingArguments.size === 1) return [...pendingArguments.keys()][0]
-  return indexFallbackCallId(undefined, pendingArguments)
-}
-
-function indexFallbackCallId(index: number | undefined, pendingArguments: Map<string, PendingToolCall>): string {
-  return index === undefined ? `call_${pendingArguments.size + 1}` : `call_${index + 1}`
-}
-
-function responseErrorMessage(payload: Record<string, unknown>): string {
-  const error = recordValue(payload, 'error') ?? recordValue(recordValue(payload, 'response'), 'error')
-  const message = error ? recordString(error, 'message') : ''
-  return message || recordString(payload, 'message') || 'model stream reported an error'
 }
 
 function modelPayloadError(payload: Record<string, unknown>): { message: string; code?: string } | null {
@@ -2082,21 +1378,6 @@ function successErrorCode(code: string): boolean {
   return normalized === '0' || normalized === 'ok' || normalized === 'success'
 }
 
-function anthropicStopReason(value: unknown): ModelStopReason | undefined {
-  if (typeof value !== 'string') return undefined
-  switch (value) {
-    case 'tool_use':
-      return 'tool_calls'
-    case 'max_tokens':
-      return 'length'
-    case 'end_turn':
-    case 'stop_sequence':
-      return 'stop'
-    default:
-      return undefined
-  }
-}
-
 function recordValue(value: unknown, key?: string): Record<string, unknown> | null {
   const target = key === undefined
     ? value
@@ -2137,213 +1418,6 @@ function mergeUsageSnapshots(current: UsageSnapshot | null, next: UsageSnapshot)
   }
 }
 
-function applyReasoningEffort(
-  body: Record<string, unknown>,
-  effort: string | undefined,
-  options: {
-    includeThinking?: boolean
-    nativeDeepSeekHost?: boolean
-    reasoning?: ModelReasoningCapability
-    maxReasoningEffort?: 'high' | 'max'
-  } = {}
-): void {
-  const normalized = options.reasoning
-    ? resolveReasoningEffort(effort, options.reasoning)
-    : normalizeReasoningEffortValue(effort)
-  if (!normalized) return
-  const includeThinking = options.includeThinking !== false
-  // thinking field in DeepSeek format is only supported on the official DeepSeek API.
-  // Third-party OpenAI-compat proxies (SiliconFlow, OpenRouter, llama.cpp, etc.) may
-  // reject or mishandle it, causing 400 errors or empty responses. See issue #26.
-  const nativeDeepSeek = options.nativeDeepSeekHost === true
-  if (options.reasoning) {
-    applyProfileReasoningEffort(body, normalized, options.reasoning, includeThinking, nativeDeepSeek)
-    return
-  }
-  switch (normalized) {
-    case 'off':
-      if (includeThinking) body.thinking = { type: 'disabled' }
-      break
-    case 'low':
-    case 'medium':
-    case 'high':
-      body.reasoning_effort = 'high'
-      if (nativeDeepSeek) body.thinking = { type: 'enabled' }
-      break
-    case 'max':
-      body.reasoning_effort = options.maxReasoningEffort ?? 'max'
-      if (nativeDeepSeek) body.thinking = { type: 'enabled' }
-      break
-  }
-}
-
-function applyProfileReasoningEffort(
-  body: Record<string, unknown>,
-  effort: NormalizedReasoningEffort,
-  reasoning: ModelReasoningCapability,
-  includeThinking: boolean,
-  nativeDeepSeekHost: boolean
-): void {
-  switch (reasoning.requestProtocol) {
-    case 'none':
-    case 'openai-responses':
-    case 'anthropic-thinking':
-      return
-    case 'deepseek-chat-completions':
-      applyDeepSeekChatReasoningEffort(body, effort, nativeDeepSeekHost)
-      return
-    case 'glm-chat-completions':
-      applyGlmChatReasoningEffort(body, effort, includeThinking)
-      return
-    case 'mimo-chat-completions':
-      applyMimoChatReasoningEffort(body, effort, includeThinking)
-      return
-  }
-}
-
-function applyDeepSeekChatReasoningEffort(
-  body: Record<string, unknown>,
-  effort: NormalizedReasoningEffort,
-  includeThinking: boolean
-): void {
-  if (effort === 'off') {
-    if (includeThinking) body.thinking = { type: 'disabled' }
-    return
-  }
-  if (effort === 'max') {
-    body.reasoning_effort = 'max'
-  } else if (effort !== 'auto') {
-    body.reasoning_effort = 'high'
-  }
-  if (includeThinking && effort !== 'auto') body.thinking = { type: 'enabled' }
-}
-
-function applyGlmChatReasoningEffort(
-  body: Record<string, unknown>,
-  effort: NormalizedReasoningEffort,
-  includeThinking: boolean
-): void {
-  if (!includeThinking || effort === 'auto') return
-  body.thinking = {
-    type: effort === 'off' ? 'disabled' : 'enabled',
-    clear_thinking: true
-  }
-}
-
-function applyMimoChatReasoningEffort(
-  body: Record<string, unknown>,
-  effort: NormalizedReasoningEffort,
-  includeThinking: boolean
-): void {
-  if (effort === 'off') {
-    if (includeThinking) body.thinking = { type: 'disabled' }
-    return
-  }
-  if (effort === 'low' || effort === 'medium' || effort === 'high') {
-    body.reasoning_effort = effort
-    if (includeThinking) body.thinking = { type: 'enabled' }
-  }
-}
-
-function applyAnthropicReasoningEffort(
-  body: Record<string, unknown>,
-  effort: string | undefined,
-  reasoning?: ModelReasoningCapability
-): void {
-  if (reasoning?.requestProtocol !== 'anthropic-thinking') return
-  const resolved = resolveReasoningEffort(effort, reasoning)
-  if (!resolved) return
-  if (resolved === 'off') {
-    body.thinking = { type: 'disabled' }
-    return
-  }
-  body.thinking = { type: 'adaptive' }
-  const outputEffort = anthropicOutputEffortForReasoningEffort(resolved)
-  if (outputEffort) body.output_config = { effort: outputEffort }
-}
-
-function anthropicOutputEffortForReasoningEffort(
-  effort: NormalizedReasoningEffort
-): 'low' | 'medium' | 'high' | 'max' | null {
-  switch (effort) {
-    case 'low':
-    case 'medium':
-    case 'high':
-    case 'max':
-      return effort
-    case 'auto':
-    case 'off':
-      return null
-  }
-}
-
-function resolveReasoningEffort(
-  effort: string | undefined,
-  reasoning: ModelReasoningCapability
-): NormalizedReasoningEffort | undefined {
-  const normalized = normalizeReasoningEffortValue(effort)
-  if (!normalized) return undefined
-  if (reasoning.supportedEfforts.includes(normalized)) return normalized
-  if (
-    normalized === 'low' &&
-    reasoning.supportedEfforts.includes('off') &&
-    !reasoning.supportedEfforts.includes('low')
-  ) {
-    return 'off'
-  }
-  return reasoning.defaultEffort
-}
-
-function normalizeReasoningEffortValue(effort: string | undefined): NormalizedReasoningEffort | undefined {
-  switch (effort?.trim().toLowerCase()) {
-    case 'auto':
-    case 'adaptive':
-      return 'auto'
-    case 'off':
-    case 'disabled':
-    case 'none':
-    case 'false':
-      return 'off'
-    case 'low':
-    case 'minimal':
-      return 'low'
-    case 'medium':
-    case 'mid':
-      return 'medium'
-    case 'high':
-      return 'high'
-    case 'max':
-    case 'maximum':
-    case 'xhigh':
-      return 'max'
-    default:
-      return undefined
-  }
-}
-
-// Transient upstream gateway statuses worth retrying — load balancers and
-// reverse proxies return these for momentary backend unavailability.
-const TRANSIENT_RETRY_STATUSES = new Set([502, 503, 504])
-const MAX_TRANSIENT_RETRIES = 2
-const TRANSIENT_RETRY_BASE_MS = 500
-
-/** Sleep `ms`, resolving early to `true` if the signal aborts first. */
-function sleepWithAbort(ms: number, signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) return Promise.resolve(true)
-  return new Promise<boolean>((resolve) => {
-    let timer: ReturnType<typeof setTimeout>
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      resolve(true)
-    }
-    timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort)
-      resolve(false)
-    }, ms)
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
 function shouldRetryWithoutStreamUsage(
   status: number,
   text: string,
@@ -2354,62 +1428,6 @@ function shouldRetryWithoutStreamUsage(
   return /\b(stream_options|include_usage)\b/i.test(text)
 }
 
-function isAzureOpenAiEndpoint(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl)
-    const host = url.hostname.toLowerCase()
-    return host.endsWith('.openai.azure.com') || host.endsWith('.cognitiveservices.azure.com')
-  } catch {
-    return /\.openai\.azure\.com\b|\.cognitiveservices\.azure\.com\b/i.test(baseUrl)
-  }
-}
-
-function isThinkingMode(effort: string | undefined): boolean {
-  const normalized = effort?.trim().toLowerCase()
-  if (!normalized) return false
-  return !['off', 'disabled', 'none', 'false'].includes(normalized)
-}
-
-function requiresReasoningRoundTrip(
-  effort: string | undefined,
-  model: string | undefined,
-  baseUrl: string,
-  reasoning?: ModelReasoningCapability
-): boolean {
-  if (reasoning) {
-    const resolved = resolveReasoningEffort(effort, reasoning)
-    if (resolved) {
-      return resolved !== 'off' && reasoning.requestProtocol !== 'none'
-    }
-    return isDeepSeekHost(baseUrl) && isThinkingProducerModel(model)
-  }
-  // Thinking-mode round trip is a DeepSeek-specific protocol extension.
-  // OpenAI-compat providers (OpenRouter, llama.cpp, etc.) may reject
-  // or misinterpret the `thinking` field, so we only auto-enable it
-  // on the official DeepSeek host. User-selected reasoningEffort still
-  // forces the path (opt-in). See issue #26.
-  return isThinkingMode(effort) || (isDeepSeekHost(baseUrl) && isThinkingProducerModel(model))
-}
-
-function isThinkingProducerModel(model: string | undefined): boolean {
-  const normalized = normalizeModelId(model)
-  if (!normalized) return false
-  return normalized === 'deepseek-v4-pro' ||
-    normalized === 'deepseek-v4-flash' ||
-    normalized.includes('deepseek-reasoner') ||
-    normalized.endsWith('/deepseek-v4-pro') ||
-    normalized.endsWith('/deepseek-v4-flash')
-}
-
-function reasoningContentOrSpace(text: string): string {
-  return text.trim() ? text : ' '
-}
-
-function toolResultContent(output: unknown): string {
-  if (typeof output === 'string') return output
-  return JSON.stringify(output) ?? ''
-}
-
 function reasoningFromMessage(message: ChatCompletionResponse['choices'][number]['message'] | undefined): string {
   if (!message) return ''
   const value = message.reasoning_content ??
@@ -2417,65 +1435,149 @@ function reasoningFromMessage(message: ChatCompletionResponse['choices'][number]
   return typeof value === 'string' ? value : ''
 }
 
-function isPreToolCallBridgeItem(item: TurnItem, turnId: string): boolean {
-  if (item.turnId !== turnId) return false
-  return item.kind === 'assistant_reasoning' || item.kind === 'assistant_text'
-}
-
-function isBridgeItemBeforeToolCall(items: TurnItem[], index: number): boolean {
-  const item = items[index]
-  if (!item || (item.kind !== 'assistant_reasoning' && item.kind !== 'assistant_text')) {
-    return false
-  }
-  let cursor = index + 1
-  while (cursor < items.length) {
-    const next = items[cursor]
-    if (!next) return false
-    if (next.kind === 'assistant_reasoning' || next.kind === 'assistant_text') {
-      if (next.turnId !== item.turnId) return false
-      cursor += 1
-      continue
-    }
-    return next.kind === 'tool_call' && next.turnId === item.turnId
-  }
-  return false
-}
-
-function normalizeThinkingAssistantMessages(
-  messages: ChatMessage[],
-  thinkingMode: boolean
-): ChatMessage[] {
-  if (!thinkingMode) return messages
-  return messages.map((message) => {
-    if (message.role !== 'assistant') return message
-    const next = { ...message }
-    if (next.content == null) next.content = ''
-    if (
-      !Object.prototype.hasOwnProperty.call(next, 'reasoning_content') ||
-      next.reasoning_content == null ||
-      !next.reasoning_content.trim()
-    ) {
-      next.reasoning_content = ' '
-    }
-    return next
-  })
-}
-
-function canonicalizeSchema(value: unknown): Record<string, unknown> {
-  const canonical = canonicalize(value)
-  return canonical && typeof canonical === 'object' && !Array.isArray(canonical)
-    ? canonical as Record<string, unknown>
-    : {}
-}
-
-function normalizeModelId(model: string | undefined): string {
-  return model?.trim().toLowerCase() ?? ''
-}
-
 function normalizeStreamIdleTimeoutMs(value: number | undefined): number {
   if (value === undefined) return DEFAULT_STREAM_IDLE_TIMEOUT_MS
   if (!Number.isFinite(value)) return DEFAULT_STREAM_IDLE_TIMEOUT_MS
   return Math.max(0, Math.floor(value))
+}
+
+function normalizeModelStreamLimits(input: Partial<ModelStreamLimits> | undefined): ModelStreamLimits {
+  const normalize = (value: number | undefined, fallback: number): number => {
+    if (value === undefined || !Number.isFinite(value)) return fallback
+    return Math.max(1, Math.floor(value))
+  }
+  return {
+    maxBufferBytes: normalize(input?.maxBufferBytes, DEFAULT_MODEL_STREAM_LIMITS.maxBufferBytes),
+    maxFrameBytes: normalize(input?.maxFrameBytes, DEFAULT_MODEL_STREAM_LIMITS.maxFrameBytes),
+    maxTotalBytes: normalize(input?.maxTotalBytes, DEFAULT_MODEL_STREAM_LIMITS.maxTotalBytes),
+    maxFrames: normalize(input?.maxFrames, DEFAULT_MODEL_STREAM_LIMITS.maxFrames),
+    maxOutputBytes: normalize(input?.maxOutputBytes, DEFAULT_MODEL_STREAM_LIMITS.maxOutputBytes),
+    maxPendingToolCalls: normalize(input?.maxPendingToolCalls, DEFAULT_MODEL_STREAM_LIMITS.maxPendingToolCalls),
+    maxPendingToolArgumentBytes: normalize(
+      input?.maxPendingToolArgumentBytes,
+      DEFAULT_MODEL_STREAM_LIMITS.maxPendingToolArgumentBytes
+    ),
+    maxTotalPendingToolArgumentBytes: normalize(
+      input?.maxTotalPendingToolArgumentBytes,
+      DEFAULT_MODEL_STREAM_LIMITS.maxTotalPendingToolArgumentBytes
+    ),
+    maxCompletedToolCalls: normalize(input?.maxCompletedToolCalls, DEFAULT_MODEL_STREAM_LIMITS.maxCompletedToolCalls),
+    maxCompletedToolArgumentBytes: normalize(
+      input?.maxCompletedToolArgumentBytes,
+      DEFAULT_MODEL_STREAM_LIMITS.maxCompletedToolArgumentBytes
+    )
+  }
+}
+
+let modelTraceFailureWarned = false
+
+function ignoreModelTraceFailure<T>(operation: () => T): T | undefined {
+  try {
+    return operation()
+  } catch {
+    warnModelTraceFailure()
+    return undefined
+  }
+}
+
+function warnModelTraceFailure(): void {
+  if (modelTraceFailureWarned) return
+  modelTraceFailureWarned = true
+  console.warn('[kun:model] model request observability capture failed; the provider request continues unchanged')
+}
+
+type LimitedResponseJson =
+  | { kind: 'ok'; value: unknown }
+  | { kind: 'limit'; maxBytes: number }
+  | { kind: 'invalid_json'; message: string }
+
+/** Read an HTTP body without delegating an unbounded response to Response.text/json. */
+async function readLimitedResponseText(response: Response, maxBytes: number): Promise<{ text: string; exceeded: boolean }> {
+  const declaredLength = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    void response.body?.cancel('model response body limit exceeded').catch(() => {})
+    return { text: '', exceeded: true }
+  }
+  if (!response.body) return { text: '', exceeded: false }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  const parts: string[] = []
+  let totalBytes = 0
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (!value) continue
+      totalBytes += value.byteLength
+      if (totalBytes > maxBytes) {
+        void reader.cancel('model response body limit exceeded').catch(() => {})
+        return { text: parts.join(''), exceeded: true }
+      }
+      const text = decoder.decode(value, { stream: true })
+      if (text) parts.push(text)
+    }
+    const tail = decoder.decode()
+    if (tail) parts.push(tail)
+    return { text: parts.join(''), exceeded: false }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // Best effort; cancellation or a completed reader may already release it.
+    }
+  }
+}
+
+async function readLimitedResponseJson(response: Response, maxBytes: number): Promise<LimitedResponseJson> {
+  const body = await readLimitedResponseText(response, maxBytes)
+  if (body.exceeded) return { kind: 'limit', maxBytes }
+  try {
+    return { kind: 'ok', value: JSON.parse(body.text) }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { kind: 'invalid_json', message }
+  }
+}
+
+function* enforceNonStreamingLimits(
+  chunks: Iterable<ModelStreamChunk>,
+  limits: ModelStreamLimits
+): Generator<ModelStreamChunk> {
+  const budget = new ModelStreamResourceBudget(limits)
+  try {
+    for (const chunk of chunks) {
+      if (chunk.kind === 'tool_call_complete') {
+        budget.completeToolCall(JSON.stringify(chunk.arguments) ?? '{}')
+      }
+      budget.addOutput([chunk])
+      yield chunk
+    }
+  } catch (error) {
+    if (error instanceof ModelStreamResourceLimitError) {
+      yield { kind: 'error', message: error.message, code: 'stream_resource_limit' }
+      return
+    }
+    throw error
+  }
+}
+
+function isRecoverableStreamTransportError(
+  chunk: ModelStreamChunk
+): chunk is Extract<ModelStreamChunk, { kind: 'error' }> {
+  return chunk.kind === 'error' && (
+    chunk.code === 'stream_read_error' ||
+    chunk.code === 'stream_truncated' ||
+    chunk.code === 'stream_idle_timeout'
+  )
+}
+
+function isCommittedStreamOutput(chunk: ModelStreamChunk): boolean {
+  return (
+    chunk.kind === 'assistant_text_delta' ||
+    chunk.kind === 'tool_call_delta' ||
+    chunk.kind === 'tool_call_complete' ||
+    chunk.kind === 'image_generation_complete'
+  )
 }
 
 async function readStreamChunk(
@@ -2512,171 +1614,9 @@ async function readStreamChunk(
   if (timeout) clearTimeout(timeout)
   cleanupAbort?.()
   if (result.kind === 'timeout') {
-    try {
-      await reader.cancel('model stream idle timeout')
-    } catch {
-      // Best-effort cancellation; the caller will surface the timeout.
-    }
+    // A custom stream may never resolve `cancel()`. Fire-and-forget it so an
+    // idle timeout remains a real deadline rather than another await point.
+    void reader.cancel('model stream idle timeout').catch(() => {})
   }
   return result
-}
-
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize)
-  if (!value || typeof value !== 'object') return value
-  const out: Record<string, unknown> = {}
-  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    out[key] = canonicalize((value as Record<string, unknown>)[key])
-  }
-  return out
-}
-
-function resolveToolCallDeltaId(
-  call: { index?: number; id?: string },
-  pending: Map<string, PendingToolCall>
-): string {
-  const index = numericIndex(call.index)
-  const existingByIndex = findPendingToolCallIdByIndex(pending, index)
-  if (call.id) {
-    if (existingByIndex && existingByIndex !== call.id) {
-      const existing = pending.get(existingByIndex)
-      if (existing) {
-        pending.delete(existingByIndex)
-        pending.set(call.id, existing)
-      }
-    }
-    return call.id
-  }
-  return existingByIndex ?? `call_${pending.size + 1}`
-}
-
-function findPendingToolCallIdByIndex(
-  pending: Map<string, PendingToolCall>,
-  index: number | undefined
-): string | undefined {
-  if (index === undefined) return undefined
-  for (const [callId, value] of pending) {
-    if (value.index === index) return callId
-  }
-  return undefined
-}
-
-function numericIndex(index: unknown): number | undefined {
-  return typeof index === 'number' && Number.isInteger(index) && index >= 0
-    ? index
-    : undefined
-}
-
-function healToolMessagePairs(messages: ChatMessage[]): ChatMessage[] {
-  const healed: ChatMessage[] = []
-  for (let i = 0; i < messages.length; i += 1) {
-    const message = messages[i]
-    if (message.role === 'tool') {
-      continue
-    }
-    if (message.role === 'assistant' && message.tool_calls?.length) {
-      const expectedIds = new Set(message.tool_calls.map((call) => call.id))
-      const toolResults: ChatMessage[] = []
-      let j = i + 1
-      while (j < messages.length && messages[j].role === 'tool') {
-        const toolResult = messages[j]
-        if (toolResult.tool_call_id && expectedIds.has(toolResult.tool_call_id)) {
-          toolResults.push(toolResult)
-        }
-        j += 1
-      }
-      const seenIds = new Set(toolResults.map((toolResult) => toolResult.tool_call_id))
-      if ([...expectedIds].every((id) => seenIds.has(id))) {
-        healed.push(message, ...toolResults)
-      }
-      i = j - 1
-      continue
-    }
-    healed.push(message)
-  }
-  return healed
-}
-
-function attachImagesToLatestUserMessage(
-  messages: ChatMessage[],
-  attachments: NonNullable<ModelRequest['attachments']>
-): void {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (message.role !== 'user') continue
-    const parts: ChatMessageContentPart[] = []
-    if (typeof message.content === 'string' && message.content) {
-      parts.push({ type: 'text', text: message.content })
-    }
-    for (const attachment of attachments) {
-      parts.push({
-        type: 'image_url',
-        image_url: {
-          url: `data:${attachment.mimeType};base64,${attachment.dataBase64}`
-        }
-      })
-    }
-    message.content = parts
-    return
-  }
-}
-
-function attachTextFallbacksToLatestUserMessage(
-  messages: ChatMessage[],
-  attachments: NonNullable<ModelRequest['attachmentTextFallbacks']>
-): void {
-  const text = attachments.map(formatAttachmentTextFallback).join('\n\n')
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (message.role !== 'user') continue
-    if (typeof message.content === 'string') {
-      message.content = message.content ? `${message.content}\n\n${text}` : text
-      return
-    }
-    if (Array.isArray(message.content)) {
-      message.content.push({ type: 'text', text })
-      return
-    }
-    message.content = text
-    return
-  }
-}
-
-function formatAttachmentTextFallback(
-  attachment: NonNullable<ModelRequest['attachmentTextFallbacks']>[number]
-): string {
-  return [
-    '[Attached image as base64 text]',
-    `Name: ${attachment.name}`,
-    `FilePath: ${attachment.localFilePath ?? 'unknown'}`,
-    `MIME: ${attachment.mimeType}`,
-    `Dimensions: ${formatAttachmentDimensions(attachment)}`,
-    `Bytes: ${attachment.byteSize}`,
-    'Base64:',
-    '```base64',
-    attachment.dataBase64,
-    '```',
-    '[/Attached image]'
-  ].join('\n')
-}
-
-function formatAttachmentDimensions(
-  attachment: NonNullable<ModelRequest['attachmentTextFallbacks']>[number]
-): string {
-  return attachment.width && attachment.height ? `${attachment.width}x${attachment.height}` : 'unknown'
-}
-
-function limitHistoryPreservingCompaction(history: TurnItem[], windowSize: number): TurnItem[] {
-  if (history.length <= windowSize) return history
-  const windowStart = history.length - windowSize
-  const limited = history.slice(windowStart)
-  if (limited.some((item) => item.kind === 'compaction' && item.replacedTokens > 0)) {
-    return limited
-  }
-  for (let index = windowStart - 1; index >= 0; index -= 1) {
-    const item = history[index]
-    if (item.kind !== 'compaction' || item.replacedTokens === 0) continue
-    return windowSize <= 1 ? [item] : [item, ...history.slice(-(windowSize - 1))]
-  }
-  return limited
 }

@@ -1,4 +1,12 @@
-import { useEffect, useState, type ReactElement, type ReactNode } from 'react'
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactElement,
+  type ReactNode
+} from 'react'
 import {
   AudioLines,
   Brain,
@@ -13,7 +21,8 @@ import {
   Pencil,
   Plus,
   Search,
-  Trash2
+  Trash2,
+  X
 } from 'lucide-react'
 import {
   MODEL_ENDPOINT_FORMATS,
@@ -22,7 +31,7 @@ import {
   type ModelReasoningEffort,
   type ModelReasoningRequestProtocol
 } from '@shared/app-settings'
-import { Toggle } from './settings-controls'
+import { AdvancedSettingsDisclosure, Toggle } from './settings-controls'
 import {
   CONTEXT_WINDOW_PRESETS,
   PROVIDER_MODEL_REASONING_EFFORT_CHOICES,
@@ -58,6 +67,9 @@ const REASONING_PROTOCOL_LABEL_KEYS: Record<ModelReasoningRequestProtocol, strin
   'deepseek-chat-completions': 'providerModelReasoningProtocolDeepseek',
   'glm-chat-completions': 'providerModelReasoningProtocolGlm',
   'mimo-chat-completions': 'providerModelReasoningProtocolMimo',
+  'openai-chat-completions': 'providerModelReasoningProtocolOpenAiChat',
+  'qwen-chat-completions': 'providerModelReasoningProtocolQwen',
+  'thinking-toggle-chat-completions': 'providerModelReasoningProtocolThinkingToggle',
   'openai-responses': 'providerModelReasoningProtocolResponses',
   'anthropic-thinking': 'providerModelReasoningProtocolAnthropic',
   none: 'providerModelReasoningProtocolNone'
@@ -274,7 +286,7 @@ function ToggleField({
         <span className="text-[12.5px] font-semibold text-ds-ink">{label}</span>
         <span className="text-[12px] leading-5 text-ds-faint">{description}</span>
       </div>
-      <Toggle checked={checked} onChange={onChange} />
+      <Toggle checked={checked} onChange={onChange} ariaLabel={label} />
     </div>
   )
 }
@@ -293,6 +305,10 @@ export function ProviderModelsManager({
   const [editor, setEditor] = useState<EditorState | null>(null)
   const [query, setQuery] = useState('')
   const [page, setPage] = useState(0)
+  const dialogTitleId = useId()
+  const dialogRef = useRef<HTMLElement | null>(null)
+  const editorOpenerRef = useRef<HTMLElement | null>(null)
+  const editorOpen = editor !== null
   // Batch selection for bulk delete (#397). Survives search/page changes so a
   // user can search, select-all-visible, search again, select-all-visible, then
   // delete. Reset when the user navigates to a different provider.
@@ -300,6 +316,67 @@ export function ProviderModelsManager({
   useEffect(() => {
     setSelected(new Set())
   }, [provider.id])
+
+  useEffect(() => {
+    if (!editorOpen || typeof document === 'undefined') return
+
+    const opener = editorOpenerRef.current
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const focusInitialControl = (): void => {
+      dialogRef.current
+        ?.querySelector<HTMLElement>('[data-model-editor-initial-focus="true"]')
+        ?.focus()
+    }
+    const frame = typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function'
+      ? window.requestAnimationFrame(focusInitialControl)
+      : null
+    if (frame === null) focusInitialControl()
+
+    return () => {
+      if (frame !== null && typeof window !== 'undefined') window.cancelAnimationFrame(frame)
+      document.body.style.overflow = previousOverflow
+      if (opener?.isConnected) opener.focus()
+    }
+  }, [editorOpen])
+
+  const openEditor = (next: EditorState, opener: HTMLElement): void => {
+    editorOpenerRef.current = opener
+    setEditor(next)
+  }
+
+  const closeEditor = (): void => {
+    setEditor(null)
+  }
+
+  const handleDialogKeyDown = (event: KeyboardEvent<HTMLElement>): void => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeEditor()
+      return
+    }
+    if (event.key !== 'Tab' || !dialogRef.current || typeof document === 'undefined') return
+
+    const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>([
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      'a[href]',
+      'summary'
+    ].join(','))).filter((element) => element.getClientRects().length > 0)
+    if (focusable.length === 0) return
+
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
 
   const updateForm = (patch: Partial<ProviderModelForm>): void => {
     setEditor((prev) => prev ? { ...prev, form: { ...prev.form, ...patch } } : prev)
@@ -310,7 +387,7 @@ export function ProviderModelsManager({
     const form = effectiveFormForEditor(editor)
     if (validateProviderModelForm(form, provider).length > 0) return
     onChange(applyProviderModelForm(provider, form))
-    setEditor(null)
+    closeEditor()
   }
 
   const deleteModel = (kind: ProviderModelKind, modelId: string): void => {
@@ -527,7 +604,10 @@ export function ProviderModelsManager({
                       <button
                         type="button"
                         aria-label={t('providerModelEditAction', { model: modelId })}
-                        onClick={() => setEditor(editorStateForExisting(provider, kind, modelId))}
+                        onClick={(event) => openEditor(
+                          editorStateForExisting(provider, kind, modelId),
+                          event.currentTarget
+                        )}
                         className="rounded-full p-1.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
                       >
                         <Pencil className="h-3.5 w-3.5" strokeWidth={1.9} />
@@ -578,287 +658,328 @@ export function ProviderModelsManager({
           ) : null}
         </>
       )}
-      {editor === null ? (
-        <button
-          type="button"
-          onClick={() => setEditor(editorStateForNew(provider))}
-          className="inline-flex h-9 w-fit items-center gap-2 rounded-full border border-ds-border bg-ds-card px-3 text-[12.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink"
+      <button
+        type="button"
+        onClick={(event) => openEditor(editorStateForNew(provider), event.currentTarget)}
+        className="inline-flex h-9 w-fit items-center gap-2 rounded-full border border-ds-border bg-ds-card px-3 text-[12.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink"
+      >
+        <Plus className="h-3.5 w-3.5" strokeWidth={1.9} />
+        {t('providerModelAdd')}
+      </button>
+      {editor ? (
+        <div
+          className="ds-no-drag fixed inset-0 z-50 grid place-items-center overscroll-none bg-slate-950/40 p-4 backdrop-blur-md dark:bg-black/65"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeEditor()
+          }}
         >
-          <Plus className="h-3.5 w-3.5" strokeWidth={1.9} />
-          {t('providerModelAdd')}
-        </button>
-      ) : (
-        <div className="grid gap-3 rounded-xl border border-ds-border bg-ds-card/70 p-3.5">
-          <h4 className="text-[13px] font-semibold text-ds-ink">
-            {editor.mode === 'add'
-              ? t('providerModelAddTitle')
-              : t('providerModelEditTitle', { model: editor.form.originalModelId })}
-          </h4>
-          {editor.mode === 'add' ? (
-            <div className="grid gap-2">
-              <span className="text-[12px] font-semibold text-ds-muted">{t('providerModelKindLabel')}</span>
-              <div className="grid gap-2 md:grid-cols-3">
-                {MODEL_KIND_META.map(({ kind, icon: Icon, titleKey, descKey }) => {
-                  const selected = editor.form.kind === kind
-                  return (
-                    <button
-                      key={kind}
-                      type="button"
-                      aria-pressed={selected}
-                      onClick={() => updateForm({ kind })}
-                      className={`grid gap-1 rounded-xl border px-3 py-2.5 text-left transition ${
-                        selected
-                          ? 'border-accent/60 bg-ds-main/45 ring-1 ring-accent/30'
-                          : 'border-ds-border bg-ds-card hover:bg-ds-hover'
-                      }`}
-                    >
-                      <span className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-ds-ink">
-                        <Icon className="h-3.5 w-3.5" strokeWidth={1.9} />
-                        {t(titleKey)}
-                      </span>
-                      <span className="text-[11.5px] leading-4 text-ds-faint">{t(descKey)}</span>
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
-          ) : null}
-          <label className={fieldLabelClass}>
-            {t('providerModelIdLabel')}
-            <input
-              className={`${textInputClass} font-mono text-[13px]`}
-              value={editor.form.modelId}
-              placeholder={t('providerModelIdPlaceholder')}
-              spellCheck={false}
-              autoFocus
-              onChange={(e) => updateForm({ modelId: e.target.value })}
-            />
-            <span className="text-[12px] font-normal leading-5 text-ds-faint">{t('providerModelIdHint')}</span>
-            {showNonTextWarning ? (
-              <span className="text-[12px] font-normal leading-5 text-amber-600 dark:text-amber-300">
-                {t('providerModelNonTextWarning')}
-              </span>
-            ) : null}
-          </label>
-          {editor.form.kind === 'chat' ? (
-            <>
-              <div className="grid gap-1.5">
-                <span className="text-[12px] font-semibold text-ds-muted">{t('providerModelContextLabel')}</span>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {CONTEXT_WINDOW_PRESETS.map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => setEditor((prev) =>
-                        prev ? { ...prev, contextText: describeContextWindowTokens(preset) } : prev
-                      )}
-                      className={chipButtonClass(parsedContextTokens === preset)}
-                    >
-                      {describeContextWindowTokens(preset)}
-                    </button>
-                  ))}
-                  <input
-                    className="w-36 min-w-0 rounded-xl border border-ds-border bg-ds-card px-3 py-1.5 font-mono text-[12.5px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
-                    value={editor.contextText}
-                    placeholder={t('providerModelContextPlaceholder')}
-                    spellCheck={false}
-                    onChange={(e) => {
-                      const value = e.target.value
-                      setEditor((prev) => prev ? { ...prev, contextText: value } : prev)
-                    }}
-                  />
-                  {parsedContextTokens ? (
-                    <span className="text-[12px] text-ds-faint">
-                      {t('providerModelContextParsed', { tokens: parsedContextTokens.toLocaleString() })}
-                    </span>
-                  ) : null}
+          <section
+            ref={dialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={dialogTitleId}
+            onKeyDown={handleDialogKeyDown}
+            className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-card shadow-panel"
+          >
+            <header className="flex shrink-0 items-start justify-between gap-3 border-b border-ds-border px-5 py-4">
+              <h2 id={dialogTitleId} className="min-w-0 break-words text-[15px] font-semibold text-ds-ink">
+                {editor.mode === 'add'
+                  ? t('providerModelAddTitle')
+                  : t('providerModelEditTitle', { model: editor.form.originalModelId })}
+              </h2>
+              <button
+                type="button"
+                aria-label={t('providerModelCancel')}
+                onClick={closeEditor}
+                className="shrink-0 rounded-full p-1.5 text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
+              >
+                <X className="h-4 w-4" strokeWidth={1.9} />
+              </button>
+            </header>
+
+            <div className="grid min-h-0 flex-1 gap-3 overscroll-contain overflow-y-auto px-5 py-4">
+              {editor.mode === 'add' ? (
+                <div className="grid gap-2">
+                  <span className="text-[12px] font-semibold text-ds-muted">{t('providerModelKindLabel')}</span>
+                  <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3">
+                    {MODEL_KIND_META.map(({ kind, icon: Icon, titleKey, descKey }) => {
+                      const selected = editor.form.kind === kind
+                      return (
+                        <button
+                          key={kind}
+                          type="button"
+                          aria-pressed={selected}
+                          onClick={() => updateForm({ kind })}
+                          className={`grid gap-1 rounded-xl border px-3 py-2.5 text-left transition ${
+                            selected
+                              ? 'border-accent/60 bg-ds-main/45 ring-1 ring-accent/30'
+                              : 'border-ds-border bg-ds-card hover:bg-ds-hover'
+                          }`}
+                        >
+                          <span className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-ds-ink">
+                            <Icon className="h-3.5 w-3.5" strokeWidth={1.9} />
+                            {t(titleKey)}
+                          </span>
+                          <span className="text-[11.5px] leading-4 text-ds-faint">{t(descKey)}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
-                <span className="text-[12px] leading-5 text-ds-faint">{t('providerModelContextHint')}</span>
-              </div>
+              ) : null}
+
               <label className={fieldLabelClass}>
-                {t('providerModelMaxOutputLabel')}
+                {t('providerModelIdLabel')}
                 <input
-                  className="w-36 min-w-0 rounded-xl border border-ds-border bg-ds-card px-3 py-1.5 font-mono text-[12.5px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
-                  value={editor.maxOutputText}
-                  placeholder={t('providerModelMaxOutputPlaceholder')}
+                  data-model-editor-initial-focus="true"
+                  className={`${textInputClass} font-mono text-[13px]`}
+                  value={editor.form.modelId}
+                  placeholder={t('providerModelIdPlaceholder')}
                   spellCheck={false}
-                  onChange={(e) => {
-                    const value = e.target.value
-                    setEditor((prev) => prev ? { ...prev, maxOutputText: value } : prev)
-                  }}
+                  onChange={(e) => updateForm({ modelId: e.target.value })}
                 />
-                {parsedMaxOutputTokens ? (
-                  <span className="text-[12px] font-normal leading-5 text-ds-faint">
-                    {t('providerModelMaxOutputParsed', { tokens: parsedMaxOutputTokens.toLocaleString() })}
+                <span className="text-[12px] font-normal leading-5 text-ds-faint">{t('providerModelIdHint')}</span>
+                {showNonTextWarning ? (
+                  <span className="text-[12px] font-normal leading-5 text-amber-600 dark:text-amber-300">
+                    {t('providerModelNonTextWarning')}
                   </span>
                 ) : null}
-                <span className="text-[12px] font-normal leading-5 text-ds-faint">
-                  {t('providerModelMaxOutputHint')}
-                </span>
               </label>
-              <div className="grid gap-2 md:grid-cols-2">
-                <ToggleField
-                  label={t('providerModelVisionLabel')}
-                  description={t('providerModelVisionDesc')}
-                  checked={editor.form.visionInput}
-                  onChange={(value) => updateForm({ visionInput: value })}
-                />
-                <ToggleField
-                  label={t('providerModelToolsLabel')}
-                  description={t('providerModelToolsDesc')}
-                  checked={editor.form.supportsToolCalling}
-                  onChange={(value) => updateForm({ supportsToolCalling: value })}
-                />
-              </div>
-              <div className="grid gap-2">
-                <ToggleField
-                  label={t('providerModelReasoningLabel')}
-                  description={t('providerModelReasoningDesc')}
-                  checked={editor.form.reasoningEnabled}
-                  onChange={(value) => updateForm({ reasoningEnabled: value })}
-                />
-                {editor.form.reasoningEnabled ? (
-                  <div className="grid gap-3 rounded-xl border border-ds-border-muted bg-ds-main/30 p-3">
-                    <div className="grid gap-1.5">
-                      <span className="text-[12px] font-semibold text-ds-muted">
-                        {t('providerModelReasoningEfforts')}
-                      </span>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {reasoningEffortPool.map((effort) => {
-                          const selected = editor.form.reasoningEfforts.includes(effort)
-                          return (
-                            <button
-                              key={effort}
-                              type="button"
-                              aria-pressed={selected}
-                              onClick={() => updateForm({
-                                reasoningEfforts: selected
-                                  ? editor.form.reasoningEfforts.filter((item) => item !== effort)
-                                  : sortReasoningEfforts([...editor.form.reasoningEfforts, effort])
-                              })}
-                              className={chipButtonClass(selected)}
-                            >
-                              {t(REASONING_EFFORT_LABEL_KEYS[effort])}
-                            </button>
-                          )
-                        })}
-                      </div>
-                    </div>
-                    <div className="grid gap-3 md:grid-cols-2">
-                      <label className={fieldLabelClass}>
-                        {t('providerModelReasoningDefault')}
-                        <select
-                          className={selectControlClass}
-                          value={editor.form.reasoningDefaultEffort}
-                          onChange={(e) => updateForm({
-                            reasoningDefaultEffort: e.target.value as ModelReasoningEffort
-                          })}
-                        >
-                          {(editor.form.reasoningEfforts.length > 0
-                            ? sortReasoningEfforts(editor.form.reasoningEfforts)
-                            : reasoningEffortPool
-                          ).map((effort) => (
-                            <option key={effort} value={effort}>
-                              {t(REASONING_EFFORT_LABEL_KEYS[effort])}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className={fieldLabelClass}>
-                        {t('providerModelReasoningProtocol')}
-                        <select
-                          className={selectControlClass}
-                          value={editor.form.reasoningProtocol}
-                          onChange={(e) => updateForm({
-                            reasoningProtocol: e.target.value as ModelReasoningRequestProtocol
-                          })}
-                        >
-                          {PROVIDER_MODEL_REASONING_PROTOCOLS.map((protocol) => (
-                            <option key={protocol} value={protocol}>
-                              {t(REASONING_PROTOCOL_LABEL_KEYS[protocol])}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-                    <span className="text-[12px] leading-5 text-ds-faint">
-                      {t('providerModelReasoningProtocolHint')}
-                    </span>
+
+              {editor.form.kind === 'chat' ? (
+                <>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <ToggleField
+                      label={t('providerModelVisionLabel')}
+                      description={t('providerModelVisionDesc')}
+                      checked={editor.form.visionInput}
+                      onChange={(value) => updateForm({ visionInput: value })}
+                    />
+                    <ToggleField
+                      label={t('providerModelToolsLabel')}
+                      description={t('providerModelToolsDesc')}
+                      checked={editor.form.supportsToolCalling}
+                      onChange={(value) => updateForm({ supportsToolCalling: value })}
+                    />
                   </div>
-                ) : null}
-              </div>
-              <label className={fieldLabelClass}>
-                {t('providerModelEndpointFormatLabel')}
-                <select
-                  className={selectControlClass}
-                  value={editor.form.endpointFormat ?? ''}
-                  onChange={(e) => updateForm({
-                    endpointFormat: e.target.value === ''
-                      ? null
-                      : e.target.value as ModelEndpointFormat
-                  })}
-                >
-                  <option value="">
-                    {t('providerModelEndpointInherit', {
-                      format: t(ENDPOINT_FORMAT_LABEL_KEYS[provider.endpointFormat])
-                    })}
-                  </option>
-                  {MODEL_ENDPOINT_FORMATS.map((format) => (
-                    <option key={format} value={format}>
-                      {t(ENDPOINT_FORMAT_LABEL_KEYS[format])}
-                    </option>
+                  <ToggleField
+                    label={t('providerModelReasoningLabel')}
+                    description={t('providerModelReasoningDesc')}
+                    checked={editor.form.reasoningEnabled}
+                    onChange={(value) => updateForm({ reasoningEnabled: value })}
+                  />
+
+                  <AdvancedSettingsDisclosure
+                    title={t('providerModelAdvancedTitle')}
+                    description={t('providerModelAdvancedDesc')}
+                    contentClassName="max-h-[min(48dvh,480px)] overflow-y-auto overscroll-contain [scrollbar-gutter:stable]"
+                  >
+                    <div className="grid gap-3 px-3 py-3">
+                      <div className="grid gap-1.5">
+                        <span className="text-[12px] font-semibold text-ds-muted">{t('providerModelContextLabel')}</span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {CONTEXT_WINDOW_PRESETS.map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setEditor((prev) =>
+                                prev ? { ...prev, contextText: describeContextWindowTokens(preset) } : prev
+                              )}
+                              className={chipButtonClass(parsedContextTokens === preset)}
+                            >
+                              {describeContextWindowTokens(preset)}
+                            </button>
+                          ))}
+                          <input
+                            className="w-36 min-w-0 rounded-xl border border-ds-border bg-ds-card px-3 py-1.5 font-mono text-[12.5px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                            value={editor.contextText}
+                            placeholder={t('providerModelContextPlaceholder')}
+                            spellCheck={false}
+                            onChange={(e) => {
+                              const value = e.target.value
+                              setEditor((prev) => prev ? { ...prev, contextText: value } : prev)
+                            }}
+                          />
+                          {parsedContextTokens ? (
+                            <span className="text-[12px] text-ds-faint">
+                              {t('providerModelContextParsed', { tokens: parsedContextTokens.toLocaleString() })}
+                            </span>
+                          ) : null}
+                        </div>
+                        <span className="text-[12px] leading-5 text-ds-faint">{t('providerModelContextHint')}</span>
+                      </div>
+
+                      <label className={fieldLabelClass}>
+                        {t('providerModelMaxOutputLabel')}
+                        <input
+                          className="w-36 min-w-0 rounded-xl border border-ds-border bg-ds-card px-3 py-1.5 font-mono text-[12.5px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                          value={editor.maxOutputText}
+                          placeholder={t('providerModelMaxOutputPlaceholder')}
+                          spellCheck={false}
+                          onChange={(e) => {
+                            const value = e.target.value
+                            setEditor((prev) => prev ? { ...prev, maxOutputText: value } : prev)
+                          }}
+                        />
+                        {parsedMaxOutputTokens ? (
+                          <span className="text-[12px] font-normal leading-5 text-ds-faint">
+                            {t('providerModelMaxOutputParsed', { tokens: parsedMaxOutputTokens.toLocaleString() })}
+                          </span>
+                        ) : null}
+                        <span className="text-[12px] font-normal leading-5 text-ds-faint">
+                          {t('providerModelMaxOutputHint')}
+                        </span>
+                      </label>
+
+                      {editor.form.reasoningEnabled ? (
+                        <div className="grid gap-3 rounded-xl border border-ds-border-muted bg-ds-card/60 p-3">
+                          <div className="grid gap-1.5">
+                            <span className="text-[12px] font-semibold text-ds-muted">
+                              {t('providerModelReasoningEfforts')}
+                            </span>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {reasoningEffortPool.map((effort) => {
+                                const selected = editor.form.reasoningEfforts.includes(effort)
+                                return (
+                                  <button
+                                    key={effort}
+                                    type="button"
+                                    aria-pressed={selected}
+                                    onClick={() => updateForm({
+                                      reasoningEfforts: selected
+                                        ? editor.form.reasoningEfforts.filter((item) => item !== effort)
+                                        : sortReasoningEfforts([...editor.form.reasoningEfforts, effort])
+                                    })}
+                                    className={chipButtonClass(selected)}
+                                  >
+                                    {t(REASONING_EFFORT_LABEL_KEYS[effort])}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+                          <div className="grid gap-3 md:grid-cols-2">
+                            <label className={fieldLabelClass}>
+                              {t('providerModelReasoningDefault')}
+                              <select
+                                className={selectControlClass}
+                                value={editor.form.reasoningDefaultEffort}
+                                onChange={(e) => updateForm({
+                                  reasoningDefaultEffort: e.target.value as ModelReasoningEffort
+                                })}
+                              >
+                                {(editor.form.reasoningEfforts.length > 0
+                                  ? sortReasoningEfforts(editor.form.reasoningEfforts)
+                                  : reasoningEffortPool
+                                ).map((effort) => (
+                                  <option key={effort} value={effort}>
+                                    {t(REASONING_EFFORT_LABEL_KEYS[effort])}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className={fieldLabelClass}>
+                              {t('providerModelReasoningProtocol')}
+                              <select
+                                className={selectControlClass}
+                                value={editor.form.reasoningProtocol}
+                                onChange={(e) => updateForm({
+                                  reasoningProtocol: e.target.value as ModelReasoningRequestProtocol
+                                })}
+                              >
+                                {PROVIDER_MODEL_REASONING_PROTOCOLS.map((protocol) => (
+                                  <option key={protocol} value={protocol}>
+                                    {t(REASONING_PROTOCOL_LABEL_KEYS[protocol])}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          </div>
+                          <span className="text-[12px] leading-5 text-ds-faint">
+                            {t('providerModelReasoningProtocolHint')}
+                          </span>
+                        </div>
+                      ) : null}
+
+                      <label className={fieldLabelClass}>
+                        {t('providerModelEndpointFormatLabel')}
+                        <select
+                          className={selectControlClass}
+                          value={editor.form.endpointFormat ?? ''}
+                          onChange={(e) => updateForm({
+                            endpointFormat: e.target.value === ''
+                              ? null
+                              : e.target.value as ModelEndpointFormat
+                          })}
+                        >
+                          <option value="">
+                            {t('providerModelEndpointInherit', {
+                              format: t(ENDPOINT_FORMAT_LABEL_KEYS[provider.endpointFormat])
+                            })}
+                          </option>
+                          {MODEL_ENDPOINT_FORMATS.map((format) => (
+                            <option key={format} value={format}>
+                              {t(ENDPOINT_FORMAT_LABEL_KEYS[format])}
+                            </option>
+                          ))}
+                        </select>
+                        <span className="text-[12px] font-normal leading-5 text-ds-faint">
+                          {t('providerModelEndpointFormatHint')}
+                        </span>
+                      </label>
+
+                      <label className={fieldLabelClass}>
+                        {t('providerModelAliasesLabel')}
+                        <input
+                          className={`${textInputClass} font-mono text-[13px]`}
+                          value={editor.aliasesText}
+                          placeholder={t('providerModelAliasesPlaceholder')}
+                          spellCheck={false}
+                          onChange={(e) => {
+                            const value = e.target.value
+                            setEditor((prev) => prev ? { ...prev, aliasesText: value } : prev)
+                          }}
+                        />
+                        <span className="text-[12px] font-normal leading-5 text-ds-faint">
+                          {t('providerModelAliasesHint')}
+                        </span>
+                      </label>
+                    </div>
+                  </AdvancedSettingsDisclosure>
+                </>
+              ) : null}
+
+              {errors.length > 0 && editor.form.modelId.trim() !== '' ? (
+                <div className="grid gap-1" role="alert">
+                  {errors.map((error) => (
+                    <span key={error.code} className="text-[12px] text-red-600 dark:text-red-300">
+                      {formErrorMessage(t, error)}
+                    </span>
                   ))}
-                </select>
-                <span className="text-[12px] font-normal leading-5 text-ds-faint">
-                  {t('providerModelEndpointFormatHint')}
-                </span>
-              </label>
-              <label className={fieldLabelClass}>
-                {t('providerModelAliasesLabel')}
-                <input
-                  className={`${textInputClass} font-mono text-[13px]`}
-                  value={editor.aliasesText}
-                  placeholder={t('providerModelAliasesPlaceholder')}
-                  spellCheck={false}
-                  onChange={(e) => {
-                    const value = e.target.value
-                    setEditor((prev) => prev ? { ...prev, aliasesText: value } : prev)
-                  }}
-                />
-                <span className="text-[12px] font-normal leading-5 text-ds-faint">
-                  {t('providerModelAliasesHint')}
-                </span>
-              </label>
-            </>
-          ) : null}
-          {errors.length > 0 && editor.form.modelId.trim() !== '' ? (
-            <div className="grid gap-1">
-              {errors.map((error) => (
-                <span key={error.code} className="text-[12px] text-red-600 dark:text-red-300">
-                  {formErrorMessage(t, error)}
-                </span>
-              ))}
+                </div>
+              ) : null}
             </div>
-          ) : null}
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={errors.length > 0}
-              onClick={saveEditor}
-              className="inline-flex h-9 items-center gap-2 rounded-full bg-accent px-4 text-[12.5px] font-semibold text-white shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {t('providerModelSave')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setEditor(null)}
-              className="inline-flex h-9 items-center rounded-full border border-ds-border bg-ds-card px-3 text-[12.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink"
-            >
-              {t('providerModelCancel')}
-            </button>
-          </div>
+
+            <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-ds-border px-5 py-3">
+              <button
+                type="button"
+                onClick={closeEditor}
+                className="inline-flex h-9 items-center rounded-full border border-ds-border bg-ds-card px-3 text-[12.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink"
+              >
+                {t('providerModelCancel')}
+              </button>
+              <button
+                type="button"
+                disabled={errors.length > 0}
+                onClick={saveEditor}
+                className="inline-flex h-9 items-center gap-2 rounded-full bg-accent px-4 text-[12.5px] font-semibold text-white shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {t('providerModelSave')}
+              </button>
+            </footer>
+          </section>
         </div>
-      )}
+      ) : null}
     </div>
   )
 }

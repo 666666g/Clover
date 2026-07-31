@@ -2,6 +2,7 @@ import i18n from '../i18n'
 import { isWriteImageFilePath, isWritePdfFilePath, isWriteWorkspaceFilePath } from '@shared/write-text-file'
 import { writePathToFileUrl } from '@shared/write-markdown-resource'
 import type { WriteWorkspaceGet, WriteWorkspaceSet, WriteWorkspaceState } from './write-workspace-store-types'
+import { nextWriteDocumentEpoch } from './write-document-context'
 import {
   emptySelection,
   filterWriteEntries,
@@ -14,6 +15,11 @@ import {
   rememberActiveFile,
   writeDirnameFromPath
 } from './write-workspace-store-helpers'
+import {
+  forgetWriteFileThreads,
+  moveWriteFileThreads,
+  saveWriteThreadRegistry
+} from './write-thread-registry'
 
 type WriteFileActions = Pick<
   WriteWorkspaceState,
@@ -32,7 +38,6 @@ type WriteFileActionContext = {
   set: WriteWorkspaceSet
   get: WriteWorkspaceGet
   cancelExternalSyncAnimation: () => void
-  setLastSavedContent: (content: string) => void
 }
 
 function formatActionError(error: unknown): string {
@@ -65,29 +70,69 @@ function withoutLoadingDirs(
   return next
 }
 
+async function prepareActiveFileForNavigation(
+  get: WriteWorkspaceGet,
+  workspaceRoot: string
+): Promise<boolean> {
+  const state = get()
+  if (!state.activeFilePath || state.activeFileKind !== 'text') return true
+  if (state.autoSaveEnabled) return get().flushSave(workspaceRoot)
+  if (state.saveStatus !== 'dirty' && state.saveStatus !== 'error') return true
+  return window.confirm(i18n.t('common:writeDiscardUnsavedChangesConfirm'))
+}
+
 export function createWriteFileActions({
   set,
   get,
-  cancelExternalSyncAnimation,
-  setLastSavedContent
+  cancelExternalSyncAnimation
 }: WriteFileActionContext): WriteFileActions {
+  let navigationGeneration = 0
+  const directoryRequestGenerations = new Map<string, number>()
+  const nextNavigationGeneration = (): number => {
+    navigationGeneration += 1
+    return navigationGeneration
+  }
+  const navigationIsCurrent = (generation: number, workspaceRoot?: string): boolean => {
+    if (generation !== navigationGeneration) return false
+    if (!workspaceRoot) return true
+    const activeRoot = normalizePath(get().workspaceRoot)
+    return !activeRoot || activeRoot === normalizePath(workspaceRoot)
+  }
+  const workspaceIsCurrent = (workspaceRoot: string): boolean => {
+    const activeRoot = normalizePath(get().workspaceRoot)
+    return !activeRoot || activeRoot === normalizePath(workspaceRoot)
+  }
+
   return {
     initializeWorkspace: async (workspaceRoot) => {
+      const generation = nextNavigationGeneration()
       const normalized = normalizePath(workspaceRoot.trim())
       if (!normalized) {
         cancelExternalSyncAnimation()
-        setLastSavedContent('')
-        set(initialState())
+        set((state) => ({
+          ...initialState(),
+          documentEpoch: nextWriteDocumentEpoch(state.documentEpoch)
+        }))
         return
       }
       const current = get()
-      if (current.workspaceRoot === normalized && current.rootDirectory) return
+      if (current.workspaceRoot === normalized && current.rootDirectory) {
+        await get().refreshWorkspace(normalized)
+        return
+      }
+      if (current.workspaceRoot && current.workspaceRoot !== normalized) {
+        const canLeaveCurrentFile = await prepareActiveFileForNavigation(get, current.workspaceRoot)
+        if (!canLeaveCurrentFile || generation !== navigationGeneration) return
+      }
 
-      setLastSavedContent('')
       cancelExternalSyncAnimation()
-      set({ ...initialState(), workspaceRoot: normalized })
+      set((state) => ({
+        ...initialState(),
+        workspaceRoot: normalized,
+        documentEpoch: nextWriteDocumentEpoch(state.documentEpoch)
+      }))
       const root = await get().loadDirectory(normalized)
-      if (!root) return
+      if (!root || !navigationIsCurrent(generation, normalized)) return
       set((state) => ({ rootDirectory: root, expandedDirs: new Set([...state.expandedDirs, root]) }))
       const remembered = readRememberedActiveFile(normalized)
       if (remembered.trim() && isWriteWorkspaceFilePath(remembered)) {
@@ -98,19 +143,27 @@ export function createWriteFileActions({
     },
 
     loadDirectory: async (workspaceRoot, path) => {
+      const requestedWorkspace = normalizePath(workspaceRoot)
       const requestedRoot = normalizePath(path || workspaceRoot)
       const targetKey = path ? requestedRoot : '__root__'
+      const requestKey = `${requestedWorkspace}\0${requestedRoot}`
+      const requestGeneration = (directoryRequestGenerations.get(requestKey) ?? 0) + 1
+      directoryRequestGenerations.set(requestKey, requestGeneration)
+      const requestIsCurrent = (): boolean =>
+        directoryRequestGenerations.get(requestKey) === requestGeneration && workspaceIsCurrent(workspaceRoot)
       set((state) => ({ loadingDirs: { ...state.loadingDirs, [targetKey]: true } }))
       let result: Awaited<ReturnType<typeof window.kunGui.listWorkspaceDirectory>>
       try {
         result = await window.kunGui.listWorkspaceDirectory({ workspaceRoot, path })
       } catch (error) {
+        if (!requestIsCurrent()) return null
         set((state) => ({
           loadingDirs: withoutLoadingDirs(state.loadingDirs, [targetKey, requestedRoot]),
           treeError: formatActionError(error)
         }))
         return null
       }
+      if (!requestIsCurrent()) return null
       set((state) => {
         const loadingDirs = withoutLoadingDirs(state.loadingDirs, [
           targetKey,
@@ -170,9 +223,8 @@ export function createWriteFileActions({
     },
 
     openFile: async (workspaceRoot, path) => {
+      const generation = nextNavigationGeneration()
       cancelExternalSyncAnimation()
-      const saved = await get().flushSave(workspaceRoot)
-      if (!saved) return
       if (!isWriteWorkspaceFilePath(path)) {
         set({
           fileLoading: false,
@@ -180,17 +232,19 @@ export function createWriteFileActions({
         })
         return
       }
+      const canLeaveCurrentFile = await prepareActiveFileForNavigation(get, workspaceRoot)
+      if (!canLeaveCurrentFile || !navigationIsCurrent(generation, workspaceRoot)) return
       set({ fileLoading: true, fileError: null })
       try {
         if (isWriteImageFilePath(path)) {
           const result = await window.kunGui.readWorkspaceImage({ path, workspaceRoot })
+          if (!navigationIsCurrent(generation, workspaceRoot)) return
           if (!result.ok) {
             set({ fileLoading: false, fileError: result.message })
             return
           }
-          setLastSavedContent('')
           rememberActiveFile(workspaceRoot, result.path)
-          set({
+          set((state) => ({
             activeFilePath: result.path,
             activeFileKind: 'image',
             fileContent: '',
@@ -204,21 +258,27 @@ export function createWriteFileActions({
             fileLoading: false,
             fileError: null,
             saveStatus: 'saved',
+            documentEpoch: nextWriteDocumentEpoch(state.documentEpoch),
+            contentRevision: 0,
+            persistedContent: '',
+            pendingAgentReview: null,
+            reviewActive: false,
             selection: emptySelection(),
-            quotedSelections: []
-          })
+            quotedSelections: [],
+            recentEdits: []
+          }))
           return
         }
 
         if (isWritePdfFilePath(path)) {
           const result = await window.kunGui.readWorkspacePdf({ path, workspaceRoot })
+          if (!navigationIsCurrent(generation, workspaceRoot)) return
           if (!result.ok) {
             set({ fileLoading: false, fileError: result.message })
             return
           }
-          setLastSavedContent('')
           rememberActiveFile(workspaceRoot, result.path)
-          set({
+          set((state) => ({
             activeFilePath: result.path,
             activeFileKind: 'pdf',
             fileContent: '',
@@ -232,20 +292,26 @@ export function createWriteFileActions({
             fileLoading: false,
             fileError: null,
             saveStatus: 'saved',
+            documentEpoch: nextWriteDocumentEpoch(state.documentEpoch),
+            contentRevision: 0,
+            persistedContent: '',
+            pendingAgentReview: null,
+            reviewActive: false,
             selection: emptySelection(),
-            quotedSelections: []
-          })
+            quotedSelections: [],
+            recentEdits: []
+          }))
           return
         }
 
         const result = await window.kunGui.readWorkspaceFile({ path, workspaceRoot })
+        if (!navigationIsCurrent(generation, workspaceRoot)) return
         if (!result.ok) {
           set({ fileLoading: false, fileError: result.message })
           return
         }
-        setLastSavedContent(result.content)
         rememberActiveFile(workspaceRoot, result.path)
-        set({
+        set((state) => ({
           activeFilePath: result.path,
           activeFileKind: 'text',
           fileContent: result.content,
@@ -259,14 +325,20 @@ export function createWriteFileActions({
           fileLoading: false,
           fileError: null,
           saveStatus: 'saved',
+          documentEpoch: nextWriteDocumentEpoch(state.documentEpoch),
+          contentRevision: 0,
+          persistedContent: result.content,
+          pendingAgentReview: null,
+          reviewActive: false,
           selection: emptySelection(),
-          quotedSelections: []
-        })
+          quotedSelections: [],
+          recentEdits: []
+        }))
       } catch (error) {
+        if (!navigationIsCurrent(generation, workspaceRoot)) return
         if (isWriteImageFilePath(path) && isMissingImageIpc(error)) {
-          setLastSavedContent('')
           rememberActiveFile(workspaceRoot, path)
-          set({
+          set((state) => ({
             activeFilePath: path,
             activeFileKind: 'image',
             fileContent: '',
@@ -280,9 +352,15 @@ export function createWriteFileActions({
             fileLoading: false,
             fileError: null,
             saveStatus: 'saved',
+            documentEpoch: nextWriteDocumentEpoch(state.documentEpoch),
+            contentRevision: 0,
+            persistedContent: '',
+            pendingAgentReview: null,
+            reviewActive: false,
             selection: emptySelection(),
-            quotedSelections: []
-          })
+            quotedSelections: [],
+            recentEdits: []
+          }))
           return
         }
         set({
@@ -299,9 +377,10 @@ export function createWriteFileActions({
       try {
         result = await window.kunGui.createWorkspaceFile({ workspaceRoot, path, content })
       } catch (error) {
-        set({ fileError: formatActionError(error) })
+        if (workspaceIsCurrent(workspaceRoot)) set({ fileError: formatActionError(error) })
         return null
       }
+      if (!workspaceIsCurrent(workspaceRoot)) return null
       if (!result.ok) {
         set({ fileError: result.message })
         return null
@@ -316,9 +395,10 @@ export function createWriteFileActions({
       try {
         result = await window.kunGui.createWorkspaceDirectory({ workspaceRoot, path })
       } catch (error) {
-        set({ fileError: formatActionError(error) })
+        if (workspaceIsCurrent(workspaceRoot)) set({ fileError: formatActionError(error) })
         return null
       }
+      if (!workspaceIsCurrent(workspaceRoot)) return null
       if (!result.ok) {
         set({ fileError: result.message })
         return null
@@ -339,13 +419,19 @@ export function createWriteFileActions({
       try {
         result = await window.kunGui.renameWorkspaceEntry({ workspaceRoot, path, newName: nextName })
       } catch (error) {
-        set({ fileError: formatActionError(error) })
+        if (workspaceIsCurrent(workspaceRoot)) set({ fileError: formatActionError(error) })
         return null
       }
+      if (!workspaceIsCurrent(workspaceRoot)) return null
       if (!result.ok) {
         set({ fileError: result.message })
         return null
       }
+      saveWriteThreadRegistry(moveWriteFileThreads(
+        workspaceRoot,
+        result.previousPath,
+        result.path
+      ))
       const previousPrefix = `${normalizePath(result.previousPath)}/`
       set((state) => {
         const nextActiveFilePath = state.activeFilePath === result.previousPath
@@ -357,6 +443,10 @@ export function createWriteFileActions({
         const nextActiveFileKind = keepActiveFile && nextActiveFilePath
           ? isWriteImageFilePath(nextActiveFilePath) ? 'image' : isWritePdfFilePath(nextActiveFilePath) ? 'pdf' : 'text'
           : null
+        const activeDocumentChanged = nextActiveFilePath !== state.activeFilePath
+        const nextDocumentEpoch = activeDocumentChanged
+          ? nextWriteDocumentEpoch(state.documentEpoch)
+          : state.documentEpoch
         const expandedDirs = new Set<string>()
         for (const dirPath of state.expandedDirs) {
           if (dirPath === result.previousPath) {
@@ -379,6 +469,17 @@ export function createWriteFileActions({
           fileSize: keepActiveFile ? state.fileSize : 0,
           fileTruncated: keepActiveFile ? state.fileTruncated : false,
           saveStatus: keepActiveFile ? state.saveStatus : 'saved',
+          documentEpoch: nextDocumentEpoch,
+          contentRevision: keepActiveFile ? state.contentRevision : 0,
+          persistedContent: nextActiveFileKind === 'text' ? state.persistedContent : '',
+          pendingAgentReview: state.pendingAgentReview && keepActiveFile && nextActiveFilePath
+            ? {
+                ...state.pendingAgentReview,
+                filePath: nextActiveFilePath,
+                documentEpoch: nextDocumentEpoch
+              }
+            : null,
+          reviewActive: keepActiveFile ? state.reviewActive : false,
           selection: nextActiveFileKind === 'text' || nextActiveFileKind === 'pdf' ? state.selection : emptySelection(),
           quotedSelections: nextActiveFileKind === 'text' || nextActiveFileKind === 'pdf' ? state.quotedSelections : [],
           expandedDirs,
@@ -401,32 +502,42 @@ export function createWriteFileActions({
       try {
         result = await window.kunGui.deleteWorkspaceEntry({ workspaceRoot, path })
       } catch (error) {
-        set({ fileError: formatActionError(error) })
+        if (workspaceIsCurrent(workspaceRoot)) set({ fileError: formatActionError(error) })
         return false
       }
+      if (!workspaceIsCurrent(workspaceRoot)) return false
       if (!result.ok) {
         set({ fileError: result.message })
         return false
       }
+      saveWriteThreadRegistry(forgetWriteFileThreads(workspaceRoot, result.path))
       const deletedPath = normalizePath(result.path)
       const currentActiveFilePath = get().activeFilePath
       const activePath = currentActiveFilePath ? normalizePath(currentActiveFilePath) : ''
       if (activePath === deletedPath || activePath.startsWith(`${deletedPath}/`)) {
-        setLastSavedContent('')
         rememberActiveFile(workspaceRoot, null)
-        set({
+        set((state) => ({
           activeFilePath: null,
           activeFileKind: null,
           fileContent: '',
           imageDataUrl: '',
           imageMimeType: '',
+          pdfDataBase64: '',
+          pdfMimeType: '',
+          pdfMtimeMs: 0,
           fileSize: 0,
           fileTruncated: false,
           fileError: null,
           saveStatus: 'saved',
+          documentEpoch: nextWriteDocumentEpoch(state.documentEpoch),
+          contentRevision: 0,
+          persistedContent: '',
+          pendingAgentReview: null,
+          reviewActive: false,
           selection: emptySelection(),
-          quotedSelections: []
-        })
+          quotedSelections: [],
+          recentEdits: []
+        }))
       }
       set((state) => {
         const expandedDirs = new Set<string>()

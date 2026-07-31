@@ -1,0 +1,33 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "direct-dom",
+  "publisher": "kun-examples",
+  "version": "0.1.0",
+  "displayName": "Direct DOM Warning Badge",
+  "description": "A high-risk isolated-world content script example with unsupported selectors.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/host/extension.js",
+  "activationEvents": [
+    "onStartup"
+  ],
+  "contributes": {
+    "hostContentScripts": [
+      {
+        "id": "warning-badge",
+        "matches": ["workbench:*"],
+        "scripts": ["dist/content/content.js"],
+        "styles": ["dist/content/content.css"],
+        "runAt": "documentEnd"
+      }
+    ]
+  },
+  "permissions": [
+    "hostDom"
+  ],
+  "stateSchemaVersion": 1
+}

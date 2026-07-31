@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  activeModelProviderNeedsApiKey,
   DEFAULT_DEEPSEEK_BASE_URL,
   defaultClawSettings,
   defaultKeyboardShortcuts,
@@ -14,19 +15,30 @@ import {
   isTextToSpeechModelId,
   isVideoGenerationModelId,
   modelProviderPresetProfile,
+  modelProviderRequiresApiKey,
+  modelProviderPresetAccountCount,
+  modelProviderPresetAccountProfile,
   modelProviderTokenPlanProfile,
+  resolveModelProviderPresetSource,
   defaultScheduleSettings,
   defaultWorkflowSettings,
   defaultTerminalSettings,
   defaultWriteSettings,
+  defaultModelRequestRetrySettings,
+  CHATGPT_SUBSCRIPTION_MODEL_IDS,
+  GROK_SUBSCRIPTION_PROVIDER_ID,
+  OLLAMA_CLOUD_MODEL_IDS,
   listMusicGenerationProviderProfiles,
   listSpeechToTextProviderProfiles,
   listTextToSpeechProviderProfiles,
   listVideoGenerationProviderProfiles,
-  modelProviderModelProfilesForSettings,
+  modelProviderModelProfilesForProvider,
   listModelProviderModelIds,
   modelSupportsImageInput,
+  defaultDesignSettings,
   normalizeModelProviderSettings,
+  projectExecutableModelRoutePools,
+  resolveModelRouteTargetReference,
   resolveKunImageGenerationSettings,
   resolveKunMusicGenerationSettings,
   resolveModelProviderBaseUrl,
@@ -35,8 +47,610 @@ import {
   resolveKunSpeechToTextSettings,
   resolveKunTextToSpeechSettings,
   resolveKunVideoGenerationSettings,
-  type AppSettingsV1
+  type AppSettingsV1,
+  type ModelProviderModelProfileV1
 } from './app-settings'
+
+describe('model provider retry settings', () => {
+  it('adds default retry settings to default providers', () => {
+    const settings = defaultModelProviderSettings()
+
+    expect(settings.providers[0].retry).toEqual(defaultModelRequestRetrySettings())
+    expect(settings.providers[0]?.retry?.maxAttempts).toBe(5)
+  })
+
+  it('uses the common five-retry default for new ChatGPT subscription profiles', () => {
+    const preset = getModelProviderPreset('codex')
+    expect(preset).not.toBeNull()
+
+    expect(modelProviderPresetProfile(preset!, '').retry).toMatchObject({
+      maxAttempts: 5,
+      httpStatusCodes: expect.arrayContaining([429, 503])
+    })
+  })
+
+  it('normalizes retry attempts, delay, and HTTP status codes', () => {
+    const settings = normalizeModelProviderSettings({
+      providers: [
+        {
+          id: 'custom',
+          name: 'Custom',
+          apiKey: 'k',
+          baseUrl: 'https://example.com/v1',
+          endpointFormat: 'chat_completions',
+          retry: {
+            maxAttempts: 99,
+            initialDelayMs: 700_000,
+            httpStatusCodes: [503, 429, 200, 503, 599]
+          },
+          models: ['m'],
+          modelProfiles: {}
+        }
+      ]
+    })
+
+    const provider = settings.providers.find((item) => item.id === 'custom')
+    expect(provider?.retry).toEqual({
+      maxAttempts: 10,
+      initialDelayMs: 600_000,
+      httpStatusCodes: [429, 503, 599]
+    })
+  })
+})
+
+describe('Gemini subscription provider preset', () => {
+  it('uses the official Antigravity CLI transport and current subscription models', () => {
+    const preset = getModelProviderPreset('gemini-subscription')
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, '')
+    const normalized = normalizeModelProviderSettings({ providers: [profile] })
+    expect(normalized.providers.find((provider) => provider.id === profile.id)).toMatchObject({
+      kind: 'antigravity-cli',
+      baseUrl: '',
+      endpointFormat: 'custom_endpoint',
+      models: expect.arrayContaining(['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-pro'])
+    })
+  })
+
+  it('keeps the Gemini CLI direct API transport and models separate from Antigravity', () => {
+    const preset = getModelProviderPreset('gemini-cli-subscription')
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, 'must-not-be-stored')
+    const normalized = normalizeModelProviderSettings({ providers: [profile] })
+    expect(
+      normalized.providers.find((provider) => provider.id === 'gemini-cli-subscription')
+    ).toMatchObject({
+      name: 'Gemini CLI 订阅（API）',
+      kind: 'gemini-cli-api',
+      apiKey: '',
+      baseUrl: '',
+      endpointFormat: 'custom_endpoint',
+      retry: expect.objectContaining({
+        maxAttempts: 5,
+        httpStatusCodes: expect.arrayContaining([429, 503])
+      }),
+      speech: {
+        protocol: 'gemini-cli-audio',
+        baseUrl: '',
+        models: expect.arrayContaining(['gemini-2.5-flash'])
+      },
+      models: expect.arrayContaining([
+        'gemini-3.1-pro-preview',
+        'gemini-3-flash-preview',
+        'gemini-3.1-flash-lite',
+        'gemini-2.5-pro',
+        'gemini-2.5-flash'
+      ])
+    })
+    expect(
+      normalized.providers.find((provider) => provider.id === 'gemini-cli-subscription')?.models
+    ).not.toContain('gemini-3.6-flash')
+  })
+
+  it('migrates the retired Code Assist transport to Antigravity CLI', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        ...modelProviderPresetProfile(getModelProviderPreset('gemini-subscription')!, ''),
+        kind: 'gemini-code-assist'
+      }]
+    })
+    expect(
+      normalized.providers.find((provider) => provider.id === 'gemini-subscription')
+    ).toMatchObject({
+      kind: 'antigravity-cli',
+      apiKey: '',
+      models: ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-pro']
+    })
+  })
+})
+
+describe('Cursor subscription provider preset', () => {
+  it('uses the official Cursor SDK transport with an auto fallback model', () => {
+    const preset = getModelProviderPreset('cursor-subscription')
+    expect(preset).not.toBeNull()
+    expect(preset?.apiKeyUrl).toBe('https://cursor.com/dashboard/api?section=user-keys#user-api-keys')
+    const profile = modelProviderPresetProfile(preset!, 'cursor-secret')
+    const normalized = normalizeModelProviderSettings({ providers: [profile] })
+    expect(normalized.providers.find((provider) => provider.id === profile.id)).toMatchObject({
+      kind: 'cursor-sdk',
+      apiKey: 'cursor-secret',
+      baseUrl: '',
+      endpointFormat: 'custom_endpoint',
+      models: ['auto'],
+      modelProfiles: {
+        auto: {
+          reasoning: {
+            supportedEfforts: ['auto'],
+            defaultEffort: 'auto',
+            requestProtocol: 'none'
+          }
+        }
+      }
+    })
+  })
+
+  it('removes stale media capabilities that are absent from the current subscription preset', () => {
+    const profile = {
+      ...modelProviderPresetProfile(getModelProviderPreset('cursor-subscription')!, 'cursor-secret'),
+      image: {
+        protocol: 'openai-images' as const,
+        baseUrl: 'https://stale-images.example/v1',
+        models: ['stale-image']
+      },
+      speech: {
+        protocol: 'openai-transcriptions' as const,
+        baseUrl: '',
+        models: ['gemini-2.5-flash']
+      },
+      video: {
+        protocol: 'minimax-video' as const,
+        baseUrl: 'https://stale-video.example/v1',
+        models: ['stale-video']
+      }
+    }
+    const normalized = normalizeModelProviderSettings({ providers: [profile] })
+    const cursor = normalized.providers.find((provider) => provider.id === 'cursor-subscription')
+
+    expect(cursor?.image).toBeUndefined()
+    expect(cursor?.speech).toBeUndefined()
+    expect(cursor?.video).toBeUndefined()
+  })
+})
+
+describe('legacy subscription transport migration', () => {
+  it.each([
+    ['claude-subscription', 'agent-sdk'],
+    ['cursor-subscription', 'cursor-sdk'],
+    ['gemini-subscription', 'antigravity-cli'],
+    ['gemini-cli-subscription', 'gemini-cli-api']
+  ] as const)('restores %s to its delegated transport when kind is missing', (providerId, kind) => {
+    const profile = modelProviderPresetProfile(getModelProviderPreset(providerId)!, '')
+    const { kind: _removedKind, ...legacyProfile } = profile
+    const normalized = normalizeModelProviderSettings({ providers: [legacyProfile] })
+
+    expect(normalized.providers.find((provider) => provider.id === providerId))
+      .toMatchObject({ kind })
+  })
+
+  it('drops a retired Gemini API credential when restoring Antigravity CLI', () => {
+    const profile = modelProviderPresetProfile(getModelProviderPreset('gemini-subscription')!, '')
+    const { kind: _removedKind, ...legacyProfile } = profile
+    const normalized = normalizeModelProviderSettings({
+      providers: [{ ...legacyProfile, apiKey: 'retired-code-assist-secret' }]
+    })
+
+    expect(normalized.providers.find((provider) => provider.id === 'gemini-subscription'))
+      .toMatchObject({ kind: 'antigravity-cli', apiKey: '' })
+  })
+})
+
+describe('model route pool settings', () => {
+  it('normalizes legacy settings to an empty route catalog', () => {
+    const settings = normalizeModelProviderSettings(undefined)
+    expect(settings.routePools).toEqual([])
+    expect(settings.localGateway).toEqual({ enabled: false, name: 'Kun API' })
+  })
+
+  it('persists a custom local gateway provider name', () => {
+    expect(normalizeModelProviderSettings({
+      localGateway: { enabled: true, name: '  Team Relay  ' }
+    }).localGateway).toEqual({ enabled: true, name: 'Team Relay' })
+  })
+
+  it('keeps valid concrete targets and allows a routed alias to match a concrete model', () => {
+    const settings = normalizeModelProviderSettings({
+      providers: [{ id: 'provider-a', name: 'A', baseUrl: 'https://a.example', models: ['kimi-k3'] }],
+      routePools: [{
+        id: 'pool', name: 'Pool', modelId: 'kimi-auto', enabled: true, strategy: 'adaptive',
+        targets: [{ id: 'a', providerId: 'provider-a', modelId: 'kimi-k3', enabled: true, weight: 200 }],
+        failurePolicy: { failoverHttpStatusCodes: [429], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+        healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+      }, {
+        id: 'collision', name: 'Collision', modelId: 'kimi-k3', enabled: true, strategy: 'priority',
+        targets: [{ id: 'b', providerId: 'provider-a', modelId: 'kimi-k3', enabled: true, weight: 1 }],
+        failurePolicy: { failoverHttpStatusCodes: [429], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+        healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+      }]
+    })
+    expect(settings.routePools[0]).toMatchObject({ enabled: true, strategy: 'adaptive', targets: [{ providerId: 'provider-a', weight: 100 }] })
+    expect(settings.routePools[1]).toMatchObject({ modelId: 'kimi-k3', enabled: true })
+  })
+
+  it('preserves dangling targets while excluding them from the executable projection', () => {
+    const settings = normalizeModelProviderSettings({
+      providers: [{ id: 'provider-a', name: 'A', baseUrl: 'https://a.example', models: ['kimi-k3'] }],
+      routePools: [{
+        id: 'pool', name: 'Pool', modelId: 'kimi-auto', enabled: true, strategy: 'priority',
+        targets: [
+          { id: 'valid', providerId: 'provider-a', modelId: 'kimi-k3', enabled: true, weight: 1 },
+          { id: 'provider-missing', providerId: 'provider-gone', modelId: 'kimi-k3', enabled: true, weight: 1 },
+          { id: 'model-missing', providerId: 'provider-a', modelId: 'kimi-removed', enabled: true, weight: 1 }
+        ],
+        failurePolicy: { failoverHttpStatusCodes: [429], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+        healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+      }]
+    })
+
+    expect(settings.routePools[0].targets).toHaveLength(3)
+    expect(resolveModelRouteTargetReference(settings.routePools[0].targets[0], settings.providers).status).toBe('valid')
+    expect(resolveModelRouteTargetReference(settings.routePools[0].targets[1], settings.providers).status).toBe('provider-missing')
+    expect(resolveModelRouteTargetReference(settings.routePools[0].targets[2], settings.providers).status).toBe('model-missing')
+    expect(projectExecutableModelRoutePools(settings)[0]).toMatchObject({
+      enabled: true,
+      targets: [{ id: 'valid', providerId: 'provider-a', modelId: 'kimi-k3' }]
+    })
+
+    const withoutProvider = normalizeModelProviderSettings({
+      ...settings,
+      providers: [],
+      routePools: settings.routePools
+    })
+    expect(withoutProvider.routePools[0]).toMatchObject({ enabled: true })
+    expect(withoutProvider.routePools[0].targets).toHaveLength(3)
+    expect(projectExecutableModelRoutePools(withoutProvider)[0]).toMatchObject({ enabled: false, targets: [] })
+  })
+})
+
+describe('ChatGPT subscription migration', () => {
+  it('renames only the legacy default and upgrades exactly the legacy model set', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        id: 'codex',
+        name: 'Codex (ChatGPT)',
+        apiKey: 'oauth-json',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        endpointFormat: 'responses',
+        models: ['gpt-5.4-mini', 'gpt-5.5', 'gpt-5.3-codex-spark', 'gpt-5.4'],
+        modelProfiles: {}
+      }]
+    })
+
+    const provider = normalized.providers.find((item) => item.id === 'codex')!
+    expect(provider.name).toBe('ChatGPT 订阅')
+    expect(provider.models).toEqual(CHATGPT_SUBSCRIPTION_MODEL_IDS)
+    for (const modelId of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      expect(provider.modelProfiles[modelId]).toMatchObject({
+        contextWindowTokens: 372_000,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        responsesMode: 'lite',
+        reasoning: {
+          supportedEfforts: ['low', 'medium', 'high', 'max'],
+          defaultEffort: 'high',
+          requestProtocol: 'openai-responses'
+        },
+        serviceTiers: ['priority']
+      })
+    }
+    expect(provider.modelProfiles['gpt-5.4-mini'].serviceTiers).toBeUndefined()
+    expect(provider.modelProfiles['gpt-5.3-codex-spark'].serviceTiers).toBeUndefined()
+  })
+
+  it('removes stale priority metadata from unsupported Codex models', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        id: 'codex',
+        name: 'ChatGPT 订阅',
+        apiKey: 'oauth-json',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        endpointFormat: 'custom_endpoint',
+        models: ['gpt-5.4-mini'],
+        modelProfiles: {
+          'gpt-5.4-mini': {
+            inputModalities: ['text', 'image'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text', 'image_url'],
+            serviceTiers: ['priority']
+          }
+        }
+      }]
+    })
+
+    expect(
+      normalized.providers.find((item) => item.id === 'codex')
+        ?.modelProfiles['gpt-5.4-mini'].serviceTiers
+    ).toBeUndefined()
+  })
+
+  it('keeps custom names and custom model collections unchanged', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        id: 'codex',
+        name: 'Team subscription',
+        apiKey: 'oauth-json',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        endpointFormat: 'responses',
+        models: ['gpt-5.5', 'team-model'],
+        modelProfiles: {}
+      }]
+    })
+
+    expect(normalized.providers.find((item) => item.id === 'codex')).toMatchObject({
+      name: 'Team subscription',
+      models: ['gpt-5.5', 'team-model']
+    })
+  })
+})
+
+describe('Grok subscription media capabilities', () => {
+  it('exposes the Grok Build image, video, and speech models on the subscription profile', () => {
+    const preset = getModelProviderPreset(GROK_SUBSCRIPTION_PROVIDER_ID)
+    expect(preset).toBeDefined()
+    const provider = modelProviderPresetProfile(preset!, 'grok-oauth-json')
+
+    expect(provider.image).toEqual({
+      protocol: 'grok-imagine-image',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-imagine-image-quality', 'grok-imagine-image']
+    })
+    expect(provider.video).toEqual({
+      protocol: 'grok-imagine-video',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-imagine-video-1.5-preview', 'grok-imagine-video']
+    })
+    expect(provider.speech).toEqual({
+      protocol: 'xai-stt',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-transcribe']
+    })
+
+    const defaults = defaultKunRuntimeSettings()
+    const appSettings: AppSettingsV1 = {
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers.filter((item) => item.id !== provider.id),
+          provider
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaults,
+          videoGeneration: {
+            ...defaults.videoGeneration,
+            enabled: true,
+            providerId: provider.id,
+            defaultDuration: 8,
+            defaultResolution: '1080P'
+          }
+        }
+      }
+    }
+    expect(resolveKunVideoGenerationSettings(appSettings)).toMatchObject({
+      protocol: 'grok-imagine-video',
+      baseUrl: 'https://api.x.ai/v1',
+      apiKey: 'grok-oauth-json',
+      model: 'grok-imagine-video-1.5-preview',
+      defaultDuration: 6,
+      defaultResolution: '480P'
+    })
+  })
+
+  it('upgrades stale stored Grok image and video protocols from the current preset', () => {
+    const preset = getModelProviderPreset(GROK_SUBSCRIPTION_PROVIDER_ID)!
+    const current = modelProviderPresetProfile(preset, 'grok-oauth-json')
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        ...current,
+        image: {
+          protocol: 'openai-images',
+          baseUrl: 'https://api.x.ai/v1',
+          models: ['grok-imagine-image', 'grok-imagine-image-quality']
+        },
+        video: {
+          protocol: 'minimax-video',
+          baseUrl: 'https://api.x.ai/v1',
+          models: ['grok-imagine-video', 'grok-imagine-video-1.5-preview']
+        }
+      }]
+    })
+    const grok = normalized.providers.find((provider) => provider.id === GROK_SUBSCRIPTION_PROVIDER_ID)
+
+    expect(grok?.image).toEqual(current.image)
+    expect(grok?.video).toEqual(current.video)
+  })
+
+  it('preserves explicit media capabilities on a custom provider', () => {
+    const image = {
+      protocol: 'openai-images' as const,
+      baseUrl: 'https://images.example/v1',
+      models: ['custom-image']
+    }
+    const video = {
+      protocol: 'minimax-video' as const,
+      baseUrl: 'https://video.example/v1',
+      models: ['custom-video']
+    }
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        id: 'custom-media',
+        name: 'Custom Media',
+        apiKey: 'sk-custom',
+        baseUrl: 'https://chat.example/v1',
+        endpointFormat: 'chat_completions',
+        models: ['custom-chat'],
+        modelProfiles: {},
+        image,
+        video
+      }]
+    })
+    const custom = normalized.providers.find((provider) => provider.id === 'custom-media')
+
+    expect(custom?.image).toEqual(image)
+    expect(custom?.video).toEqual(video)
+  })
+})
+
+describe('Volcano Ark media provider presets', () => {
+  it('keeps standard API, Agent Plan, and Coding Plan gateways and catalogs distinct', () => {
+    const standard = getModelProviderPreset('volcengine')
+    const agentPlan = getModelProviderPreset('volcengine-agent-plan')
+    const codingPlan = getModelProviderPreset('volcengine-coding-plan')
+
+    expect(standard).toMatchObject({
+      id: 'volcengine',
+      name: 'Volcano Ark API',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      endpointFormat: 'chat_completions',
+      image: {
+        protocol: 'volcengine-ark-image',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+        models: [
+          'doubao-seedream-5-0-pro-260628',
+          'doubao-seedream-5-0-260128',
+          'doubao-seedream-5-0-lite-260128'
+        ]
+      },
+      video: {
+        protocol: 'volcengine-ark-video',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+        models: [
+          'doubao-seedance-2-0-260128',
+          'doubao-seedance-2-0-fast-260128',
+          'doubao-seedance-2-0-mini-260615'
+        ]
+      }
+    })
+    expect(standard?.category).toBeUndefined()
+    expect(standard?.apiKeyUrl).toContain('/apiKey')
+
+    expect(agentPlan).toMatchObject({
+      id: 'volcengine-agent-plan',
+      name: 'Volcano Ark Agent Plan',
+      category: 'subscription',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      endpointFormat: 'chat_completions',
+      image: {
+        protocol: 'volcengine-ark-image',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        models: ['doubao-seedream-5.0-lite']
+      },
+      video: {
+        protocol: 'volcengine-ark-video',
+        baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        models: [
+          'doubao-seedance-2.0',
+          'doubao-seedance-2.0-fast',
+          'doubao-seedance-2.0-mini'
+        ]
+      }
+    })
+    expect(agentPlan?.apiKeyUrl).toContain('advancedActiveKey=agentPlan')
+
+    expect(codingPlan).toMatchObject({
+      id: 'volcengine-coding-plan',
+      name: 'Volcano Ark Coding Plan',
+      category: 'subscription',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3',
+      models: ['doubao-seed-1-6-250615', 'doubao-seed-1-6-flash-250828']
+    })
+    expect(codingPlan?.image).toBeUndefined()
+    expect(codingPlan?.video).toBeUndefined()
+  })
+
+  it('resolves Agent Plan image and video settings with only its dedicated key', () => {
+    const standard = modelProviderPresetProfile(
+      getModelProviderPreset('volcengine')!,
+      'standard-ark-key'
+    )
+    const agentPlan = modelProviderPresetProfile(
+      getModelProviderPreset('volcengine-agent-plan')!,
+      'agent-plan-key'
+    )
+    const codingPlan = modelProviderPresetProfile(
+      getModelProviderPreset('volcengine-coding-plan')!,
+      'coding-plan-key'
+    )
+    const defaults = defaultKunRuntimeSettings()
+    const appSettings: AppSettingsV1 = {
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          standard,
+          agentPlan,
+          codingPlan
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaults,
+          imageGeneration: {
+            ...defaults.imageGeneration,
+            enabled: true,
+            providerId: agentPlan.id,
+            defaultResolution: '1K'
+          },
+          videoGeneration: {
+            ...defaults.videoGeneration,
+            enabled: true,
+            providerId: agentPlan.id,
+            defaultDuration: 30,
+            defaultResolution: '768P'
+          }
+        }
+      }
+    }
+
+    expect(resolveKunImageGenerationSettings(appSettings)).toMatchObject({
+      enabled: true,
+      providerId: 'volcengine-agent-plan',
+      protocol: 'volcengine-ark-image',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      apiKey: 'agent-plan-key',
+      model: 'doubao-seedream-5.0-lite',
+      defaultResolution: '2K'
+    })
+    expect(resolveKunVideoGenerationSettings(appSettings)).toMatchObject({
+      enabled: true,
+      providerId: 'volcengine-agent-plan',
+      protocol: 'volcengine-ark-video',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      apiKey: 'agent-plan-key',
+      model: 'doubao-seedance-2.0',
+      defaultDuration: 15,
+      defaultResolution: '720P'
+    })
+    expect(resolveKunImageGenerationSettings({
+      ...appSettings,
+      agents: {
+        kun: {
+          ...appSettings.agents.kun,
+          imageGeneration: {
+            ...appSettings.agents.kun.imageGeneration,
+            providerId: '',
+            protocol: 'openai-images',
+            defaultResolution: '4K'
+          }
+        }
+      }
+    }).defaultResolution).toBe('1K')
+  })
+})
 
 function settings(): AppSettingsV1 {
   return {
@@ -44,6 +658,8 @@ function settings(): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: {
       ...defaultModelProviderSettings(),
       providers: [
@@ -69,7 +685,7 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -77,12 +693,73 @@ function settings(): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
     disabledSkillIds: []
   }
 }
+
+describe('active model provider API-key status', () => {
+  it('requires an API key when the active default provider has no effective key', () => {
+    const state = settings()
+    state.provider.providers = state.provider.providers.map((provider) =>
+      provider.id === 'deepseek' ? { ...provider, apiKey: '' } : provider
+    )
+    state.agents.kun.providerId = 'deepseek'
+    state.agents.kun.apiKey = ''
+
+    expect(modelProviderRequiresApiKey(
+      state.provider.providers.find((provider) => provider.id === 'deepseek')!
+    )).toBe(true)
+    expect(activeModelProviderNeedsApiKey(state)).toBe(true)
+  })
+
+  it('accepts the configured effective key for an active API-key provider', () => {
+    const state = settings()
+    state.provider.apiKey = 'sk-deepseek'
+    state.provider.providers = state.provider.providers.map((provider) =>
+      provider.id === 'deepseek' ? { ...provider, apiKey: 'sk-deepseek' } : provider
+    )
+    state.agents.kun.providerId = 'deepseek'
+
+    expect(activeModelProviderNeedsApiKey(state)).toBe(false)
+  })
+
+  it.each([
+    ['claude-subscription', 'agent-sdk'],
+    ['gemini-subscription', 'antigravity-cli'],
+    ['gemini-cli-subscription', 'gemini-cli-api']
+  ] as const)('accepts the keyless %s transport', (presetId, expectedKind) => {
+    const preset = getModelProviderPreset(presetId)
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, '')
+    expect(profile.kind).toBe(expectedKind)
+    expect(modelProviderRequiresApiKey(profile)).toBe(false)
+
+    const state = settings()
+    state.provider.providers.push(profile)
+    state.agents.kun.providerId = profile.id
+    state.agents.kun.apiKey = ''
+
+    expect(activeModelProviderNeedsApiKey(state)).toBe(false)
+  })
+
+  it('still requires the Cursor dashboard key for the active Cursor SDK provider', () => {
+    const preset = getModelProviderPreset('cursor-subscription')
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, '')
+    expect(modelProviderRequiresApiKey(profile)).toBe(true)
+
+    const state = settings()
+    state.provider.providers.push(profile)
+    state.agents.kun.providerId = profile.id
+    state.agents.kun.apiKey = ''
+
+    expect(activeModelProviderNeedsApiKey(state)).toBe(true)
+  })
+})
 
 describe('model provider settings', () => {
   it('resolves Kun runtime credentials from the selected provider', () => {
@@ -182,7 +859,7 @@ describe('model provider settings', () => {
     expect(runtime.apiKey).toBe('sk-runtime-fallback')
   })
 
-  it('uses a 128k context window for custom provider models without explicit context metadata', () => {
+  it('uses a 256k context window for custom provider models without explicit context metadata', () => {
     const state = settings()
     state.provider.providers = state.provider.providers.map((provider) =>
       provider.id === 'custom'
@@ -200,7 +877,35 @@ describe('model provider settings', () => {
         : provider
     )
 
-    expect(modelProviderModelProfilesForSettings(state)['custom-model'].contextWindowTokens).toBe(128_000)
+    expect(modelProviderModelProfilesForProvider(state, 'custom')['custom-model'].contextWindowTokens)
+      .toBe(256_000)
+  })
+
+  it('keeps same-id model profiles scoped to the selected provider', () => {
+    const state = settings()
+    state.provider.providers = state.provider.providers.map((provider) => ({
+      ...provider,
+      models: [...provider.models, 'shared-model'],
+      modelProfiles: {
+        ...provider.modelProfiles,
+        'shared-model': {
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text'],
+          endpointFormat: provider.id === 'custom' ? 'messages' : 'responses'
+        }
+      }
+    }))
+    state.agents.kun.providerId = 'custom'
+    state.agents.kun.model = 'shared-model'
+
+    expect(resolveKunRuntimeSettings(state).modelProfiles['shared-model']).toMatchObject({
+      endpointFormat: 'messages'
+    })
+    expect(modelProviderModelProfilesForProvider(state, 'deepseek')['shared-model']).toMatchObject({
+      endpointFormat: 'responses'
+    })
   })
 
   it('preserves per-model max output tokens in custom provider profiles', () => {
@@ -254,8 +959,7 @@ describe('model provider settings', () => {
         })
       }
     })
-    expect(xiaomi && modelProviderPresetProfile(xiaomi).models.slice(0, 3)).toEqual([
-      'mimo-v2.5-pro-ultraspeed',
+    expect(xiaomi && modelProviderPresetProfile(xiaomi).models.slice(0, 2)).toEqual([
       'mimo-v2.5-pro',
       'mimo-v2.5'
     ])
@@ -582,6 +1286,89 @@ describe('model provider settings', () => {
     }))
   })
 
+  it('resolves Codex subscription image generation through provider image capability', () => {
+    const codex = getModelProviderPreset('codex')
+    expect(codex).not.toBeNull()
+    const codexKey = JSON.stringify({
+      kind: 'codex-oauth',
+      accessToken: 'codex-access',
+      refreshToken: 'codex-refresh',
+      expiresAt: Date.now() + 3600_000,
+      accountId: 'acct_123',
+      email: 'user@example.com'
+    })
+    const codexProfile = modelProviderPresetProfile(codex!, codexKey)
+    expect(codexProfile).toMatchObject({
+      id: 'codex',
+      image: {
+        protocol: 'codex-responses-image',
+        baseUrl: 'https://chatgpt.com/backend-api/codex',
+        models: ['gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini']
+      }
+    })
+
+    const resolved = resolveKunImageGenerationSettings({
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          codexProfile
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          imageGeneration: {
+            ...defaultKunRuntimeSettings().imageGeneration,
+            enabled: true,
+            providerId: codexProfile.id
+          }
+        }
+      }
+    })
+
+    expect(resolved).toEqual(expect.objectContaining({
+      enabled: true,
+      providerId: 'codex',
+      protocol: 'codex-responses-image',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      apiKey: codexKey,
+      model: 'gpt-image-2'
+    }))
+  })
+
+  it('uses 1M context defaults for Codex GPT 5.x models', () => {
+    const codex = getModelProviderPreset('codex')
+    expect(codex).not.toBeNull()
+    const codexProfile = modelProviderPresetProfile(codex!, 'sk-codex')
+    for (const modelId of ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']) {
+      expect(codexProfile.modelProfiles[modelId]).toEqual(expect.objectContaining({
+        contextWindowTokens: 1_000_000
+      }))
+    }
+
+    const resolved = resolveKunRuntimeSettings({
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          codexProfile
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          providerId: codexProfile.id,
+          model: 'gpt-5.5'
+        }
+      }
+    })
+
+    expect(resolved.modelProfiles['gpt-5.5'].contextWindowTokens).toBe(1_000_000)
+  })
+
   it('routes MiniMax token plan media capabilities through the selected region host', () => {
     const minimax = getModelProviderPreset('minimax')
     expect(minimax).not.toBeNull()
@@ -778,12 +1565,65 @@ describe('model provider settings', () => {
             modelProfiles: {}
           }
         ]
+      },
+      agents: {
+        kun: {
+          ...base.agents.kun,
+          providerId: 'xiaomi-token-plan',
+          model: 'mimo-v2.5'
+        }
       }
     })
 
     expect(modelSupportsImageInput(resolved.modelProfiles['mimo-v2.5'])).toBe(true)
     expect(modelSupportsImageInput(resolved.modelProfiles['mimo-v2-omni'])).toBe(true)
     expect(resolved.modelProfiles['mimo-v2.5-pro']).toBeDefined()
+  })
+
+  it('preserves user-edited fields while filling newly added preset capabilities', () => {
+    const codex = getModelProviderPreset('codex')
+    expect(codex).not.toBeNull()
+    const codexProfile = modelProviderPresetProfile(codex!, 'sk-codex')
+    const editedProfile: ModelProviderModelProfileV1 = {
+      contextWindowTokens: 256_000,
+      maxOutputTokens: 32_000,
+      inputModalities: ['text'],
+      outputModalities: ['text'],
+      supportsToolCalling: false,
+      messageParts: ['text']
+    }
+    const resolved = resolveKunRuntimeSettings({
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          {
+            ...codexProfile,
+            modelProfiles: {
+              ...codexProfile.modelProfiles,
+              'gpt-5.5': editedProfile
+            }
+          }
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          providerId: codexProfile.id,
+          model: 'gpt-5.5'
+        }
+      }
+    })
+
+    expect(resolved.modelProfiles['gpt-5.5']).toMatchObject({
+      ...editedProfile,
+      reasoning: {
+        supportedEfforts: ['low', 'medium', 'high', 'max'],
+        defaultEffort: 'high',
+        requestProtocol: 'openai-responses'
+      }
+    })
   })
 
   it('resolves Xiaomi speech-to-text through provider speech capability', () => {
@@ -819,6 +1659,62 @@ describe('model provider settings', () => {
       baseUrl: 'https://api.xiaomimimo.com/v1',
       apiKey: 'sk-xiaomi',
       model: 'mimo-v2.5-asr'
+    }))
+  })
+
+  it('resolves Grok and Gemini CLI subscription speech without mixing Cursor models', () => {
+    const grokProfile = modelProviderPresetProfile(
+      getModelProviderPreset('grok-subscription')!,
+      'grok-oauth-json'
+    )
+    const geminiCliProfile = modelProviderPresetProfile(
+      getModelProviderPreset('gemini-cli-subscription')!,
+      ''
+    )
+    const cursorProfile = {
+      ...modelProviderPresetProfile(
+        getModelProviderPreset('cursor-subscription')!,
+        'cursor-secret'
+      ),
+      speech: {
+        protocol: 'openai-transcriptions' as const,
+        baseUrl: '',
+        models: ['gemini-2.5-flash']
+      }
+    }
+    const appSettings = {
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [
+          ...defaultModelProviderSettings().providers,
+          grokProfile,
+          geminiCliProfile,
+          cursorProfile
+        ]
+      },
+      agents: {
+        kun: {
+          ...defaultKunRuntimeSettings(),
+          speechToText: {
+            ...defaultKunRuntimeSettings().speechToText,
+            enabled: true,
+            providerId: geminiCliProfile.id,
+            model: 'gemini-2.5-flash'
+          }
+        }
+      }
+    }
+
+    expect(listSpeechToTextProviderProfiles(appSettings).map((profile) => profile.id))
+      .toEqual(['grok-subscription', 'gemini-cli-subscription'])
+    expect(resolveKunSpeechToTextSettings(appSettings)).toEqual(expect.objectContaining({
+      enabled: true,
+      providerId: 'gemini-cli-subscription',
+      protocol: 'gemini-cli-audio',
+      baseUrl: '',
+      apiKey: '',
+      model: 'gemini-2.5-flash'
     }))
   })
 
@@ -1001,6 +1897,167 @@ describe('model provider settings', () => {
   })
 })
 
+describe('multi-account provider presets', () => {
+  it('defines Ollama Cloud as a key-backed United States subscription with stable accounts', () => {
+    const ollama = getModelProviderPreset('ollama')
+    expect(ollama).toMatchObject({
+      id: 'ollama',
+      name: 'Ollama Cloud',
+      category: 'subscription',
+      subscriptionRegion: 'united-states',
+      baseUrl: 'https://ollama.com/v1',
+      endpointFormat: 'chat_completions',
+      models: [...OLLAMA_CLOUD_MODEL_IDS],
+      docsUrl: 'https://docs.ollama.com/cloud',
+      apiKeyUrl: 'https://ollama.com/settings/keys'
+    })
+
+    const first = modelProviderPresetAccountProfile(ollama!, 'api', [])!
+    const second = modelProviderPresetAccountProfile(ollama!, 'api', [first])!
+    expect(first).toMatchObject({
+      id: 'ollama',
+      name: 'Ollama Cloud',
+      presetSource: { presetId: 'ollama', mode: 'api' },
+      baseUrl: 'https://ollama.com/v1',
+      endpointFormat: 'chat_completions',
+      models: [...OLLAMA_CLOUD_MODEL_IDS]
+    })
+    expect(first.models).toContain('gpt-oss:120b')
+    expect(modelProviderRequiresApiKey(first)).toBe(true)
+    expect(second).toMatchObject({
+      id: 'ollama-2',
+      name: 'Ollama Cloud 2',
+      presetSource: { presetId: 'ollama', mode: 'api' }
+    })
+  })
+
+  it('allocates stable numbered identities for repeated subscription accounts', () => {
+    const kimi = getModelProviderPreset('kimi-code')
+    expect(kimi).not.toBeNull()
+
+    const first = modelProviderPresetAccountProfile(kimi!, 'api', [])!
+    const second = modelProviderPresetAccountProfile(kimi!, 'api', [first])!
+    const renamedSecond = { ...second, name: 'Work Kimi' }
+    const third = modelProviderPresetAccountProfile(kimi!, 'api', [first, renamedSecond])!
+
+    expect(first).toMatchObject({
+      id: 'kimi-code',
+      name: 'Kimi Code',
+      presetSource: { presetId: 'kimi-code', mode: 'api' }
+    })
+    expect(second).toMatchObject({
+      id: 'kimi-code-2',
+      name: 'Kimi Code 2',
+      presetSource: { presetId: 'kimi-code', mode: 'api' }
+    })
+    expect(third).toMatchObject({ id: 'kimi-code-3', name: 'Kimi Code 3' })
+    expect(modelProviderPresetAccountCount(kimi!, 'api', [first, renamedSecond, third])).toBe(3)
+  })
+
+  it('avoids global id and display-name collisions while preserving family ordinals', () => {
+    const kimi = getModelProviderPreset('kimi-code')!
+    const first = modelProviderPresetAccountProfile(kimi, 'api', [])!
+    const collisions = [
+      first,
+      { ...first, id: 'custom-kimi', name: 'Kimi Code 2', presetSource: undefined },
+      { ...first, id: 'kimi-code-2', name: 'Unrelated', presetSource: undefined }
+    ]
+
+    expect(modelProviderPresetAccountProfile(kimi, 'api', collisions)).toMatchObject({
+      id: 'kimi-code-3',
+      name: 'Kimi Code 3'
+    })
+  })
+
+  it('allocates independent Token Plan accounts and retains their preset capabilities', () => {
+    const minimax = getModelProviderPreset('minimax')
+    expect(minimax?.tokenPlan).toBeDefined()
+    const first = modelProviderPresetAccountProfile(minimax!, 'token-plan', [])!
+    const second = {
+      ...modelProviderPresetAccountProfile(minimax!, 'token-plan', [first])!,
+      apiKey: 'sk-second',
+      modelProfiles: {}
+    }
+    const normalized = normalizeModelProviderSettings({ providers: [first, second] })
+    const resolved = normalized.providers.find((provider) => provider.id === 'minimax-token-plan-2')!
+
+    expect(first).toMatchObject({
+      id: 'minimax-token-plan',
+      name: 'MiniMax Token Plan',
+      presetSource: { presetId: 'minimax', mode: 'token-plan' }
+    })
+    expect(resolved).toMatchObject({
+      id: 'minimax-token-plan-2',
+      name: 'MiniMax Token Plan 2',
+      apiKey: 'sk-second',
+      presetSource: { presetId: 'minimax', mode: 'token-plan' },
+      textToSpeech: expect.objectContaining({ models: expect.arrayContaining(['speech-2.8-hd']) })
+    })
+    expect(resolved.modelProfiles['minimax-m3']).toEqual(expect.objectContaining({
+      supportsToolCalling: true,
+      inputModalities: expect.arrayContaining(['image'])
+    }))
+  })
+
+  it('backfills legacy canonical sources and keeps duplicate account credentials independent', () => {
+    const kimi = getModelProviderPreset('kimi-code')!
+    const first = { ...modelProviderPresetAccountProfile(kimi, 'api', [])!, apiKey: 'sk-first' }
+    const second = {
+      ...modelProviderPresetAccountProfile(kimi, 'api', [first])!,
+      apiKey: 'sk-second',
+      modelProfiles: {}
+    }
+    const state = settings()
+    state.provider = normalizeModelProviderSettings({
+      providers: [
+        { ...first, presetSource: undefined },
+        second
+      ]
+    })
+    state.agents.kun = {
+      ...defaultKunRuntimeSettings(),
+      providerId: second.id,
+      model: second.models[0]
+    }
+
+    const normalizedFirst = state.provider.providers.find((provider) => provider.id === first.id)!
+    const normalizedSecond = state.provider.providers.find((provider) => provider.id === second.id)!
+    expect(resolveModelProviderPresetSource(normalizedFirst)).toMatchObject({
+      preset: expect.objectContaining({ id: 'kimi-code' }),
+      mode: 'api'
+    })
+    expect(normalizedFirst.presetSource).toEqual({ presetId: 'kimi-code', mode: 'api' })
+    expect(normalizedFirst.apiKey).toBe('sk-first')
+    expect(normalizedSecond.apiKey).toBe('sk-second')
+    expect(normalizedSecond.modelProfiles['kimi-for-coding']).toEqual(expect.objectContaining({
+      supportsToolCalling: true
+    }))
+    expect(resolveKunRuntimeSettings(state)).toMatchObject({
+      apiKey: 'sk-second',
+      baseUrl: 'https://api.kimi.com/coding/v1',
+      model: 'k3'
+    })
+  })
+
+  it('does not grant preset behavior to an invalid duplicate source', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        id: 'fake-plan-2',
+        name: 'Fake plan',
+        presetSource: { presetId: 'missing-preset', mode: 'token-plan' },
+        apiKey: 'sk-fake',
+        baseUrl: 'https://fake.example/v1',
+        endpointFormat: 'chat_completions',
+        models: ['fake-model'],
+        modelProfiles: {}
+      }]
+    }).providers.find((provider) => provider.id === 'fake-plan-2')!
+
+    expect(normalized.presetSource).toBeUndefined()
+    expect(normalized.modelProfiles).toEqual({})
+  })
+})
+
 describe('provider presets', () => {
   it('includes optional LiteLLM and Vercel AI Gateway presets', () => {
     const litellm = getModelProviderPreset('litellm')
@@ -1107,8 +2164,17 @@ describe('provider presets', () => {
       name: 'Kimi Code',
       baseUrl: 'https://api.kimi.com/coding/v1',
       endpointFormat: 'chat_completions',
-      models: ['kimi-for-coding'],
+      models: ['k3', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
       modelProfiles: {
+        k3: expect.objectContaining({
+          supportsToolCalling: true,
+          inputModalities: ['text', 'image'],
+          reasoning: {
+            supportedEfforts: ['low', 'high', 'max'],
+            defaultEffort: 'high',
+            requestProtocol: 'openai-chat-completions'
+          }
+        }),
         'kimi-for-coding': expect.objectContaining({
           supportsToolCalling: true,
           inputModalities: ['text']
@@ -1217,5 +2283,138 @@ describe('provider presets', () => {
     })
     expect(resolved.modelProfiles['minimax-m3'].endpointFormat).toBe('messages')
     expect(resolved.modelProfiles['glm-5.1'].endpointFormat).toBeUndefined()
+  })
+
+  it('keeps current OpenCode Go GLM models reasoning-selectable', () => {
+    const preset = getModelProviderPreset('opencode-go')
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, 'sk-opencode')
+
+    expect(profile.models).toContain('glm-5.2')
+    for (const modelId of ['glm-5.2', 'glm-5.1', 'glm-5']) {
+      expect(profile.modelProfiles[modelId]?.reasoning).toEqual({
+        supportedEfforts: ['off', 'high', 'max'],
+        defaultEffort: 'max',
+        requestProtocol: 'glm-chat-completions'
+      })
+    }
+  })
+
+  it('upgrades the obsolete generated single-auto GLM capability', () => {
+    const preset = getModelProviderPreset('opencode-go')!
+    const profile = modelProviderPresetProfile(preset, 'sk-opencode')
+    profile.modelProfiles['glm-5.2'] = {
+      ...profile.modelProfiles['glm-5.2']!,
+      reasoning: {
+        supportedEfforts: ['auto'],
+        defaultEffort: 'auto',
+        requestProtocol: 'none'
+      }
+    }
+
+    const normalized = normalizeModelProviderSettings({
+      providers: [profile]
+    }).providers.find((provider) => provider.id === 'opencode-go')
+
+    expect(normalized?.modelProfiles['glm-5.2']?.reasoning).toEqual({
+      supportedEfforts: ['off', 'high', 'max'],
+      defaultEffort: 'max',
+      requestProtocol: 'glm-chat-completions'
+    })
+  })
+
+  it('upgrades old placeholder reasoning protocols and the Kimi K3 transport', () => {
+    const aliyun = modelProviderPresetProfile(getModelProviderPreset('aliyun')!, 'sk-aliyun')
+    aliyun.modelProfiles['qwq-plus'] = {
+      ...aliyun.modelProfiles['qwq-plus']!,
+      reasoning: {
+        supportedEfforts: ['auto', 'off'],
+        defaultEffort: 'auto',
+        requestProtocol: 'none'
+      }
+    }
+    const kimi = modelProviderPresetProfile(getModelProviderPreset('kimi-code')!, 'sk-kimi')
+    kimi.modelProfiles.k3 = {
+      ...kimi.modelProfiles.k3!,
+      reasoning: {
+        supportedEfforts: ['off', 'low', 'medium', 'high', 'max'],
+        defaultEffort: 'high',
+        requestProtocol: 'openai-responses'
+      }
+    }
+
+    const normalized = normalizeModelProviderSettings({ providers: [aliyun, kimi] }).providers
+    expect(normalized.find((provider) => provider.id === 'aliyun')
+      ?.modelProfiles['qwq-plus']?.reasoning?.requestProtocol).toBe('qwen-chat-completions')
+    expect(normalized.find((provider) => provider.id === 'kimi-code')
+      ?.modelProfiles.k3?.reasoning).toEqual({
+        supportedEfforts: ['low', 'high', 'max'],
+        defaultEffort: 'high',
+        requestProtocol: 'openai-chat-completions'
+      })
+  })
+
+  it('adds K3 when normalizing the legacy Kimi Code model catalog', () => {
+    const normalized = normalizeModelProviderSettings({
+      providers: [{
+        ...modelProviderPresetProfile(getModelProviderPreset('kimi-code')!, 'sk-kimi'),
+        models: ['kimi-for-coding', 'kimi-for-coding-highspeed']
+      }]
+    }).providers.find((provider) => provider.id === 'kimi-code')
+
+    expect(normalized?.models).toEqual(['k3', 'kimi-for-coding', 'kimi-for-coding-highspeed'])
+    expect(normalized?.modelProfiles.k3?.reasoning?.requestProtocol)
+      .toBe('openai-chat-completions')
+  })
+
+  it.each([
+    ['claude-subscription', 'claude-sonnet-4-6', 'anthropic-thinking'],
+    ['kimi-code', 'k3', 'openai-chat-completions'],
+    ['volcengine-coding-plan', 'doubao-seed-1-6-250615', 'thinking-toggle-chat-completions'],
+    ['xiaomi', 'mimo-v2.5-pro', 'mimo-chat-completions'],
+    ['minimax', 'MiniMax-M3', 'anthropic-thinking'],
+    ['aliyun', 'qwq-plus', 'qwen-chat-completions'],
+    ['tencentcloud', 'hunyuan-t1-latest', 'thinking-toggle-chat-completions'],
+    ['codex', 'gpt-5.6-luna', 'openai-responses'],
+    ['grok-subscription', 'grok-4.5', 'openai-responses']
+  ])('publishes the audited %s/%s reasoning protocol', (
+    presetId,
+    model,
+    requestProtocol
+  ) => {
+    const preset = getModelProviderPreset(presetId)
+    expect(preset).not.toBeNull()
+    expect(modelProviderPresetProfile(preset!).modelProfiles[model]?.reasoning?.requestProtocol)
+      .toBe(requestProtocol)
+  })
+
+  it('keeps OpenCode Go DeepSeek v4 profiles aligned with DeepSeek defaults (#658)', () => {
+    const preset = getModelProviderPreset('opencode-go')
+    expect(preset).not.toBeNull()
+    const profile = modelProviderPresetProfile(preset!, 'sk-opencode')
+
+    for (const modelId of ['deepseek-v4-pro', 'deepseek-v4-flash']) {
+      expect(profile.modelProfiles[modelId]).toMatchObject({
+        contextWindowTokens: 1_000_000,
+        reasoning: {
+          supportedEfforts: ['off', 'high', 'max'],
+          defaultEffort: 'max',
+          requestProtocol: 'deepseek-chat-completions'
+        }
+      })
+    }
+
+    const resolved = resolveKunRuntimeSettings({
+      ...settings(),
+      provider: {
+        ...defaultModelProviderSettings(),
+        providers: [...defaultModelProviderSettings().providers, profile]
+      },
+      agents: {
+        kun: { ...defaultKunRuntimeSettings(), providerId: profile.id, model: 'deepseek-v4-pro' }
+      }
+    })
+    expect(resolved.modelProfiles['deepseek-v4-pro']).toEqual(profile.modelProfiles['deepseek-v4-pro'])
+    expect(resolved.modelProfiles['deepseek-v4-flash']).toEqual(profile.modelProfiles['deepseek-v4-flash'])
   })
 })

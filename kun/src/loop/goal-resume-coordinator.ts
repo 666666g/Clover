@@ -157,6 +157,23 @@ export class GoalResumeCoordinator {
     this.state.delete(threadId)
   }
 
+  /**
+   * Retry a launch that could not start because the runtime is temporarily at
+   * its global turn capacity. This is intentionally separate from
+   * `noteGoalTurnSettled`: no model turn ran, so it must not burn the goal's
+   * no-progress budget or incorrectly block an otherwise healthy goal.
+   */
+  defer(threadId: string): void {
+    if (this.shuttingDown) return
+    const entry = this.state.get(threadId)
+    if (!entry) return
+    entry.timer?.cancel()
+    const { goalKey } = entry
+    entry.timer = this.setTimer(() => {
+      void this.fire(threadId, goalKey)
+    }, this.baseDelayMs)
+  }
+
   /** Cancel all pending resumes; called on runtime shutdown. */
   shutdown(): void {
     this.shuttingDown = true

@@ -37,6 +37,7 @@ function createTodoWriteTool(threadService: ThreadService): LocalTool {
     description: [
       'Replace the current thread todo list with the supplied full list.',
       'Use it for visible task tracking in both Agent and Plan modes.',
+      'Call todo_list first when updating an existing list and reuse stable ids; plan linkage is managed internally.',
       'At most one item may be in_progress; if more than one is supplied, only the first in_progress item is kept active.',
       'In Plan mode, save implementation plans with the advertised plan-saving tool; todo_write only updates the progress list.'
     ].join(' '),
@@ -55,18 +56,6 @@ function createTodoWriteTool(threadService: ThreadService): LocalTool {
               status: {
                 type: 'string',
                 enum: ['pending', 'in_progress', 'completed']
-              },
-              source: {
-                type: 'object',
-                properties: {
-                  kind: { type: 'string', enum: ['plan'] },
-                  planId: { type: 'string' },
-                  relativePath: { type: 'string' },
-                  ordinal: { type: 'integer', minimum: 0 },
-                  contentHash: { type: 'string' }
-                },
-                required: ['kind', 'planId', 'relativePath', 'ordinal', 'contentHash'],
-                additionalProperties: false
               }
             },
             required: ['content', 'status'],
@@ -83,8 +72,14 @@ function createTodoWriteTool(threadService: ThreadService): LocalTool {
       if (!Array.isArray(args.todos)) {
         return { output: { error: 'todos must be an array' }, isError: true }
       }
+      if (args.todos.some((todo) => isRecord(todo) && Object.hasOwn(todo, 'source'))) {
+        return {
+          output: { error: 'todo source is managed internally and cannot be written by todo_write' },
+          isError: true
+        }
+      }
       try {
-        const todos = await threadService.setTodos(context.threadId, {
+        const todos = await threadService.setTodosFromTool(context.threadId, {
           todos: normalizeToolTodos(args.todos as SetThreadTodosRequest['todos'])
         })
         return { output: todoResponse(todos) }
@@ -110,6 +105,22 @@ function normalizeToolTodos(
   })
 }
 
-function todoResponse(todos: ThreadTodoList | null): { todos: ThreadTodoList | null } {
-  return { todos }
+function todoResponse(todos: ThreadTodoList | null): {
+  todos: { items: Array<{ id: string; content: string; status: string }> } | null
+} {
+  return {
+    todos: todos
+      ? {
+          items: todos.items.map((item) => ({
+            id: item.id,
+            content: item.content,
+            status: item.status
+          }))
+        }
+      : null
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }

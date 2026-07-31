@@ -22,6 +22,7 @@
  */
 import type { RuntimeEventDraft } from '../../services/runtime-event-recorder.js'
 import type { UsageSnapshot } from '../../contracts/usage.js'
+import { DEFAULT_MODEL_STREAM_LIMITS } from '../../adapters/model/model-stream-resource-budget.js'
 import {
   makeAssistantTextItem,
   makeAssistantReasoningItem,
@@ -42,6 +43,8 @@ export interface SdkEventMapperContext {
   turnId: string
   /** Monotonic id generator, e.g. `(p) => `${p}_${++n}``. Injected for tests. */
   nextId: (prefix: string) => string
+  /** Optional test/runtime overrides; production defaults mirror native model-stream limits. */
+  streamLimits?: Partial<SdkStreamResourceLimits>
 }
 
 export interface SdkTurnFinal {
@@ -50,6 +53,40 @@ export interface SdkTurnFinal {
   text?: string
   /** Failure detail for error subtypes. */
   message?: string
+  /** Stable kun error code when the SDK reports a native-equivalent limit. */
+  code?: 'turn_step_limit'
+}
+
+export type SdkStreamResourceLimits = {
+  maxEvents: number
+  maxEventBytes: number
+  maxTotalEventBytes: number
+  maxOutputBytes: number
+  maxToolCallsPerStep: number
+  maxPendingToolCalls: number
+  maxToolArgumentBytes: number
+  maxToolArgumentBytesPerStep: number
+}
+
+export const DEFAULT_SDK_STREAM_RESOURCE_LIMITS: SdkStreamResourceLimits = {
+  maxEvents: DEFAULT_MODEL_STREAM_LIMITS.maxFrames,
+  maxEventBytes: DEFAULT_MODEL_STREAM_LIMITS.maxFrameBytes,
+  maxTotalEventBytes: DEFAULT_MODEL_STREAM_LIMITS.maxTotalBytes,
+  maxOutputBytes: DEFAULT_MODEL_STREAM_LIMITS.maxOutputBytes,
+  maxToolCallsPerStep: DEFAULT_MODEL_STREAM_LIMITS.maxCompletedToolCalls,
+  maxPendingToolCalls: DEFAULT_MODEL_STREAM_LIMITS.maxPendingToolCalls,
+  maxToolArgumentBytes: DEFAULT_MODEL_STREAM_LIMITS.maxPendingToolArgumentBytes,
+  maxToolArgumentBytesPerStep: DEFAULT_MODEL_STREAM_LIMITS.maxCompletedToolArgumentBytes
+}
+
+export type SdkResourceLimitCode = 'stream_resource_limit' | 'tool_call_limit_exceeded'
+
+/** A stable, content-free failure that the runtime can safely project to the GUI. */
+export class SdkResourceLimitError extends Error {
+  constructor(readonly code: SdkResourceLimitCode, message: string) {
+    super(message)
+    this.name = 'SdkResourceLimitError'
+  }
 }
 
 /** Claude Code built-in tool names that imply a richer kun tool kind. */
@@ -109,16 +146,22 @@ export class SdkEventMapper {
   private sessionId?: string
   private textItemId?: string
   private reasoningItemId?: string
-  private textAccum = ''
-  private reasoningAccum = ''
-  /** tool_use id -> the tool_call item id we minted for it. */
-  private readonly toolItemIds = new Map<string, string>()
+  private readonly textAccum = new StreamTextAccumulator()
+  private readonly reasoningAccum = new StreamTextAccumulator()
+  /** Text emitted in only the current SDK query, used to dedupe its result copy. */
+  private readonly queryTextAccum = new StreamTextAccumulator()
+  /** Deltas emitted since the previous authoritative assistant message. */
+  private readonly currentAssistantTextAccum = new StreamTextAccumulator()
+  private readonly currentAssistantReasoningAccum = new StreamTextAccumulator()
   /** tool_use id -> tool name, so a later tool_result can recover it. */
   private readonly toolNames = new Map<string, string>()
   private toolReadyCount = 0
   private final?: SdkTurnFinal
+  private readonly budget: SdkStreamResourceBudget
 
-  constructor(private readonly ctx: SdkEventMapperContext) {}
+  constructor(private readonly ctx: SdkEventMapperContext) {
+    this.budget = new SdkStreamResourceBudget(normalizeSdkStreamLimits(ctx.streamLimits))
+  }
 
   /** SDK session id captured from the `system/init` message (for resume). */
   getSessionId(): string | undefined {
@@ -130,7 +173,21 @@ export class SdkEventMapper {
     return this.final
   }
 
+  /** Diagnostic/test seam proving completed tool calls release retained name state. */
+  getPendingToolCallCount(): number {
+    return this.toolNames.size
+  }
+
+  /** Reset query-local result/delta state while retaining turn-wide output budgets and item ids. */
+  beginQuery(): void {
+    this.queryTextAccum.clear()
+    this.currentAssistantTextAccum.clear()
+    this.currentAssistantReasoningAccum.clear()
+    this.final = undefined
+  }
+
   map(message: SdkMessage): RuntimeEventDraft[] {
+    this.budget.addEvent(message, this.toolNames.size)
     switch (message.type) {
       case 'system':
         if ((message as { subtype?: string }).subtype === 'init') {
@@ -157,11 +214,16 @@ export class SdkEventMapper {
     if (!event || event.type !== 'content_block_delta' || !event.delta) return []
     const delta = event.delta
     if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text.length > 0) {
-      this.textAccum += delta.text
+      this.budget.addOutputDelta('text', delta.text, this.toolNames.size)
+      this.textAccum.append(delta.text)
+      this.queryTextAccum.append(delta.text)
+      this.currentAssistantTextAccum.append(delta.text)
       return [this.textDeltaEvent(delta.text)]
     }
     if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking.length > 0) {
-      this.reasoningAccum += delta.thinking
+      this.budget.addOutputDelta('reasoning', delta.thinking, this.toolNames.size)
+      this.reasoningAccum.append(delta.thinking)
+      this.currentAssistantReasoningAccum.append(delta.thinking)
       return [this.reasoningDeltaEvent(delta.thinking)]
     }
     return []
@@ -169,33 +231,48 @@ export class SdkEventMapper {
 
   private mapAssistant(message: SdkApiMessage): RuntimeEventDraft[] {
     const events: RuntimeEventDraft[] = []
-    let text = ''
-    let thinking = ''
-    for (const block of blocksOf(message)) {
+    const blocks = blocksOf(message)
+    const textParts: string[] = []
+    const thinkingParts: string[] = []
+    const toolUses: SdkToolUseBlock[] = []
+    for (const block of blocks) {
       if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
-        text += (block as { text: string }).text
+        textParts.push((block as { text: string }).text)
       } else if (
         block.type === 'thinking' &&
         typeof (block as { thinking?: unknown }).thinking === 'string'
       ) {
-        thinking += (block as { thinking: string }).thinking
+        thinkingParts.push((block as { thinking: string }).thinking)
       } else if (block.type === 'tool_use') {
-        events.push(...this.toolUseEvents(block as SdkToolUseBlock))
+        toolUses.push(block as SdkToolUseBlock)
       }
     }
+    const text = textParts.join('')
+    const thinking = thinkingParts.join('')
+    const streamedText = this.currentAssistantTextAccum.value
+    const streamedThinking = this.currentAssistantReasoningAccum.value
+    this.budget.completeAssistant(
+      { text, thinking, toolUses },
+      this.toolNames,
+      { text: streamedText, thinking: streamedThinking }
+    )
+    for (const toolUse of toolUses) events.push(...this.toolUseEvents(toolUse))
     // Finalize text/thinking as item_created with the authoritative full payload.
     // (Native finalizes via applyItem -> item_created, a replace — NOT a delta —
     // so the streamed chunks above are not re-appended.)
     if (thinking) {
-      this.reasoningAccum = thinking
+      this.reasoningAccum.replace(thinking)
       events.unshift(this.reasoningItemCreated())
     }
     if (text) {
-      this.textAccum = text
+      this.textAccum.replace(text)
+      this.queryTextAccum.replace(text)
       events.unshift(this.textItemCreated())
-    } else if (this.textItemId && this.textAccum) {
+    } else if (this.textItemId && streamedText) {
       events.unshift(this.textItemCreated())
     }
+    this.currentAssistantTextAccum.clear()
+    this.currentAssistantReasoningAccum.clear()
     return events
   }
 
@@ -213,16 +290,23 @@ export class SdkEventMapper {
     const subtype = String(message.subtype ?? 'success')
     const isError = message.is_error === true || subtype !== 'success'
     const resultText = typeof message.result === 'string' ? message.result : undefined
+    if (resultText) {
+      this.budget.completeResult(resultText, this.queryTextAccum.value, this.toolNames.size)
+    }
     this.final = {
       status: isError ? 'failed' : 'completed',
-      ...(resultText ? { text: resultText } : this.textAccum ? { text: this.textAccum } : {}),
-      ...(isError ? { message: resultText ?? subtype } : {})
+      ...(resultText ? { text: resultText } : this.textAccum.value ? { text: this.textAccum.value } : {}),
+      ...(isError ? { message: resultText ?? subtype } : {}),
+      ...(subtype === 'error_max_turns' ? { code: 'turn_step_limit' as const } : {})
     }
     const usage = mapSdkUsage(
       message.usage as SdkUsage | undefined,
       Number(message.num_turns ?? 1),
       typeof message.total_cost_usd === 'number' ? (message.total_cost_usd as number) : undefined
     )
+    // A result is terminal for one SDK query. No later tool result may legally
+    // refer back across an SVG recovery query boundary.
+    this.toolNames.clear()
     return [
       {
         kind: 'usage',
@@ -265,7 +349,7 @@ export class SdkEventMapper {
         id: this.textItemId,
         turnId: this.ctx.turnId,
         threadId: this.ctx.threadId,
-        text: this.textAccum,
+        text: this.textAccum.value,
         status: 'completed'
       })
     }
@@ -299,7 +383,7 @@ export class SdkEventMapper {
         id: this.reasoningItemId,
         turnId: this.ctx.turnId,
         threadId: this.ctx.threadId,
-        text: this.reasoningAccum,
+        text: this.reasoningAccum.value,
         status: 'completed'
       })
     }
@@ -307,7 +391,6 @@ export class SdkEventMapper {
 
   private toolUseEvents(block: SdkToolUseBlock): RuntimeEventDraft[] {
     const itemId = `item_tool_${this.ctx.turnId}_${block.id}`
-    this.toolItemIds.set(block.id, itemId)
     this.toolNames.set(block.id, block.name)
     this.toolReadyCount += 1
     const toolKind = toolKindFor(block.name)
@@ -345,6 +428,7 @@ export class SdkEventMapper {
     const itemId = `item_toolresult_${this.ctx.turnId}_${block.tool_use_id}`
     // Recover the tool name/kind from the matching tool_use we saw earlier.
     const toolName = this.toolNames.get(block.tool_use_id) ?? 'tool'
+    this.toolNames.delete(block.tool_use_id)
     return {
       kind: 'tool_call_finished',
       threadId: this.ctx.threadId,
@@ -362,5 +446,189 @@ export class SdkEventMapper {
         status: block.is_error === true ? 'failed' : 'completed'
       })
     }
+  }
+}
+
+/** O(1)-append, lazily joined accumulator bounded by the enclosing byte/event budget. */
+class StreamTextAccumulator {
+  private parts: string[] = []
+  private joined: string | undefined
+
+  append(text: string): void {
+    if (!text) return
+    this.parts.push(text)
+    this.joined = undefined
+  }
+
+  replace(text: string): void {
+    this.parts = text ? [text] : []
+    this.joined = text
+  }
+
+  clear(): void {
+    this.parts = []
+    this.joined = ''
+  }
+
+  get value(): string {
+    if (this.joined === undefined) {
+      this.joined = this.parts.join('')
+      this.parts = this.joined ? [this.joined] : []
+    }
+    return this.joined
+  }
+}
+
+function normalizeSdkStreamLimits(
+  overrides: Partial<SdkStreamResourceLimits> | undefined
+): SdkStreamResourceLimits {
+  const merged = { ...DEFAULT_SDK_STREAM_RESOURCE_LIMITS, ...overrides }
+  return {
+    maxEvents: positiveInt(merged.maxEvents),
+    maxEventBytes: positiveInt(merged.maxEventBytes),
+    maxTotalEventBytes: positiveInt(merged.maxTotalEventBytes),
+    maxOutputBytes: positiveInt(merged.maxOutputBytes),
+    maxToolCallsPerStep: positiveInt(merged.maxToolCallsPerStep),
+    maxPendingToolCalls: positiveInt(merged.maxPendingToolCalls),
+    maxToolArgumentBytes: positiveInt(merged.maxToolArgumentBytes),
+    maxToolArgumentBytesPerStep: positiveInt(merged.maxToolArgumentBytesPerStep)
+  }
+}
+
+function positiveInt(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : 1
+}
+
+function serializedBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? 'null', 'utf8')
+}
+
+function authoritativeAdditionalBytes(authoritative: string, streamed: string): number {
+  if (!authoritative || authoritative === streamed) return 0
+  if (streamed && authoritative.startsWith(streamed)) {
+    return Buffer.byteLength(authoritative.slice(streamed.length), 'utf8')
+  }
+  // Divergent authoritative content replaces the streamed draft, so charge
+  // the full replacement instead of deduplicating by byte length alone.
+  return Buffer.byteLength(authoritative, 'utf8')
+}
+
+class SdkStreamResourceBudget {
+  private eventCount = 0
+  private eventBytes = 0
+  private outputBytes = 0
+
+  constructor(private readonly limits: SdkStreamResourceLimits) {}
+
+  addEvent(message: SdkMessage, pendingToolCalls: number): void {
+    this.eventCount += 1
+    if (this.eventCount > this.limits.maxEvents) {
+      throw this.exceeded('stream_resource_limit', `${this.limits.maxEvents} SDK events`, pendingToolCalls)
+    }
+    let bytes: number
+    try {
+      bytes = serializedBytes(message)
+    } catch {
+      throw this.exceeded('stream_resource_limit', 'an unmeasurable SDK event', pendingToolCalls)
+    }
+    this.eventBytes += bytes
+    if (bytes > this.limits.maxEventBytes) {
+      throw this.exceeded('stream_resource_limit', `${this.limits.maxEventBytes} bytes for one SDK event`, pendingToolCalls)
+    }
+    if (this.eventBytes > this.limits.maxTotalEventBytes) {
+      throw this.exceeded('stream_resource_limit', `${this.limits.maxTotalEventBytes} total SDK event bytes`, pendingToolCalls)
+    }
+  }
+
+  addOutputDelta(_kind: 'text' | 'reasoning', value: string, pendingToolCalls: number): void {
+    const bytes = Buffer.byteLength(value, 'utf8')
+    this.addOutputBytes(bytes, pendingToolCalls)
+  }
+
+  completeAssistant(
+    response: { text: string; thinking: string; toolUses: readonly SdkToolUseBlock[] },
+    pendingTools: ReadonlyMap<string, string>,
+    streamed: { text: string; thinking: string }
+  ): void {
+    if (response.toolUses.length > this.limits.maxToolCallsPerStep) {
+      throw this.exceeded(
+        'tool_call_limit_exceeded',
+        `${this.limits.maxToolCallsPerStep} tool calls in one model step`,
+        pendingTools.size
+      )
+    }
+
+    const pendingIds = new Set(pendingTools.keys())
+    let argumentBytes = 0
+    for (const toolUse of response.toolUses) {
+      let bytes: number
+      try {
+        bytes = serializedBytes(toolUse.input ?? {})
+      } catch {
+        throw this.exceeded('stream_resource_limit', 'an unmeasurable tool argument', pendingTools.size)
+      }
+      if (bytes > this.limits.maxToolArgumentBytes) {
+        throw this.exceeded(
+          'stream_resource_limit',
+          `${this.limits.maxToolArgumentBytes} bytes for one SDK tool argument (argumentBytes=${bytes})`,
+          pendingTools.size
+        )
+      }
+      argumentBytes += bytes
+      pendingIds.add(toolUse.id)
+    }
+    if (argumentBytes > this.limits.maxToolArgumentBytesPerStep) {
+      throw this.exceeded(
+        'stream_resource_limit',
+        `${this.limits.maxToolArgumentBytesPerStep} SDK tool-argument bytes in one model step`,
+        pendingTools.size
+      )
+    }
+    if (pendingIds.size > this.limits.maxPendingToolCalls) {
+      throw this.exceeded(
+        'stream_resource_limit',
+        `${this.limits.maxPendingToolCalls} pending SDK tool calls`,
+        pendingIds.size
+      )
+    }
+
+    this.addOutputBytes(
+      authoritativeAdditionalBytes(response.text, streamed.text) +
+        authoritativeAdditionalBytes(response.thinking, streamed.thinking),
+      pendingTools.size
+    )
+  }
+
+  completeResult(resultText: string, authoritativeText: string, pendingToolCalls: number): void {
+    if (!resultText || resultText === authoritativeText) return
+    // The result usually repeats the final assistant item. If the SDK only
+    // emitted partial deltas and the result extends them, charge just the
+    // suffix; otherwise conservatively charge the standalone result payload.
+    const additional = authoritativeText && resultText.startsWith(authoritativeText)
+      ? resultText.slice(authoritativeText.length)
+      : resultText
+    this.addOutputBytes(Buffer.byteLength(additional, 'utf8'), pendingToolCalls)
+  }
+
+  private addOutputBytes(bytes: number, pendingToolCalls: number): void {
+    this.outputBytes += bytes
+    if (this.outputBytes > this.limits.maxOutputBytes) {
+      throw this.exceeded(
+        'stream_resource_limit',
+        `${this.limits.maxOutputBytes} response text and reasoning bytes`,
+        pendingToolCalls
+      )
+    }
+  }
+
+  private exceeded(
+    code: SdkResourceLimitCode,
+    detail: string,
+    pendingToolCalls: number
+  ): SdkResourceLimitError {
+    return new SdkResourceLimitError(
+      code,
+      `agent SDK stream exceeded ${detail} (events=${this.eventCount}, eventBytes=${this.eventBytes}, outputBytes=${this.outputBytes}, pendingToolCalls=${pendingToolCalls})`
+    )
   }
 }

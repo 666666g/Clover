@@ -3,7 +3,6 @@ import type { WriteExportFormat } from '@shared/write-export'
 import type { WritePreviewMode, WriteSaveStatus } from '../../write/write-workspace-store'
 import { parseWriteMarkdown } from '../../write/tiptap/markdown-manager'
 
-export const WRITE_AUTOSAVE_MS = 900
 export const WRITE_PREVIEW_DEBOUNCE_MS = 60
 
 /**
@@ -17,12 +16,13 @@ export function writePreviewDebounceMs(contentLength: number): number {
   if (contentLength < 300_000) return 320
   return 500
 }
-export const INLINE_AGENT_MIN_WIDTH = 264
-export const INLINE_AGENT_MAX_WIDTH = 340
+export const INLINE_AGENT_MIN_WIDTH = 420
+export const INLINE_AGENT_MAX_WIDTH = 560
 export const INLINE_AGENT_GAP = 8
+export const INLINE_AGENT_VIEWPORT_MARGIN = 16
 export const WRITE_EXPORT_NOTICE_MS = 3_600
 export const INLINE_EDIT_RECENT_CONTEXT_CHARS = 180
-export const WRITE_EXPORT_FORMATS: WriteExportFormat[] = ['html', 'pdf', 'doc', 'docx']
+export const WRITE_EXPORT_FORMATS: WriteExportFormat[] = ['html', 'pdf', 'png', 'doc', 'docx']
 export const WRITE_RICH_CLIPBOARD_ACTION = 'clipboard'
 
 export type WriteNotice = {
@@ -32,6 +32,7 @@ export type WriteNotice = {
 
 export type WriteDocumentStats = {
   characterCount: number
+  wordCount: number
 }
 
 export type WriteModeMenuItem = {
@@ -45,10 +46,22 @@ export type WriteModeMenuItem = {
 export type WriteInlineAgentPosition = {
   left: number
   width: number
-  /** Top of the selection rect in viewport coords; the menu measures itself and places above/below. */
+  anchorLeft: number
+  anchorRight: number
+  /** Body zoom used to convert viewport coordinates into fixed-position layout coordinates. */
+  coordinateScale: number
+  /** Top of the selection rect in fixed-position layout coords; the menu measures itself and places above/below. */
   anchorTop: number
-  /** Bottom of the selection rect in viewport coords. */
+  /** Bottom of the selection rect in fixed-position layout coords. */
   anchorBottom: number
+}
+
+export type WriteInlineAgentPlacement = {
+  left: number
+  top: number
+  maxHeight: number
+  constrained: boolean
+  origin: 'top-center' | 'bottom-center' | 'center-left' | 'center-right'
 }
 
 export function isMarkdownFile(filePath: string): boolean {
@@ -62,16 +75,68 @@ export function formatSaveLabel(status: WriteSaveStatus, t: (key: string) => str
   return t('writeSaved')
 }
 
-function collectVisibleText(node: { type?: string; text?: string; content?: unknown[] } | undefined, acc: string[]): string[] {
+export function isInlineCompletionToggleShortcut(
+  event: Pick<
+    KeyboardEvent,
+    | 'code'
+    | 'ctrlKey'
+    | 'metaKey'
+    | 'shiftKey'
+    | 'altKey'
+    | 'repeat'
+    | 'isComposing'
+    | 'defaultPrevented'
+  >
+): boolean {
+  return (
+    event.code === 'Space' &&
+    event.shiftKey &&
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.repeat &&
+    !event.isComposing &&
+    !event.defaultPrevented
+  )
+}
+
+type MarkdownTextNode = {
+  type?: string
+  text?: string
+  content?: unknown[]
+}
+
+const MARKDOWN_TEXT_BOUNDARY_NODES = new Set([
+  'paragraph',
+  'heading',
+  'blockquote',
+  'codeBlock',
+  'listItem',
+  'taskItem',
+  'tableCell',
+  'tableHeader',
+  'tableRow'
+])
+const WRITE_WORD_SEGMENTER = typeof Intl.Segmenter === 'function'
+  ? new Intl.Segmenter(undefined, { granularity: 'word' })
+  : null
+
+function appendVisibleTextBoundary(acc: string[]): void {
+  const previous = acc.at(-1)
+  if (previous && !/\s$/.test(previous)) acc.push(' ')
+}
+
+function collectVisibleText(node: MarkdownTextNode | undefined, acc: string[]): string[] {
   if (!node) return acc
   if (node.type === 'text' && typeof node.text === 'string') acc.push(node.text)
+  if (node.type === 'hardBreak') appendVisibleTextBoundary(acc)
   if (Array.isArray(node.content)) {
     for (const child of node.content) {
       if (child && typeof child === 'object') {
-        collectVisibleText(child as { type?: string; text?: string; content?: unknown[] }, acc)
+        collectVisibleText(child as MarkdownTextNode, acc)
       }
     }
   }
+  if (node.type && MARKDOWN_TEXT_BOUNDARY_NODES.has(node.type)) appendVisibleTextBoundary(acc)
   return acc
 }
 
@@ -83,10 +148,21 @@ function visibleTextFromMarkdown(markdown: string): string {
   }
 }
 
+function countWords(text: string): number {
+  if (WRITE_WORD_SEGMENTER) {
+    let count = 0
+    for (const segment of WRITE_WORD_SEGMENTER.segment(text)) {
+      if (segment.isWordLike) count += 1
+    }
+    return count
+  }
+  return text.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu)?.length ?? 0
+}
+
 export function computeWriteDocumentStats(content: string, isMarkdown: boolean): WriteDocumentStats {
   const visibleText = isMarkdown ? visibleTextFromMarkdown(content) : content
   const characterCount = Array.from(visibleText.replace(/\s+/g, '')).length
-  return { characterCount }
+  return { characterCount, wordCount: countWords(visibleText) }
 }
 
 export function clamp(value: number, min: number, max: number): number {
@@ -106,21 +182,134 @@ export function useDebouncedValue<T>(value: T, delayMs: number): T {
 }
 
 export function inlineAgentPosition(selection: {
-  anchorRect?: { left: number; top: number; bottom: number; width: number } | null
-}, options: { compact?: boolean } = {}): WriteInlineAgentPosition | null {
+  anchorRect?: { left: number; right?: number; top: number; bottom: number; width: number } | null
+}, options: {
+  compact?: boolean
+  coordinateScale?: number
+  viewportWidth?: number
+} = {}): WriteInlineAgentPosition | null {
   const rect = selection.anchorRect
   if (!rect) return null
-  const minWidth = options.compact ? 240 : INLINE_AGENT_MIN_WIDTH
-  const maxWidth = options.compact ? 320 : INLINE_AGENT_MAX_WIDTH
-  const targetRatio = options.compact ? 0.22 : 0.28
-  const width = clamp(Math.round(window.innerWidth * targetRatio), minWidth, maxWidth)
-  const left = clamp(rect.left + rect.width / 2 - width / 2, 16, window.innerWidth - width - 16)
+  const coordinateScale = validCoordinateScale(options.coordinateScale ?? currentBodyZoom())
+  const viewportWidth = (options.viewportWidth ?? window.innerWidth) / coordinateScale
+  const anchorLeft = rect.left / coordinateScale
+  const anchorWidth = rect.width / coordinateScale
+  const availableWidth = Math.max(0, viewportWidth - INLINE_AGENT_VIEWPORT_MARGIN * 2)
+  const minWidth = Math.min(options.compact ? 360 : INLINE_AGENT_MIN_WIDTH, availableWidth)
+  const maxWidth = Math.min(options.compact ? 480 : INLINE_AGENT_MAX_WIDTH, availableWidth)
+  const targetRatio = options.compact ? 0.4 : 0.46
+  const width = clamp(Math.round(viewportWidth * targetRatio), minWidth, maxWidth)
+  const left = clamp(anchorLeft + anchorWidth / 2 - width / 2, 16, viewportWidth - width - 16)
   return {
     left,
     width,
-    anchorTop: rect.top,
-    anchorBottom: rect.bottom
+    anchorLeft,
+    anchorRight: (Number.isFinite(rect.right) ? Number(rect.right) : rect.left + rect.width) / coordinateScale,
+    coordinateScale,
+    anchorTop: rect.top / coordinateScale,
+    anchorBottom: rect.bottom / coordinateScale
   }
+}
+
+export function inlineAgentPlacement(
+  action: WriteInlineAgentPosition,
+  options: {
+    menuHeight: number
+    viewportWidth: number
+    viewportHeight: number
+    preferAbove?: boolean
+  }
+): WriteInlineAgentPlacement {
+  const coordinateScale = validCoordinateScale(action.coordinateScale)
+  const viewportWidth = Math.max(0, options.viewportWidth / coordinateScale)
+  const viewportHeight = Math.max(0, options.viewportHeight / coordinateScale)
+  const maxViewportHeight = Math.max(0, viewportHeight - INLINE_AGENT_VIEWPORT_MARGIN * 2)
+  const naturalMenuHeight = Math.max(0, options.menuHeight)
+  const menuHeight = Math.min(naturalMenuHeight, maxViewportHeight)
+  const left = clamp(
+    action.left,
+    INLINE_AGENT_VIEWPORT_MARGIN,
+    viewportWidth - action.width - INLINE_AGENT_VIEWPORT_MARGIN
+  )
+  const aboveSpace = Math.max(
+    0,
+    action.anchorTop - INLINE_AGENT_GAP - INLINE_AGENT_VIEWPORT_MARGIN
+  )
+  const belowSpace = Math.max(
+    0,
+    viewportHeight - INLINE_AGENT_VIEWPORT_MARGIN - action.anchorBottom - INLINE_AGENT_GAP
+  )
+  const aboveFits = menuHeight <= aboveSpace
+  const belowFits = menuHeight <= belowSpace
+
+  if ((options.preferAbove && aboveFits) || (!belowFits && aboveFits)) {
+    return {
+      left,
+      top: action.anchorTop - INLINE_AGENT_GAP - menuHeight,
+      maxHeight: menuHeight,
+      constrained: naturalMenuHeight > menuHeight,
+      origin: 'bottom-center'
+    }
+  }
+  if (belowFits) {
+    return {
+      left,
+      top: action.anchorBottom + INLINE_AGENT_GAP,
+      maxHeight: menuHeight,
+      constrained: naturalMenuHeight > menuHeight,
+      origin: 'top-center'
+    }
+  }
+
+  const rightSpace = Math.max(
+    0,
+    viewportWidth - INLINE_AGENT_VIEWPORT_MARGIN - action.anchorRight - INLINE_AGENT_GAP
+  )
+  const leftSpace = Math.max(
+    0,
+    action.anchorLeft - INLINE_AGENT_GAP - INLINE_AGENT_VIEWPORT_MARGIN
+  )
+  const rightFits = action.width <= rightSpace
+  const leftFits = action.width <= leftSpace
+  if (rightFits || leftFits) {
+    const placeRight = rightFits && (!leftFits || rightSpace >= leftSpace)
+    return {
+      left: placeRight
+        ? action.anchorRight + INLINE_AGENT_GAP
+        : action.anchorLeft - INLINE_AGENT_GAP - action.width,
+      top: clamp(
+        (action.anchorTop + action.anchorBottom - menuHeight) / 2,
+        INLINE_AGENT_VIEWPORT_MARGIN,
+        viewportHeight - menuHeight - INLINE_AGENT_VIEWPORT_MARGIN
+      ),
+      maxHeight: menuHeight,
+      constrained: naturalMenuHeight > menuHeight,
+      origin: placeRight ? 'center-left' : 'center-right'
+    }
+  }
+
+  const placeAbove = aboveSpace === belowSpace
+    ? options.preferAbove === true
+    : aboveSpace > belowSpace
+  const maxHeight = placeAbove ? aboveSpace : belowSpace
+  return {
+    left,
+    top: placeAbove
+      ? action.anchorTop - INLINE_AGENT_GAP - maxHeight
+      : action.anchorBottom + INLINE_AGENT_GAP,
+    maxHeight,
+    constrained: naturalMenuHeight > maxHeight,
+    origin: placeAbove ? 'bottom-center' : 'top-center'
+  }
+}
+
+function currentBodyZoom(): number {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return 1
+  return validCoordinateScale(Number.parseFloat(window.getComputedStyle(document.body).zoom))
+}
+
+function validCoordinateScale(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 1
 }
 
 export function modeButtonClass(active: boolean): string {
@@ -150,6 +339,7 @@ export function toolbarMenuButtonClass(active = false): string {
 export function exportFormatLabel(format: WriteExportFormat, t: (key: string) => string): string {
   if (format === 'html') return t('writeExportHtml')
   if (format === 'pdf') return t('writeExportPdf')
+  if (format === 'png') return t('writeExportPng')
   if (format === 'doc') return t('writeExportDoc')
   return t('writeExportDocx')
 }

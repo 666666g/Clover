@@ -1,0 +1,16 @@
+#kun-example-direct-dom-warning[data-kun-extension-root='kun-examples.direct-dom'] {
+  display: inline-flex;
+  align-items: center;
+  max-width: 18rem;
+  margin-inline: 0.5rem;
+  padding: 0.2rem 0.45rem;
+  overflow: hidden;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: #9a6700;
+  background: #fff8c5;
+  font: 600 11px/1.4 system-ui, sans-serif;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}

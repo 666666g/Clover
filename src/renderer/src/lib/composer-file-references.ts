@@ -22,6 +22,9 @@ export type ComposerFileContextEntry = {
   truncated?: boolean
 }
 
+export const COMPOSER_FILE_REFERENCE_DRAG_MIME = 'application/x-kun-file-reference'
+const MAX_COMPOSER_FILE_REFERENCE_DRAG_BYTES = 16 * 1024
+
 const FILE_MENTION_BOUNDARY = /(^|[\s([{，。；：、])@([^\s@"']*)$/u
 const QUOTED_FILE_MENTION_BOUNDARY = /(^|[\s([{，。；：、])@"([^"\n\r]*)$/u
 const TOKEN_SPECIAL_CHARS = /[\s"']/u
@@ -36,6 +39,67 @@ function trimTrailingSlash(value: string): string {
 
 function normalizeForCompare(value: string): string {
   return trimTrailingSlash(value).toLowerCase()
+}
+
+function isComposerFileReferenceKind(value: unknown): value is ComposerFileReferenceKind {
+  return value === 'file' || value === 'directory'
+}
+
+export function parseComposerFileReferenceDragData(
+  raw: string,
+  expectedWorkspaceRoot?: string
+): ComposerFileReference | null {
+  if (!raw || raw.length > MAX_COMPOSER_FILE_REFERENCE_DRAG_BYTES) return null
+  if (new TextEncoder().encode(raw).byteLength > MAX_COMPOSER_FILE_REFERENCE_DRAG_BYTES) return null
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    if (
+      typeof value.path !== 'string' || !value.path.trim() ||
+      typeof value.relativePath !== 'string' || !value.relativePath.trim() ||
+      typeof value.name !== 'string' || !value.name.trim()
+    ) {
+      return null
+    }
+    if (value.type !== undefined && !isComposerFileReferenceKind(value.type)) return null
+    if (
+      value.workspaceRoot !== undefined &&
+      value.workspaceRoot !== null &&
+      typeof value.workspaceRoot !== 'string'
+    ) {
+      return null
+    }
+    const reference: ComposerFileReference = {
+      path: normalizeSlashes(value.path),
+      relativePath: normalizeSlashes(value.relativePath),
+      name: value.name.trim(),
+      ...(value.type ? { type: value.type } : {}),
+      ...(value.workspaceRoot === null
+        ? { workspaceRoot: null }
+        : typeof value.workspaceRoot === 'string'
+          ? { workspaceRoot: normalizeSlashes(value.workspaceRoot) }
+          : {})
+    }
+    const expectedRoot = trimTrailingSlash(expectedWorkspaceRoot ?? '')
+    if (!expectedRoot) return reference
+
+    const expectedRelativePath = relativeWorkspacePath(reference.path, expectedRoot)
+    if (
+      normalizeForCompare(expectedRelativePath) === normalizeForCompare(reference.path) ||
+      normalizeForCompare(expectedRelativePath) !== normalizeForCompare(reference.relativePath)
+    ) {
+      return null
+    }
+    if (
+      reference.workspaceRoot != null &&
+      normalizeForCompare(reference.workspaceRoot) !== normalizeForCompare(expectedRoot)
+    ) {
+      return null
+    }
+    return { ...reference, workspaceRoot: expectedRoot }
+  } catch {
+    return null
+  }
 }
 
 export function relativeWorkspacePath(path: string, workspaceRoot: string): string {
@@ -132,6 +196,44 @@ const MENTION_TOKEN_CONTINUATION = /[^\s@"'([{)\]}，。；：、,;:]/u
 function isMentionTokenBoundary(char: string | undefined): boolean {
   if (char === undefined) return true
   return !MENTION_TOKEN_CONTINUATION.test(char)
+}
+
+function isMentionTokenStartBoundary(char: string | undefined): boolean {
+  if (char === undefined) return true
+  return /[\s([{，。；：、]/u.test(char)
+}
+
+function composerFileMentionTokenCandidates(relativePath: string, isDirectory: boolean): string[] {
+  const normalized = trimTrailingSlash(relativePath)
+  return isDirectory
+    ? [
+        formatComposerFileMentionToken(normalized, true),
+        formatComposerFileMentionToken(normalized, false)
+      ]
+    : [formatComposerFileMentionToken(normalized, false)]
+}
+
+export function hasComposerFileMentionToken(
+  input: string,
+  relativePath: string,
+  isDirectory = false
+): boolean {
+  const candidates = composerFileMentionTokenCandidates(relativePath, isDirectory)
+  return candidates.some((token) => {
+    let from = 0
+    while (from <= input.length) {
+      const index = input.indexOf(token, from)
+      if (index < 0) return false
+      if (
+        isMentionTokenStartBoundary(input[index - 1]) &&
+        isMentionTokenBoundary(input[index + token.length])
+      ) {
+        return true
+      }
+      from = index + token.length
+    }
+    return false
+  })
 }
 
 export function removeComposerFileMentionToken(

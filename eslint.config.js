@@ -7,7 +7,15 @@ export default tseslint.config(
   {
     // Build output, deps, coverage, and nested git worktrees are not source — match at any depth
     // ('dist/**' alone misses kun/dist/**, and the .claude worktree holds a full repo copy).
-    ignores: ['**/build/**', '**/dist/**', '**/node_modules/**', '**/out/**', '**/coverage/**', '.claude/**']
+    ignores: [
+      '**/build/**',
+      '**/dist/**',
+      '**/node_modules/**',
+      '**/out/**',
+      '**/coverage/**',
+      '.cache/**',
+      '.claude/**'
+    ]
   },
   js.configs.recommended,
   {

@@ -48,7 +48,7 @@ export function WorkflowHookTriggers({
         className="flex max-h-[82vh] w-[620px] flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-card shadow-xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <header className="flex items-center justify-between border-b border-ds-border px-5 py-3.5">
+        <header className="flex shrink-0 items-center justify-between border-b border-ds-border px-5 py-3.5">
           <div className="flex items-center gap-2">
             <Zap className="h-4 w-4 text-ds-muted" strokeWidth={1.8} />
             <div className="flex flex-col">
@@ -65,7 +65,7 @@ export function WorkflowHookTriggers({
           </button>
         </header>
 
-        <div className="flex flex-col gap-3 overflow-y-auto px-5 py-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4">
           {triggers.length === 0 ? (
             <p className="py-6 text-center text-[12.5px] leading-5 text-ds-faint">{t('workflowHooksEmpty')}</p>
           ) : (

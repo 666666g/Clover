@@ -7,9 +7,39 @@ import {
 } from '../shared/app-settings'
 import type { ModelProviderProbeRequest, ModelProviderProbeResult } from '../shared/kun-gui-api'
 import { upstreamOpenAiModelsUrl } from '../shared/openai-compat-url'
+import {
+  CHATGPT_SUBSCRIPTION_MODEL_IDS,
+  GROK_SUBSCRIPTION_MODEL_IDS
+} from '../shared/model-provider-presets'
 import { fetchWithOptionalProxy } from './proxy-fetch'
+import { isCodexOAuthCredentials, parseCodexCredentials } from './codex-auth'
+import {
+  ensureFreshGrokCredentials,
+  isGrokOAuthCredentials,
+  parseGrokCredentials
+} from './grok-auth'
+
+function isCodexBaseUrl(url: string): boolean {
+  return hasExpectedHttpsHost(url, 'chatgpt.com') && new URL(url).pathname.startsWith('/backend-api/codex')
+}
+
+function isGrokSubscriptionBaseUrl(url: string): boolean {
+  return hasExpectedHttpsHost(url, 'cli-chat-proxy.grok.com')
+}
+
+function hasExpectedHttpsHost(url: string, host: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'https:' && parsed.hostname === host
+  } catch {
+    return false
+  }
+}
 
 const PROBE_TIMEOUT_MS = 10_000
+const MAX_MODEL_LIST_RESPONSE_BYTES = 2_000_000
+const MAX_MODEL_COUNT = 2_000
+const MAX_MODEL_ID_LENGTH = 512
 // The proxy-vs-direct diagnosis runs only after the proxied probe already
 // failed, so it gets a shorter budget — we just need to learn whether the
 // provider is reachable at all, not wait out another full timeout (which would
@@ -47,6 +77,41 @@ export async function probeModelProvider(
   if (!/^https?:\/\//i.test(baseUrl)) {
     return { ok: false, message: 'Base URL must start with http:// or https://.' }
   }
+  if (isCodexBaseUrl(baseUrl)) {
+    const rawKey = request.apiKey.trim()
+    if (!rawKey) {
+      return { ok: false, message: 'ChatGPT 订阅未登录，请先点击「登录 ChatGPT」。' }
+    }
+    if (!isCodexOAuthCredentials(rawKey)) {
+      return { ok: false, message: 'ChatGPT 订阅凭据格式无效，请重新登录。' }
+    }
+    const creds = parseCodexCredentials(rawKey)
+    if (!creds) {
+      return { ok: false, message: 'ChatGPT 订阅凭据已损坏，请重新登录。' }
+    }
+    if (creds.expiresAt < Date.now()) {
+      return { ok: false, message: 'ChatGPT 订阅凭据已过期，请重新登录。' }
+    }
+    return { ok: true, latencyMs: 0, modelIds: [...CHATGPT_SUBSCRIPTION_MODEL_IDS] }
+  }
+  if (isGrokSubscriptionBaseUrl(baseUrl)) {
+    const rawKey = request.apiKey.trim()
+    if (!rawKey) {
+      return { ok: false, message: 'Grok 订阅未登录，请先点击「登录 Grok」。' }
+    }
+    if (!isGrokOAuthCredentials(rawKey)) {
+      return { ok: false, message: 'Grok 订阅凭据格式无效，请重新登录。' }
+    }
+    const fresh = await ensureFreshGrokCredentials(rawKey)
+    const creds = fresh.credentials ?? parseGrokCredentials(fresh.apiKey)
+    if (!creds) {
+      return { ok: false, message: 'Grok 订阅凭据已损坏，请重新登录。' }
+    }
+    if (creds.expiresAt < Date.now()) {
+      return { ok: false, message: 'Grok 订阅凭据已过期，请重新登录。' }
+    }
+    return { ok: true, latencyMs: 0, modelIds: [...GROK_SUBSCRIPTION_MODEL_IDS] }
+  }
   const endpointFormat = normalizeModelEndpointFormat(request.endpointFormat)
   if (isCustomModelEndpointFormat(endpointFormat)) {
     return {
@@ -65,7 +130,11 @@ export async function probeModelProvider(
       headers: providerProbeHeaders(endpointFormat, request.apiKey),
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
     }, proxyUrl)
-    text = await res.text()
+    const body = await readBoundedResponseText(res, MAX_MODEL_LIST_RESPONSE_BYTES)
+    if (body.truncated) {
+      return { ok: false, message: `Model list response exceeded the ${MAX_MODEL_LIST_RESPONSE_BYTES} byte limit.` }
+    }
+    text = body.text
   } catch (e) {
     const message = providerProbeFailureMessage(e, url)
     if (proxyUrl && await directProviderReachable(url, endpointFormat, request.apiKey, fetcher)) {
@@ -109,21 +178,70 @@ async function directProviderReachable(
   }
 }
 
-function parseModelIds(body: string): string[] {
+export function parseModelIds(body: string): string[] {
+  if (body.length > MAX_MODEL_LIST_RESPONSE_BYTES) return []
   let parsed: unknown
   try {
     parsed = JSON.parse(body) as unknown
   } catch {
     return []
   }
-  const data = (parsed as { data?: unknown }).data
-  if (!Array.isArray(data)) return []
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === 'object'
+      ? (() => {
+          const record = parsed as { data?: unknown; models?: unknown }
+          if (Array.isArray(record.data)) return record.data
+          if (Array.isArray(record.models)) return record.models
+          return []
+        })()
+      : []
   const ids = new Set<string>()
-  for (const row of data) {
+  for (const row of rows.slice(0, MAX_MODEL_COUNT)) {
     if (row && typeof row === 'object' && typeof (row as { id?: unknown }).id === 'string') {
       const id = (row as { id: string }).id.trim()
-      if (id) ids.add(id)
+      if (id && id.length <= MAX_MODEL_ID_LENGTH) ids.add(id)
     }
   }
   return [...ids]
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<{ text: string; truncated: boolean }> {
+  const contentLength = Number(response.headers.get('content-length'))
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await response.body?.cancel().catch(() => undefined)
+    return { text: '', truncated: true }
+  }
+  if (!response.body) {
+    const text = await response.text()
+    return { text, truncated: new TextEncoder().encode(text).byteLength > maxBytes }
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      if (!next.value) continue
+      totalBytes += next.value.byteLength
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        return { text: '', truncated: true }
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return { text: new TextDecoder().decode(bytes), truncated: false }
 }

@@ -8,9 +8,11 @@ describe('renderer content security policy', () => {
     return html.match(/Content-Security-Policy"[\s\S]*?content="([^"]+)"/)?.[1] ?? ''
   })()
 
-  it('allows blob image URLs for local attachment previews', () => {
+  it('allows only the required local and extension image URL families', () => {
     const imgSrc = csp.match(/img-src\s+([^;]+)/)?.[1] ?? ''
     expect(imgSrc.split(/\s+/)).toContain('blob:')
+    expect(imgSrc.split(/\s+/)).toContain('kun-extension:')
+    expect(imgSrc.split(/\s+/)).not.toContain('https:')
   })
 
   it('allows data and blob URLs for workspace video previews', () => {

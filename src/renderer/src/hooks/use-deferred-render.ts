@@ -66,6 +66,11 @@ export function useDeferredRender<T extends Element>({
   useEffect(() => {
     if (!enabled || immediate || shouldRender || !node) return
 
+    if (typeof IntersectionObserver === 'undefined') {
+      setShouldRender(true)
+      return
+    }
+
     let debounceId: number | null = null
     let idleId: IdleCallbackHandle | null = null
 

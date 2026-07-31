@@ -1,61 +1,80 @@
 import type { ReactElement } from 'react'
-import { Code2, PencilLine } from 'lucide-react'
+import { Code2, Palette, PencilLine } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 type Props = {
-  activeView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'image-edit'
+  activeView: 'chat' | 'write' | 'design' | 'claw' | 'schedule' | 'workflow' | 'subagents' | 'image-edit'
   onCodeOpen: () => void
   onWriteOpen: () => void
+  onDesignOpen: () => void
 }
 
 export function WorkspaceModeTabs({
   activeView,
   onCodeOpen,
-  onWriteOpen
+  onWriteOpen,
+  onDesignOpen
 }: Props): ReactElement {
   const { t } = useTranslation('common')
 
   const tabClass = (active: boolean): string =>
-    `group inline-flex min-h-[28px] flex-1 min-w-0 items-center justify-center gap-1.5 rounded-[6px] px-2 py-0.5 text-[13px] outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-black/10 dark:focus-visible:ring-white/20 ${
+    `workspace-mode-tab group inline-flex min-h-8 flex-1 min-w-0 items-center justify-center gap-1.5 rounded-full border px-2 py-0.5 text-[13px] outline-none transition-[background-color,border-color,color] duration-150 focus-visible:ring-2 focus-visible:ring-accent/30 ${
       active
-        ? 'bg-white font-medium text-[#1f2733] shadow-[0_1px_2px_rgba(20,47,95,0.12),0_2px_5px_rgba(20,47,95,0.06)] dark:bg-white/[0.12] dark:text-white dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)]'
-        : 'font-normal text-[#646e7c] hover:text-[#1f2733] dark:text-white/55 dark:hover:text-white/90'
+        ? 'border-ds-border bg-ds-card font-medium text-ds-ink'
+        : 'border-transparent font-normal text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
     }`
 
   const iconClass = (active: boolean): string =>
     `h-[15px] w-[15px] shrink-0 transition-colors ${
       active
-        ? 'text-[#1f2733] dark:text-white'
-        : 'text-[#8b95a3] group-hover:text-[#1f2733] dark:text-white/45 dark:group-hover:text-white/85'
+        ? 'text-ds-ink'
+        : 'text-ds-faint group-hover:text-ds-ink'
     }`
 
   return (
     <div
       role="tablist"
-      aria-label={`${t('code')} / ${t('write')}`}
-      className="mb-1.5 flex flex-row gap-1 rounded-[8px] bg-[color-mix(in_srgb,var(--ds-sidebar-field-bg)_72%,transparent)] p-0.5 shadow-[inset_0_0_0_1px_var(--ds-sidebar-row-ring)] dark:bg-white/[0.045] dark:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]"
+      aria-label={`${t('code')} / ${t('write')} / ${t('design')}`}
+      className="workspace-mode-tabs mb-1.5 flex flex-row gap-1 rounded-full border border-[var(--ds-sidebar-row-ring)] bg-[var(--ds-sidebar-field-bg)] p-0.5"
     >
       <button
         type="button"
+        data-workspace-mode="chat"
         data-cursor-spotlight-target
         role="tab"
         aria-selected={activeView === 'chat'}
         onClick={onCodeOpen}
         className={tabClass(activeView === 'chat')}
+        title={t('code')}
       >
         <Code2 className={iconClass(activeView === 'chat')} strokeWidth={1.9} />
-        <span className="truncate">{t('code')}</span>
+        <span className="workspace-mode-tab-label whitespace-nowrap">{t('code')}</span>
       </button>
       <button
         type="button"
+        data-workspace-mode="write"
         data-cursor-spotlight-target
         role="tab"
         aria-selected={activeView === 'write'}
         onClick={onWriteOpen}
         className={tabClass(activeView === 'write')}
+        title={t('write')}
       >
         <PencilLine className={iconClass(activeView === 'write')} strokeWidth={1.9} />
-        <span className="truncate">{t('write')}</span>
+        <span className="workspace-mode-tab-label whitespace-nowrap">{t('write')}</span>
+      </button>
+      <button
+        type="button"
+        data-workspace-mode="design"
+        data-cursor-spotlight-target
+        role="tab"
+        aria-selected={activeView === 'design'}
+        onClick={onDesignOpen}
+        className={tabClass(activeView === 'design')}
+        title={t('design')}
+      >
+        <Palette className={iconClass(activeView === 'design')} strokeWidth={1.9} />
+        <span className="workspace-mode-tab-label whitespace-nowrap">{t('design')}</span>
       </button>
     </div>
   )

@@ -8,7 +8,10 @@ import {
   COMMON_WORKSPACE_SKILL_DIRS,
   type CommonSkillDir
 } from '../../shared/skill-dirs'
-import { expandHomePath } from './workspace-service'
+// Keep the skill catalog usable from Node-only migration/config tests. The
+// workspace barrel also exports Electron-backed editors and files, which
+// unnecessarily requires the Electron binary during CI.
+import { expandHomePath } from './workspace-paths'
 
 export type GuiSkillScope = 'project' | 'global'
 
@@ -63,7 +66,7 @@ type SkillRootCandidate = {
 
 /**
  * Enabled, on-disk skill roots passed to the Kun runtime. Builds the common
- * directory conventions (.agents/.claude/.codex/skills + global equivalents)
+ * directory conventions (.agents/.claude/.codex/.kun/skills + global equivalents)
  * plus configured extra dirs, drops any the user toggled off, and appends
  * enabled Codex plugin caches. Precedence (earlier wins on duplicate skill
  * id): project commons → global commons → plugin caches → extra dirs.

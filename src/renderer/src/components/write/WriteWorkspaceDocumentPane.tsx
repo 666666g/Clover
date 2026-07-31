@@ -1,4 +1,5 @@
-import { type MutableRefObject, type ReactElement, type RefObject } from 'react'
+import { useEffect, type MutableRefObject, type ReactElement, type RefObject } from 'react'
+import { Maximize2, Minimize2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { WriteInlineCompletionSettingsV1 } from '@shared/app-settings'
 import type { WriteRenderSafety } from '../../write/write-render-safety'
@@ -13,9 +14,14 @@ import { WriteMarkdownPreview } from './WriteMarkdownPreview'
 import { WriteWorkspaceStart } from './WriteWorkspaceStart'
 import { WriteImagePreview } from './WriteImagePreview'
 import { WritePdfViewer } from './WritePdfViewer'
+import {
+  isWriteFocusModeFormControl,
+  isWriteFocusModeShortcut
+} from '../../write/write-focus-mode'
 
 type Props = {
   activeFilePath: string | null
+  documentEpoch: number
   activeFileIsImage: boolean
   activeFileIsPdf: boolean
   activeFileIsText: boolean
@@ -30,6 +36,7 @@ type Props = {
   workspaceRoot: string
   workspaceName: string
   workspacePathLabel: string
+  workspaceError?: string | null
   renderSafety: WriteRenderSafety
   fileGuardMessage: string
   fileGuardDetail: string
@@ -59,10 +66,15 @@ type Props = {
   onImagePasteSaved: () => void
   onImagePasteError: (message: string) => void
   onMarkdownReviewStateChange?: (active: boolean) => void
+  focusMode: boolean
+  onFocusModeChange: (active: boolean) => void
+  onboarding?: boolean
+  workspaceLoading?: boolean
 }
 
 export function WriteWorkspaceDocumentPane({
   activeFilePath,
+  documentEpoch,
   activeFileIsImage,
   activeFileIsPdf,
   activeFileIsText,
@@ -77,6 +89,7 @@ export function WriteWorkspaceDocumentPane({
   workspaceRoot,
   workspaceName,
   workspacePathLabel,
+  workspaceError,
   renderSafety,
   fileGuardMessage,
   fileGuardDetail,
@@ -105,19 +118,55 @@ export function WriteWorkspaceDocumentPane({
   onSaveShortcut,
   onImagePasteSaved,
   onImagePasteError,
-  onMarkdownReviewStateChange
+  onMarkdownReviewStateChange,
+  focusMode,
+  onFocusModeChange,
+  onboarding = false,
+  workspaceLoading = false
 }: Props): ReactElement {
   const { t } = useTranslation('common')
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (
+        activeFileIsText &&
+        !isWriteFocusModeFormControl(event.target) &&
+        isWriteFocusModeShortcut(event)
+      ) {
+        event.preventDefault()
+        onFocusModeChange(!focusMode)
+        return
+      }
+      if (focusMode && event.key === 'Escape' && !event.defaultPrevented) {
+        onFocusModeChange(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [activeFileIsText, focusMode, onFocusModeChange])
+
+  useEffect(() => {
+    if (!activeFileIsText && focusMode) onFocusModeChange(false)
+  }, [activeFileIsText, focusMode, onFocusModeChange])
+
   if (!activeFilePath) {
+    if (workspaceLoading) {
+      return (
+        <div className="flex h-full min-h-[320px] items-center justify-center text-[14px] text-ds-muted">
+          {t('writeWorkspaceLoading')}
+        </div>
+      )
+    }
     return (
       <WriteWorkspaceStart
         workspaceName={workspaceName}
         workspacePathLabel={workspacePathLabel}
+        error={workspaceError}
         onAskAssistant={onAskAssistant}
         onCreateDraft={onCreateDraft}
         onPickWorkspace={onPickWorkspace}
         onRefreshWorkspace={onRefreshWorkspace}
+        onboarding={onboarding}
       />
     )
   }
@@ -165,7 +214,20 @@ export function WriteWorkspaceDocumentPane({
   }
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+      <button
+        type="button"
+        onClick={() => onFocusModeChange(!focusMode)}
+        className={`${focusMode ? 'absolute right-2 top-2 z-30 sm:right-0 sm:top-0' : 'absolute right-3 top-3 z-30 opacity-45 hover:opacity-100'} inline-flex h-9 w-9 items-center justify-center rounded-xl border border-ds-border bg-ds-card/95 text-ds-muted shadow-[0_12px_28px_rgba(20,47,95,0.12)] backdrop-blur-xl transition hover:bg-ds-hover hover:text-ds-ink`}
+        title={`${t(focusMode ? 'writeFocusModeExit' : 'writeFocusModeEnter')} · ${focusMode ? 'Esc' : t('writeFocusModeShortcut')}`}
+        aria-label={t(focusMode ? 'writeFocusModeExit' : 'writeFocusModeEnter')}
+        aria-pressed={focusMode}
+        aria-keyshortcuts="Meta+Shift+F Control+Shift+F"
+      >
+        {focusMode
+          ? <Minimize2 className="h-4 w-4" strokeWidth={1.85} />
+          : <Maximize2 className="h-4 w-4" strokeWidth={1.85} />}
+      </button>
       {renderSafety.notice !== 'none' ? (
         <div className="shrink-0 border-b border-amber-200/80 bg-amber-50/90 px-5 py-3 text-[12.5px] leading-5 text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/35 dark:text-amber-100 sm:px-6">
           <div className="font-semibold">{fileGuardMessage}</div>
@@ -182,6 +244,7 @@ export function WriteWorkspaceDocumentPane({
                 value={fileContent}
                 workspaceRoot={workspaceRoot}
                 filePath={activeFilePath}
+                documentEpoch={documentEpoch}
                 readOnly={renderSafety.readOnly}
                 completionModel={inlineCompletion.model}
                 completionEnabled={inlineCompletion.enabled && inlineCompletionApiReady}
@@ -203,6 +266,7 @@ export function WriteWorkspaceDocumentPane({
                     value={fileContent}
                     workspaceRoot={workspaceRoot}
                     filePath={activeFilePath}
+                    documentEpoch={documentEpoch}
                     appearance="live"
                     livePreviewEnabled={renderSafety.livePreviewEnabled}
                     readOnly={renderSafety.readOnly}
@@ -230,6 +294,7 @@ export function WriteWorkspaceDocumentPane({
                 value={fileContent}
                 workspaceRoot={workspaceRoot}
                 filePath={activeFilePath}
+                documentEpoch={documentEpoch}
                 appearance={editorAppearance}
                 livePreviewEnabled={renderSafety.livePreviewEnabled}
                 readOnly={renderSafety.readOnly}

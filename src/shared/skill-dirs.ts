@@ -23,6 +23,7 @@ export const COMMON_WORKSPACE_SKILL_DIRS: readonly CommonSkillDir[] = [
   { id: 'workspace-agents', scope: 'project', relativePath: '.agents/skills', labelKey: 'pluginSkillRootWorkspaceAgents' },
   { id: 'workspace-claude', scope: 'project', relativePath: '.claude/skills', labelKey: 'pluginSkillRootWorkspaceClaude' },
   { id: 'workspace-codex', scope: 'project', relativePath: '.codex/skills', labelKey: 'pluginSkillRootWorkspaceCodex' },
+  { id: 'workspace-kun', scope: 'project', relativePath: '.kun/skills', labelKey: 'pluginSkillRootWorkspaceKun' },
   { id: 'workspace-skills', scope: 'project', relativePath: 'skills', labelKey: 'pluginSkillRootWorkspaceSkills' }
 ]
 

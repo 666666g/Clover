@@ -32,6 +32,7 @@ export class UsageCounter {
     const current = this.perThread.get(threadId) ?? emptyUsageSnapshot()
     const promptTokens = current.promptTokens + snapshot.promptTokens
     const completionTokens = current.completionTokens + snapshot.completionTokens
+    const reasoningTokens = sumOptional(current.reasoningTokens, snapshot.reasoningTokens)
     const totalTokens = promptTokens + completionTokens
     const cachedTokens =
       (current.cachedTokens ?? 0) + (snapshot.cachedTokens ?? 0)
@@ -39,6 +40,7 @@ export class UsageCounter {
       (current.cacheHitTokens ?? 0) + (snapshot.cacheHitTokens ?? 0)
     const cacheMissTokens =
       (current.cacheMissTokens ?? 0) + (snapshot.cacheMissTokens ?? 0)
+    const cacheWriteTokens = sumOptional(current.cacheWriteTokens, snapshot.cacheWriteTokens)
     const cacheTotal = cacheHitTokens + cacheMissTokens
     const cacheHitRate =
       cacheTotal === 0
@@ -53,6 +55,7 @@ export class UsageCounter {
       current.costCny === undefined && snapshot.costCny === undefined
         ? undefined
         : (current.costCny ?? 0) + (snapshot.costCny ?? 0)
+    const costByCurrency = mergeCurrencyCosts(current.costByCurrency, snapshot.costByCurrency)
     const cacheSavingsUsd =
       current.cacheSavingsUsd === undefined && snapshot.cacheSavingsUsd === undefined
         ? undefined
@@ -74,10 +77,12 @@ export class UsageCounter {
     const next: UsageSnapshot = {
       promptTokens,
       completionTokens,
+      ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
       totalTokens,
       cachedTokens,
       cacheHitTokens,
       cacheMissTokens,
+      ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
       cacheHitRate,
       cacheableTokenHitRate: snapshot.cacheableTokenHitRate,
       totalInputTokenHitRate: snapshot.totalInputTokenHitRate,
@@ -86,6 +91,7 @@ export class UsageCounter {
       turns,
       costUsd,
       costCny,
+      ...(costByCurrency ? { costByCurrency } : {}),
       cacheSavingsUsd,
       cacheSavingsCny,
       tokenEconomySavingsTokens,
@@ -137,6 +143,9 @@ export class UsageCounter {
 function normalizeUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
   const promptTokens = Math.max(0, Math.floor(snapshot.promptTokens))
   const completionTokens = Math.max(0, Math.floor(snapshot.completionTokens))
+  const reasoningTokens = snapshot.reasoningTokens !== undefined
+    ? Math.max(0, Math.floor(snapshot.reasoningTokens))
+    : undefined
   const totalTokens = Math.max(0, Math.floor(snapshot.totalTokens || promptTokens + completionTokens))
   const cachedTokens = snapshot.cachedTokens !== undefined
     ? Math.max(0, Math.floor(snapshot.cachedTokens))
@@ -147,14 +156,19 @@ function normalizeUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
   const cacheMissTokens = snapshot.cacheMissTokens !== undefined
     ? Math.max(0, Math.floor(snapshot.cacheMissTokens))
     : undefined
+  const cacheWriteTokens = snapshot.cacheWriteTokens !== undefined
+    ? Math.max(0, Math.floor(snapshot.cacheWriteTokens))
+    : undefined
   const cacheTotal = (cacheHitTokens ?? 0) + (cacheMissTokens ?? 0)
   return {
     promptTokens,
     completionTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     totalTokens,
     ...(cachedTokens !== undefined ? { cachedTokens } : {}),
     ...(cacheHitTokens !== undefined ? { cacheHitTokens } : {}),
     ...(cacheMissTokens !== undefined ? { cacheMissTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
     cacheHitRate: cacheHitTokens !== undefined && cacheTotal > 0 ? cacheHitTokens / cacheTotal : null,
     ...(snapshot.cacheableTokenHitRate !== undefined
       ? { cacheableTokenHitRate: snapshot.cacheableTokenHitRate }
@@ -167,6 +181,10 @@ function normalizeUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
     turns: Math.max(0, Math.floor(snapshot.turns)),
     ...(snapshot.costUsd !== undefined ? { costUsd: Math.max(0, snapshot.costUsd) } : {}),
     ...(snapshot.costCny !== undefined ? { costCny: Math.max(0, snapshot.costCny) } : {}),
+    ...(snapshot.costByCurrency ? {
+      costByCurrency: Object.fromEntries(Object.entries(snapshot.costByCurrency)
+        .map(([currency, cost]) => [currency, Math.max(0, cost)]))
+    } : {}),
     ...(snapshot.cacheSavingsUsd !== undefined ? { cacheSavingsUsd: Math.max(0, snapshot.cacheSavingsUsd) } : {}),
     ...(snapshot.cacheSavingsCny !== undefined ? { cacheSavingsCny: Math.max(0, snapshot.cacheSavingsCny) } : {}),
     ...(snapshot.tokenEconomySavingsTokens !== undefined
@@ -185,12 +203,14 @@ function normalizeUsageSnapshot(snapshot: UsageSnapshot): UsageSnapshot {
 function mergeUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapshot {
   const promptTokens = into.promptTokens + delta.promptTokens
   const completionTokens = into.completionTokens + delta.completionTokens
+  const reasoningTokens = sumOptional(into.reasoningTokens, delta.reasoningTokens)
   const totalTokens = promptTokens + completionTokens
   const cachedTokens = (into.cachedTokens ?? 0) + (delta.cachedTokens ?? 0)
   const cacheHitTokens =
     (into.cacheHitTokens ?? 0) + (delta.cacheHitTokens ?? 0)
   const cacheMissTokens =
     (into.cacheMissTokens ?? 0) + (delta.cacheMissTokens ?? 0)
+  const cacheWriteTokens = sumOptional(into.cacheWriteTokens, delta.cacheWriteTokens)
   const cacheTotal = cacheHitTokens + cacheMissTokens
   const cacheHitRate =
     cacheTotal === 0 ? null : cacheHitTokens / cacheTotal
@@ -212,6 +232,7 @@ function mergeUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapshot {
     into.costCny === undefined && delta.costCny === undefined
       ? undefined
       : (into.costCny ?? 0) + (delta.costCny ?? 0)
+  const costByCurrency = mergeCurrencyCosts(into.costByCurrency, delta.costByCurrency)
   const cacheSavingsUsd =
     into.cacheSavingsUsd === undefined && delta.cacheSavingsUsd === undefined
       ? undefined
@@ -233,10 +254,12 @@ function mergeUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapshot {
   return {
     promptTokens,
     completionTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     totalTokens,
     cachedTokens,
     cacheHitTokens,
     cacheMissTokens,
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
     cacheHitRate,
     cacheableTokenHitRate,
     totalInputTokenHitRate,
@@ -245,12 +268,29 @@ function mergeUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapshot {
     turns,
     costUsd,
     costCny,
+    ...(costByCurrency ? { costByCurrency } : {}),
     cacheSavingsUsd,
     cacheSavingsCny,
     tokenEconomySavingsTokens,
     tokenEconomySavingsUsd,
     tokenEconomySavingsCny
   }
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0)
+}
+
+function mergeCurrencyCosts(
+  left: Record<string, number> | undefined,
+  right: Record<string, number> | undefined
+): Record<string, number> | undefined {
+  if (!left && !right) return undefined
+  const merged: Record<string, number> = { ...(left ?? {}) }
+  for (const [currency, cost] of Object.entries(right ?? {})) {
+    merged[currency] = (merged[currency] ?? 0) + cost
+  }
+  return merged
 }
 
 /**

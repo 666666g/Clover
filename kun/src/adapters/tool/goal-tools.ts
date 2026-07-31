@@ -43,8 +43,8 @@ function createCreateGoalTool(threadService: ThreadService): LocalTool {
     name: CREATE_GOAL_TOOL_NAME,
     description: [
       'Create a goal only when explicitly requested by the user or system/developer instructions;',
-      'do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget',
-      `is requested. Fails if a goal exists; use ${UPDATE_GOAL_TOOL_NAME} only for status.`
+      'do not infer goals from ordinary tasks. Goals created by this tool have no token limit.',
+      `Fails if a goal exists; use ${UPDATE_GOAL_TOOL_NAME} only for status.`
     ].join(' '),
     inputSchema: {
       type: 'object',
@@ -53,10 +53,6 @@ function createCreateGoalTool(threadService: ThreadService): LocalTool {
           type: 'string',
           description:
             'Required. The concrete objective to start pursuing. This starts a new active goal only when no goal is currently defined.'
-        },
-        token_budget: {
-          type: 'integer',
-          description: 'Optional positive token budget for the new active goal.'
         }
       },
       required: ['objective'],
@@ -66,12 +62,8 @@ function createCreateGoalTool(threadService: ThreadService): LocalTool {
     toolKind: 'tool_call',
     execute: async (args, context) => {
       const objective = typeof args.objective === 'string' ? args.objective.trim() : ''
-      const tokenBudget = normalizeTokenBudget(args.token_budget)
       if (!objective) {
         return { output: { error: 'objective is required' }, isError: true }
-      }
-      if (tokenBudget === false) {
-        return { output: { error: 'token_budget must be a positive integer' }, isError: true }
       }
       const existing = await threadService.getGoal(context.threadId)
       if (existing) {
@@ -85,8 +77,7 @@ function createCreateGoalTool(threadService: ThreadService): LocalTool {
       }
       const goal = await threadService.setGoal(context.threadId, {
         objective,
-        status: 'active',
-        ...(tokenBudget === undefined ? {} : { tokenBudget })
+        status: 'active'
       })
       return { output: goalResponse(goal) }
     }
@@ -147,12 +138,6 @@ function createUpdateGoalTool(threadService: ThreadService): LocalTool {
       }
     }
   })
-}
-
-function normalizeTokenBudget(value: unknown): number | undefined | false {
-  if (value === undefined || value === null) return undefined
-  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) return false
-  return value
 }
 
 function goalResponse(goal: ThreadGoal | null, completionBudgetReport?: string): {

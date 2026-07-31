@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { resolveLogDirectory, resolvePreloadPath } from './main-paths'
+import { resolveLogDirectory, resolveNamedPreloadPath, resolvePreloadPath } from './main-paths'
 
 describe('main paths', () => {
   it('resolves the log directory under Electron userData', () => {
@@ -22,6 +22,23 @@ describe('main paths', () => {
 
     expect(resolvePreloadPath(distDir, () => false)).toBe(
       join(distDir, '../preload/index.mjs')
+    )
+  })
+
+  it('resolves packaged extension preloads independently from the workbench preload', () => {
+    const distDir = 'C:\\app\\out\\main'
+    expect(resolveNamedPreloadPath(distDir, 'extension-view', () => true)).toBe(
+      join(distDir, '../preload/extension-view.cjs')
+    )
+    expect(resolveNamedPreloadPath(distDir, 'extension-protected-surface', () => false)).toBe(
+      join(distDir, '../preload/extension-protected-surface.mjs')
+    )
+  })
+
+  it('resolves the isolated tray quota preload', () => {
+    const distDir = 'C:\\app\\out\\main'
+    expect(resolveNamedPreloadPath(distDir, 'tray-quota', () => true)).toBe(
+      join(distDir, '../preload/tray-quota.cjs')
     )
   })
 })

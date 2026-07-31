@@ -1,0 +1,97 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "streaming-model-provider",
+  "publisher": "kun-examples",
+  "version": "0.1.0",
+  "displayName": "Streaming Model Provider",
+  "description": "A deterministic headless model adapter with API-key and OAuth account bindings.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "activationEvents": [
+    "onProvider:echo-api-key",
+    "onProvider:echo-oauth",
+    "onAuthentication:api-key",
+    "onAuthentication:oauth"
+  ],
+  "contributes": {
+    "authentication": [
+      {
+        "id": "api-key",
+        "displayName": "Example API Key",
+        "type": "api-key",
+        "apiKey": {
+          "header": "Authorization",
+          "prefix": "Bearer "
+        }
+      },
+      {
+        "id": "oauth",
+        "displayName": "Example OAuth",
+        "type": "oauth2-pkce",
+        "clientId": "kun-extension-provider-example",
+        "redirectUri": "kun-extension://kun-examples.streaming-model-provider/oauth/callback",
+        "authorizationUrl": "https://example.com/oauth/authorize",
+        "tokenUrl": "https://example.com/oauth/token",
+        "scopes": ["models.read", "responses.create"]
+      }
+    ],
+    "modelProviders": [
+      {
+        "id": "echo-api-key",
+        "displayName": "Echo Stream (API Key)",
+        "authenticationProviderId": "api-key",
+        "adapterApiVersion": "1.0.0",
+        "models": [
+          {
+            "id": "echo-1",
+            "displayName": "Echo 1",
+            "description": "A deterministic model for Extension Provider integration tests.",
+            "capabilities": {
+              "input": ["text"],
+              "output": ["text"],
+              "reasoning": false,
+              "tools": false,
+              "parallelTools": false,
+              "streaming": true,
+              "maxContextTokens": 8192,
+              "maxOutputTokens": 2048
+            }
+          }
+        ]
+      },
+      {
+        "id": "echo-oauth",
+        "displayName": "Echo Stream (OAuth PKCE)",
+        "authenticationProviderId": "oauth",
+        "adapterApiVersion": "1.0.0",
+        "models": [
+          {
+            "id": "echo-1",
+            "displayName": "Echo 1",
+            "description": "The same deterministic transport selected through an OAuth account.",
+            "capabilities": {
+              "input": ["text"],
+              "output": ["text"],
+              "reasoning": false,
+              "tools": false,
+              "parallelTools": false,
+              "streaming": true,
+              "maxContextTokens": 8192,
+              "maxOutputTokens": 2048
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": [
+    "providers.register",
+    "accounts.read"
+  ],
+  "stateSchemaVersion": 1
+}

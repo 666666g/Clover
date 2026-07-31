@@ -4,7 +4,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement
 } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -12,34 +11,37 @@ import { useShallow } from 'zustand/react/shallow'
 import {
   ArrowDownToLine,
   ChevronDown,
-  CornerDownLeft,
-  Loader2,
   MessageCircleMore,
   Minus,
   MoreHorizontal,
   Plus,
   Trash2,
-  Wrench,
   X
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { useChatStore } from '../../store/chat-store'
-import type { ChatBlock } from '../../agent/types'
+import type { SideConversation } from '../../store/chat-store-types'
+import { threadHasPendingRuntimeWork } from '../../store/chat-store-runtime-helpers'
+import { ConversationTurn } from './MessageTimeline'
+import { FloatingComposer } from './FloatingComposer'
+import { groupTurns, stableTurnKey } from './message-timeline-turns'
+import { InjectedMemoryLookupProvider } from './injected-memory-lookup'
+import { TimelineFilePreviewWorkspaceProvider } from './timeline-file-preview-workspace'
 
 type Props = {
   className?: string
   rightOffset?: number
+  variant?: 'floating' | 'docked'
+  onRequestClose?: () => void
+  onTitleChange?: (title: string) => void
 }
 
-type SideChatComposerProps = {
-  value: string
-  onChange: (value: string) => void
-  onSend: () => void
-  busy?: boolean
-  disabled?: boolean
-  placeholder: string
+type SideConversationTimelineProps = {
+  side: SideConversation
+  workspaceRoot: string
 }
+
+const EMPTY_QUEUED_MESSAGES: [] = []
+const noop = (): void => undefined
 
 function formatInheritedTime(value: string, locale: string): string {
   const date = new Date(value)
@@ -52,12 +54,6 @@ function formatInheritedTime(value: string, locale: string): string {
   }).format(date)
 }
 
-function compactSideTitle(value: string): string {
-  const trimmed = value.replace(/\s*·\s*side$/i, '').trim()
-  const prefix = Array.from(trimmed || value.trim()).slice(0, 5).join('')
-  return prefix || value
-}
-
 function overlayStyle(rightOffset = 24): CSSProperties {
   const offset = Math.max(12, Math.round(rightOffset))
   return {
@@ -65,133 +61,125 @@ function overlayStyle(rightOffset = 24): CSSProperties {
   }
 }
 
-function SideChatComposer({
-  value,
-  onChange,
-  onSend,
-  busy = false,
-  disabled = false,
-  placeholder
-}: SideChatComposerProps): ReactElement {
-  const sendDisabled = disabled || busy || value.trim().length === 0
-
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
-    if (event.key !== 'Enter' || event.shiftKey || event.metaKey || event.ctrlKey) return
-    event.preventDefault()
-    if (!sendDisabled) onSend()
-  }
-
-  return (
-    <div className="rounded-[10px] border border-ds-border-muted bg-ds-card/80 px-2 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.42)] dark:bg-white/[0.045]">
-      <div className="flex items-end gap-1.5">
-        <textarea
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={disabled || busy}
-          rows={1}
-          placeholder={placeholder}
-          className="max-h-24 min-h-[30px] flex-1 resize-none bg-transparent px-1 py-1 text-[13px] leading-5 text-ds-ink outline-none placeholder:text-ds-faint disabled:cursor-not-allowed disabled:opacity-65"
-        />
-        <button
-          type="button"
-          onClick={onSend}
-          disabled={sendDisabled}
-          className="mb-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-40"
-          aria-label={placeholder}
-          title={placeholder}
-        >
-          {busy ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.9} />
-          ) : (
-            <CornerDownLeft className="h-3.5 w-3.5" strokeWidth={1.9} />
-          )}
-        </button>
-      </div>
-    </div>
-  )
+export function activeSideConversationOrdinal(
+  sides: readonly SideConversation[],
+  activeSideId: string | null
+): number {
+  const index = activeSideId
+    ? sides.findIndex((side) => side.threadId === activeSideId)
+    : -1
+  return index >= 0 ? index + 1 : sides.length + 1
 }
 
-function SideMessageBubble({ block }: { block: ChatBlock }): ReactElement | null {
-  if (block.kind === 'user') {
-    return (
-      <div className="flex justify-end">
-        <div className="max-w-[86%] rounded-[14px] bg-ds-card px-3 py-2 text-[13px] leading-5 text-ds-ink shadow-[0_6px_18px_rgba(20,47,95,0.06)]">
-          <div className="ds-markdown whitespace-pre-wrap break-words">{block.text}</div>
+function SideConversationTimeline({
+  side,
+  workspaceRoot
+}: SideConversationTimelineProps): ReactElement {
+  const { t } = useTranslation('common')
+  const viewportRef = useRef<HTMLDivElement | null>(null)
+  const endRef = useRef<HTMLDivElement | null>(null)
+  const turns = useMemo(() => groupTurns(side.blocks), [side.blocks])
+  const scrollKey = [
+    side.blocks.length,
+    side.liveReasoning.length,
+    side.liveAssistant.length,
+    side.busy ? 'busy' : 'idle'
+  ].join(':')
+
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    viewport.scrollTop = viewport.scrollHeight
+  }, [scrollKey])
+
+  const hasContent =
+    side.blocks.length > 0 || Boolean(side.liveReasoning.trim() || side.liveAssistant.trim())
+
+  return (
+    <TimelineFilePreviewWorkspaceProvider workspaceRoot={workspaceRoot}>
+      <InjectedMemoryLookupProvider workspaceRoot={workspaceRoot}>
+        <div
+          ref={viewportRef}
+          className="ds-sidebar-surface-body ds-no-drag min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+          data-testid="side-conversation-timeline"
+        >
+          <div className="mx-auto flex w-full min-w-0 flex-col gap-8 px-5 pb-10 pt-6 sm:px-6">
+            {!hasContent ? (
+              <div className="flex min-h-[180px] flex-col items-center justify-center gap-2 text-center text-[12.5px] leading-5 text-ds-faint">
+                <MessageCircleMore className="h-5 w-5 opacity-65" strokeWidth={1.7} />
+                <p>{t('sidePanelEmpty')}</p>
+              </div>
+            ) : null}
+
+            {turns.map((turn, index) => {
+              const isLatest = index === turns.length - 1
+              const turnPending = threadHasPendingRuntimeWork(turn.blocks)
+              const hasLiveStream =
+                isLatest && Boolean(side.liveReasoning.trim() || side.liveAssistant.trim())
+              const isProcessing = (side.busy && isLatest) || turnPending || hasLiveStream
+              return (
+                <ConversationTurn
+                  key={stableTurnKey(turn, index)}
+                  turn={turn}
+                  isProcessing={isProcessing}
+                  liveReasoning={isLatest ? side.liveReasoning : ''}
+                  live={isLatest ? side.liveAssistant : ''}
+                  filePreviewWorkspaceRoot={workspaceRoot}
+                  viewportRef={viewportRef}
+                  compactCards
+                  allowMainThreadActions={false}
+                />
+              )
+            })}
+
+            {turns.length === 0 && (side.liveReasoning || side.liveAssistant) ? (
+              <ConversationTurn
+                turn={{ blocks: [] }}
+                isProcessing={side.busy}
+                liveReasoning={side.liveReasoning}
+                live={side.liveAssistant}
+                filePreviewWorkspaceRoot={workspaceRoot}
+                viewportRef={viewportRef}
+                compactCards
+                allowMainThreadActions={false}
+              />
+            ) : null}
+
+            {side.error ? (
+              <div
+                role="alert"
+                className="rounded-[12px] border border-red-300/70 bg-red-500/10 px-3 py-2 text-[12px] text-red-700 dark:border-red-800/60 dark:bg-red-950/35 dark:text-red-200"
+              >
+                {side.error}
+              </div>
+            ) : null}
+            <div ref={endRef} aria-hidden className="h-px w-full shrink-0" />
+          </div>
         </div>
-      </div>
-    )
-  }
-  if (block.kind === 'assistant') {
-    const streaming = block.id === 'live-assistant'
-    return (
-      <div className="ds-markdown ds-chat-answer min-w-0 max-w-full text-[13px] leading-5 text-ds-ink">
-        {streaming ? (
-          <span>{block.text}</span>
-        ) : (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
-        )}
-      </div>
-    )
-  }
-  if (block.kind === 'reasoning') {
-    return (
-      <div className="rounded-[12px] border border-ds-border-muted bg-ds-card/55 px-2.5 py-2 text-[12px] leading-5 text-ds-muted">
-        <div className="ds-markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
-        </div>
-      </div>
-    )
-  }
-  if (block.kind === 'tool') {
-    return (
-      <div className="flex items-center gap-2 rounded-full border border-ds-border-muted bg-ds-card/70 px-3 py-1.5 text-[12px] text-ds-muted">
-        <Wrench className="h-3 w-3 shrink-0" strokeWidth={1.9} />
-        <span className="min-w-0 flex-1 truncate">
-          {block.summary || block.toolKind || 'tool'}
-        </span>
-        {block.status === 'running' ? (
-          <Loader2 className="h-3 w-3 shrink-0 animate-spin" strokeWidth={1.9} />
-        ) : null}
-      </div>
-    )
-  }
-  if (block.kind === 'approval' || block.kind === 'compaction') {
-    return (
-      <div className="rounded-full border border-ds-border-muted bg-ds-card/60 px-3 py-1.5 text-[12px] text-ds-muted">
-        {block.summary}
-      </div>
-    )
-  }
-  if (block.kind === 'user_input') {
-    return (
-      <div className="rounded-full border border-ds-border-muted bg-ds-card/60 px-3 py-1.5 text-[12px] text-ds-muted">
-        {block.questions.map((q) => q.question).join(' · ') || 'user input'}
-      </div>
-    )
-  }
-  if (block.kind === 'system') {
-    return (
-      <div className="rounded-[12px] border border-ds-border-muted bg-ds-card/55 px-3 py-2 text-[12px] text-ds-muted">
-        {block.text}
-      </div>
-    )
-  }
-  return null
+      </InjectedMemoryLookupProvider>
+    </TimelineFilePreviewWorkspaceProvider>
+  )
 }
 
 export function SideConversationPanel({
   className,
-  rightOffset = 24
+  rightOffset = 24,
+  variant = 'floating',
+  onRequestClose,
+  onTitleChange
 }: Props): ReactElement | null {
   const { t, i18n } = useTranslation('common')
   const [draftInput, setDraftInput] = useState('')
+  const [draftModel, setDraftModel] = useState('')
+  const [draftProviderId, setDraftProviderId] = useState('')
+  const [draftReasoningEffort, setDraftReasoningEffort] = useState('max')
   const [minimized, setMinimized] = useState(false)
   const [switchMenuOpen, setSwitchMenuOpen] = useState(false)
   const [moreMenuOpen, setMoreMenuOpen] = useState(false)
   const switchMenuRef = useRef<HTMLDivElement | null>(null)
   const moreMenuRef = useRef<HTMLDivElement | null>(null)
-  const prevOpenRef = useRef(false)
+  const previousParentRef = useRef<string | null>(null)
+  const previousActiveRef = useRef<string | null | undefined>(undefined)
 
   const sideData = useChatStore(
     useShallow((s) => ({
@@ -199,11 +187,20 @@ export function SideConversationPanel({
       panel: s.sidePanel,
       parentThreadId: s.activeThreadId,
       threads: s.threads,
+      workspaceRoot: s.workspaceRoot,
       runtimeConnection: s.runtimeConnection,
+      composerModel: s.composerModel,
+      composerProviderId: s.composerProviderId,
+      composerPickList: s.composerPickList,
+      composerModelGroups: s.composerModelGroups,
+      composerReasoningEffort: s.composerReasoningEffort,
       spawnSideConversation: s.spawnSideConversation,
       sendSideMessage: s.sendSideMessage,
       interruptSide: s.interruptSide,
+      resolveSideUserInput: s.resolveSideUserInput,
       setSideInput: s.setSideInput,
+      setSideModel: s.setSideModel,
+      setSideReasoningEffort: s.setSideReasoningEffort,
       selectSideConversation: s.selectSideConversation,
       setSidePanelOpen: s.setSidePanelOpen,
       openSideConversationDraft: s.openSideConversationDraft,
@@ -225,34 +222,69 @@ export function SideConversationPanel({
       ? sideData.panel.activeSideId
       : null
   const activeSide = activeId ? sideData.sides[activeId] : null
+  const canSwitchSide = activeSide ? currentSides.length > 1 : currentSides.length > 0
   const parentThread = sideData.parentThreadId
     ? sideData.threads.find((thread) => thread.id === sideData.parentThreadId) ?? null
     : null
-  const runningCount = currentSides.reduce((count, side) => count + (side.busy ? 1 : 0), 0)
-  const shouldRender = Boolean(sideData.parentThreadId && sideData.panel.open)
+  const docked = variant === 'docked'
+  const shouldRender = Boolean(sideData.parentThreadId && (docked || sideData.panel.open))
   const showDraft = shouldRender && !activeSide
-  const rightStyle = overlayStyle(rightOffset)
+  const ordinal = activeSideConversationOrdinal(currentSides, activeId)
+  const reportedTitle = activeSide
+    ? t('sidePanelTabTitle', { index: ordinal })
+    : t('sidePanelNewTabTitle')
+  const effectiveDraftModel = draftModel || sideData.composerModel
+  const effectiveDraftProviderId = draftModel
+    ? draftProviderId
+    : sideData.composerProviderId
+  const effectiveDraftReasoningEffort =
+    draftReasoningEffort || sideData.composerReasoningEffort || 'max'
 
   useEffect(() => {
-    if (sideData.panel.open && !prevOpenRef.current) {
-      setMinimized(false)
-    }
-    prevOpenRef.current = sideData.panel.open
-  }, [sideData.panel.open])
+    if (previousParentRef.current === sideData.parentThreadId) return
+    previousParentRef.current = sideData.parentThreadId
+    setDraftInput('')
+    setDraftModel(sideData.composerModel)
+    setDraftProviderId(sideData.composerProviderId)
+    setDraftReasoningEffort(sideData.composerReasoningEffort || 'max')
+  }, [
+    sideData.composerModel,
+    sideData.composerProviderId,
+    sideData.composerReasoningEffort,
+    sideData.parentThreadId
+  ])
+
+  useEffect(() => {
+    const previous = previousActiveRef.current
+    previousActiveRef.current = activeId
+    if (!showDraft || previous === undefined || previous === null) return
+    setDraftInput('')
+    setDraftModel(sideData.composerModel)
+    setDraftProviderId(sideData.composerProviderId)
+    setDraftReasoningEffort(sideData.composerReasoningEffort || 'max')
+  }, [
+    activeId,
+    showDraft,
+    sideData.composerModel,
+    sideData.composerProviderId,
+    sideData.composerReasoningEffort
+  ])
+
+  useEffect(() => {
+    onTitleChange?.(reportedTitle)
+  }, [onTitleChange, reportedTitle])
 
   useEffect(() => {
     if (!shouldRender) return
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') {
-        setSwitchMenuOpen(false)
-        setMoreMenuOpen(false)
-        setMinimized(false)
-        sideData.setSidePanelOpen(false)
-      }
+      if (event.key !== 'Escape') return
+      setSwitchMenuOpen(false)
+      setMoreMenuOpen(false)
+      if (!docked) setMinimized(false)
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [shouldRender, sideData])
+  }, [docked, shouldRender])
 
   useEffect(() => {
     if (!switchMenuOpen && !moreMenuOpen) return
@@ -273,30 +305,32 @@ export function SideConversationPanel({
 
   if (!shouldRender) return null
 
-  const titleCount = sideIds.length > 0 ? ` · ${sideIds.length}` : ''
-  const title = `${t('sidePanelTitle')}${titleCount}`
-  const subtitle = parentThread
-    ? t('sidePanelParentLabel', { title: parentThread.title })
-    : t('sidePanelParentMissing')
+  const rightStyle = overlayStyle(rightOffset)
+  const parentTitle = parentThread?.title?.trim() || t('sidePanelParentMissing')
+  const originLabel = activeSide
+    ? t('sidePanelOriginMeta', {
+        title: parentTitle,
+        time: formatInheritedTime(activeSide.inheritedAt, i18n.language)
+      })
+    : t('sidePanelDraftOrigin', { title: parentTitle })
 
   const closeWindow = (): void => {
     setMinimized(false)
     setSwitchMenuOpen(false)
     setMoreMenuOpen(false)
     sideData.setSidePanelOpen(false)
-  }
-
-  const openDraft = (): void => {
-    setSwitchMenuOpen(false)
-    setMoreMenuOpen(false)
-    sideData.openSideConversationDraft()
+    onRequestClose?.()
   }
 
   const sendDraft = (): void => {
     const text = draftInput.trim()
     if (!text) return
     setDraftInput('')
-    void sideData.spawnSideConversation(text)
+    void sideData.spawnSideConversation(text, {
+      model: effectiveDraftModel,
+      providerId: effectiveDraftProviderId,
+      reasoningEffort: effectiveDraftReasoningEffort
+    })
   }
 
   const sendActiveSide = (): void => {
@@ -316,7 +350,7 @@ export function SideConversationPanel({
     void sideData.promoteSideConversation(activeSide.threadId)
   }
 
-  if (minimized) {
+  if (minimized && !docked) {
     return (
       <button
         type="button"
@@ -328,42 +362,47 @@ export function SideConversationPanel({
       >
         <MessageCircleMore className="h-4 w-4" strokeWidth={1.85} />
         <span className="text-[12px] font-semibold">{Math.max(sideIds.length, 1)}</span>
-        {runningCount > 0 ? (
-          <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.18)]" />
-        ) : null}
       </button>
     )
   }
 
+  const composerInput = activeSide?.input ?? draftInput
+  const composerModel = activeSide?.model ?? effectiveDraftModel
+  const composerProviderId = activeSide?.providerId ?? effectiveDraftProviderId
+  const composerReasoningEffort =
+    activeSide?.reasoningEffort ?? effectiveDraftReasoningEffort
+  const runtimeReady = sideData.runtimeConnection === 'ready'
+
   return (
     <aside
-      className={`ds-side-chat ds-no-drag fixed bottom-[112px] z-40 flex max-h-[min(520px,calc(100vh-180px))] w-[min(360px,calc(100vw-24px))] flex-col overflow-hidden rounded-[14px] border border-ds-border bg-ds-card/96 text-ds-ink shadow-[0_22px_64px_rgba(20,47,95,0.2)] backdrop-blur-xl dark:bg-ds-card/96 dark:shadow-[0_24px_72px_rgba(0,0,0,0.46)] ${className ?? ''}`}
-      style={rightStyle}
+      className={`ds-side-chat ds-sidebar-surface ds-no-drag flex flex-col overflow-hidden text-ds-ink ${
+        docked
+          ? 'h-full min-h-0 w-full'
+          : 'fixed bottom-[112px] z-40 max-h-[min(680px,calc(100vh-156px))] w-[min(520px,calc(100vw-24px))] rounded-[16px] border border-ds-border shadow-[0_22px_64px_rgba(20,47,95,0.2)] dark:shadow-[0_24px_72px_rgba(0,0,0,0.46)]'
+      } ${className ?? ''}`}
+      style={docked ? undefined : rightStyle}
       aria-label={t('sidePanelTitle')}
     >
-      <header className="flex shrink-0 items-start gap-2 border-b border-ds-border-muted px-3 py-2.5">
-        <MessageCircleMore className="mt-0.5 h-4 w-4 shrink-0 text-accent" strokeWidth={1.85} />
+      <div className="ds-sidebar-surface-chrome flex h-10 shrink-0 items-center gap-2 border-b border-ds-border-muted px-3">
         <div ref={switchMenuRef} className="relative min-w-0 flex-1">
           <button
             type="button"
-            onClick={() => sideIds.length > 0 && setSwitchMenuOpen((open) => !open)}
-            className="flex max-w-full items-center gap-1 rounded-md text-left text-[13px] font-semibold text-ds-ink transition hover:text-accent disabled:hover:text-ds-ink"
-            disabled={sideIds.length === 0}
+            onClick={() => canSwitchSide && setSwitchMenuOpen((open) => !open)}
+            disabled={!canSwitchSide}
+            className="flex max-w-full items-center gap-1.5 rounded-md text-left text-[11.5px] text-ds-faint transition enabled:hover:text-ds-ink"
+            aria-label={t('sidePanelSwitch')}
             aria-expanded={switchMenuOpen}
-            title={title}
+            title={originLabel}
           >
-            <span className="min-w-0 truncate">{title}</span>
-            {sideIds.length > 0 ? (
-              <ChevronDown className="h-3 w-3 shrink-0 text-ds-faint" strokeWidth={1.9} />
+            <span className="min-w-0 truncate">{originLabel}</span>
+            {canSwitchSide ? (
+              <ChevronDown className="h-3 w-3 shrink-0" strokeWidth={1.9} />
             ) : null}
           </button>
-          <div className="truncate text-[11.5px] leading-4 text-ds-faint" title={subtitle}>
-            {subtitle}
-          </div>
 
           {switchMenuOpen ? (
-            <div className="absolute left-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-[12px] border border-ds-border bg-ds-card/98 p-1 shadow-[0_18px_46px_rgba(20,47,95,0.18)] backdrop-blur-xl">
-              {currentSides.map((side) => {
+            <div className="absolute left-0 top-full z-50 mt-2 w-72 overflow-hidden rounded-[12px] border border-ds-border bg-ds-card/98 p-1 shadow-[0_18px_46px_rgba(20,47,95,0.18)] backdrop-blur-xl">
+              {currentSides.map((side, index) => {
                 const selected = side.threadId === activeSide?.threadId
                 return (
                   <button
@@ -373,15 +412,26 @@ export function SideConversationPanel({
                       sideData.selectSideConversation(side.threadId)
                       setSwitchMenuOpen(false)
                     }}
-                    className={`flex min-h-[34px] w-full items-center gap-2 rounded-lg px-2 text-left text-[12.5px] transition ${
-                      selected ? 'bg-ds-hover text-ds-ink' : 'text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
+                    className={`flex min-h-[38px] w-full items-center gap-2 rounded-lg px-2 text-left transition ${
+                      selected
+                        ? 'bg-ds-hover text-ds-ink'
+                        : 'text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
                     }`}
                   >
-                    <span className="min-w-0 flex-1 truncate" title={side.title}>
-                      {compactSideTitle(side.title)}
+                    <MessageCircleMore className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[12.5px] font-medium">
+                        {t('sidePanelTabTitle', { index: index + 1 })}
+                      </span>
+                      <span className="block truncate text-[10.5px] text-ds-faint" title={side.title}>
+                        {side.title}
+                      </span>
                     </span>
                     {side.busy ? (
-                      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />
+                      <span
+                        className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500"
+                        aria-label={t('sidePanelRunningDot')}
+                      />
                     ) : null}
                   </button>
                 )
@@ -390,150 +440,132 @@ export function SideConversationPanel({
           ) : null}
         </div>
 
-        <div className="flex shrink-0 items-center gap-0.5">
+        {!docked ? (
           <button
             type="button"
-            onClick={openDraft}
+            onClick={() => sideData.openSideConversationDraft()}
             className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
             aria-label={t('sidePanelNew')}
             title={t('sidePanelNew')}
           >
             <Plus className="h-3.5 w-3.5" strokeWidth={1.9} />
           </button>
-          {activeSide ? (
-            <button
-              type="button"
-              onClick={discardActiveSide}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-300"
-              aria-label={t('sidePanelDiscardTitle')}
-              title={t('sidePanelDiscardTitle')}
-            >
-              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.9} />
-            </button>
-          ) : null}
-          <div ref={moreMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setMoreMenuOpen((open) => !open)}
-              disabled={!activeSide}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-35"
-              aria-label={t('sidePanelMore')}
-              title={t('sidePanelMore')}
-              aria-expanded={moreMenuOpen}
-            >
-              <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.9} />
-            </button>
-            {moreMenuOpen && activeSide ? (
-              <div className="absolute right-0 top-full z-50 mt-2 w-44 overflow-hidden rounded-[12px] border border-ds-border bg-ds-card/98 p-1 text-[12.5px] shadow-[0_18px_46px_rgba(20,47,95,0.18)] backdrop-blur-xl">
-                <button
-                  type="button"
-                  onClick={promoteActiveSide}
-                  className="flex min-h-[32px] w-full items-center gap-2 rounded-lg px-2 text-left text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
-                >
-                  <ArrowDownToLine className="h-3.5 w-3.5" strokeWidth={1.8} />
-                  <span className="min-w-0 flex-1 truncate">{t('sidePanelPromote')}</span>
-                </button>
-              </div>
-            ) : null}
-          </div>
-          <button
-            type="button"
-            onClick={() => setMinimized(true)}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
-            aria-label={t('sidePanelMinimize')}
-            title={t('sidePanelMinimize')}
-          >
-            <Minus className="h-3.5 w-3.5" strokeWidth={1.9} />
-          </button>
-          <button
-            type="button"
-            onClick={closeWindow}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
-            aria-label={t('sidePanelHide')}
-            title={t('sidePanelHide')}
-          >
-            <X className="h-3.5 w-3.5" strokeWidth={1.9} />
-          </button>
-        </div>
-      </header>
+        ) : null}
 
-      <div className="flex min-h-[190px] flex-1 flex-col overflow-hidden">
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
-          {activeSide ? (
-            <>
-              <div className="text-[11.5px] leading-4 text-ds-faint">
-                {t('sidePanelInheritedAt', {
-                  time: formatInheritedTime(activeSide.inheritedAt, i18n.language)
-                })}
-              </div>
-              {activeSide.blocks.length === 0 && !activeSide.liveAssistant && !activeSide.liveReasoning ? (
-                <div className="flex min-h-[132px] flex-col items-center justify-center gap-2 text-center text-[12.5px] text-ds-faint">
-                  <MessageCircleMore className="h-5 w-5 opacity-60" strokeWidth={1.7} />
-                  <p>{t('sidePanelEmpty')}</p>
-                </div>
-              ) : null}
-              {activeSide.blocks.map((block) => (
-                <SideMessageBubble key={block.id} block={block} />
-              ))}
-              {activeSide.liveReasoning ? (
-                <SideMessageBubble
-                  block={{
-                    kind: 'reasoning',
-                    id: `live-reasoning-${activeSide.lastSeq || Date.now()}`,
-                    text: activeSide.liveReasoning
-                  }}
-                />
-              ) : null}
-              {activeSide.liveAssistant ? (
-                <SideMessageBubble
-                  block={{
-                    kind: 'assistant',
-                    id: 'live-assistant',
-                    text: activeSide.liveAssistant
-                  }}
-                />
-              ) : null}
-              {activeSide.busy ? (
-                <div className="flex items-center gap-2 text-[12px] text-ds-faint">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.9} />
-                  <span>{t('sidePanelThinking')}</span>
-                </div>
-              ) : null}
-              {activeSide.error ? (
-                <div className="rounded-[12px] border border-red-300/70 bg-red-500/10 px-3 py-2 text-[12px] text-red-700 dark:border-red-800/60 dark:bg-red-950/35 dark:text-red-200">
-                  {activeSide.error}
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <div className="flex min-h-[168px] flex-col items-center justify-center gap-2 text-center text-[12.5px] leading-5 text-ds-faint">
-              <MessageCircleMore className="h-5 w-5 opacity-65" strokeWidth={1.7} />
-              <p>{t('sidePanelDraftEmpty')}</p>
+        <div ref={moreMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setMoreMenuOpen((open) => !open)}
+            disabled={!activeSide}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-35"
+            aria-label={t('sidePanelMore')}
+            title={t('sidePanelMore')}
+            aria-expanded={moreMenuOpen}
+          >
+            <MoreHorizontal className="h-3.5 w-3.5" strokeWidth={1.9} />
+          </button>
+          {moreMenuOpen && activeSide ? (
+            <div className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-[12px] border border-ds-border bg-ds-card/98 p-1 text-[12.5px] shadow-[0_18px_46px_rgba(20,47,95,0.18)] backdrop-blur-xl">
+              <button
+                type="button"
+                onClick={promoteActiveSide}
+                className="flex min-h-[34px] w-full items-center gap-2 rounded-lg px-2 text-left text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
+              >
+                <ArrowDownToLine className="h-3.5 w-3.5" strokeWidth={1.8} />
+                <span className="min-w-0 flex-1 truncate">{t('sidePanelPromote')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={discardActiveSide}
+                className="flex min-h-[34px] w-full items-center gap-2 rounded-lg px-2 text-left text-red-600 transition hover:bg-red-500/10 dark:text-red-300"
+              >
+                <Trash2 className="h-3.5 w-3.5" strokeWidth={1.8} />
+                <span className="min-w-0 flex-1 truncate">{t('sidePanelDiscard')}</span>
+              </button>
             </div>
-          )}
+          ) : null}
         </div>
 
-        <footer className="shrink-0 border-t border-ds-border-muted px-2.5 pb-2.5 pt-2">
-          {activeSide ? (
-            <SideChatComposer
-              value={activeSide.input}
-              onChange={(value) => sideData.setSideInput(activeSide.threadId, value)}
-              onSend={sendActiveSide}
-              busy={activeSide.busy}
-              disabled={sideData.runtimeConnection !== 'ready'}
-              placeholder={t('sidePanelComposerPlaceholder')}
-            />
-          ) : (
-            <SideChatComposer
-              value={draftInput}
-              onChange={setDraftInput}
-              onSend={sendDraft}
-              disabled={sideData.runtimeConnection !== 'ready'}
-              placeholder={t('sidePanelComposerPlaceholder')}
-            />
-          )}
-        </footer>
+        {!docked ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setMinimized(true)}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
+              aria-label={t('sidePanelMinimize')}
+              title={t('sidePanelMinimize')}
+            >
+              <Minus className="h-3.5 w-3.5" strokeWidth={1.9} />
+            </button>
+            <button
+              type="button"
+              onClick={closeWindow}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
+              aria-label={t('sidePanelHide')}
+              title={t('sidePanelHide')}
+            >
+              <X className="h-3.5 w-3.5" strokeWidth={1.9} />
+            </button>
+          </>
+        ) : null}
       </div>
+
+      {activeSide ? (
+        <SideConversationTimeline side={activeSide} workspaceRoot={sideData.workspaceRoot} />
+      ) : (
+        <div className="ds-sidebar-surface-body flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-8 text-center text-[12.5px] leading-5 text-ds-faint">
+          <MessageCircleMore className="h-5 w-5 opacity-65" strokeWidth={1.7} />
+          <p>{t('sidePanelDraftEmpty')}</p>
+        </div>
+      )}
+
+      <footer className="ds-sidebar-surface-chrome shrink-0 px-3 pb-3 pt-2">
+        <FloatingComposer
+          variant="side"
+          workspaceRootOverride={sideData.workspaceRoot}
+          activeThreadIdOverride={activeSide?.threadId ?? null}
+          userInputBlocksOverride={activeSide?.blocks ?? []}
+          onResolveUserInput={async (blockId, action) => {
+            if (!activeSide) return
+            await sideData.resolveSideUserInput(activeSide.threadId, blockId, action)
+          }}
+          input={composerInput}
+          setInput={(value) => {
+            if (activeSide) sideData.setSideInput(activeSide.threadId, value)
+            else setDraftInput(value)
+          }}
+          mode="agent"
+          setMode={noop}
+          busy={activeSide?.busy ?? false}
+          runtimeReady={runtimeReady}
+          hasActiveThread={Boolean(sideData.parentThreadId)}
+          composerModel={composerModel}
+          composerProviderId={composerProviderId}
+          composerPickList={sideData.composerPickList}
+          composerModelGroups={sideData.composerModelGroups}
+          composerReasoningEffort={composerReasoningEffort}
+          modelControlVariant="split"
+          onComposerModelChange={(model, providerId) => {
+            if (activeSide) {
+              sideData.setSideModel(activeSide.threadId, model, providerId)
+            } else {
+              setDraftModel(model)
+              setDraftProviderId(providerId?.trim() ?? '')
+            }
+          }}
+          onComposerReasoningEffortChange={(effort) => {
+            if (activeSide) sideData.setSideReasoningEffort(activeSide.threadId, effort)
+            else setDraftReasoningEffort(effort)
+          }}
+          queuedMessages={EMPTY_QUEUED_MESSAGES}
+          onRemoveQueuedMessage={noop}
+          onSend={activeSide ? sendActiveSide : sendDraft}
+          onInterrupt={() => {
+            if (activeSide) void sideData.interruptSide(activeSide.threadId)
+          }}
+          hideBtwCommand
+        />
+      </footer>
     </aside>
   )
 }

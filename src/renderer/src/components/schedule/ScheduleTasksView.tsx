@@ -1,5 +1,5 @@
 import type { ReactElement, ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Brain,
@@ -49,6 +49,7 @@ import {
 } from '../../lib/settings-home-paths'
 import { SidebarTitlebarToggleButton } from '../sidebar/SidebarPrimitives'
 import { ScheduleDefaultsDialog } from './ScheduleDefaultsDialog'
+import { createScheduleRefreshCoordinator } from './schedule-refresh-coordinator'
 
 type Props = {
   leftSidebarCollapsed: boolean
@@ -395,8 +396,11 @@ export function ScheduleTasksView({
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [expandedResultTaskIds, setExpandedResultTaskIds] = useState<Set<string>>(() => new Set())
+  const refreshCoordinator = useRef(createScheduleRefreshCoordinator()).current
 
   const load = useCallback(async (): Promise<void> => {
+    const ticket = refreshCoordinator.beginRefresh()
+    if (ticket === null) return
     try {
       const [nextSettings, nextStatus] = await Promise.all([
         rendererRuntimeClient.getSettings({ forceRefresh: true }),
@@ -404,21 +408,26 @@ export function ScheduleTasksView({
           ? window.kunGui.getScheduleStatus()
           : Promise.resolve(null)
       ])
+      if (!refreshCoordinator.isCurrent(ticket)) return
       setSettings(nextSettings)
       setStatus(nextStatus)
       setError(null)
     } catch (loadError) {
+      if (!refreshCoordinator.isCurrent(ticket)) return
       setError(loadError instanceof Error ? loadError.message : String(loadError))
     } finally {
-      setLoading(false)
+      if (refreshCoordinator.isCurrent(ticket)) setLoading(false)
     }
-  }, [])
+  }, [refreshCoordinator])
 
   useEffect(() => {
     void load()
     const id = window.setInterval(() => void load(), 5_000)
-    return () => window.clearInterval(id)
-  }, [load])
+    return () => {
+      window.clearInterval(id)
+      refreshCoordinator.invalidate()
+    }
+  }, [load, refreshCoordinator])
 
   const schedule = settings ? normalizeScheduleSettings(settings.schedule) : null
   const tasks = schedule?.tasks ?? EMPTY_SCHEDULE_TASKS
@@ -433,12 +442,19 @@ export function ScheduleTasksView({
 
   const persistSchedule = async (patch: Parameters<typeof mergeScheduleSettings>[1]): Promise<void> => {
     if (!settings) return
+    const ticket = refreshCoordinator.beginMutation()
     const nextSchedule = mergeScheduleSettings(settings.schedule, patch)
     setSettings({ ...settings, schedule: nextSchedule })
-    const saved = await rendererRuntimeClient.setSettings({ schedule: nextSchedule })
-    setSettings(saved)
-    if (typeof window.kunGui?.getScheduleStatus === 'function') {
-      setStatus(await window.kunGui.getScheduleStatus())
+    try {
+      const saved = await rendererRuntimeClient.setSettings({ schedule: nextSchedule })
+      if (!refreshCoordinator.isCurrent(ticket)) return
+      setSettings(saved)
+      if (typeof window.kunGui?.getScheduleStatus === 'function') {
+        const nextStatus = await window.kunGui.getScheduleStatus()
+        if (refreshCoordinator.isCurrent(ticket)) setStatus(nextStatus)
+      }
+    } finally {
+      refreshCoordinator.endMutation()
     }
   }
 

@@ -1,14 +1,15 @@
 import { describe, expect, test } from 'vitest'
-import { SdkEventMapper, mapSdkUsage } from './sdk-event-mapper.js'
-import type { SdkEventMapperContext } from './sdk-event-mapper.js'
+import { SdkEventMapper, SdkResourceLimitError, mapSdkUsage } from './sdk-event-mapper.js'
+import type { SdkEventMapperContext, SdkStreamResourceLimits } from './sdk-event-mapper.js'
 import type { SdkMessage } from './sdk-protocol.js'
 
-function makeMapper(): SdkEventMapper {
+function makeMapper(streamLimits?: Partial<SdkStreamResourceLimits>): SdkEventMapper {
   let n = 0
   const ctx: SdkEventMapperContext = {
     threadId: 'th_1',
     turnId: 'tn_1',
-    nextId: (prefix) => `${prefix}_${++n}`
+    nextId: (prefix) => `${prefix}_${++n}`,
+    ...(streamLimits ? { streamLimits } : {})
   }
   return new SdkEventMapper(ctx)
 }
@@ -192,6 +193,179 @@ describe('SdkEventMapper', () => {
     const m = makeMapper()
     m.map({ type: 'result', subtype: 'error_max_turns', is_error: true } as SdkMessage)
     expect(m.getFinal()?.status).toBe('failed')
+    expect(m.getFinal()?.code).toBe('turn_step_limit')
+  })
+
+  test('keeps thousands of tiny text deltas exact without repeated string append semantics', () => {
+    const m = makeMapper({ maxEvents: 4_000, maxOutputBytes: 4_000 })
+    for (let index = 0; index < 2_048; index += 1) {
+      m.map({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }
+      } as SdkMessage)
+    }
+    const events = m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(2_048) }] }
+    } as SdkMessage)
+    expect(events[0]).toMatchObject({
+      kind: 'item_created',
+      item: { text: 'x'.repeat(2_048), status: 'completed' }
+    })
+  })
+
+  test('deduplicates the authoritative assistant copy from the streamed output byte budget', () => {
+    const m = makeMapper({ maxOutputBytes: 5 })
+    m.map({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hello' } }
+    } as SdkMessage)
+    expect(() => m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }] }
+    } as SdkMessage)).not.toThrow()
+  })
+
+  test('charges an equal-length authoritative rewrite instead of deduplicating it', () => {
+    const m = makeMapper({ maxOutputBytes: 5 })
+    m.map({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'abc' } }
+    } as SdkMessage)
+
+    expect(() => m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'xyz' }] }
+    } as SdkMessage)).toThrow(expect.objectContaining({ code: 'stream_resource_limit' }))
+  })
+
+  test('does not re-emit prior text for a later tool-only assistant message', () => {
+    const m = makeMapper()
+    m.map({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } }
+    } as SdkMessage)
+    m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'answer' }] }
+    } as SdkMessage)
+
+    const toolOnly = m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tool_1', name: 'Read', input: {} }]
+      }
+    } as SdkMessage)
+
+    expect(toolOnly.filter((event) =>
+      event.kind === 'item_created' &&
+      'item' in event &&
+      event.item.kind === 'assistant_text'
+    )).toEqual([])
+    expect(toolOnly).toContainEqual(expect.objectContaining({ kind: 'tool_call_ready' }))
+  })
+
+  test('rejects over-budget output with a stable content-free code', () => {
+    const m = makeMapper({ maxOutputBytes: 3 })
+    let error: unknown
+    try {
+      m.map({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'SECRET_MARKER' }
+        }
+      } as SdkMessage)
+    } catch (caught) {
+      error = caught
+    }
+    expect(error).toBeInstanceOf(SdkResourceLimitError)
+    expect(error).toMatchObject({ code: 'stream_resource_limit' })
+    expect((error as Error).message).toContain('response text and reasoning bytes')
+    expect((error as Error).message).not.toContain('SECRET_MARKER')
+  })
+
+  test('applies the output budget when the SDK only supplies result text', () => {
+    const m = makeMapper({ maxOutputBytes: 3 })
+    expect(() => m.map({
+      type: 'result', subtype: 'success', is_error: false, result: 'result-only'
+    } as SdkMessage)).toThrow(expect.objectContaining({ code: 'stream_resource_limit' }))
+  })
+
+  test('does not dedupe identical result-only text across separate SDK queries', () => {
+    const m = makeMapper({ maxOutputBytes: 4 })
+    m.beginQuery()
+    m.map({
+      type: 'result', subtype: 'success', is_error: false, result: 'done'
+    } as SdkMessage)
+    m.beginQuery()
+    expect(() => m.map({
+      type: 'result', subtype: 'success', is_error: false, result: 'done'
+    } as SdkMessage)).toThrow(expect.objectContaining({ code: 'stream_resource_limit' }))
+  })
+
+  test('rejects an SDK event-count storm independently of payload bytes', () => {
+    const m = makeMapper({ maxEvents: 2 })
+    m.map({ type: 'system', subtype: 'init', session_id: 'one' } as SdkMessage)
+    m.map({ type: 'system', subtype: 'init', session_id: 'two' } as SdkMessage)
+    expect(() => m.map({
+      type: 'system', subtype: 'init', session_id: 'three'
+    } as SdkMessage)).toThrow(expect.objectContaining({ code: 'stream_resource_limit' }))
+  })
+
+  test('enforces maxToolCallsPerStep atomically', () => {
+    const m = makeMapper({ maxToolCallsPerStep: 1 })
+    expect(() => m.map({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'one', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'two', name: 'Read', input: {} }
+        ]
+      }
+    } as SdkMessage)).toThrow(expect.objectContaining({ code: 'tool_call_limit_exceeded' }))
+    expect(m.getPendingToolCallCount()).toBe(0)
+  })
+
+  test('bounds pending tool state and releases it after the matching result', () => {
+    const m = makeMapper({ maxToolCallsPerStep: 1, maxPendingToolCalls: 1 })
+    const call = (id: string): void => {
+      m.map({
+        type: 'assistant', parent_tool_use_id: null,
+        message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: {} }] }
+      } as SdkMessage)
+    }
+    call('one')
+    expect(m.getPendingToolCallCount()).toBe(1)
+    expect(() => call('two')).toThrow(expect.objectContaining({ code: 'stream_resource_limit' }))
+    m.map({
+      type: 'user', parent_tool_use_id: null,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'one', content: 'ok' }] }
+    } as SdkMessage)
+    expect(m.getPendingToolCallCount()).toBe(0)
+    expect(() => call('two')).not.toThrow()
+  })
+
+  test('releases unresolved tool-name state when an SDK query result terminates the query', () => {
+    const m = makeMapper()
+    m.map({
+      type: 'assistant', parent_tool_use_id: null,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'pending', name: 'Read', input: {} }]
+      }
+    } as SdkMessage)
+    expect(m.getPendingToolCallCount()).toBe(1)
+    m.map({ type: 'result', subtype: 'success', is_error: false } as SdkMessage)
+    expect(m.getPendingToolCallCount()).toBe(0)
   })
 })
 

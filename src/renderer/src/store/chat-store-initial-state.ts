@@ -1,16 +1,19 @@
 import {
   mergeComposerPickList,
+  readStoredComposerFastMode,
   readStoredComposerMode
 } from './chat-store-helpers'
 import { defaultConversationWorkspaceRoot } from '../lib/workspace-path'
+import { readProtectedSurfaceRestore } from '../extensions/protected-surface-session'
 
 export function createInitialChatStoreState(workingDirectoryLabel: string) {
+  const protectedSurfaceRestore = readProtectedSurfaceRestore()
   return {
-    route: 'chat' as const,
+    route: (protectedSurfaceRestore === 'settings' ? 'settings' : 'chat') as 'settings' | 'chat',
     settingsReturnRoute: 'chat' as const,
     pluginHostRoute: 'chat' as const,
     settingsSection: 'general' as const,
-    initialSetupOpen: false,
+    initialSetupOpen: protectedSurfaceRestore === 'initial-setup',
     initialSetupMode: 'required' as const,
     workspaceRoot: '',
     conversationWorkspaceRoot: defaultConversationWorkspaceRoot(),
@@ -31,11 +34,14 @@ export function createInitialChatStoreState(workingDirectoryLabel: string) {
     liveAssistant: '',
     lastSeq: 0,
     usageRefreshKey: 0,
+    lastContextSnapshot: null,
+    lastDelegatedRuntimeState: null,
     lastTurnUsage: null,
     busy: false,
     error: null,
     runtimeErrorDetail: null,
     currentTurnId: null,
+    currentTurnOrchestration: null,
     currentTurnUserId: null,
     turnStartedAtByUserId: {},
     turnDurationByUserId: {},
@@ -43,13 +49,18 @@ export function createInitialChatStoreState(workingDirectoryLabel: string) {
     turnReasoningLastAtByUserId: {},
     inspectorSelectedId: null,
     composerMode: readStoredComposerMode(),
+    composerOrchestration: 'direct' as const,
+    graphEnabled: false,
     composerModel: '',
     composerProviderId: '',
+    composerReasoningEffort: 'max' as const,
+    composerFastMode: readStoredComposerFastMode(),
     composerAgentId: '',
     composerPickList: mergeComposerPickList(false, []),
     composerModelGroups: [],
     disabledSkillIds: [],
     queuedMessages: [],
+    extensionComposerContexts: [],
     watchTurnCompletion: {},
     unreadThreadIds: {},
     sideConversations: {},

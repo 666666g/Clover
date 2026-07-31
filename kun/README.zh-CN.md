@@ -8,8 +8,8 @@ Kun 是同名桌面应用的本地 HTTP/SSE 代理运行时。它为 GUI 提供�
 
 Kun 取意于《庄子·逍遥游》中的“北冥有鱼，其名为鲲”。在本项目
 里，它代表一个更深的本地运行时：不是把模型回复包一层 UI，而是让模型可以
-长期携带项目上下文、稳定调用工具、恢复会话，并在桌面、写作、手机连接和
-定时任务之间复用同一套 agent loop。
+长期携带项目上下文、稳定调用工具、恢复会话，并在桌面聊天、设计、写作、
+手机连接和定时任务之间复用同一套 agent loop。
 
 Kun 的核心目标是提高每一个 token 的 ROI。它会尽量让 token 花在用户需求、
 代码、决策和结果上，而不是浪费在重复工具 schema、失控工具输出、畸形历史、
@@ -66,10 +66,10 @@ kun/
 
 ```bash
 kun serve \
-  --config ~/.deepseekgui/kun/config.json \
+  --config ~/.kun/data/config.json \
   --host 127.0.0.1 \
   --port 18899 \
-  --data-dir ~/.deepseekgui/kun \
+  --data-dir ~/.kun/data \
   --runtime-token dev-token \
   --api-key "$DEEPSEEK_API_KEY" \
   --model deepseek-v4-pro
@@ -78,14 +78,16 @@ kun serve \
 Kun 也可以在无 GUI 的情况下独立运行：
 
 ```bash
-kun run --data-dir ~/.deepseekgui/kun --workspace "$PWD" "summarize this repo"
-kun chat --data-dir ~/.deepseekgui/kun --workspace "$PWD"
-kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" --list-tools
-kun exec --data-dir ~/.deepseekgui/kun --workspace "$PWD" read --args '{"path":"README.md"}'
+kun run --data-dir ~/.kun/data --workspace "$PWD" "summarize this repo"
+kun chat --data-dir ~/.kun/data --workspace "$PWD"
+kun --data-dir ~/.kun/data --workspace "$PWD"
+kun exec --data-dir ~/.kun/data --workspace "$PWD" --list-tools
+kun exec --data-dir ~/.kun/data --workspace "$PWD" read --args '{"path":"README.md"}'
 ```
 
 - `kun run` 会创建一个线程，执行一个回合并流式输出助手文本后退出。
 - `kun chat` 启动行式 REPL。使用 `/exit`、`/quit` 或空行退出。
+- 裸 `kun`（或别名 `kun tui`）连接或自动启动共享后台运行时，提供可与 GUI 同时使用、保留终端 scrollback 的 pi-tui 内联界面。参见 [TUI 指南](../docs/kun-tui.md)。
 - `kun exec --list-tools` 打印当前配置 / 工作区下生效的动态工具列表。
 - `kun exec <tool> --args <json>` 直接调用单个工具。`run` 或 `exec` 上可配合 `--json` 获取机器可读输出。
 
@@ -119,7 +121,7 @@ Kun 使用 JSON 配置文件管理运行时行为，避免重建后重配或硬�
 `{data-dir}/config.json`（若存在）。GUI 默认路径是：
 
 ```text
-~/.deepseekgui/kun/config.json
+~/.kun/data/config.json
 ```
 
 示例结构：
@@ -129,7 +131,7 @@ Kun 使用 JSON 配置文件管理运行时行为，避免重建后重配或硬�
   "serve": {
     "host": "127.0.0.1",
     "port": 18899,
-    "dataDir": "~/.deepseekgui/kun",
+    "dataDir": "~/.kun/data",
     "runtimeToken": "",
     "apiKey": "",
     "baseUrl": "https://api.deepseek.com/beta",
@@ -188,6 +190,13 @@ Kun 使用 JSON 配置文件管理运行时行为，避免重建后重配或硬�
           "transport": "streamable-http",
           "url": "https://mcp.example.com/mcp",
           "headers": { "authorization": "Bearer <docs-mcp-token>" },
+          "oauth": {
+            "enabled": true,
+            "clientName": "Kun",
+            "clientId": "<optional-oauth-client-id>",
+            "clientSecret": "<optional-oauth-client-secret>",
+            "scopes": ["docs.readonly"]
+          },
           "trustScope": "user",
           "timeoutMs": 30000
         }
@@ -235,17 +244,31 @@ Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.j
 
 功能开关是显式设计：
 
-- `capabilities.mcp` 启动配置化 MCP 客户端并将工具加入动态注册表；工作区级服务器要求设置 `trustedWorkspaceRoots`。
+- `capabilities.mcp` 启动配置化 MCP 客户端并将工具加入动态注册表；工作区级服务器要求设置 `trustedWorkspaceRoots`。远程 HTTP/SSE MCP 可配置 `oauth`，Kun 会把 OAuth token 存在数据目录下，而不是写进 config。使用 `GET /v1/mcp/oauth` 可查看脱敏后的 OAuth 状态，使用 `DELETE /v1/mcp/oauth/{serverId}` 可清除某个服务保存的授权。
 - `serve.mcpSearch` 可把大量 MCP 工具收敛为 `mcp_search`、`mcp_describe`、`mcp_call` 和 `mcp_refresh_catalog` 四个入口；当工具目录过大时，模型先检索意图相关工具，再描述和调用具体工具，避免每轮都携带完整 MCP schema。
 - `serve.tokenEconomy` / `tokenEconomyMode` 会压缩工具描述、工具结果和历史上下文；保留代码、路径、命令、URL、错误信号等高价值信息，同时省掉重复、超长或二进制 payload。
 - `contextCompaction` 控制长会话压缩的兜底阈值和摘要方式；模型级阈值写在 `models.profiles`。压缩时保留目标、约束、决策、已触碰文件、工具结果和未解决事项。
 - `serve.runtimeTuning.toolStorm` 会抑制同一回合内重复的相同工具调用，阻止无意义 tool loop 继续烧 token。
-- `runtime.streamIdleTimeoutMs`（`config.json` 顶层）限制流式分片之间的最大空闲间隔，超时会以 `stream_idle_timeout` 结束本轮（默认 `45000`）。本地模型预处理超大输入时会长时间静默，可调大此值；填 `0` 表示不限制。
+- `runtime.streamIdleTimeoutMs`（`config.json` 顶层）限制流式分片之间的最大空闲间隔，超时会以 `stream_idle_timeout` 结束本轮（默认 `450000`，即 7.5 分钟）。本地模型预处理超大输入时会长时间静默，可调大此值；填 `0` 表示不限制。
 - `capabilities.web` 暴露 `web_fetch` 与/或 `web_search`。内置 provider 负责 HTTP(S) 抓取；搜索功能依赖 provider 实现，未配置时会变为不可用。
 - `capabilities.skills` 扫描 `roots` 下的 `skill.json`，并在 `legacySkillMd` 为 `true` 时兼容 `SKILL.md`。
 - `capabilities.attachments` 将图片二进制从线程日志剥离，允许回合记录引用 `attachmentIds`。视觉模型直接接收图片部分，纯文本模型走受限文本 fallback。
 - `capabilities.memory` 在数据目录下持久化跨会话记忆，按作用域检索并注入上下文；也会公开 `memory_create`、`memory_update`、`memory_delete` 工具。
 - `capabilities.subagents` 通过 `maxParallel` 与 `maxChildRuns` 限制委派任务并发。
+
+Kun 内置 33 个固定、真正独立的 subagent profile：9 个原有通用/设计/专业角色，
+以及从 `addyosmani/agent-skills` 的 24 个工程工作流重新设计出的独立 agent。每个
+agent 都有自包含 system prompt，不通过 Skill id 加载，即使关闭 Skills 也能工作。
+其中 `interview-me` 改为向主代理返回高价值需求问题，`doubt-driven-development`
+改为执行一次 fresh-context 反证审查。
+
+主代理可以显式选择 `profile`、手写一次性 `custom_agent`，也可以全部省略。自动
+路径先对 agent profile 做 BM25 Top-5，再由小模型判断现有 agent 是否合适；若都
+不合适，独立生成器会从最多 3 个可信内置 agent 中总结设计模式，创建并立即执行
+一个临时角色。`generate_subagent` 工具也可显式走这条“设计并执行”路径。生成角色
+不会写入配置或可复用目录，但完整定义会保留在受权限保护的 child-run 审计快照中；
+它不能再次委派，也不能加载 Skill；router 与 generator usage 分开记录。
+许可证归属见 `../THIRD_PARTY_NOTICES.md`。
 
 在渲染端使用 `GET /v1/runtime/info` 获取运行时能力清单，使用
 `GET /v1/runtime/tools` 查看 provider 诊断。GUI 设置页会读取这两条接口。
@@ -254,7 +277,7 @@ Kun 默认使用混合存储：`threads/{threadId}/messages.jsonl` 与 `events.j
 
 Hooks 允许外部命令观察并干预 agent 生命周期，无需重新编译 Kun。在
 `config.json` 顶层 `hooks` 键下配置（GUI 默认的
-`~/.deepseekgui/kun/config.json` 直接生效），主循环、子代理和 CLI
+`~/.kun/data/config.json` 直接生效），主循环、子代理和 CLI
 共用同一套 hook。
 
 ```json
@@ -341,9 +364,9 @@ HTTP 服务在 `/v1/*` 提供以下路由：
 | GET | `/v1/threads?include=side` | 列表线程（按最近更新）；未传 `include=side` 时会隐藏 side 线程 |
 | POST | `/v1/threads` | 创建线程 |
 | GET | `/v1/threads/{id}` | 获取线程 |
-| PATCH | `/v1/threads/{id}` | 更新标题/状态/审批/副线程关系（`relation: "primary"`） |
+| PATCH | `/v1/threads/{id}` | 更新标题/状态/mode/审批/sandbox/副线程关系和 `additionalWorkspaces`（`relation: "primary"`） |
 | DELETE | `/v1/threads/{id}` | 删除线程 |
-| POST | `/v1/threads/{id}/fork` | 复制线程。可选 body：`{ "relation": "fork" \| "side", "title"?: string }`。默认 `fork`；`relation: "side"` 会将结果标记为 side 并写入 `parentThreadId` |
+| POST | `/v1/threads/{id}/fork` | 复制线程。可选 body：`{ "relation": "fork" \| "side", "title"?: string, "turnId"?: string, "beforeTurn"?: boolean }`。`turnId` 限制快照终点，`beforeTurn` 会排除该 turn，用于不改写源线程的 undo；默认 relation 为 `fork`，`side` 会写入 `parentThreadId` |
 | POST | `/v1/threads/{id}/turns` | 发起一个回合 |
 | GET | `/v1/threads/{id}/turns/{turnId}` | 获取回合 |
 | POST | `/v1/threads/{id}/turns/{turnId}/steer` | 追加 steering 文本 |

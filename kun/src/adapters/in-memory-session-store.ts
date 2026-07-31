@@ -1,4 +1,4 @@
-import type { SessionStore } from '../ports/session-store.js'
+import type { ItemHistoryCommit, ItemHistorySnapshot, SessionStore } from '../ports/session-store.js'
 import type { RuntimeEvent } from '../contracts/events.js'
 import type { TurnItem } from '../contracts/items.js'
 import type { AgentSession } from '../domain/session.js'
@@ -15,6 +15,8 @@ export class InMemorySessionStore implements SessionStore {
   private readonly events = new Map<string, RuntimeEvent[]>()
   private readonly items = new Map<string, TurnItem[]>()
   private readonly sessions = new Map<string, AgentSession>()
+  private readonly itemHistoryRevisions = new Map<string, number>()
+  private nextItemHistoryRevision = 0
 
   async appendEvent(threadId: string, event: RuntimeEvent): Promise<void> {
     const list = this.events.get(threadId) ?? []
@@ -38,6 +40,7 @@ export class InMemorySessionStore implements SessionStore {
       ? list.map((existing) => (existing.id === item.id ? item : existing))
       : [...list, item]
     this.items.set(threadId, nextList)
+    this.bumpItemHistoryRevision(threadId)
     const session = this.sessions.get(threadId)
     if (session) {
       this.sessions.set(threadId, {
@@ -53,6 +56,7 @@ export class InMemorySessionStore implements SessionStore {
   async rewriteItems(threadId: string, items: TurnItem[]): Promise<void> {
     const nextItems = [...items]
     this.items.set(threadId, nextItems)
+    this.bumpItemHistoryRevision(threadId)
     const session = this.sessions.get(threadId)
     if (session) {
       this.sessions.set(threadId, {
@@ -61,6 +65,36 @@ export class InMemorySessionStore implements SessionStore {
         updatedAt: new Date().toISOString()
       })
     }
+  }
+
+  async loadItemSnapshot(threadId: string): Promise<ItemHistorySnapshot> {
+    return {
+      revision: this.itemHistoryRevision(threadId),
+      items: [...(this.items.get(threadId) ?? [])]
+    }
+  }
+
+  async rewriteItemsIfRevision(
+    threadId: string,
+    expectedRevision: number,
+    items: TurnItem[]
+  ): Promise<ItemHistoryCommit> {
+    const revision = this.itemHistoryRevision(threadId)
+    if (revision !== expectedRevision) {
+      return { applied: false, reason: 'conflict', revision }
+    }
+    const nextItems = [...items]
+    this.items.set(threadId, nextItems)
+    const nextRevision = this.bumpItemHistoryRevision(threadId)
+    const session = this.sessions.get(threadId)
+    if (session) {
+      this.sessions.set(threadId, {
+        ...session,
+        items: nextItems,
+        updatedAt: new Date().toISOString()
+      })
+    }
+    return { applied: true, revision: nextRevision }
   }
 
   async updateItem(threadId: string, itemId: string, patch: Partial<TurnItem>): Promise<TurnItem | null> {
@@ -73,6 +107,7 @@ export class InMemorySessionStore implements SessionStore {
     })
     if (!updated) return null
     this.items.set(threadId, nextList)
+    this.bumpItemHistoryRevision(threadId)
     const session = this.sessions.get(threadId)
     if (session) {
       this.sessions.set(threadId, {
@@ -91,6 +126,13 @@ export class InMemorySessionStore implements SessionStore {
       .sort((a, b) => a.seq - b.seq)
   }
 
+  async *iterateEventsSince(threadId: string, sinceSeq: number): AsyncIterable<RuntimeEvent> {
+    const list = this.events.get(threadId) ?? []
+    for (const event of list) {
+      if (event.seq > sinceSeq) yield event
+    }
+  }
+
   async loadItems(threadId: string): Promise<TurnItem[]> {
     return [...(this.items.get(threadId) ?? [])]
   }
@@ -106,6 +148,7 @@ export class InMemorySessionStore implements SessionStore {
     }
     if (!this.items.has(session.threadId)) {
       this.items.set(session.threadId, [...session.items])
+      this.bumpItemHistoryRevision(session.threadId)
     }
   }
 
@@ -118,5 +161,25 @@ export class InMemorySessionStore implements SessionStore {
     this.events.clear()
     this.items.clear()
     this.sessions.clear()
+    this.itemHistoryRevisions.clear()
+  }
+
+  clearThreadMemory(threadId: string): void {
+    this.events.delete(threadId)
+    this.items.delete(threadId)
+    this.sessions.delete(threadId)
+    this.itemHistoryRevisions.delete(threadId)
+  }
+
+  private itemHistoryRevision(threadId: string): number {
+    const existing = this.itemHistoryRevisions.get(threadId)
+    if (existing !== undefined) return existing
+    return this.bumpItemHistoryRevision(threadId)
+  }
+
+  private bumpItemHistoryRevision(threadId: string): number {
+    this.nextItemHistoryRevision += 1
+    this.itemHistoryRevisions.set(threadId, this.nextItemHistoryRevision)
+    return this.nextItemHistoryRevision
   }
 }

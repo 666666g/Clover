@@ -1,18 +1,25 @@
 import { useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
 import type {
   AppSettingsV1,
+  KunBrowserUseSettingsV1,
   KunToolPermissionMode,
   ModelProviderProfileV1
 } from '@shared/app-settings'
 import {
   DEFAULT_MODEL_PROVIDER_ID,
+  DEFAULT_PROMPT_OPTIMIZATION_PROMPT,
   DEFAULT_WRITE_INLINE_COMPLETION_BASE_URL,
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_COMPLETION_MODEL,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
   DEFAULT_KUN_DATA_DIR,
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
   MIN_KUN_LOCAL_PORT,
   WRITE_INLINE_COMPLETION_MODEL_IDS,
+  defaultKunContextCompactionSettings,
+  defaultKunBrowserUseSettings,
+  defaultKunGraphSettings,
   defaultModelProviderSettings,
   isKunRuntimeInsecure,
   kunToolPermissionModeFromSettings,
@@ -27,35 +34,77 @@ import type {
 } from '@shared/kun-gui-api'
 import {
   Ban,
+  Bot,
   Check,
-  Eye,
+  FlaskConical,
   FolderOpen,
-  FolderPen,
+  Globe2,
   Hand,
   Loader2,
   LockKeyholeOpen,
+  Monitor,
+  Palette,
   RefreshCw,
+  RotateCcw,
   Settings,
-  ShieldQuestion,
-  Trash2
+  ShieldCheck,
+  Sparkles,
+  Trash2,
+  Workflow,
+  Wrench
 } from 'lucide-react'
 import { GuiUpdateControl } from './settings-gui-update'
 import { McpServersEditor } from './mcp/McpServersEditor'
-import { parseMcpConfigText, type McpFormServer } from './mcp/mcp-config-form'
 import {
   AdvancedSettingsDisclosure,
   InlineNoticeView,
   ModelSelect,
   SecretInput,
-  SectionJumpButton,
   SettingsCard,
+  SettingsSubTabs,
+  SettingsTabPanel,
+  SettingsTabs,
   SettingRow,
   Toggle
 } from './settings-controls'
 import { formatCompactNumber } from '../hooks/use-thread-usage'
-import { parseUsageResponse } from '../hooks/usage-response'
+import {
+  compactList,
+  EMPTY_TOKEN_ECONOMY_SAVINGS_STATE,
+  loadTokenEconomySavingsSummary,
+  modelContextProfileSummary,
+  skillRootShortLabel,
+  statusPill,
+  summarizeMcpPermissionSources,
+  summarizeSkillPermissionSources,
+  type TokenEconomySavingsState
+} from './settings-section-agents-utils'
+import {
+  BrowserUseSettingsPanel,
+  ComputerUseSettingsPanel,
+  DesignQualitySettingsPanel
+} from './settings-section-agent-panels'
+import { GraphModeSettingsPanel } from './settings-section-graph-panel'
+import { runTrustedUserActivation } from '../extensions/protected-user-activation'
 
 export { modelProvidersSettingsPatch } from './settings-section-providers'
+
+type AgentsSettingsPanel =
+  | 'assistant'
+  | 'permissions'
+  | 'skills'
+  | 'tools'
+  | 'project'
+  | 'runtime'
+type PermissionsSettingsPanel = 'policy' | 'quality'
+type LaboratorySettingsPanel = 'computer' | 'browser' | 'graph'
+
+function panelForSettingsSection(section: unknown): AgentsSettingsPanel {
+  if (section === 'permissions') return 'permissions'
+  if (section === 'skill') return 'skills'
+  if (section === 'mcp') return 'tools'
+  return 'assistant'
+}
 
 const TOOL_PERMISSION_OPTIONS: Array<{
   value: KunToolPermissionMode
@@ -65,218 +114,27 @@ const TOOL_PERMISSION_OPTIONS: Array<{
   iconClass: string
 }> = [
   {
-    value: 'always-ask',
-    labelKey: 'toolPermissionAlwaysAsk',
-    descriptionKey: 'toolPermissionAlwaysAskDesc',
+    value: 'ask-for-approval',
+    labelKey: 'toolPermissionAskForApproval',
+    descriptionKey: 'toolPermissionAskForApprovalDesc',
     Icon: Hand,
     iconClass: 'border-sky-400/30 bg-sky-500/10 text-sky-700 dark:text-sky-200'
   },
   {
-    value: 'read-only',
-    labelKey: 'toolPermissionReadOnly',
-    descriptionKey: 'toolPermissionReadOnlyDesc',
-    Icon: Eye,
-    iconClass: 'border-emerald-400/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'
+    value: 'approve-for-me',
+    labelKey: 'toolPermissionApproveForMe',
+    descriptionKey: 'toolPermissionApproveForMeDesc',
+    Icon: Bot,
+    iconClass: 'border-teal-400/30 bg-teal-500/10 text-teal-700 dark:text-teal-200'
   },
   {
-    value: 'sensitive-ask',
-    labelKey: 'toolPermissionSensitiveAsk',
-    descriptionKey: 'toolPermissionSensitiveAskDesc',
-    Icon: ShieldQuestion,
-    iconClass: 'border-amber-400/35 bg-amber-500/10 text-amber-700 dark:text-amber-200'
-  },
-  {
-    value: 'workspace-write',
-    labelKey: 'toolPermissionWorkspaceWrite',
-    descriptionKey: 'toolPermissionWorkspaceWriteDesc',
-    Icon: FolderPen,
-    iconClass: 'border-indigo-400/30 bg-indigo-500/10 text-indigo-700 dark:text-indigo-200'
-  },
-  {
-    value: 'bypass',
-    labelKey: 'toolPermissionBypass',
-    descriptionKey: 'toolPermissionBypassDesc',
+    value: 'full-access',
+    labelKey: 'toolPermissionFullAccess',
+    descriptionKey: 'toolPermissionFullAccessDesc',
     Icon: LockKeyholeOpen,
     iconClass: 'border-orange-400/35 bg-orange-500/10 text-orange-700 dark:text-orange-200'
   }
 ]
-
-function statusPill(status: string | undefined): string {
-  if (status === 'available') return 'border-emerald-400/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'
-  if (status === 'disabled') return 'border-ds-border-muted bg-ds-card text-ds-faint'
-  return 'border-red-300/50 bg-red-500/10 text-red-700 dark:text-red-200'
-}
-
-function skillRootShortLabel(path: string): string {
-  const parts = path.split(/[\\/]+/).filter(Boolean)
-  return parts.slice(-2).join('/') || path
-}
-
-function compactList(values: unknown, empty: string): string {
-  if (!Array.isArray(values) || values.length === 0) return empty
-  return values
-    .map((value) => typeof value === 'string' ? value : JSON.stringify(value))
-    .slice(0, 4)
-    .join(', ')
-}
-
-type SkillPermissionSummary = {
-  enabledRoots: number
-  disabledRoots: number
-  workspaceRoots: number
-  globalRoots: number
-  disabledSkillIds: number
-}
-
-function summarizeSkillPermissionSources(
-  roots: readonly SkillRootListItem[],
-  disabledSkillIds: unknown
-): SkillPermissionSummary {
-  return {
-    enabledRoots: roots.filter((root) => root.enabled).length,
-    disabledRoots: roots.filter((root) => !root.enabled).length,
-    workspaceRoots: roots.filter((root) => root.enabled && root.scope === 'project').length,
-    globalRoots: roots.filter((root) => root.enabled && root.scope === 'global').length,
-    disabledSkillIds: Array.isArray(disabledSkillIds) ? disabledSkillIds.length : 0
-  }
-}
-
-type McpPermissionSummary = {
-  parseError: string | null
-  enabledServers: number
-  disabledServers: number
-  userScopeServers: number
-  workspaceScopeServers: number
-  workspaceVisibleServers: number
-  localServers: number
-  remoteServers: number
-  envServers: number
-  headerServers: number
-}
-
-function hasEntries(entries: McpFormServer['env'] | McpFormServer['headers']): boolean {
-  return entries.some((entry) => entry.key.trim() || entry.value.trim())
-}
-
-function summarizeMcpPermissionSources(text: string): McpPermissionSummary {
-  const parsed = parseMcpConfigText(text)
-  if (!parsed.ok) {
-    return {
-      parseError: parsed.error,
-      enabledServers: 0,
-      disabledServers: 0,
-      userScopeServers: 0,
-      workspaceScopeServers: 0,
-      workspaceVisibleServers: 0,
-      localServers: 0,
-      remoteServers: 0,
-      envServers: 0,
-      headerServers: 0
-    }
-  }
-  const enabled = parsed.model.servers.filter((server) => server.enabled)
-  return {
-    parseError: null,
-    enabledServers: enabled.length,
-    disabledServers: parsed.model.servers.length - enabled.length,
-    userScopeServers: enabled.filter((server) => server.trustScope === 'user').length,
-    workspaceScopeServers: enabled.filter((server) => server.trustScope === 'workspace').length,
-    workspaceVisibleServers: enabled.filter((server) =>
-      server.workspaceRoots.some((root) => root.trim())
-    ).length,
-    localServers: enabled.filter((server) => server.transport === 'stdio').length,
-    remoteServers: enabled.filter((server) => server.transport !== 'stdio').length,
-    envServers: enabled.filter((server) => hasEntries(server.env)).length,
-    headerServers: enabled.filter((server) => hasEntries(server.headers)).length
-  }
-}
-
-type TokenEconomySavingsSummary = {
-  tokens: number
-}
-
-type TokenEconomySavingsState = {
-  loading: boolean
-  loaded: boolean
-  summary: TokenEconomySavingsSummary | null
-}
-
-const EMPTY_TOKEN_ECONOMY_SAVINGS_STATE: TokenEconomySavingsState = {
-  loading: false,
-  loaded: false,
-  summary: null
-}
-
-type ModelContextProfileSummary = {
-  modelLabel: string
-  contextWindowLabel: string
-  softThresholdLabel: string
-  hardThresholdLabel: string
-  sourceLabelKey: string
-}
-
-const DEEPSEEK_V4_CONTEXT_PROFILE = {
-  contextWindowTokens: 1_000_000,
-  softThreshold: 980_000,
-  hardThreshold: 990_000
-}
-
-function formatTokenNumber(value: number): string {
-  return new Intl.NumberFormat('en-US').format(value)
-}
-
-function normalizeModelId(model: string | undefined): string {
-  const normalized = model?.trim().toLowerCase() ?? ''
-  return normalized === 'auto' ? '' : normalized
-}
-
-function knownModelContextProfile(input: string | undefined): { modelLabel: string } | null {
-  const normalized = normalizeModelId(input)
-  if (!normalized) return null
-  const match = ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner']
-    .find((modelId) => normalized === modelId || normalized.endsWith(`/${modelId}`))
-  return match ? { modelLabel: match } : null
-}
-
-function modelContextProfileSummary(input: {
-  model: string | undefined
-  fallbackSoftThreshold: number
-  fallbackHardThreshold: number
-}): ModelContextProfileSummary {
-  const known = knownModelContextProfile(input.model)
-  if (known) {
-    return {
-      modelLabel: known.modelLabel,
-      contextWindowLabel: formatTokenNumber(DEEPSEEK_V4_CONTEXT_PROFILE.contextWindowTokens),
-      softThresholdLabel: formatTokenNumber(DEEPSEEK_V4_CONTEXT_PROFILE.softThreshold),
-      hardThresholdLabel: formatTokenNumber(DEEPSEEK_V4_CONTEXT_PROFILE.hardThreshold),
-      sourceLabelKey: 'kunModelContextSourceBuiltIn'
-    }
-  }
-  const model = input.model?.trim() || 'auto'
-  return {
-    modelLabel: model,
-    contextWindowLabel: 'models.profiles',
-    softThresholdLabel: formatTokenNumber(input.fallbackSoftThreshold),
-    hardThresholdLabel: formatTokenNumber(input.fallbackHardThreshold),
-    sourceLabelKey: 'kunModelContextSourceFallback'
-  }
-}
-
-function usageNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-async function loadTokenEconomySavingsSummary(): Promise<TokenEconomySavingsSummary | null> {
-  if (typeof window === 'undefined' || typeof window.kunGui?.runtimeRequest !== 'function') return null
-  const response = await window.kunGui.runtimeRequest('/v1/usage?group_by=thread', 'GET')
-  if (!response.ok || !response.body.trim()) return null
-  const parsed = parseUsageResponse<{ totals?: Record<string, unknown> }>(response.body, 'token economy usage')
-  const totals = parsed.totals ?? {}
-  const tokens = usageNumber(totals.token_economy_savings_tokens)
-  if (tokens <= 0) return null
-  return { tokens }
-}
 
 export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): ReactElement {
   const {
@@ -320,7 +178,6 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     effectiveWriteInlineModel,
     setWriteDebugModalOpen,
     loadWriteDebugEntries,
-    scrollToAgentSection,
     agentsSectionRef,
     skillSectionRef,
     mcpSectionRef,
@@ -341,6 +198,17 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     saveMcpConfig,
     loadMcpConfig,
     openMcpConfigDir,
+    activeProjectWorkspaceRoot,
+    projectConfig,
+    projectConfigText,
+    setProjectConfigText,
+    projectConfigLoading,
+    projectConfigBusy,
+    projectConfigNotice,
+    loadProjectConfig,
+    saveProjectConfig,
+    setProjectConfigTrust,
+    openProjectConfigDir,
     runtimeInfo,
     toolDiagnostics,
     memoryRecords,
@@ -348,6 +216,7 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     runtimeDiagnosticsNotice,
     refreshKunDiagnostics,
     disableMemoryRecord,
+    restoreMemoryRecord,
     deleteMemoryRecord,
     pickClawWorkspace,
     resetClawWorkspaceToDefault,
@@ -389,11 +258,25 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
   const [tokenEconomySavingsState, setTokenEconomySavingsState] =
     useState<TokenEconomySavingsState>(EMPTY_TOKEN_ECONOMY_SAVINGS_STATE)
   const [mcpRawMode, setMcpRawMode] = useState(false)
+  const [activePanel, setActivePanel] = useState<AgentsSettingsPanel>(() =>
+    panelForSettingsSection(ctx.settingsSection)
+  )
+  const [activePermissionsPanel, setActivePermissionsPanel] =
+    useState<PermissionsSettingsPanel>('policy')
   const skillPermissionSummary = summarizeSkillPermissionSources(skillRoots, form.disabledSkillIds)
   const mcpPermissionSummary = useMemo(
     () => summarizeMcpPermissionSources(mcpConfigText),
     [mcpConfigText]
   )
+  useEffect(() => {
+    const requestedPanel = panelForSettingsSection(ctx.settingsSection)
+    if (ctx.settingsSection === 'agents' || requestedPanel !== 'assistant') {
+      setActivePanel(requestedPanel)
+    }
+    if (ctx.settingsSection === 'permissions') {
+      setActivePermissionsPanel('policy')
+    }
+  }, [ctx.settingsSection])
   useEffect(() => {
     let cancelled = false
     if (!tokenEconomy.enabled) {
@@ -417,21 +300,17 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     backend: 'hybrid',
     sqlitePath: ''
   }
-  const contextCompaction = kun.contextCompaction ?? {
-    defaultSoftThreshold: 16000,
-    defaultHardThreshold: 24000,
-    summaryMode: 'model',
-    summaryTimeoutMs: 15000,
-    summaryMaxTokens: 1200,
-    summaryInputMaxBytes: 98304
-  }
+  const contextCompaction = kun.contextCompaction ?? defaultKunContextCompactionSettings()
+  const graph = kun.graph ?? defaultKunGraphSettings()
   const modelContext = modelContextProfileSummary({
     model: kun.model,
     fallbackSoftThreshold: contextCompaction.defaultSoftThreshold,
     fallbackHardThreshold: contextCompaction.defaultHardThreshold
   })
   const runtimeTuning = kun.runtimeTuning ?? {
-    streamIdleTimeoutMs: 45000,
+    maxConcurrentTurns: 256,
+    maxWallTimeMs: 86400000,
+    streamIdleTimeoutMs: 450000,
     toolStorm: {
       enabled: true,
       windowSize: 8,
@@ -440,6 +319,10 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     toolArgumentRepair: {
       maxStringBytes: 524288
     }
+  }
+  const toolOutputLimits = kun.toolOutputLimits ?? {
+    maxLines: DEFAULT_TOOL_OUTPUT_MAX_LINES,
+    maxBytes: DEFAULT_TOOL_OUTPUT_MAX_BYTES
   }
   const updateMcpSearch = (patch: Record<string, unknown>): void => {
     updateKun({
@@ -492,6 +375,14 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
       }
     })
   }
+  const updateToolOutputLimits = (patch: Record<string, unknown>): void => {
+    updateKun({
+      toolOutputLimits: {
+        ...toolOutputLimits,
+        ...patch
+      }
+    })
+  }
   const updateToolStorm = (patch: Record<string, unknown>): void => {
     updateRuntimeTuning({
       toolStorm: {
@@ -516,10 +407,30 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
     maxImageDimension: 1280,
     maxActionsPerTurn: 40
   }
+  const browserUse = kun.browserUse ?? defaultKunBrowserUseSettings()
+  const instructions = kun.instructions ?? {
+    enabled: true
+  }
+  const updateInstructions = (patch: Record<string, unknown>): void => {
+    updateKun({
+      instructions: {
+        ...instructions,
+        ...patch
+      }
+    })
+  }
   const updateComputerUse = (patch: Record<string, unknown>): void => {
     updateKun({
       computerUse: {
         ...computerUse,
+        ...patch
+      }
+    })
+  }
+  const updateBrowserUse = (patch: Partial<KunBrowserUseSettingsV1>): void => {
+    updateKun({
+      browserUse: {
+        ...browserUse,
         ...patch
       }
     })
@@ -542,6 +453,35 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
   const activeProviderId = kun.providerId?.trim() || DEFAULT_MODEL_PROVIDER_ID
   const activeProvider = modelProviders.find((item) => item.id === activeProviderId) ?? modelProviders[0]
   const activeProviderModels = activeProvider?.models ?? []
+  const promptOptimization = {
+    enabled: false,
+    providerId: '',
+    model: '',
+    prompt: '',
+    timeoutMs: 60000,
+    ...(kun.promptOptimization ?? {})
+  }
+  const promptOptimizationProviderId = promptOptimization.providerId?.trim() || activeProviderId
+  const promptOptimizationProvider =
+    modelProviders.find((item) => item.id === promptOptimizationProviderId) ?? activeProvider
+  const promptOptimizationModels = promptOptimizationProvider?.models ?? []
+  const promptOptimizationDefaultModel = (() => {
+    const providerId = promptOptimizationProvider?.id ?? promptOptimizationProviderId
+    const smallModel = kun.smallModel?.trim() ?? ''
+    const smallProviderId = kun.smallModelProviderId?.trim() || activeProviderId
+    if (smallModel && smallProviderId === providerId) return smallModel
+    const mainModel = kun.model?.trim() ?? ''
+    if (mainModel && activeProviderId === providerId) return mainModel
+    return promptOptimizationModels[0] ?? mainModel
+  })()
+  const updatePromptOptimization = (patch: Record<string, unknown>): void => {
+    updateKun({
+      promptOptimization: {
+        ...promptOptimization,
+        ...patch
+      }
+    })
+  }
   const selectKunProvider = (providerId: string): void => {
     const nextProvider = modelProviders.find((item) => item.id === providerId) ?? activeProvider
     const nextModel = nextProvider?.models.includes(kun.model)
@@ -553,17 +493,28 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
 
   return (
             <>
-              <div className="mb-6 flex flex-wrap gap-2">
-                <SectionJumpButton label={t('agentsQuickBase')} onClick={() => scrollToAgentSection('agents')} />
-                <SectionJumpButton label={t('agentsQuickSkill')} onClick={() => scrollToAgentSection('skill')} />
-                <SectionJumpButton label={t('agentsQuickMcp')} onClick={() => scrollToAgentSection('mcp')} />
-                <SectionJumpButton
-                  label={t('agentsQuickPermissions')}
-                  onClick={() => scrollToAgentSection('permissions')}
-                />
-              </div>
+              <SettingsTabs<AgentsSettingsPanel>
+                baseId="agents-settings"
+                ariaLabel={t('agents')}
+                items={[
+                  { id: 'assistant', label: t('agentsQuickBase'), icon: Bot },
+                  { id: 'permissions', label: t('agentsQuickPermissions'), icon: ShieldCheck },
+                  { id: 'skills', label: t('agentsQuickSkill'), icon: Sparkles },
+                  { id: 'tools', label: t('agentsQuickMcp'), icon: Wrench },
+                  { id: 'project', label: t('projectConfigTitle'), icon: FolderOpen },
+                  { id: 'runtime', label: t('kunAdvanced'), icon: Settings }
+                ]}
+                value={activePanel}
+                onChange={setActivePanel}
+              />
 
-              <div ref={agentsSectionRef}>
+              <div
+                id="agents-settings-panel-assistant"
+                ref={agentsSectionRef}
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-assistant"
+                className={activePanel === 'assistant' ? '' : 'hidden'}
+              >
                 <SettingsCard title={t('agents')}>
                   <SettingRow
                     title={t('autoStart')}
@@ -625,6 +576,87 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                       />
                     }
                   />
+                  <SettingRow
+                    title={t('kunPromptOptimization')}
+                    description={t('kunPromptOptimizationDesc')}
+                    control={
+                      <Toggle
+                        checked={promptOptimization.enabled}
+                        onChange={(enabled) => updatePromptOptimization({ enabled })}
+                      />
+                    }
+                  />
+                  {promptOptimization.enabled ? (
+                    <SettingRow
+                      title={t('kunPromptOptimizationConfig')}
+                      description={t('kunPromptOptimizationConfigDesc')}
+                      wideControl
+                      control={
+                        <div className="grid gap-3 lg:grid-cols-[minmax(0,220px)_minmax(0,1fr)_minmax(120px,160px)]">
+                          <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted">
+                            {t('kunPromptOptimizationProvider')}
+                            <select
+                              className={selectControlClass}
+                              value={promptOptimization.providerId?.trim() || ''}
+                              onChange={(e) => {
+                                const providerId = e.target.value
+                                const nextProvider = modelProviders.find((item) => item.id === providerId) ?? activeProvider
+                                const keepModel = nextProvider?.models.includes(promptOptimization.model) === true
+                                updatePromptOptimization({
+                                  providerId,
+                                  model: keepModel ? promptOptimization.model : ''
+                                })
+                              }}
+                            >
+                              <option value="">{t('modelSelectDefaultSuffix', {
+                                model: activeProvider?.name ?? DEFAULT_MODEL_PROVIDER_ID
+                              })}</option>
+                              {modelProviders.map((item) => (
+                                <option key={item.id} value={item.id}>{item.name}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted">
+                            {t('kunPromptOptimizationModel')}
+                            <ModelSelect
+                              value={promptOptimization.model}
+                              options={promptOptimizationModels}
+                              defaultLabel={t('kunPromptOptimizationModelDefault', {
+                                model: promptOptimizationDefaultModel
+                              })}
+                              optionLabel={(model) => model}
+                              allowCustom
+                              customLabel={t('modelSelectCustomOption')}
+                              customPlaceholder={t('modelSelectCustomPlaceholder')}
+                              selectClassName={selectControlClass}
+                              onChange={(model) => updatePromptOptimization({ model: model.trim() })}
+                            />
+                          </label>
+                          <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted">
+                            {t('kunPromptOptimizationTimeout')}
+                            <input
+                              type="number"
+                              min={1000}
+                              max={600000}
+                              step={1000}
+                              className="rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                              value={promptOptimization.timeoutMs}
+                              onChange={(e) => updatePromptOptimization({ timeoutMs: Number(e.target.value) })}
+                            />
+                          </label>
+                          <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted lg:col-span-3">
+                            {t('kunPromptOptimizationPrompt')}
+                            <textarea
+                              value={promptOptimization.prompt}
+                              onChange={(e) => updatePromptOptimization({ prompt: e.target.value })}
+                              placeholder={DEFAULT_PROMPT_OPTIMIZATION_PROMPT}
+                              className="min-h-[140px] w-full resize-y rounded-xl border border-ds-border bg-ds-main/60 px-3 py-3 text-[13px] leading-6 text-ds-ink outline-none focus:border-accent/40 focus:ring-1 focus:ring-accent/25"
+                            />
+                          </label>
+                        </div>
+                      }
+                    />
+                  ) : null}
                   <div className="px-3 py-4">
                     <AdvancedSettingsDisclosure
                       title={t('kunAssistantAdvanced')}
@@ -695,15 +727,10 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                   />
                   <SettingRow
                     title={t('kunInsecure')}
-                    description={
-                      kun.runtimeToken.trim()
-                        ? t('kunInsecureDesc')
-                        : t('kunInsecureForcedDesc')
-                    }
+                    description={t('kunInsecureDesc')}
                     control={
                       <Toggle
                         checked={isKunRuntimeInsecure(kun)}
-                        disabled={!kun.runtimeToken.trim()}
                         onChange={(v) => updateKun({ insecure: v })}
                       />
                     }
@@ -738,142 +765,307 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                       </div>
                     }
                   />
-                </SettingsCard>
-              </div>
-
-              <div className="mt-6" ref={permissionsSectionRef}>
-                <SettingsCard title={t('permissions')}>
-                  <div className="px-3 py-4">
-                    <InlineNoticeView notice={{ tone: 'info', message: t('permissionsBehaviorHint') }} />
-                  </div>
                   <SettingRow
-                    title={t('toolPermissionMode')}
-                    description={t('toolPermissionModeDesc')}
-                    wideControl
+                    title={t('kunInstructions')}
+                    description={t('kunInstructionsDesc')}
                     control={
-                      <div
-                        role="radiogroup"
-                        aria-label={t('toolPermissionMode')}
-                        className="grid gap-2 sm:grid-cols-2"
-                      >
-                        {TOOL_PERMISSION_OPTIONS.map((option) => {
-                          const selected = toolPermissionMode === option.value
-                          const PermissionIcon = option.Icon
-                          return (
-                            <button
-                              key={option.value}
-                              type="button"
-                              role="radio"
-                              aria-checked={selected}
-                              onClick={() => updateKun(kunToolPermissionModeSettings(option.value))}
-                              className={`min-h-[72px] rounded-lg border px-3 py-2.5 text-left transition ${
-                                selected
-                                  ? 'border-accent/55 bg-accent/10 text-ds-ink'
-                                  : 'border-ds-border-muted bg-ds-card/70 text-ds-ink hover:bg-ds-hover/70'
-                              }`}
-                            >
-                              <span className="flex items-start gap-2">
-                                <span
-                                  className={`mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${option.iconClass}`}
-                                >
-                                  <PermissionIcon className="h-4 w-4" strokeWidth={1.9} />
-                                </span>
-                                <span className="min-w-0 flex-1">
-                                  <span className="block text-[13px] font-semibold">{t(option.labelKey)}</span>
-                                  <span className="mt-1 block text-[12px] leading-snug text-ds-muted">
-                                    {t(option.descriptionKey)}
-                                  </span>
-                                </span>
-                                {selected ? <Check className="mt-0.5 h-4 w-4 shrink-0 text-accent" strokeWidth={2} /> : null}
-                              </span>
-                            </button>
-                          )
-                        })}
+                      <div className="flex min-w-0 flex-col items-start gap-2 sm:items-end">
+                        <Toggle
+                          checked={instructions.enabled}
+                          onChange={(enabled) => updateInstructions({ enabled })}
+                        />
+                        <div className="max-w-full rounded-lg border border-ds-border-muted bg-ds-main/40 px-2.5 py-1.5 text-[12px] leading-5 text-ds-muted">
+                          {t('kunInstructionsDiagnostics', {
+                            count: toolDiagnostics?.instructions?.lastInjection?.sources?.length ?? runtimeInfo?.capabilities?.instructions?.lastSourceCount ?? 0
+                          })}
+                        </div>
                       </div>
                     }
                   />
                 </SettingsCard>
               </div>
 
-
-              <div className="mt-6">
-                <SettingsCard title={t('computerUseTitle')}>
-                  <div className="space-y-4 px-3 py-4">
-                    <InlineNoticeView notice={{ tone: 'info', message: t('computerUseHint') }} />
-                    <div className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-amber-700 dark:text-amber-200">
-                      <div className="font-semibold">{t('computerUseModelQualityTitle')}</div>
-                      <div className="mt-1">{t('computerUseModelQualityBody')}</div>
-                    </div>
-                  </div>
-                  <SettingRow
-                    title={t('computerUseEnable')}
-                    description={t('computerUseEnableDesc')}
-                    control={
-                      <Toggle
-                        checked={computerUse.enabled}
-                        onChange={(enabled) => updateComputerUse({ enabled })}
-                      />
-                    }
+              <div
+                id="agents-settings-panel-permissions"
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-permissions"
+                className={activePanel === 'permissions' ? 'grid gap-4' : 'hidden'}
+              >
+                <div ref={permissionsSectionRef} className="grid gap-4">
+                  <SettingsSubTabs<PermissionsSettingsPanel>
+                    baseId="agents-permissions"
+                    ariaLabel={t('permissions')}
+                    items={[
+                      { id: 'policy', label: t('toolPermissionMode'), icon: ShieldCheck },
+                      { id: 'quality', label: t('designQualityTitle'), icon: Palette }
+                    ]}
+                    value={activePermissionsPanel}
+                    onChange={setActivePermissionsPanel}
                   />
-                  {computerUse.enabled ? (
-                    <>
+
+                  <SettingsTabPanel<PermissionsSettingsPanel>
+                    baseId="agents-permissions"
+                    tabId="policy"
+                    active={activePermissionsPanel === 'policy'}
+                  >
+                    <SettingsCard title={t('permissions')}>
+                      <div className="px-3 py-4">
+                        <InlineNoticeView notice={{ tone: 'info', message: t('permissionsBehaviorHint') }} />
+                      </div>
                       <SettingRow
-                        title={t('computerUseMode')}
-                        description={t('computerUseModeDesc')}
+                        title={t('toolPermissionMode')}
+                        description={t('toolPermissionModeDesc')}
+                        wideControl
                         control={
-                          <select
-                            className={selectControlClass}
-                            value={computerUse.mode}
-                            onChange={(e) => updateComputerUse({ mode: e.target.value })}
+                          <div
+                            role="radiogroup"
+                            aria-label={t('toolPermissionMode')}
+                            className="grid gap-2 lg:grid-cols-3"
                           >
-                            <option value="auto">{t('computerUseModeAuto')}</option>
-                            <option value="always">{t('computerUseModeAlways')}</option>
-                            <option value="off">{t('computerUseModeOff')}</option>
-                          </select>
+                            {TOOL_PERMISSION_OPTIONS.map((option) => {
+                              const selected = toolPermissionMode === option.value
+                              const PermissionIcon = option.Icon
+                              return (
+                                <button
+                                  key={option.value}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={selected}
+                                  onClick={(event) => runTrustedUserActivation(
+                                    event,
+                                    () => updateKun(kunToolPermissionModeSettings(option.value))
+                                  )}
+                                  className={`min-h-[72px] rounded-lg border px-3 py-2.5 text-left transition ${
+                                    selected
+                                      ? 'border-accent/55 bg-accent/10 text-ds-ink'
+                                      : 'border-ds-border-muted bg-ds-card/70 text-ds-ink hover:bg-ds-hover/70'
+                                  }`}
+                                >
+                                  <span className="flex items-start gap-2">
+                                    <span
+                                      className={`mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${option.iconClass}`}
+                                    >
+                                      <PermissionIcon className="h-4 w-4" strokeWidth={1.9} />
+                                    </span>
+                                    <span className="min-w-0 flex-1">
+                                      <span className="block text-[13px] font-semibold">{t(option.labelKey)}</span>
+                                      <span className="mt-1 block text-[12px] leading-snug text-ds-muted">
+                                        {t(option.descriptionKey)}
+                                      </span>
+                                    </span>
+                                    {selected ? (
+                                      <Check className="mt-0.5 h-4 w-4 shrink-0 text-accent" strokeWidth={2} />
+                                    ) : null}
+                                  </span>
+                                </button>
+                              )
+                            })}
+                          </div>
                         }
                       />
-                      <ComputerUsePermissionRow t={t} />
-                    </>
-                  ) : null}
-                </SettingsCard>
-              </div>
+                    </SettingsCard>
+                  </SettingsTabPanel>
 
-              <div className="mt-6">
-                <SettingsCard title={t('designQualityTitle')}>
-                  <div className="px-3 py-4">
-                    <InlineNoticeView notice={{ tone: 'info', message: t('designQualityHint') }} />
-                  </div>
-                  <SettingRow
-                    title={t('designQualityEnable')}
-                    description={t('designQualityEnableDesc')}
-                    control={
-                      <Toggle
-                        checked={quality.enabled}
-                        onChange={(enabled) => updateQuality({ enabled })}
-                      />
-                    }
-                  />
-                  {quality.enabled ? (
-                    <SettingRow
-                      title={t('designQualityStrictness')}
-                      description={t('designQualityStrictnessDesc')}
-                      control={
-                        <select
-                          className={selectControlClass}
-                          value={quality.strictness}
-                          onChange={(e) => updateQuality({ strictness: e.target.value })}
-                        >
-                          <option value="relaxed">{t('designQualityStrictnessRelaxed')}</option>
-                          <option value="standard">{t('designQualityStrictnessStandard')}</option>
-                          <option value="strict">{t('designQualityStrictnessStrict')}</option>
-                        </select>
-                      }
+                  <SettingsTabPanel<PermissionsSettingsPanel>
+                    baseId="agents-permissions"
+                    tabId="quality"
+                    active={activePermissionsPanel === 'quality'}
+                    className="[&>div]:mt-0"
+                  >
+                    <DesignQualitySettingsPanel
+                      t={t}
+                      value={quality}
+                      selectControlClass={selectControlClass}
+                      onChange={updateQuality}
                     />
-                  ) : null}
+                  </SettingsTabPanel>
+                </div>
+              </div>
+
+              <div
+                id="agents-settings-panel-project"
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-project"
+                className={activePanel === 'project' ? '' : 'hidden'}
+              >
+                <SettingsCard title={t('projectConfigTitle')}>
+                  <div className="space-y-3 px-3 py-4">
+                    <InlineNoticeView notice={{ tone: 'info', message: t('projectConfigDescription') }} />
+                    <div className="rounded-xl border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-amber-700 dark:text-amber-200">
+                      {t('projectConfigSecurityHint')}
+                    </div>
+                  </div>
+                  {!activeProjectWorkspaceRoot ? (
+                    <div className="px-3 pb-4">
+                      <InlineNoticeView notice={{ tone: 'info', message: t('projectConfigWorkspaceRequired') }} />
+                    </div>
+                  ) : (
+                    <>
+                      <SettingRow
+                        title={t('projectConfigWorkspace')}
+                        description={t('projectConfigWorkspaceDesc')}
+                        wideControl
+                        control={
+                          <div className="w-full rounded-xl border border-ds-border bg-ds-card px-3 py-2 font-mono text-[12px] text-ds-ink shadow-sm">
+                            <div className="break-all">{compactHomePath(activeProjectWorkspaceRoot)}</div>
+                            <div className="mt-1 break-all text-ds-muted">
+                              {compactHomePath(projectConfig?.path ?? `${activeProjectWorkspaceRoot}/.kun/project.json`)}
+                            </div>
+                          </div>
+                        }
+                      />
+                      <SettingRow
+                        title={t('projectConfigStatus')}
+                        description={t('projectConfigStatusDesc')}
+                        wideControl
+                        control={
+                          <div className="flex w-full flex-col gap-2">
+                            <div className="flex flex-wrap gap-2 text-[12px]">
+                              <span className="rounded-full border border-ds-border bg-ds-main/70 px-2.5 py-1 font-medium text-ds-ink">
+                                {projectConfigLoading
+                                  ? t('loading')
+                                  : t(`projectConfigStatus_${projectConfig?.status ?? 'missing'}`)}
+                              </span>
+                              <span className={`rounded-full border px-2.5 py-1 font-medium ${
+                                projectConfig?.trust === 'trusted'
+                                  ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200'
+                                  : projectConfig?.trust === 'stale'
+                                    ? 'border-amber-400/30 bg-amber-500/10 text-amber-700 dark:text-amber-200'
+                                    : 'border-ds-border bg-ds-main/70 text-ds-muted'
+                              }`}>
+                                {t(`projectConfigTrust_${projectConfig?.trust ?? 'untrusted'}`)}
+                              </span>
+                              {projectConfig?.digest ? (
+                                <span className="rounded-full border border-ds-border bg-ds-main/70 px-2.5 py-1 font-mono text-ds-muted">
+                                  sha256:{projectConfig.digest.slice(0, 12)}
+                                </span>
+                              ) : null}
+                            </div>
+                            {projectConfig?.message ? (
+                              <div className="rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2 text-[12px] leading-5 text-red-700 dark:text-red-200">
+                                {projectConfig.message}
+                              </div>
+                            ) : null}
+                          </div>
+                        }
+                      />
+                      <SettingRow
+                        title={t('projectConfigSummary')}
+                        description={t('projectConfigSummaryDesc')}
+                        wideControl
+                        control={
+                          <div className="grid w-full gap-2 text-[12.5px] text-ds-muted sm:grid-cols-3">
+                            <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                              {t('projectConfigMcpServers')}: <span className="font-mono text-ds-ink">{projectConfig?.serverSummaries.length ?? 0}</span>
+                            </div>
+                            <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                              {t('projectConfigSkillRoots')}: <span className="font-mono text-ds-ink">{projectConfig?.skillRootCount ?? 0}</span>
+                            </div>
+                            <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                              {t('projectConfigDisabledSkills')}: <span className="font-mono text-ds-ink">{projectConfig?.disabledSkillCount ?? 0}</span>
+                            </div>
+                            {projectConfig?.serverSummaries.length ? (
+                              <div className="sm:col-span-3 rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                                {projectConfig.serverSummaries.map((server: { id: string; target: string; enabled: boolean }) => (
+                                  <div key={server.id} className="flex min-w-0 items-center justify-between gap-3 py-0.5">
+                                    <span className="font-mono text-ds-ink">{server.id}</span>
+                                    <span className="min-w-0 truncate font-mono" title={server.target}>{server.target}</span>
+                                    <span>{server.enabled ? t('projectConfigServerEnabled') : t('projectConfigServerDisabled')}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        }
+                      />
+                      <SettingRow
+                        title={t('projectConfigEditor')}
+                        description={t('projectConfigEditorDesc')}
+                        wideControl
+                        control={
+                          <textarea
+                            value={projectConfigText ?? ''}
+                            onChange={(event) => setProjectConfigText?.(event.target.value)}
+                            disabled={projectConfigLoading || projectConfigBusy}
+                            spellCheck={false}
+                            aria-label={t('projectConfigEditor')}
+                            className="min-h-64 w-full rounded-2xl border border-ds-border bg-ds-card px-4 py-3 font-mono text-[12.5px] leading-5 text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30 disabled:opacity-60"
+                          />
+                        }
+                      />
+                      <SettingRow
+                        title={t('projectConfigActions')}
+                        description={t('projectConfigActionsDesc')}
+                        wideControl
+                        control={
+                          <div className="flex w-full flex-col gap-3">
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void saveProjectConfig?.()}
+                                disabled={projectConfigBusy || projectConfigLoading}
+                                className="inline-flex items-center gap-1.5 rounded-xl bg-ds-userbubble px-3 py-2 text-[13px] font-medium text-ds-userbubbleFg shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+                              >
+                                {projectConfigBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                                {t('projectConfigSave')}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void loadProjectConfig?.()}
+                                disabled={projectConfigBusy || projectConfigLoading}
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-subtle disabled:opacity-55"
+                              >
+                                <RefreshCw className={`h-3.5 w-3.5 ${projectConfigLoading ? 'animate-spin' : ''}`} />
+                                {t('projectConfigRefresh')}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void openProjectConfigDir?.()}
+                                disabled={projectConfigBusy}
+                                className="inline-flex items-center gap-1.5 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[13px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-subtle disabled:opacity-55"
+                              >
+                                <FolderOpen className="h-3.5 w-3.5" />
+                                {t('projectConfigOpenDir')}
+                              </button>
+                              {projectConfig?.trust !== 'trusted' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void setProjectConfigTrust?.(true)}
+                                  disabled={projectConfigBusy || projectConfig?.status !== 'valid'}
+                                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-400/35 bg-emerald-500/10 px-3 py-2 text-[13px] font-medium text-emerald-700 transition hover:bg-emerald-500/15 disabled:opacity-55 dark:text-emerald-200"
+                                >
+                                  <ShieldCheck className="h-3.5 w-3.5" />
+                                  {projectConfig?.trust === 'stale' ? t('projectConfigReapprove') : t('projectConfigApprove')}
+                                </button>
+                              ) : null}
+                              {projectConfig?.trust === 'trusted' || projectConfig?.trust === 'stale' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void setProjectConfigTrust?.(false)}
+                                  disabled={projectConfigBusy}
+                                  className="inline-flex items-center gap-1.5 rounded-xl border border-red-400/35 bg-red-500/10 px-3 py-2 text-[13px] font-medium text-red-700 transition hover:bg-red-500/15 disabled:opacity-55 dark:text-red-200"
+                                >
+                                  <Ban className="h-3.5 w-3.5" />
+                                  {t('projectConfigRevoke')}
+                                </button>
+                              ) : null}
+                            </div>
+                            {projectConfigNotice ? <InlineNoticeView notice={projectConfigNotice} /> : null}
+                          </div>
+                        }
+                      />
+                    </>
+                  )}
                 </SettingsCard>
               </div>
 
-              <div ref={skillSectionRef} className="mt-6">
+              <div
+                id="agents-settings-panel-skills"
+                ref={skillSectionRef}
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-skills"
+                className={activePanel === 'skills' ? '' : 'hidden'}
+              >
                 <SettingsCard title={t('skill')}>
                   <SettingRow
                     title={t('skillsDetectedDirs')}
@@ -1011,7 +1203,13 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                 </SettingsCard>
               </div>
 
-              <div ref={mcpSectionRef} className="mt-6">
+              <div
+                id="agents-settings-panel-tools"
+                ref={mcpSectionRef}
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-tools"
+                className={activePanel === 'tools' ? '' : 'hidden'}
+              >
                 <SettingsCard title={t('mcp')}>
                   <SettingRow
                     title={t('mcpSearchEnabled')}
@@ -1242,8 +1440,13 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                 </SettingsCard>
               </div>
 
-
-              <div className="mt-6">
+              <div
+                id="agents-settings-panel-runtime"
+                role="tabpanel"
+                aria-labelledby="agents-settings-tab-runtime"
+                className={activePanel === 'runtime' ? 'grid items-start gap-4 xl:grid-cols-2' : 'hidden'}
+              >
+              <div>
                 <SettingsCard title={t('kunAdvanced')}>
                   <div className="px-3 py-4">
                     <AdvancedSettingsDisclosure
@@ -1516,6 +1719,39 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                     }
                   />
                   <SettingRow
+                    title={t('kunMaxConcurrentTurns')}
+                    description={t('kunMaxConcurrentTurnsDesc')}
+                    control={
+                      <input
+                        type="number"
+                        min={1}
+                        max={256}
+                        className="w-40 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                        value={runtimeTuning.maxConcurrentTurns}
+                        onChange={(e) =>
+                          updateRuntimeTuning({ maxConcurrentTurns: Number(e.target.value) })
+                        }
+                      />
+                    }
+                  />
+                  <SettingRow
+                    title={t('kunMaxWallTime')}
+                    description={t('kunMaxWallTimeDesc')}
+                    control={
+                      <input
+                        type="number"
+                        min={1000}
+                        max={86400000}
+                        step={60000}
+                        className="w-40 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                        value={runtimeTuning.maxWallTimeMs}
+                        onChange={(e) =>
+                          updateRuntimeTuning({ maxWallTimeMs: Number(e.target.value) })
+                        }
+                      />
+                    }
+                  />
+                  <SettingRow
                     title={t('kunStreamIdleTimeout')}
                     description={t('kunStreamIdleTimeoutDesc')}
                     control={
@@ -1576,6 +1812,39 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                     }
                   />
                   <SettingRow
+                    title={t('kunToolOutputLimits')}
+                    description={t('kunToolOutputLimitsDesc')}
+                    wideControl
+                    control={
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted">
+                          {t('kunToolOutputMaxLines')}
+                          <input
+                            type="number"
+                            min={1}
+                            max={1000000}
+                            step={1000}
+                            className="rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                            value={toolOutputLimits.maxLines}
+                            onChange={(e) => updateToolOutputLimits({ maxLines: Number(e.target.value) })}
+                          />
+                        </label>
+                        <label className="flex min-w-0 flex-col gap-1.5 text-[12px] font-medium text-ds-muted">
+                          {t('kunToolOutputMaxBytes')}
+                          <input
+                            type="number"
+                            min={1}
+                            max={67108864}
+                            step={1024}
+                            className="rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30"
+                            value={toolOutputLimits.maxBytes}
+                            onChange={(e) => updateToolOutputLimits({ maxBytes: Number(e.target.value) })}
+                          />
+                        </label>
+                      </div>
+                    }
+                  />
+                  <SettingRow
                     title={t('kunToolArgumentRepair')}
                     description={t('kunToolArgumentRepairDesc')}
                     control={
@@ -1596,7 +1865,7 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                 </SettingsCard>
               </div>
 
-              <div className="mt-6">
+              <div>
                 <SettingsCard title={t('kunDiagnostics')}>
                   <div className="px-3 py-4">
                     <AdvancedSettingsDisclosure
@@ -1614,6 +1883,7 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                           {[
                             ['MCP', runtimeInfo?.capabilities?.mcp?.status],
                             ['Web', runtimeInfo?.capabilities?.web?.status],
+                            ['Instructions', runtimeInfo?.capabilities?.instructions?.status],
                             ['Skills', runtimeInfo?.capabilities?.skills?.status],
                             ['Subagents', runtimeInfo?.capabilities?.subagents?.status],
                             ['Images', runtimeInfo?.capabilities?.attachments?.status],
@@ -1640,6 +1910,9 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                           </div>
                           <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
                             Web: <span className="font-mono text-ds-ink">{runtimeInfo?.capabilities?.web?.provider ?? 'none'}</span>
+                          </div>
+                          <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
+                            Instructions: <span className="font-mono text-ds-ink">{toolDiagnostics?.instructions?.lastInjection?.sources?.length ?? runtimeInfo?.capabilities?.instructions?.lastSourceCount ?? 0}</span>
                           </div>
                           {runtimeInfo?.capabilities?.subagents?.enabled ? (
                             <div className="rounded-xl border border-ds-border-muted bg-ds-main/40 px-3 py-2">
@@ -1711,16 +1984,27 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                                   </div>
                                 </div>
                                 <div className="flex shrink-0 items-center gap-1">
-                                  <button
-                                    type="button"
-                                    disabled={Boolean(memory.disabledAt)}
-                                    onClick={() => void disableMemoryRecord(memory.id)}
-                                    className="rounded-lg p-1.5 text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45"
-                                    aria-label={t('kunMemoryDisable')}
-                                    title={t('kunMemoryDisable')}
-                                  >
-                                    <Ban className="h-3.5 w-3.5" strokeWidth={1.8} />
-                                  </button>
+                                  {memory.disabledAt ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => void restoreMemoryRecord(memory.id)}
+                                      className="rounded-lg p-1.5 text-ds-muted transition hover:bg-emerald-500/10 hover:text-emerald-600"
+                                      aria-label={t('memoryRestore')}
+                                      title={t('memoryRestore')}
+                                    >
+                                      <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.8} />
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => void disableMemoryRecord(memory.id)}
+                                      className="rounded-lg p-1.5 text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
+                                      aria-label={t('kunMemoryDisable')}
+                                      title={t('kunMemoryDisable')}
+                                    >
+                                      <Ban className="h-3.5 w-3.5" strokeWidth={1.8} />
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     onClick={() => void deleteMemoryRecord(memory.id)}
@@ -1743,7 +2027,103 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
                   </div>
                 </SettingsCard>
               </div>
+              </div>
             </>
+  )
+}
+
+export function LaboratorySettingsSection({ ctx }: { ctx: Record<string, any> }): ReactElement {
+  const { t, form, kun, updateKun, selectControlClass } = ctx
+  const [activePanel, setActivePanel] = useState<LaboratorySettingsPanel>('computer')
+  const provider = form.provider ?? defaultModelProviderSettings()
+  const modelProviders = provider.providers as ModelProviderProfileV1[]
+  const activeProviderId = kun.providerId?.trim() || DEFAULT_MODEL_PROVIDER_ID
+  const computerUse = kun.computerUse ?? {
+    enabled: false,
+    mode: 'auto' as const,
+    maxImageDimension: 1280,
+    maxActionsPerTurn: 40
+  }
+  const browserUse = kun.browserUse ?? defaultKunBrowserUseSettings()
+  const graph = kun.graph ?? defaultKunGraphSettings()
+
+  const updateComputerUse = (patch: Record<string, unknown>): void => {
+    updateKun({
+      computerUse: {
+        ...computerUse,
+        ...patch
+      }
+    })
+  }
+  const updateBrowserUse = (patch: Partial<KunBrowserUseSettingsV1>): void => {
+    updateKun({
+      browserUse: {
+        ...browserUse,
+        ...patch
+      }
+    })
+  }
+
+  return (
+    <>
+      <SettingsTabs<LaboratorySettingsPanel>
+        baseId="laboratory-settings"
+        ariaLabel={t('agentsQuickLaboratory')}
+        items={[
+          { id: 'computer', label: t('computerUseTitle'), icon: Monitor },
+          { id: 'browser', label: t('browserUseSettingsTitle'), icon: Globe2 },
+          { id: 'graph', label: t('graphSettingsTitle'), icon: Workflow }
+        ]}
+        value={activePanel}
+        onChange={setActivePanel}
+      />
+
+      <SettingsTabPanel<LaboratorySettingsPanel>
+        baseId="laboratory-settings"
+        tabId="computer"
+        active={activePanel === 'computer'}
+        className="[&>div]:mt-0"
+      >
+        <ComputerUseSettingsPanel
+          t={t}
+          value={computerUse}
+          selectControlClass={selectControlClass}
+          permissionRow={<ComputerUsePermissionRow t={t} />}
+          onChange={updateComputerUse}
+        />
+      </SettingsTabPanel>
+
+      <SettingsTabPanel<LaboratorySettingsPanel>
+        baseId="laboratory-settings"
+        tabId="browser"
+        active={activePanel === 'browser'}
+        className="[&>div]:mt-0"
+      >
+        <BrowserUseSettingsPanel
+          t={t}
+          value={browserUse}
+          selectControlClass={selectControlClass}
+          onChange={updateBrowserUse}
+        />
+      </SettingsTabPanel>
+
+      <SettingsTabPanel<LaboratorySettingsPanel>
+        baseId="laboratory-settings"
+        tabId="graph"
+        active={activePanel === 'graph'}
+        className="[&>div]:mt-0"
+      >
+        <GraphModeSettingsPanel
+          t={t}
+          value={graph}
+          modelProviders={modelProviders}
+          leadProviderId={activeProviderId}
+          leadModel={kun.model}
+          selectControlClass={selectControlClass}
+          onChange={(patch) => updateKun({ graph: patch })}
+        />
+      </SettingsTabPanel>
+    </>
   )
 }
 

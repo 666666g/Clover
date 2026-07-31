@@ -16,6 +16,10 @@ import kunRest from '../../../../asset/img/kun_rest.png'
  * Pose map:
  *   design-reviewer            → kun_clip    (写字板·审查,  bob)
  *   over-engineering-reviewer  → kun_search  (放大镜·审视,  float)
+ *   code-reviewer              → kun_laptop  (笔记本·审查,  breathe)
+ *   test-engineer              → kun_wrench  (工具·测试,    sway)
+ *   security-auditor           → kun_clip    (写字板·审计,  bob)
+ *   web-performance-auditor    → kun_search  (放大镜·性能,  float)
  *   code-review                → kun_laptop  (笔记本·看代码, breathe)
  *   compaction                 → kun_magic   (魔法棒·压缩,  sway)
  *   title                      → kun_cheer   (庆祝·命名,    bob)
@@ -56,6 +60,10 @@ const POSE: Record<string, { src: string; anim: Anim }> = {
   explore: { src: kunSearch, anim: 'float' },
   'design-reviewer': { src: kunClip, anim: 'bob' },
   'over-engineering-reviewer': { src: kunWrench, anim: 'sway' },
+  'code-reviewer': { src: kunLaptop, anim: 'breathe' },
+  'test-engineer': { src: kunWrench, anim: 'sway' },
+  'security-auditor': { src: kunClip, anim: 'bob' },
+  'web-performance-auditor': { src: kunSearch, anim: 'float' },
   'code-review': { src: kunClip, anim: 'breathe' },
   compaction: { src: kunMagic, anim: 'sway' },
   title: { src: kunCheer, anim: 'bob' },

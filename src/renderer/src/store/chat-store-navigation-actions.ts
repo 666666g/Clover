@@ -3,6 +3,7 @@ import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
 import {
+  applyChatContentMaxWidth,
   applyCursorSpotlight,
   applyCursorSpotlightColor,
   applyTheme,
@@ -26,10 +27,21 @@ import {
   saveThreadForkRegistry
 } from '../lib/thread-fork-registry'
 import { workspaceLabelFromPath } from '../lib/workspace-label'
-import { isConversationWorkspacePath, isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
+import {
+  showWorkspaceMissingDialog,
+  workspaceDirectoryExists,
+  workspaceMissingError
+} from '../lib/workspace-availability'
+import {
+  isConversationWorkspacePath,
+  isInternalDeepSeekGuiWorkspace,
+  isInternalTemporaryWorkspace,
+  normalizeWorkspaceRoot,
+  workspaceRootIdentityKey
+} from '../lib/workspace-path'
 import { resolveProjectWorkspacePath } from '../lib/worktree-project-path'
 import { readThreadWorktreeRegistry } from '../lib/thread-worktree-registry'
-import { buildClawRuntimePrompt, getActiveAgentApiKey } from '@shared/app-settings'
+import { buildClawRuntimePrompt } from '@shared/app-settings'
 import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
 import {
   activeClawChannel,
@@ -38,7 +50,6 @@ import {
   isClawThread,
   optimisticUserModelLabel,
   readCodeWorkspaceRoots,
-  readStoredComposerModel,
   rememberCodeWorkspaceRoots,
   rememberTurnModel,
   reconcileCodeWorkspaceRoots,
@@ -58,7 +69,7 @@ import {
   activeWriteThreadForWorkspace,
   forgetWriteThread,
   hydrateWriteThreadRegistry,
-  isWriteThreadId,
+  isWriteAssistantThread,
   markWriteThread,
   pruneWriteThreadRegistry,
   readWriteThreadRegistry,
@@ -66,6 +77,17 @@ import {
   writeThreadBelongsToWorkspace,
   writeWorkspaceForThreadId
 } from '../write/write-thread-registry'
+import { useWriteWorkspaceStore } from '../write/write-workspace-store'
+import {
+  DESIGN_ASSISTANT_THREAD_TITLE,
+  activeDesignThreadForWorkspace,
+  designDocKey,
+  isDesignThreadId,
+  markDesignThread,
+  readDesignThreadRegistry,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
+import { persistDesignChatMetaForDoc } from '../design/design-chat-transcript'
 import {
   isSddAssistantThread,
   readSddThreadRegistry
@@ -95,6 +117,7 @@ import {
   runtimeStreamRecoveringMessage,
   shouldOpenSettingsForError,
   syncTurnCompletionPoll,
+  turnCompleteNotificationSource,
   watchTurnCompletionNotification
 } from './chat-store-runtime'
 
@@ -113,19 +136,22 @@ let trayActionUnsubscribe: (() => void) | null = null
 
 export function createNavigationActions(
   { set, get, sseAbortRef }: StoreActionContext
-): Pick<ChatState, 'openCode' | 'openWrite' | 'ensureWriteThreadForWorkspace' | 'createWriteThread' | 'selectWriteThread' | 'probeRuntime' | 'boot' | 'chooseWorkspace' | 'selectWorkspaceRoot' | 'clearWorkspace' | 'deleteWorkspace' | 'refreshThreads' | 'setThreadSearch' | 'setShowArchivedThreads'> {
+): Pick<ChatState, 'openCode' | 'openWrite' | 'openDesign' | 'clearActiveThreadSelection' | 'ensureWriteThreadForWorkspace' | 'createWriteThread' | 'selectWriteThread' | 'ensureDesignThreadForWorkspace' | 'createDesignThread' | 'probeRuntime' | 'boot' | 'chooseWorkspace' | 'selectWorkspaceRoot' | 'clearWorkspace' | 'deleteWorkspace' | 'refreshThreads' | 'setThreadSearch' | 'setShowArchivedThreads'> {
   return {
   openCode: async () => {
     const state = get()
+    const designRegistry = readDesignThreadRegistry()
     const activeThread = state.activeThreadId
       ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
       : null
-    if (activeThread && isCodeThread(activeThread, state.clawChannels)) {
+    if (activeThread && isCodeThread(activeThread, state.clawChannels, undefined, designRegistry)) {
       set({ route: 'chat' })
       return
     }
 
-    const codeThreads = state.threads.filter((thread) => isCodeThread(thread, state.clawChannels))
+    const codeThreads = state.threads.filter((thread) =>
+      isCodeThread(thread, state.clawChannels, undefined, designRegistry)
+    )
     const selectedWorkspace = normalizeWorkspaceRoot(state.workspaceRoot)
     const target =
       latestThread(codeThreads.filter((thread) => threadBelongsToWorkspace(thread, selectedWorkspace))) ??
@@ -143,11 +169,64 @@ export function createNavigationActions(
     const nextWatch = { ...state.watchTurnCompletion }
     if (state.activeThreadId && state.busy) {
       nextWatch[state.activeThreadId] = true
-      watchTurnCompletionNotification(state.activeThreadId)
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
     }
     set({
       ...clearedThreadSelection(),
       route: 'chat',
+      watchTurnCompletion: nextWatch
+    })
+    syncTurnCompletionPoll(set, get)
+  },
+
+  openDesign: () => {
+    const state = get()
+    if (isDesignThreadId(state.activeThreadId)) {
+      set({ route: 'design' })
+      return
+    }
+
+    const nextWatch = { ...state.watchTurnCompletion }
+    if (state.activeThreadId && state.busy) {
+      nextWatch[state.activeThreadId] = true
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
+    }
+    sseAbortRef.current?.abort()
+    sseAbortRef.current = null
+    clearBusyWatchdog()
+    set({
+      ...clearedThreadSelection(),
+      route: 'design',
+      watchTurnCompletion: nextWatch
+    })
+    syncTurnCompletionPoll(set, get)
+  },
+
+  clearActiveThreadSelection: () => {
+    const state = get()
+    if (!state.activeThreadId && state.blocks.length === 0 && !state.busy) return
+    const nextWatch = { ...state.watchTurnCompletion }
+    if (state.activeThreadId && state.busy) {
+      nextWatch[state.activeThreadId] = true
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
+    }
+    sseAbortRef.current?.abort()
+    sseAbortRef.current = null
+    clearBusyWatchdog()
+    set({
+      ...clearedThreadSelection(),
       watchTurnCompletion: nextWatch
     })
     syncTurnCompletionPoll(set, get)
@@ -194,7 +273,11 @@ export function createNavigationActions(
     const nextWatch = { ...state.watchTurnCompletion }
     if (state.activeThreadId && state.busy) {
       nextWatch[state.activeThreadId] = true
-      watchTurnCompletionNotification(state.activeThreadId)
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
     }
     set({
       ...clearedThreadSelection(),
@@ -204,13 +287,21 @@ export function createNavigationActions(
     syncTurnCompletionPoll(set, get)
   },
 
-  ensureWriteThreadForWorkspace: async (workspaceRoot) => {
+  ensureWriteThreadForWorkspace: async (workspaceRoot, activeFilePath) => {
     const state = get()
     const targetWorkspace = normalizeWorkspaceRoot(workspaceRoot) || (await readActiveWriteWorkspace(state.workspaceRoot))
     if (!targetWorkspace) {
       set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
       return null
     }
+    const writeState = useWriteWorkspaceStore.getState()
+    const targetFilePath = activeFilePath !== undefined
+      ? activeFilePath.trim() || undefined
+      : (
+          workspaceRootIdentityKey(writeState.workspaceRoot) === workspaceRootIdentityKey(targetWorkspace)
+            ? writeState.activeFilePath?.trim() || undefined
+            : undefined
+        )
     if (state.runtimeConnection !== 'ready') {
       set({ error: i18n.t('common:runtimeActionNeedsConnection') })
       return null
@@ -225,22 +316,27 @@ export function createNavigationActions(
     const activeThread = state.activeThreadId
       ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
       : null
-    if (activeThread && writeThreadBelongsToWorkspace(activeThread, targetWorkspace, registry)) {
+    const existing = activeWriteThreadForWorkspace(
+      targetWorkspace,
+      state.threads,
+      registry,
+      targetFilePath
+    )
+    if (activeThread && existing?.id === activeThread.id) {
       set({ route: 'write', error: null })
       return activeThread.id
     }
 
-    const existing = activeWriteThreadForWorkspace(targetWorkspace, state.threads, registry)
     if (existing) {
       set({ route: 'write' })
       await get().selectThread(existing.id)
       return existing.id
     }
 
-    return get().createWriteThread(targetWorkspace)
+    return get().createWriteThread(targetWorkspace, targetFilePath)
   },
 
-  createWriteThread: async (workspaceRoot) => {
+  createWriteThread: async (workspaceRoot, activeFilePath) => {
     const targetWorkspace = normalizeWorkspaceRoot(workspaceRoot) || (await readActiveWriteWorkspace(get().workspaceRoot))
     if (!targetWorkspace) {
       set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
@@ -250,6 +346,11 @@ export function createNavigationActions(
       set({ error: i18n.t('common:runtimeActionNeedsConnection') })
       return null
     }
+    if (!(await workspaceDirectoryExists(targetWorkspace))) {
+      set({ error: workspaceMissingError() })
+      await showWorkspaceMissingDialog(targetWorkspace)
+      return null
+    }
     try {
       const p = getProvider()
       const thread = await p.createThread({
@@ -257,7 +358,12 @@ export function createNavigationActions(
         title: WRITE_ASSISTANT_THREAD_TITLE,
         mode: 'agent'
       })
-      saveWriteThreadRegistry(markWriteThread(targetWorkspace, thread.id))
+      saveWriteThreadRegistry(markWriteThread(
+        targetWorkspace,
+        thread.id,
+        readWriteThreadRegistry(),
+        activeFilePath
+      ))
       set((s) => ({
         route: 'write',
         threads: s.threads.some((item) => item.id === thread.id) ? s.threads : [thread, ...s.threads],
@@ -289,6 +395,90 @@ export function createNavigationActions(
     }
     set({ route: 'write' })
     await get().selectThread(targetId)
+  },
+
+  ensureDesignThreadForWorkspace: async (workspaceRoot, docId) => {
+    const state = get()
+    const targetWorkspace =
+      normalizeWorkspaceRoot(workspaceRoot) || normalizeWorkspaceRoot(state.workspaceRoot)
+    if (!targetWorkspace) {
+      set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
+      return null
+    }
+    if (state.runtimeConnection !== 'ready') {
+      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return null
+    }
+    const targetDoc = (docId ?? '').trim()
+    const registry = readDesignThreadRegistry()
+    const record = registry.workspaces[designDocKey(targetWorkspace, targetDoc)]
+    const activeThread = state.activeThreadId
+      ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
+      : null
+    // Reuse the active thread only when it is THIS 设计稿's registered thread (a
+    // thread id belongs to exactly one (workspace, 设计稿) scope).
+    if (activeThread && record && record.threadIds.includes(activeThread.id)) {
+      set({ route: 'design', error: null })
+      return activeThread.id
+    }
+    const existing = activeDesignThreadForWorkspace(targetWorkspace, targetDoc, state.threads, registry)
+    if (existing) {
+      set({ route: 'design' })
+      await get().selectThread(existing.id)
+      return existing.id
+    }
+    return get().createDesignThread(targetWorkspace, targetDoc)
+  },
+
+  createDesignThread: async (workspaceRoot, docId) => {
+    const targetWorkspace =
+      normalizeWorkspaceRoot(workspaceRoot) || normalizeWorkspaceRoot(get().workspaceRoot)
+    if (!targetWorkspace) {
+      set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
+      return null
+    }
+    if (get().runtimeConnection !== 'ready') {
+      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return null
+    }
+    if (!(await workspaceDirectoryExists(targetWorkspace))) {
+      set({ error: workspaceMissingError() })
+      await showWorkspaceMissingDialog(targetWorkspace)
+      return null
+    }
+    const targetDoc = (docId ?? '').trim()
+    try {
+      const provider = getProvider()
+      const thread = await provider.createThread({
+        workspace: targetWorkspace,
+        title: DESIGN_ASSISTANT_THREAD_TITLE,
+        titleAuto: true,
+        mode: 'agent'
+      })
+      const nextRegistry = markDesignThread(targetWorkspace, targetDoc, thread.id)
+      saveDesignThreadRegistry(nextRegistry)
+      void persistDesignChatMetaForDoc({
+        workspaceRoot: targetWorkspace,
+        docId: targetDoc,
+        stampThreadId: thread.id
+      }).catch(() => undefined)
+      set((s) => ({
+        route: 'design',
+        threads: s.threads.some((item) => item.id === thread.id) ? s.threads : [thread, ...s.threads],
+        error: null
+      }))
+      await get().refreshThreads()
+      await get().selectThread(thread.id)
+      return thread.id
+    } catch (e) {
+      set({
+        error: formatRuntimeError(e),
+        ...(shouldOpenSettingsForError(e)
+          ? { route: 'settings' as const, settingsSection: 'agents' as const }
+          : {})
+      })
+      return null
+    }
   },
 
   probeRuntime: async (mode = 'user', options) => {
@@ -373,9 +563,10 @@ export function createNavigationActions(
           preservedWorkspaceRoots: [workspaceRoot]
         })
         saveCodeWorkspaceRoots(codeWorkspaceRoots)
-        const needsInitialSetup = !getActiveAgentApiKey(settings).trim()
+        const needsInitialSetup = settings.initialSetupCompleted !== true
         applyTheme(settings.theme)
         applyUiFontScale(settings.uiFontScale)
+        applyChatContentMaxWidth(settings.chatContentMaxWidthPx)
         applyCursorSpotlight(settings.cursorSpotlight !== false)
         applyCursorSpotlightColor(settings.cursorSpotlightColor)
         if (settings.write?.typography) applyWriteTypography(settings.write.typography)
@@ -445,15 +636,18 @@ export function createNavigationActions(
             })()
           })
         }
+        const stateBeforeBootCommit = get()
         set({
-          route: 'chat',
-          initialSetupOpen: needsInitialSetup,
+          route: stateBeforeBootCommit.route === 'settings' ? 'settings' : 'chat',
+          initialSetupOpen: needsInitialSetup || stateBeforeBootCommit.initialSetupOpen,
           initialSetupMode: 'required',
           workspaceRoot,
           codeWorkspaceRoots,
           workspaceLabel: workspaceLabelFromPath(workspaceRoot),
           conversationWorkspaceRoot: settings.conversationWorkspaceRoot || '',
           disabledSkillIds: settings.disabledSkillIds,
+          graphEnabled: settings.agents.kun.graph?.enabled === true,
+          composerOrchestration: 'direct',
           clawChannels: settings.claw.channels,
           activeClawChannelId: settings.claw.channels.find((channel) => channel.enabled)?.id ?? '',
           runtimeConnection: needsInitialSetup ? 'idle' : get().runtimeConnection,
@@ -461,11 +655,6 @@ export function createNavigationActions(
           runtimeErrorDetail: needsInitialSetup ? null : get().runtimeErrorDetail
         })
         if (needsInitialSetup) return
-        const initialPick = get().composerPickList
-        const fromStorage = readStoredComposerModel(initialPick)
-        if (fromStorage) {
-          set({ composerModel: fromStorage })
-        }
         scheduleStartupRuntimeProbe(get)
       } catch (e) {
         set({
@@ -683,7 +872,10 @@ export function createNavigationActions(
       const p = getProvider()
       let rawThreads: NormalizedThread[]
       try {
-        rawThreads = await p.listThreads({ limit: 200, includeArchived: true })
+        // Omitting `limit` is intentional: migrated and long-lived profiles
+        // must expose the complete inventory instead of silently hiding older
+        // conversations after an arbitrary client-side cutoff.
+        rawThreads = await p.listThreads({ includeArchived: true })
       } catch {
         rawThreads = await p.listThreads()
       }
@@ -692,8 +884,8 @@ export function createNavigationActions(
         workspace: normalizeWorkspaceRoot(thread.workspace)
       }))
       const sddThreadRegistry = readSddThreadRegistry()
-      const sidebarThreads = (await filterThreadsForSidebar(threads, p))
-        .filter((thread) => !isSddAssistantThread(thread, sddThreadRegistry))
+      const designRegistry = readDesignThreadRegistry()
+      const sidebarThreads = await filterThreadsForSidebar(threads, p)
       const forkRegistry = hydrateThreadForkRegistry(sidebarThreads, readThreadForkRegistry())
       saveThreadForkRegistry(forkRegistry)
       const enrichedThreads = enrichThreadsWithForkInfo(sidebarThreads, forkRegistry)
@@ -759,7 +951,7 @@ export function createNavigationActions(
         ...threads,
         ...displayThreads
       ]
-        .filter((thread) => isCodeThread(thread, get().clawChannels, writeRegistry))
+        .filter((thread) => isCodeThread(thread, get().clawChannels, writeRegistry, designRegistry))
         .map((thread) => {
           const record = threadWorktreeRegistry[thread.id]
           if (record?.projectPath?.trim()) return record.projectPath.trim()
@@ -783,8 +975,10 @@ export function createNavigationActions(
       const activeThreadIsManagedInCodeRoute =
         get().route === 'chat' &&
         activeThread != null &&
-        (isWriteThreadId(activeThread.id, writeRegistry) ||
-          isClawThread(activeThread, get().clawChannels))
+        (isWriteAssistantThread(activeThread, writeRegistry) ||
+          isClawThread(activeThread, get().clawChannels) ||
+          isDesignThreadId(activeThread.id, designRegistry) ||
+          isInternalDeepSeekGuiWorkspace(activeThread.workspace))
       const shouldClearSelection =
         activeThreadId != null && !displayThreads.some((thread) => thread.id === activeThreadId)
       if (shouldClearSelection) {

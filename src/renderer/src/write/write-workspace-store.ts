@@ -4,6 +4,7 @@ import {
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_COMPLETION_MIN_ACCEPT_SCORE,
   DEFAULT_WRITE_INLINE_COMPLETION_MODEL,
+  DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_DEBOUNCE_MS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS,
   DEFAULT_WRITE_INLINE_LONG_COMPLETION_MIN_ACCEPT_SCORE,
@@ -16,6 +17,16 @@ import type { WriteWorkspaceState } from './write-workspace-store-types'
 import { createWriteSettingsActions } from './write-workspace-settings-actions'
 import { createWriteFileActions } from './write-workspace-file-actions'
 import { writeBrowserStorageItem } from '../lib/browser-storage'
+import {
+  captureWriteDocumentContext,
+  nextWriteDocumentEpoch,
+  writeDocumentContextMatches
+} from './write-document-context'
+import {
+  enqueueWriteWorkspaceSave,
+  flushWriteWorkspaceSaveQueue,
+  isWriteWorkspaceSaveContentPending
+} from './write-save-coordinator'
 import {
   WRITE_ASSISTANT_MODEL_KEY,
   WRITE_ASSISTANT_PROVIDER_KEY,
@@ -41,7 +52,6 @@ export { writeBasenameFromPath, writeDirnameFromPath, writeJoinPath, writeRelati
 
 const MAX_ANIMATED_EXTERNAL_SYNC_CHARS = 120_000
 
-let lastSavedContent = ''
 let externalSyncTimer: number | null = null
 let externalSyncAnimationToken = 0
 
@@ -57,6 +67,8 @@ function cancelExternalSyncAnimation(): void {
 export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => ({
   defaultWorkspaceRoot: '',
   workspaceRoots: [],
+  autoSaveEnabled: true,
+  autoSaveDelayMs: DEFAULT_WRITE_AUTOSAVE_DELAY_MS,
   inlineCompletion: {
     enabled: true,
     retrievalEnabled: true,
@@ -92,17 +104,18 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
   ...createWriteFileActions({
     set,
     get,
-    cancelExternalSyncAnimation,
-    setLastSavedContent: (content) => {
-      lastSavedContent = content
-    }
+    cancelExternalSyncAnimation
   }),
 
   setFileContent: (content) => {
     cancelExternalSyncAnimation()
     set((state) => ({
       fileContent: content,
-      saveStatus: state.activeFileKind === 'text' && state.activeFilePath && content !== lastSavedContent ? 'dirty' : 'saved'
+      contentRevision: state.contentRevision + 1,
+      saveStatus:
+        state.activeFileKind === 'text' && state.activeFilePath && content !== state.persistedContent
+          ? 'dirty'
+          : 'saved'
     }))
   },
 
@@ -112,14 +125,22 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
 
   syncActiveFileFromDisk: async (workspaceRoot, options = {}) => {
     const snapshot = get()
+    const context = captureWriteDocumentContext(snapshot)
     const force = options.force === true
-    if (!snapshot.activeFilePath) return false
+    if (!context || !snapshot.activeFilePath) return false
+    if (!pathsEqual(context.workspaceRoot, workspaceRoot)) return false
     if (snapshot.activeFileKind !== 'text') return false
-    if (!force && (snapshot.saveStatus === 'dirty' || snapshot.saveStatus === 'saving')) return false
+    if (
+      !force &&
+      snapshot.fileContent !== snapshot.persistedContent &&
+      typeof options.content !== 'string'
+    ) return false
     if (options.path && !pathsEqual(options.path, snapshot.activeFilePath)) return false
 
     if (options.message) {
-      set({ fileError: options.message, saveStatus: 'error' })
+      if (writeDocumentContextMatches(get(), context)) {
+        set({ fileError: options.message, saveStatus: 'error' })
+      }
       return false
     }
 
@@ -135,7 +156,7 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
           workspaceRoot
         })
       } catch (error) {
-        if (pathsEqual(get().activeFilePath ?? '', snapshot.activeFilePath)) {
+        if (writeDocumentContextMatches(get(), context)) {
           set({
             fileError: error instanceof Error ? error.message : String(error),
             saveStatus: 'error'
@@ -144,7 +165,7 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
         return false
       }
       if (!result.ok) {
-        if (pathsEqual(get().activeFilePath ?? '', snapshot.activeFilePath)) {
+        if (writeDocumentContextMatches(get(), context)) {
           set({ fileError: result.message, saveStatus: 'error' })
         }
         return false
@@ -161,11 +182,66 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
     const nextTruncated = truncated === true
 
     const latest = get()
-    if (!latest.activeFilePath || !pathsEqual(latest.activeFilePath, resolvedPath)) return false
-    if (!force && (latest.saveStatus === 'dirty' || latest.saveStatus === 'saving')) return false
+    if (
+      !writeDocumentContextMatches(latest, context) ||
+      !latest.activeFilePath ||
+      !pathsEqual(latest.activeFilePath, resolvedPath)
+    ) return false
+    if (
+      !force &&
+      isWriteWorkspaceSaveContentPending(context.workspaceRoot, context.filePath, content)
+    ) {
+      // Filesystem watchers can fire before the corresponding IPC write has
+      // settled. Keep the save loop authoritative and do not misclassify its
+      // payload as an external assistant edit.
+      set({
+        fileLoading: false,
+        fileSize: nextSize,
+        fileTruncated: nextTruncated
+      })
+      return true
+    }
+
+    const hasLocalDraft = latest.fileContent !== latest.persistedContent
+    if (!force && hasLocalDraft) {
+      if (content === latest.persistedContent) {
+        // Delayed echo of the last confirmed baseline. It carries no new disk
+        // revision and must not disturb the newer local draft.
+        set({
+          fileLoading: false,
+          fileSize: nextSize,
+          fileTruncated: nextTruncated
+        })
+        return true
+      }
+      if (content === latest.fileContent) {
+        // The watcher confirms that the disk caught up with the local draft.
+        // This can happen just after the write promise settles.
+        cancelExternalSyncAnimation()
+        set({
+          persistedContent: content,
+          saveStatus: 'saved',
+          fileError: null,
+          fileLoading: false,
+          fileSize: nextSize,
+          fileTruncated: nextTruncated
+        })
+        return true
+      }
+      if (
+        options.reviewAsDiff !== true ||
+        nextTruncated ||
+        content.length > MAX_ANIMATED_EXTERNAL_SYNC_CHARS
+      ) {
+        return false
+      }
+      // Fall through to the diff-review branch. It updates the disk baseline
+      // but deliberately leaves fileContent/saveStatus untouched, preserving
+      // the local draft until the user resolves the review.
+    }
     if (
       latest.fileContent === content &&
-      lastSavedContent === content &&
+      latest.persistedContent === content &&
       latest.fileSize === nextSize &&
       latest.fileTruncated === nextTruncated
     ) {
@@ -191,9 +267,9 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
       content.length <= MAX_ANIMATED_EXTERNAL_SYNC_CHARS &&
       latest.fileContent !== content
     ) {
-      lastSavedContent = content
       set({
-        pendingAgentReview: { nextContent: content },
+        persistedContent: content,
+        pendingAgentReview: { ...context, nextContent: content },
         reviewActive: true,
         fileSize: nextSize,
         fileTruncated: nextTruncated,
@@ -202,8 +278,6 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
       })
       return true
     }
-
-    lastSavedContent = content
 
     if (
       options.animate !== false &&
@@ -216,6 +290,7 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
       let cursor = prefix
       set({
         fileContent: content.slice(0, prefix),
+        persistedContent: content,
         fileSize: nextSize,
         fileTruncated: nextTruncated,
         saveStatus: 'saved',
@@ -224,6 +299,7 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
       })
       const step = (): void => {
         if (token !== externalSyncAnimationToken) return
+        if (!writeDocumentContextMatches(get(), context)) return
         const remaining = content.length - cursor
         const chunk = Math.max(24, Math.ceil(remaining * 0.1))
         cursor = Math.min(content.length, cursor + chunk)
@@ -247,6 +323,7 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
 
     set({
       fileContent: content,
+      persistedContent: content,
       fileSize: nextSize,
       fileTruncated: nextTruncated,
       saveStatus: 'saved',
@@ -258,7 +335,9 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
 
   syncActiveImageFromDisk: async (workspaceRoot, path) => {
     const snapshot = get()
-    if (!snapshot.activeFilePath || snapshot.activeFileKind !== 'image') return false
+    const context = captureWriteDocumentContext(snapshot)
+    if (!context || !snapshot.activeFilePath || snapshot.activeFileKind !== 'image') return false
+    if (!pathsEqual(context.workspaceRoot, workspaceRoot)) return false
     if (path && !pathsEqual(path, snapshot.activeFilePath)) return false
 
     try {
@@ -267,14 +346,19 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
         workspaceRoot
       })
       if (!result.ok) {
-        if (pathsEqual(get().activeFilePath ?? '', snapshot.activeFilePath)) {
+        if (writeDocumentContextMatches(get(), context)) {
           set({ fileError: result.message })
         }
         return false
       }
 
       const latest = get()
-      if (!latest.activeFilePath || latest.activeFileKind !== 'image' || !pathsEqual(latest.activeFilePath, result.path)) {
+      if (
+        !writeDocumentContextMatches(latest, context) ||
+        !latest.activeFilePath ||
+        latest.activeFileKind !== 'image' ||
+        !pathsEqual(latest.activeFilePath, result.path)
+      ) {
         return false
       }
 
@@ -289,48 +373,111 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
       return true
     } catch (error) {
       if (isMissingImageIpc(error)) return false
-      if (pathsEqual(get().activeFilePath ?? '', snapshot.activeFilePath)) {
+      if (writeDocumentContextMatches(get(), context)) {
         set({ fileError: formatWriteImageLoadError(error) })
       }
       return false
     }
   },
 
-  flushSave: async (workspaceRoot) => {
-    const state = get()
-    if (!state.activeFilePath) return true
-    if (state.activeFileKind !== 'text') return true
-    if (state.fileTruncated) return false
-    if (externalSyncTimer !== null) {
-      cancelExternalSyncAnimation()
-      set({ fileContent: lastSavedContent, saveStatus: 'saved', fileError: null })
-      return true
-    }
-    cancelExternalSyncAnimation()
-    if (state.fileContent === lastSavedContent) {
-      set({ saveStatus: 'saved' })
-      return true
-    }
-    set({ saveStatus: 'saving' })
-    try {
-      const result = await window.kunGui.writeWorkspaceFile({
-        path: state.activeFilePath,
-        workspaceRoot,
-        content: state.fileContent
-      })
-      if (!result.ok) {
-        set({ saveStatus: 'error', fileError: result.message })
+  flushSave: async (workspaceRoot, options = {}) => {
+    for (;;) {
+      const state = get()
+      if (!state.activeFilePath || state.activeFileKind !== 'text') return true
+      if (state.fileTruncated) return false
+      const context = captureWriteDocumentContext(state)
+      if (!context || !pathsEqual(context.workspaceRoot, workspaceRoot)) return false
+      const resolveExternalConflict = options.resolveExternalConflict === 'keep-local'
+      if (state.reviewActive && !state.pendingAgentReview) {
+        // A live source-editor diff must be resolved through its accept/reject
+        // controls; Save cannot safely infer the user's chosen result.
         return false
       }
-      lastSavedContent = state.fileContent
-      set({ saveStatus: 'saved', fileError: null })
-      return true
-    } catch (error) {
-      set({
-        saveStatus: 'error',
-        fileError: error instanceof Error ? error.message : String(error)
+      if (state.pendingAgentReview && !resolveExternalConflict) {
+        // An unresolved external review must survive background
+        // autosave/navigation. Only an explicit Save may choose the local
+        // draft over the external disk revision.
+        return false
+      }
+      await flushWriteWorkspaceSaveQueue(context.workspaceRoot, context.filePath)
+      const afterQueuedSave = get()
+      if (!writeDocumentContextMatches(afterQueuedSave, context)) return true
+      if (afterQueuedSave !== state) {
+        // Another flush may have settled (or the user may have edited) while
+        // this caller waited. Re-evaluate from the newest persisted baseline.
+        continue
+      }
+      if (externalSyncTimer !== null) {
+        cancelExternalSyncAnimation()
+        set((current) => writeDocumentContextMatches(current, context)
+          ? {
+              fileContent: current.persistedContent,
+              contentRevision: current.contentRevision + 1,
+              saveStatus: 'saved',
+              fileError: null
+            }
+          : {})
+        return true
+      }
+      cancelExternalSyncAnimation()
+      if (state.fileContent === state.persistedContent) {
+        if (writeDocumentContextMatches(get(), context)) {
+          set({
+            saveStatus: 'saved',
+            ...(resolveExternalConflict
+              ? { pendingAgentReview: null, reviewActive: false, fileError: null }
+              : {})
+          })
+        }
+        return true
+      }
+
+      const content = state.fileContent
+      const revision = state.contentRevision
+      set((current) => writeDocumentContextMatches(current, context) && current.contentRevision === revision
+        ? { saveStatus: 'saving' }
+        : {})
+      let result: Awaited<ReturnType<typeof window.kunGui.writeWorkspaceFile>>
+      try {
+        result = await enqueueWriteWorkspaceSave({
+          path: context.filePath,
+          workspaceRoot: context.workspaceRoot,
+          content
+        })
+      } catch (error) {
+        if (writeDocumentContextMatches(get(), context)) {
+          set({
+            saveStatus: 'error',
+            fileError: error instanceof Error ? error.message : String(error)
+          })
+        }
+        return false
+      }
+      if (!result.ok) {
+        if (writeDocumentContextMatches(get(), context)) {
+          set({ saveStatus: 'error', fileError: result.message })
+        }
+        return false
+      }
+      if (!writeDocumentContextMatches(get(), context)) return true
+
+      set((current) => {
+        if (!writeDocumentContextMatches(current, context)) return {}
+        const latestIsPersisted = current.fileContent === content
+        return {
+          persistedContent: content,
+          saveStatus: latestIsPersisted ? 'saved' : 'dirty',
+          fileError: null,
+          ...(resolveExternalConflict
+            ? { pendingAgentReview: null, reviewActive: false }
+            : {})
+        }
       })
-      return false
+      const latest = get()
+      if (!writeDocumentContextMatches(latest, context)) return true
+      if (latest.fileContent === latest.persistedContent) return true
+      // Content changed while the queued write was in flight. Loop once more
+      // with the newest revision so navigation cannot treat it as persisted.
     }
   },
 
@@ -393,7 +540,9 @@ export const useWriteWorkspaceStore = create<WriteWorkspaceState>((set, get) => 
 
   resetWorkspace: () => {
     cancelExternalSyncAnimation()
-    lastSavedContent = ''
-    set(initialState())
+    set((state) => ({
+      ...initialState(),
+      documentEpoch: nextWriteDocumentEpoch(state.documentEpoch)
+    }))
   }
 }))

@@ -1,5 +1,6 @@
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { readRuntimeBuildIdForEntry } from '../../kun/src/server/runtime-build-identity.js'
 
 /**
  * Resolve the Kun executable. Kun ships as a TypeScript
@@ -20,6 +21,14 @@ import { join } from 'node:path'
 export type KunBinaryResolution =
   | { kind: 'node-script'; command: string; args: string[]; dataDir: string }
   | { kind: 'custom'; command: string; args: string[]; dataDir: string }
+
+export function shouldRunKunServeAsElectronChild(input: {
+  platform: NodeJS.Platform
+  isPackaged: boolean
+  computerUseEnabled: boolean
+}): boolean {
+  return input.platform === 'darwin' && input.computerUseEnabled && !input.isPackaged
+}
 
 const DIST_ENTRY_CANDIDATES = [
   'kun/dist/cli/serve-entry.js',
@@ -95,6 +104,14 @@ export function resolveKunExecutable(
   }
 }
 
+export async function resolveKunRuntimeBuildId(
+  resolution: KunBinaryResolution
+): Promise<string | undefined> {
+  if (resolution.kind !== 'node-script') return undefined
+  const entry = resolution.args[0]
+  return entry ? readRuntimeBuildIdForEntry(entry) : undefined
+}
+
 /**
  * Build the full `kun serve` argv from resolved binary info
  * and Kun runtime settings. The function is pure: no I/O, no
@@ -105,32 +122,27 @@ export function buildKunServeArgs(input: {
   host: string
   port: number
   dataDir: string
-  baseUrl?: string
-  modelProxyUrl?: string
-  endpointFormat?: string
-  model: string
   approvalPolicy: string
   sandboxMode: string
+  approvalReviewer: string
   tokenEconomyMode: boolean
   insecure: boolean
 }): string[] {
   return [
     ...input.resolution.args,
+    'serve',
     '--host',
     input.host,
     '--port',
     String(input.port),
     '--data-dir',
     input.dataDir,
-    ...(input.baseUrl ? ['--base-url', input.baseUrl] : []),
-    ...(input.modelProxyUrl ? ['--model-proxy-url', input.modelProxyUrl] : []),
-    ...(input.endpointFormat ? ['--endpoint-format', input.endpointFormat] : []),
-    '--model',
-    input.model,
     '--approval-policy',
     input.approvalPolicy,
     '--sandbox-mode',
     input.sandboxMode,
+    '--approval-reviewer',
+    input.approvalReviewer,
     '--token-economy-mode',
     input.tokenEconomyMode ? 'true' : 'false',
     ...(input.insecure ? ['--insecure'] : [])

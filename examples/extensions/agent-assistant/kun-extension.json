@@ -1,0 +1,53 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "agent-assistant",
+  "publisher": "kun-examples",
+  "version": "0.1.0",
+  "displayName": "Agent Assistant",
+  "description": "A sidebar that creates and observes extension-owned Kun Agent runs.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "browser": "dist/webview/index.html",
+  "activationEvents": [
+    "onView:assistant",
+    "onAgentProfile:assistant"
+  ],
+  "contributes": {
+    "views.rightSidebar": [
+      {
+        "id": "assistant",
+        "title": "Agent Assistant",
+        "entry": "dist/webview/index.html",
+        "localResourceRoots": ["dist/webview"]
+      }
+    ],
+    "agentProfiles": [
+      {
+        "id": "assistant",
+        "title": "Extension Assistant",
+        "description": "Answers concise workspace questions while preserving Kun core policy.",
+        "instructions": "Be concise. Explain which public Kun capabilities you used. Never claim that an extension can approve protected actions.",
+        "budget": {
+          "maxTokens": 4096,
+          "maxElapsedMs": 120000,
+          "maxModelRequests": 8,
+          "maxToolInvocations": 12,
+          "maxEvents": 500
+        },
+        "visibility": "private"
+      }
+    ]
+  },
+  "permissions": [
+    "ui.views",
+    "webview",
+    "agent.run",
+    "agent.threads.readOwn"
+  ],
+  "stateSchemaVersion": 1
+}

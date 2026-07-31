@@ -54,6 +54,13 @@ vi.mock('./lsp-servers.js', () => ({
 import { createLspLocalTool } from './builtin-lsp-tool.js'
 
 describe('builtin lsp tool diagnostics', () => {
+  it('classifies language-server startup as approved command execution', () => {
+    expect(createLspLocalTool()).toMatchObject({
+      policy: 'on-request',
+      toolKind: 'command_execution'
+    })
+  })
+
   it('returns simplified best-effort diagnostics from the cache-backed operation', async () => {
     mocks.readFile.mockResolvedValue('const broken = true\n')
     mocks.findLanguageServerForFile.mockReturnValue({

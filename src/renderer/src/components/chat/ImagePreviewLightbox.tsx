@@ -1,4 +1,12 @@
-import { useEffect, useId, useState, type ReactElement } from 'react'
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactElement
+} from 'react'
 import { createPortal } from 'react-dom'
 import { Download, Minus, Plus, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -16,12 +24,38 @@ type ImagePreviewLightboxProps = {
   onClose: () => void
 }
 
-const MIN_ZOOM = 0.5
+const MIN_ZOOM = 0.25
 const MAX_ZOOM = 3
 const ZOOM_STEP = 0.25
+const PREVIEW_PADDING = 16
+
+type ImagePreviewSize = {
+  width: number
+  height: number
+}
 
 function clampZoom(value: number): number {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value))
+}
+
+export function imagePreviewDisplaySize(
+  naturalSize: ImagePreviewSize,
+  viewportSize: ImagePreviewSize,
+  zoom: number
+): ImagePreviewSize {
+  const boundedZoom = clampZoom(zoom)
+  const availableWidth = Math.max(1, viewportSize.width - PREVIEW_PADDING)
+  const availableHeight = Math.max(1, viewportSize.height - PREVIEW_PADDING)
+  const fitScale = Math.min(
+    1,
+    availableWidth / Math.max(1, naturalSize.width),
+    availableHeight / Math.max(1, naturalSize.height)
+  )
+
+  return {
+    width: naturalSize.width * fitScale * boundedZoom,
+    height: naturalSize.height * fitScale * boundedZoom
+  }
 }
 
 export function ImagePreviewLightbox({
@@ -38,6 +72,9 @@ export function ImagePreviewLightbox({
 }: ImagePreviewLightboxProps): ReactElement | null {
   const { t } = useTranslation('common')
   const [zoom, setZoom] = useState(1)
+  const [naturalSize, setNaturalSize] = useState<ImagePreviewSize | null>(null)
+  const [viewportSize, setViewportSize] = useState<ImagePreviewSize | null>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
   const titleId = useId()
   const closeLabel = t('imagePreviewClose')
   const resolvedTitle = title || alt || t('imagePreviewTitle')
@@ -58,18 +95,62 @@ export function ImagePreviewLightbox({
     }
   }, [open, onClose])
 
-  if (!open || typeof document === 'undefined') return null
+  useEffect(() => {
+    setNaturalSize(null)
+  }, [src])
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const viewport = viewportRef.current
+    if (!viewport) return
+
+    const updateViewportSize = (): void => {
+      const nextSize = { width: viewport.clientWidth, height: viewport.clientHeight }
+      setViewportSize((current) =>
+        current?.width === nextSize.width && current.height === nextSize.height
+          ? current
+          : nextSize
+      )
+    }
+    updateViewportSize()
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateViewportSize)
+      return () => window.removeEventListener('resize', updateViewportSize)
+    }
+
+    const resizeObserver = new ResizeObserver(updateViewportSize)
+    resizeObserver.observe(viewport)
+    return () => resizeObserver.disconnect()
+  }, [open])
 
   const zoomPercent = `${Math.round(zoom * 100)}%`
   const canDownload = !downloadDisabled && (typeof onDownload === 'function' || Boolean(downloadHref))
-  const imageClass =
-    zoom === 1
-      ? 'max-h-full max-w-full object-contain'
-      : 'max-w-none object-contain'
-  const imageStyle =
-    zoom === 1
-      ? undefined
-      : { width: `${zoom * 100}%` }
+  const imageSize = naturalSize && viewportSize
+    ? imagePreviewDisplaySize(naturalSize, viewportSize, zoom)
+    : null
+  const stageStyle: CSSProperties = viewportSize ? {
+    width: `${Math.max(viewportSize.width, (imageSize?.width ?? 0) + PREVIEW_PADDING)}px`,
+    height: `${Math.max(viewportSize.height, (imageSize?.height ?? 0) + PREVIEW_PADDING)}px`
+  } : {
+    width: '100%',
+    height: '100%'
+  }
+  const imageStyle: CSSProperties | undefined = imageSize ? {
+    width: `${imageSize.width}px`,
+    height: `${imageSize.height}px`
+  } : undefined
+  const imageWidth = imageSize?.width ?? 0
+  const imageHeight = imageSize?.height ?? 0
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport || imageWidth <= 0 || imageHeight <= 0) return
+    viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2)
+    viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2)
+  }, [imageHeight, imageWidth])
+
+  if (!open || typeof document === 'undefined') return null
 
   const downloadControl = onDownload ? (
     <button
@@ -120,14 +201,23 @@ export function ImagePreviewLightbox({
         </button>
       </div>
       <div className="flex h-full w-full items-center justify-center px-4 py-20 sm:px-8">
-        <div className="flex max-h-[calc(100dvh-128px)] w-full max-w-[min(1120px,calc(100vw-32px))] items-center justify-center overflow-auto rounded-[18px] border border-white/16 bg-[rgba(255,250,242,0.96)] p-2 shadow-[0_30px_90px_rgba(0,0,0,0.42)] dark:bg-zinc-950/88 sm:max-h-[calc(100dvh-144px)]">
-          <img
-            src={src}
-            alt={alt}
-            className={imageClass}
-            style={imageStyle}
-            draggable={false}
-          />
+        <div
+          ref={viewportRef}
+          className="h-full w-full max-w-[min(1120px,calc(100vw-32px))] overflow-auto rounded-[18px] border border-white/16 bg-[rgba(255,250,242,0.96)] shadow-[0_30px_90px_rgba(0,0,0,0.42)] dark:bg-zinc-950/88"
+        >
+          <div className="flex items-center justify-center p-2" style={stageStyle}>
+            <img
+              src={src}
+              alt={alt}
+              className={`${imageSize ? 'max-w-none' : 'h-auto w-auto max-h-full max-w-full'} block shrink-0 select-none object-contain`}
+              style={imageStyle}
+              draggable={false}
+              onLoad={(event) => {
+                const image = event.currentTarget
+                setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight })
+              }}
+            />
+          </div>
         </div>
       </div>
       <div className="absolute bottom-5 left-1/2 flex -translate-x-1/2 items-center overflow-hidden rounded-full bg-white text-zinc-700 shadow-[0_14px_34px_rgba(0,0,0,0.24)] dark:bg-zinc-100 dark:text-zinc-800">

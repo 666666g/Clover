@@ -1,7 +1,8 @@
 import type {
   UserInputGate,
   UserInputRequest,
-  UserInputResolution
+  UserInputResolution,
+  UserInputResolutionClaim
 } from '../ports/user-input-gate.js'
 
 type PendingResolver = {
@@ -17,6 +18,7 @@ type PendingResolver = {
 export class InMemoryUserInputGate implements UserInputGate {
   private readonly requests = new Map<string, UserInputRequest>()
   private readonly resolvers = new Map<string, PendingResolver>()
+  private readonly resolutionClaims = new Set<string>()
 
   request(input: UserInputRequest): Promise<UserInputResolution> {
     this.requests.set(input.id, input)
@@ -29,7 +31,33 @@ export class InMemoryUserInputGate implements UserInputGate {
     return this.requests.get(inputId)
   }
 
+  claimResolution(inputId: string): UserInputResolutionClaim | undefined {
+    const request = this.requests.get(inputId)
+    if (!request || this.resolutionClaims.has(inputId)) return undefined
+    this.resolutionClaims.add(inputId)
+    let closed = false
+    return {
+      request,
+      resolve: (resolution) => {
+        if (closed) return false
+        closed = true
+        if (!this.resolutionClaims.delete(inputId)) return false
+        return this.settle(inputId, resolution)
+      },
+      release: () => {
+        if (closed) return false
+        closed = true
+        return this.resolutionClaims.delete(inputId)
+      }
+    }
+  }
+
   resolve(inputId: string, resolution: UserInputResolution): boolean {
+    if (this.resolutionClaims.has(inputId)) return false
+    return this.settle(inputId, resolution)
+  }
+
+  private settle(inputId: string, resolution: UserInputResolution): boolean {
     const request = this.requests.get(inputId)
     if (!request) return false
     this.requests.delete(inputId)
@@ -40,8 +68,10 @@ export class InMemoryUserInputGate implements UserInputGate {
   }
 
   pending(threadId?: string): UserInputRequest[] {
-    return [...this.requests.values()].filter(
-      (request) => !threadId || request.threadId === threadId
+    return [...this.requests.entries()].flatMap(([inputId, request]) =>
+      this.resolutionClaims.has(inputId) || (threadId && request.threadId !== threadId)
+        ? []
+        : [request]
     )
   }
 
@@ -51,5 +81,6 @@ export class InMemoryUserInputGate implements UserInputGate {
     }
     this.requests.clear()
     this.resolvers.clear()
+    this.resolutionClaims.clear()
   }
 }

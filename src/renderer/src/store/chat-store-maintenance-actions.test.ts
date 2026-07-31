@@ -1,6 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatBlock, NormalizedThread, ThreadGoal, ThreadGoalStatus } from '../agent/types'
 import type { ChatState, ChatStoreGet, ChatStoreSet, SendMessageOverrides } from './chat-store-types'
+import type { BrowserStorageLike } from '../lib/browser-storage'
+import {
+  emptyDesignThreadRegistry,
+  isDesignThreadId,
+  markDesignThread,
+  readDesignThreadRegistry,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
 
 const registryMock = vi.hoisted(() => ({
   getProvider: vi.fn()
@@ -10,7 +18,10 @@ vi.mock('../agent/registry', () => ({
   getProvider: registryMock.getProvider
 }))
 
-import { createMaintenanceActions } from './chat-store-maintenance-actions'
+import {
+  createMaintenanceActions,
+  type MaintenanceActionDependencies
+} from './chat-store-maintenance-actions'
 
 type GoalPatch = {
   objective?: string
@@ -24,9 +35,11 @@ type Harness = {
   drainQueuedMessages: ReturnType<typeof vi.fn>
   get: ChatStoreGet
   provider: {
+    deleteThread: ReturnType<typeof vi.fn>
     setThreadGoal: ReturnType<typeof vi.fn>
     clearThreadGoal: ReturnType<typeof vi.fn>
     interruptTurn: ReturnType<typeof vi.fn>
+    submitApprovalDecision: ReturnType<typeof vi.fn>
     forkThread: ReturnType<typeof vi.fn>
     rewindThread: ReturnType<typeof vi.fn>
   }
@@ -35,6 +48,32 @@ type Harness = {
   selectThread: ReturnType<typeof vi.fn>
   sendMessage: ReturnType<typeof vi.fn>
   state: ChatState
+}
+
+class MemoryStorage implements BrowserStorageLike {
+  private readonly values = new Map<string, string>()
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value)
+  }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 function thread(id: string, goal: ThreadGoal | null = null): NormalizedThread {
@@ -71,6 +110,7 @@ function buildHarness(options: {
   activeThreadId?: string | null
   createThreadSucceeds?: boolean
   initialGoal?: ThreadGoal | null
+  maintenanceDependencies?: MaintenanceActionDependencies
 } = {}): Harness {
   const activeThreadId = options.activeThreadId === undefined ? 'thr_existing' : options.activeThreadId
   const createThreadSucceeds = options.createThreadSucceeds ?? true
@@ -78,6 +118,7 @@ function buildHarness(options: {
   let state: ChatState
 
   const provider = {
+    deleteThread: vi.fn(async () => undefined),
     setThreadGoal: vi.fn(async (threadId: string, patch: GoalPatch) =>
       goal(
         threadId,
@@ -87,6 +128,7 @@ function buildHarness(options: {
     ),
     clearThreadGoal: vi.fn(async () => true),
     interruptTurn: vi.fn(async () => undefined),
+    submitApprovalDecision: vi.fn(async () => 'submitted' as const),
     rewindThread: vi.fn(async () => undefined),
     forkThread: vi.fn(async (
       threadId: string,
@@ -132,6 +174,7 @@ function buildHarness(options: {
     runtimeConnection: 'ready',
     sendMessage,
     settingsSection: 'general',
+    workspaceRoot: '/workspace/deepseek-gui',
     threads: activeThreadId ? [thread(activeThreadId, initialGoal)] : []
   } as unknown as ChatState
 
@@ -144,10 +187,14 @@ function buildHarness(options: {
     set,
     get,
     sseAbortRef: { current: null }
-  })
+  }, options.maintenanceDependencies)
 
   return { actions, createThread, drainQueuedMessages, get, provider, recoverActiveTurn, refreshThreads, selectThread, sendMessage, state }
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe('chat-store-maintenance-actions fork actions', () => {
   beforeEach(() => {
@@ -168,6 +215,77 @@ describe('chat-store-maintenance-actions fork actions', () => {
     expect(refreshThreads).toHaveBeenCalledTimes(1)
     expect(selectThread).toHaveBeenCalledWith('thr_forked')
     expect(state.activeThreadId).toBe('thr_forked')
+  })
+})
+
+describe('chat-store-maintenance-actions compaction', () => {
+  beforeEach(() => {
+    registryMock.getProvider.mockReset()
+  })
+
+  it('does not mutate cumulative usage to simulate a smaller context', async () => {
+    const { actions, provider, state } = buildHarness()
+    const usage = {
+      threadId: 'thr_existing',
+      snapshot: {
+        inputTokens: 120_000,
+        outputTokens: 5_000,
+        reasoningTokens: 0,
+        cachedTokens: 80_000,
+        cacheMissTokens: 40_000,
+        cacheHitRate: 2 / 3,
+        totalTokens: 125_000,
+        costUsd: 1,
+        costCny: null,
+        tokenEconomySavingsTokens: 0,
+        turns: 4
+      }
+    }
+    Object.assign(provider, {
+      compactThread: vi.fn(async () => ({ replacedTokens: 50_000 }))
+    })
+    Object.assign(state, {
+      busy: false,
+      lastTurnUsage: usage,
+      usageRefreshKey: 7
+    })
+
+    await actions.compactActiveThread()
+
+    expect(state.lastTurnUsage).toBe(usage)
+    expect(state.usageRefreshKey).toBe(7)
+  })
+})
+
+describe('chat-store-maintenance-actions delete actions', () => {
+  beforeEach(() => {
+    registryMock.getProvider.mockReset()
+  })
+
+  it('removes deleted design threads from the design registry', async () => {
+    const storage = new MemoryStorage()
+    saveDesignThreadRegistry(
+      markDesignThread(
+        '/workspace/deepseek-gui',
+        'login',
+        'thr_design',
+        emptyDesignThreadRegistry()
+      ),
+      storage
+    )
+    vi.stubGlobal('window', { localStorage: storage })
+    const { actions, provider, refreshThreads, state } = buildHarness({ activeThreadId: 'thr_design' })
+    state.threads = [thread('thr_design')]
+    state.watchTurnCompletion = { thr_design: true }
+    state.unreadThreadIds = { thr_design: true }
+
+    await actions.deleteThread(' thr_design ')
+
+    expect(provider.deleteThread).toHaveBeenCalledWith('thr_design')
+    expect(isDesignThreadId('thr_design', readDesignThreadRegistry(storage))).toBe(false)
+    expect(state.threads).toEqual([])
+    expect(state.activeThreadId).toBeNull()
+    expect(refreshThreads).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -201,10 +319,51 @@ describe('chat-store-maintenance-actions workspace rollback', () => {
 
       await actions.rollbackWorkspaceToCheckpoint(' gcp_1 ')
 
-      expect(restoreGitCheckpoint).toHaveBeenCalledWith({ checkpointId: 'gcp_1' })
+      expect(restoreGitCheckpoint).toHaveBeenCalledWith({
+        checkpointId: 'gcp_1',
+        expectedThreadId: 'thr_existing',
+        expectedWorkspaceRoot: '/workspace/deepseek-gui'
+      })
       expect(provider.rewindThread).not.toHaveBeenCalled()
       expect(sendMessage).not.toHaveBeenCalled()
       expect(state.blocks).toHaveLength(2)
+      expect(state.error).toBeNull()
+    } finally {
+      ;(globalThis as { window?: unknown }).window = previousWindow
+    }
+  })
+
+  it('validates restore against the thread workspace when the global picker points elsewhere', async () => {
+    const previousWindow = globalThis.window
+    const restoreGitCheckpoint = vi.fn(async () => ({
+      ok: true,
+      checkpointId: 'gcp_1',
+      repositoryRoot: '/workspace/deepseek-gui',
+      head: 'abc123',
+      currentBranch: 'develop',
+      rescueCheckpointId: 'gcp_rescue'
+    }))
+    ;(globalThis as { window?: unknown }).window = {
+      confirm: vi.fn(() => true),
+      kunGui: {
+        restoreGitCheckpoint
+      }
+    }
+    try {
+      const { actions, state } = buildHarness()
+      state.workspaceRoot = '/workspace/kun-ui-extend'
+      state.blocks = [
+        { kind: 'user', id: 'user_1', turnId: 'turn_1', text: 'question', meta: { workspaceCheckpointId: 'gcp_1' } },
+        { kind: 'assistant', id: 'assistant_1', turnId: 'turn_1', text: 'answer' }
+      ]
+
+      await actions.rollbackWorkspaceToCheckpoint('gcp_1')
+
+      expect(restoreGitCheckpoint).toHaveBeenCalledWith({
+        checkpointId: 'gcp_1',
+        expectedThreadId: 'thr_existing',
+        expectedWorkspaceRoot: '/workspace/deepseek-gui'
+      })
       expect(state.error).toBeNull()
     } finally {
       ;(globalThis as { window?: unknown }).window = previousWindow
@@ -309,7 +468,11 @@ describe('chat-store-maintenance-actions workspace rollback', () => {
 
       await actions.rollbackWorkspaceToCheckpoint('gcp_1')
 
-      expect(restoreGitCheckpoint).toHaveBeenCalledWith({ checkpointId: 'gcp_1' })
+      expect(restoreGitCheckpoint).toHaveBeenCalledWith({
+        checkpointId: 'gcp_1',
+        expectedThreadId: 'thr_existing',
+        expectedWorkspaceRoot: '/workspace/deepseek-gui'
+      })
       expect(consoleInfo).toHaveBeenCalledTimes(1)
       const logArgs = consoleInfo.mock.calls[0]
       expect(logArgs[0]).toBe('[rollback] rescue checkpoint:')
@@ -320,6 +483,161 @@ describe('chat-store-maintenance-actions workspace rollback', () => {
       expect(state.error).toBeNull()
     } finally {
       console.info = previousConsoleInfo
+      ;(globalThis as { window?: unknown }).window = previousWindow
+    }
+  })
+})
+
+describe('chat-store-maintenance-actions rewind and resend', () => {
+  beforeEach(() => {
+    registryMock.getProvider.mockReset()
+  })
+
+  it('rebuilds canvas context and preserves tool routing for edited architecture prompts', async () => {
+    const prepareCodeCanvasResend = vi.fn(async () => ({
+      text: 'architecture prompt with live canvas snapshot',
+      displayText: '\u7ed9\u6211\u8bbe\u8ba1\u4e00\u4e2a\u5f53\u524d\u76ee\u5f55\u7684\u67b6\u6784\u56fe',
+      guiDesignCanvas: true as const
+    }))
+    const requestCodeCanvasPanelOpen = vi.fn()
+    const { actions, provider, sendMessage, state } = buildHarness({
+      maintenanceDependencies: {
+        prepareCodeCanvasResend,
+        requestCodeCanvasPanelOpen
+      }
+    })
+    Object.assign(state, {
+      route: 'chat',
+      busy: false,
+      blocks: [
+        {
+          kind: 'user',
+          id: 'user_1',
+          text: 'old prompt',
+          meta: { turnId: 'turn_1', guiDesignCanvas: true }
+        },
+        { kind: 'assistant', id: 'assistant_1', text: 'old answer' }
+      ],
+      queuedMessages: [],
+      turnStartedAtByUserId: {},
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {}
+    })
+
+    await actions.rewindAndResend(
+      'user_1',
+      '  \u7ed9\u6211\u8bbe\u8ba1\u4e00\u4e2a\u5f53\u524d\u76ee\u5f55\u7684\u67b6\u6784\u56fe  '
+    )
+
+    expect(prepareCodeCanvasResend).toHaveBeenCalledWith({
+      route: 'chat',
+      text: '\u7ed9\u6211\u8bbe\u8ba1\u4e00\u4e2a\u5f53\u524d\u76ee\u5f55\u7684\u67b6\u6784\u56fe',
+      previousCanvasTurn: true,
+      fallbackWorkspaceRoot: '/workspace/deepseek-gui',
+      threadWorkspaceRoot: '/workspace/deepseek-gui',
+      threadId: 'thr_existing'
+    })
+    expect(provider.rewindThread).toHaveBeenCalledWith('thr_existing', 'turn_1')
+    expect(requestCodeCanvasPanelOpen).toHaveBeenCalledTimes(1)
+    expect(sendMessage).toHaveBeenCalledWith(
+      'architecture prompt with live canvas snapshot',
+      'agent',
+      {
+        displayText: '\u7ed9\u6211\u8bbe\u8ba1\u4e00\u4e2a\u5f53\u524d\u76ee\u5f55\u7684\u67b6\u6784\u56fe',
+        guiDesignCanvas: true
+      }
+    )
+  })
+
+  it('keeps non-canvas edited prompts on the existing resend path', async () => {
+    const prepareCodeCanvasResend = vi.fn(async () => null)
+    const requestCodeCanvasPanelOpen = vi.fn()
+    const { actions, provider, sendMessage, state } = buildHarness({
+      maintenanceDependencies: {
+        prepareCodeCanvasResend,
+        requestCodeCanvasPanelOpen
+      }
+    })
+    Object.assign(state, {
+      route: 'chat',
+      busy: false,
+      blocks: [
+        {
+          kind: 'user',
+          id: 'user_1',
+          text: 'old prompt',
+          meta: { turnId: 'turn_1' }
+        },
+        { kind: 'assistant', id: 'assistant_1', text: 'old answer' }
+      ],
+      queuedMessages: [],
+      turnStartedAtByUserId: {},
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {}
+    })
+
+    await actions.rewindAndResend('user_1', '  Refactor this module  ')
+
+    expect(provider.rewindThread).toHaveBeenCalledWith('thr_existing', 'turn_1')
+    expect(requestCodeCanvasPanelOpen).not.toHaveBeenCalled()
+    expect(sendMessage).toHaveBeenCalledWith('Refactor this module')
+  })
+
+  it('restores checkpoints against the thread workspace when resending under another global picker root', async () => {
+    const previousWindow = globalThis.window
+    const restoreGitCheckpoint = vi.fn(async () => ({
+      ok: true,
+      checkpointId: 'gcp_1',
+      repositoryRoot: '/workspace/deepseek-gui',
+      head: 'abc123',
+      currentBranch: 'develop',
+      rescueCheckpointId: null
+    }))
+    ;(globalThis as { window?: unknown }).window = {
+      kunGui: {
+        restoreGitCheckpoint
+      }
+    }
+    try {
+      const prepareCodeCanvasResend = vi.fn(async () => null)
+      const { actions, provider, sendMessage, state } = buildHarness({
+        maintenanceDependencies: {
+          prepareCodeCanvasResend
+        }
+      })
+      Object.assign(state, {
+        route: 'chat',
+        busy: false,
+        workspaceRoot: '/workspace/kun-ui-extend',
+        blocks: [
+          {
+            kind: 'user',
+            id: 'user_1',
+            text: 'old prompt',
+            meta: { turnId: 'turn_1', workspaceCheckpointId: 'gcp_1' }
+          },
+          { kind: 'assistant', id: 'assistant_1', text: 'old answer' }
+        ],
+        queuedMessages: [],
+        turnStartedAtByUserId: {},
+        turnDurationByUserId: {},
+        turnReasoningFirstAtByUserId: {},
+        turnReasoningLastAtByUserId: {}
+      })
+
+      await actions.rewindAndResend('user_1', '  Retry release review  ')
+
+      expect(restoreGitCheckpoint).toHaveBeenCalledWith({
+        checkpointId: 'gcp_1',
+        expectedThreadId: 'thr_existing',
+        expectedWorkspaceRoot: '/workspace/deepseek-gui'
+      })
+      expect(provider.rewindThread).toHaveBeenCalledWith('thr_existing', 'turn_1')
+      expect(sendMessage).toHaveBeenCalledWith('Retry release review')
+      expect(state.error).toBeNull()
+    } finally {
       ;(globalThis as { window?: unknown }).window = previousWindow
     }
   })
@@ -437,6 +755,60 @@ describe('chat-store-maintenance-actions goal actions', () => {
     expect(refreshThreads).toHaveBeenCalledTimes(1)
   })
 
+  it('restores a pending approval when the protected native prompt is cancelled', async () => {
+    const { actions, provider, state } = buildHarness()
+    provider.submitApprovalDecision.mockResolvedValueOnce('cancelled')
+    state.blocks = [{
+      kind: 'approval',
+      id: 'approval-cancelled',
+      approvalId: 'appr_cancelled',
+      summary: 'Approve command',
+      status: 'pending'
+    }]
+
+    await actions.resolveApproval('approval-cancelled', 'allow')
+
+    expect(provider.submitApprovalDecision).toHaveBeenCalledWith(
+      'appr_cancelled',
+      'allow',
+      true
+    )
+    expect(state.blocks[0]).toMatchObject({ status: 'pending' })
+  })
+
+  it('does not overwrite an SSE-expired approval when submission resolves later', async () => {
+    const submission = deferred<'submitted' | 'cancelled'>()
+    const { actions, provider, state } = buildHarness()
+    provider.submitApprovalDecision.mockReturnValueOnce(submission.promise)
+    state.blocks = [{
+      kind: 'approval',
+      id: 'approval-expired',
+      approvalId: 'appr_expired',
+      summary: 'Approve command',
+      status: 'pending'
+    }]
+
+    const resolving = actions.resolveApproval('approval-expired', 'allow')
+    await vi.waitFor(() => expect(state.blocks[0]).toMatchObject({ status: 'submitting' }))
+
+    state.blocks = state.blocks.map((block) =>
+      block.id === 'approval-expired' && block.kind === 'approval'
+        ? {
+            ...block,
+            status: 'expired',
+            errorMessage: 'turn aborted while awaiting approval'
+          }
+        : block
+    )
+    submission.resolve('submitted')
+    await resolving
+
+    expect(state.blocks[0]).toMatchObject({
+      status: 'expired',
+      errorMessage: 'turn aborted while awaiting approval'
+    })
+  })
+
   it('settles local runtime work before the backend interrupt resolves', async () => {
     const { actions, provider, recoverActiveTurn, refreshThreads, state } = buildHarness()
     const blocks: ChatBlock[] = [
@@ -467,6 +839,7 @@ describe('chat-store-maintenance-actions goal actions', () => {
       blocks,
       busy: true,
       currentTurnId: 'turn-1',
+      currentTurnOrchestration: 'graph',
       currentTurnUserId: 'user-1',
       liveAssistant: 'partial answer',
       liveReasoning: '',
@@ -487,6 +860,7 @@ describe('chat-store-maintenance-actions goal actions', () => {
     expect(busyWhenBackendCalled).toBe(false)
     expect(state.busy).toBe(false)
     expect(state.currentTurnId).toBeNull()
+    expect(state.currentTurnOrchestration).toBeNull()
     expect(state.currentTurnUserId).toBeNull()
     expect(state.liveAssistant).toBe('')
     expect(state.blocks.map((block) => ('status' in block ? block.status : block.kind))).toEqual([

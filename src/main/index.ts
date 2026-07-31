@@ -5,12 +5,19 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   Notification,
   powerSaveBlocker,
+  protocol,
+  screen,
+  session,
+  shell,
+  systemPreferences,
   Tray,
   type ContextMenuParams,
   type MenuItemConstructorOptions
 } from 'electron'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,13 +28,48 @@ import {
 import kunLogoPng from '../asset/img/kun.png?url'
 import kunMacLogoPng from '../asset/img/kun_mac.png?url'
 import kunTrayPng from '../asset/img/kun_tray.png?url'
-import { createAppIcon, pickTrayIcon, prepareTrayIcon } from './app-icon'
+import kunTrayMacPng from '../asset/img/kun_tray_mac.png?url'
+import kunTrayMacRetinaPng from '../asset/img/kun_tray_mac@2x.png?url'
+import {
+  createAppIcon,
+  createMultiScaleIcon,
+  notificationIconOptions,
+  pickTrayIcon,
+  prepareTrayIcon
+} from './app-icon'
 import { buildTrayMenuTemplate, parseTrayThreads, type TrayThreadSummary } from './tray-session-menu'
+import { listProviderQuotas } from './provider-quota'
+import { registerTrayQuotaIpc } from './tray-quota-ipc'
+import {
+  resolveTrayQuotaAnchorBounds,
+  resolveTrayQuotaPopoverPosition
+} from './tray-quota-position'
+import { TRAY_PROVIDER_QUOTA_CHANNELS } from '../shared/tray-provider-quota'
 import { configureLinuxWaylandImeSwitches } from './app-command-line'
+import {
+  clearDevelopmentRendererHttpCache,
+  configureDevelopmentRendererHttpCache,
+  reloadRenderer
+} from './dev-renderer-cache'
 import { configureAppIdentity } from './app-identity'
 import { shouldStartHidden, syncLoginItemSettings } from './desktop-behavior'
-import { resolveLogDirectory, resolvePreloadPath } from './main-paths'
-import { runLegacyKunDataMigration } from './legacy-data-migration'
+import { resolveLogDirectory, resolveNamedPreloadPath, resolvePreloadPath } from './main-paths'
+import {
+  HOME_DATA_MIGRATION_MAPPINGS,
+  migrateLegacyHomeDataDirs,
+  migrateLegacyUserDataDir,
+  rewriteLegacyPathsInSettingsFile
+} from './legacy-data-migration'
+import {
+  markCanonicalKunRuntimeMigrationRuntimeVerified,
+  runCanonicalKunRuntimeDataMigration
+} from './runtime-data-dir-migration'
+import { assertNoActiveKunRuntimeUsingDataDir } from './runtime-data-dir-ownership'
+import {
+  LegacyProviderSettingsMigrationCoordinator,
+  resolveSettingsDataDir
+} from './legacy-provider-settings-migration'
+import { resetUnreadableWindowsCredentials } from './credential-recovery'
 import {
   applyKunRuntimePatch,
   kunSettingsEnvelope,
@@ -38,6 +80,7 @@ import {
   mergeWorkflowSettings,
   mergeAppBehaviorSettings,
   mergeModelProviderSettings,
+  mergeDesignSettings,
   mergeScheduleSettings,
   mergeWriteSettings,
   mergeTerminalSettings,
@@ -55,26 +98,44 @@ import {
 } from '../shared/app-settings'
 import { parseRuntimeErrorBody, runtimeErrorToError, type RuntimeErrorCode } from '../shared/runtime-error'
 import type { GuiUpdateState } from '../shared/gui-update'
-import type { TrayActionPayload } from '../shared/kun-gui-api'
+import type {
+  KunRuntimeSettingsSyncStatusPayload,
+  TrayActionPayload,
+  TurnCompleteNotificationPayload
+} from '../shared/kun-gui-api'
 import { isAllowedDevPreviewUrl } from '../shared/dev-preview-url'
 import { isAuthorizedPrototypeFileUrl } from './services/prototype-embed-registry'
-import { fetchUpstreamModelIds } from './upstream-models'
+import { fetchUpstreamModelIds, modelListFromSharedConnections } from './upstream-models'
 import {
   kunRuntimeAdapter,
   getRuntimeBaseUrlForSettings,
   runtimeAuthHeaders,
-  runtimeRequestViaHost
+  runtimeRequestViaHost,
+  type RuntimeRequestInit
 } from './runtime/kun-adapter'
 import { waitForRuntimeTurnsIdle } from './runtime/managed-runtime-idle'
 import {
   resolveKunDataDir,
   setKunUnexpectedExitHandler,
+  syncGuiManagedKunConfig,
   waitForKunStartupSettled,
   type KunUnexpectedExitInfo
 } from './kun-process'
-import { RestartBudget, type KunRuntimeStatus } from './kun-runtime-supervisor'
-import { configureLogger, logError, logWarn, pruneOnStartup } from './logger'
+import { expandHomePath } from './settings-store'
+import { KunRuntimeSupervisor, type KunRuntimeStatus } from './kun-runtime-supervisor'
+import { managedKunHostCanAutoStart } from './managed-runtime-startup-policy'
+import { configureLogger, logError, logInfo, logWarn, pruneOnStartup } from './logger'
 import { cleanupUnusedGitCheckpointsIfDue } from './services/git-checkpoint-service'
+import { resolveMainWindowCloseDecision } from './window-close-behavior'
+import { turnCompleteNotificationDisabledReason } from './notification-preferences'
+import {
+  MAIN_WINDOW_RENDERER_RECOVERY_DELAY_MS,
+  MAIN_WINDOW_RENDERER_RECOVERY_MAX_ATTEMPTS,
+  MAIN_WINDOW_RENDERER_RECOVERY_WINDOW_MS,
+  MainWindowRendererRecoveryBudget,
+  shouldRecoverMainFrameLoad,
+  shouldRecoverRendererProcess
+} from './main-window-renderer-recovery'
 import { createClawRuntime, type ClawRuntime } from './claw-runtime'
 import { createScheduleRuntime, type ScheduleRuntime } from './schedule-runtime'
 import { createWorkflowRuntime, type WorkflowRuntime } from './workflow-runtime'
@@ -85,7 +146,16 @@ import {
   syncClawScheduleMcpConfig,
   type ClawScheduleMcpLaunchConfig
 } from './claw-schedule-mcp-config'
+import {
+  kunRuntimeConfigChanged,
+  runtimeSettingsRollbackPatch,
+  runtimeSettingsApplyMode,
+  stableSettingsStringify,
+  type RuntimeSettingsApplyMode
+} from './runtime-settings-apply-mode'
 import { registerAppIpcHandlers } from './ipc/register-app-ipc-handlers'
+import { DataMigrationController } from './data-migration/data-migration-controller'
+import { resolveDataMigrationFeatureEnabled } from './data-migration/feature-policy'
 import {
   configureManagedWeixinBridgeUrlResolver,
   pollFeishuInstall,
@@ -95,6 +165,7 @@ import {
 } from './claw-platform-install'
 import { registerRuntimeSseIpc } from './runtime-sse-ipc'
 import { registerTerminalPtyIpc } from './terminal/terminal-pty-ipc'
+import { maybePromptCliInstall, registerCliInstallIpc } from './cli-install-service'
 import {
   configureWeixinBridgeRuntimeContextProvider,
   ensureWeixinBridgeRpcUrl,
@@ -104,9 +175,50 @@ import {
 } from './weixin-bridge-runtime'
 import { webhookUrl } from './claw-runtime-helpers'
 import { createTelegramRuntime, type TelegramRuntime, verifyTelegramBotToken } from './telegram-runtime'
-import { isKunHealthResponseBody } from './kun-health'
+import { shutdownLocalWhisperService } from './services/local-whisper-service'
+import { KunRuntimeHealthMonitor } from './runtime/kun-runtime-health-monitor'
+import {
+  buildManagedRuntimeHotApplyBody,
+  classifyManagedRuntimeHotApplyResponse
+} from './runtime/kun-runtime-config-service'
+import { ManagedRuntimeShutdownCoordinator } from './runtime/managed-runtime-shutdown-coordinator'
+import {
+  registerKunExtensionProtocol,
+} from './extensions/extension-resource-protocol'
+import {
+  ExtensionMediaProtocolRegistry,
+  registerKunExtensionPlatformSchemesAsPrivileged
+} from './extensions/extension-media-protocol'
+import { ExtensionDescriptorResolver } from './extensions/extension-descriptor-resolver'
+import { ExtensionViewSessionRegistry } from './extensions/extension-view-sessions'
+import { ExtensionExternalBrowserManager } from './extensions/extension-external-browser'
+import { ExtensionViewProtocolRegistry } from './extensions/extension-view-protocol-registry'
+import { installWebviewSecurityGuards } from './extensions/extension-webview-security'
+import {
+  ExtensionConsentTokenService,
+  ProtectedExtensionActionService
+} from './extensions/extension-consent-service'
+import { localizeProtectedExtensionPrompt } from './extensions/protected-extension-prompt'
+import { ProtectedCredentialSurfaceController } from './extensions/protected-credential-surface'
+import { ExtensionContentScriptController } from './extensions/extension-content-script-controller'
+import { createExtensionWorkbenchEnvironment } from './extensions/extension-workbench-environment'
+import {
+  registerExtensionIpcHandlers,
+  startExtensionNotificationPump,
+  startExtensionSecretRevealConsentPump,
+  type RegisterExtensionIpcHandlersOptions
+} from './ipc/register-extension-ipc-handlers'
+import { WorkspacePreviewProtocolRegistry } from './services/workspace-preview-protocol'
+import {
+  configureBrowserUseHost,
+  stopBrowserUseHost,
+  updateBrowserUseHostSettings
+} from './browser-use/browser-use-host'
+import { registerBrowserUseIpc } from './browser-use/register-browser-use-ipc'
+import { browserUseCleanupForRuntimeRequest } from './browser-use/thread-lifecycle'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+registerKunExtensionPlatformSchemesAsPrivileged(protocol)
 // 品牌升级为 Kun 后仍保留旧 AppUserModelId:它必须和 electron-builder
 // 的 appId 一致才能让 Windows 通知 / 任务栏分组在升级前后连续,而
 // appId 因为 NSIS 升级 GUID 与 macOS 更新签名校验的原因永远不改。
@@ -176,7 +288,7 @@ function runtimeJsonError(code: string, message: string): Error {
 traceStartup('main module evaluated')
 
 if (runningClawScheduleMcpServer && process.platform === 'darwin') {
-  app.dock.hide()
+  app.dock?.hide()
 }
 
 // 在最早的阶段把 app 名称、AppUserModelId 都设好。
@@ -189,22 +301,21 @@ configureAppIdentity()
 // 紧跟在身份设置之后、requestSingleInstanceLock() 之前做旧数据迁移:
 // 单实例锁文件就放在 userData 里,必须先把目录定下来。rename 失败
 // (典型场景:老版本还在运行)时退回旧目录,功能不受影响,下次再迁。
-const legacyMigration = runLegacyKunDataMigration({
+const legacyUserDataMigration = migrateLegacyUserDataDir({
   userDataPath: app.getPath('userData'),
-  homeDir: homedir(),
   log: (message, detail) => console.warn(`[kun-gui] ${message}`, detail ?? '')
 })
-if (legacyMigration.userData.usedLegacyFallback) {
-  app.setPath('userData', legacyMigration.userData.userDataPath)
+if (legacyUserDataMigration.usedLegacyFallback) {
+  app.setPath('userData', legacyUserDataMigration.userDataPath)
 }
-traceStartup('legacy data migration checked', {
-  userDataPath: legacyMigration.userData.userDataPath,
-  migratedUserData: legacyMigration.userData.migrated,
-  usedLegacyFallback: legacyMigration.userData.usedLegacyFallback,
-  settingsRewritten: legacyMigration.settingsRewritten
+traceStartup('legacy userData migration checked', {
+  userDataPath: legacyUserDataMigration.userDataPath,
+  migratedUserData: legacyUserDataMigration.migrated,
+  usedLegacyFallback: legacyUserDataMigration.usedLegacyFallback
 })
 
 configureLinuxWaylandImeSwitches()
+configureDevelopmentRendererHttpCache(app.commandLine, devServerHintUrl())
 
 if (!runningClawScheduleMcpServer && process.platform === 'win32') {
   app.setAppUserModelId(APP_USER_MODEL_ID)
@@ -217,15 +328,20 @@ let clawRuntime: ClawRuntime | null = null
 let scheduleRuntime: ScheduleRuntime | null = null
 let telegramRuntime: TelegramRuntime | null = null
 let workflowRuntime: WorkflowRuntime | null = null
-let managedRuntimesStoppedForQuit = false
-let managedRuntimesStopPromise: Promise<void> | null = null
 let appBehavior: AppBehaviorConfigV1 = normalizeAppBehaviorSettings()
 let tray: Tray | null = null
 let trayMenu: Menu | null = null
 let trayMenuOpenPromise: Promise<void> | null = null
-let isQuitting = false
+let trayQuotaWindow: BrowserWindow | null = null
+let trayQuotaWindowReady: Promise<void> | null = null
+let trayQuotaToggleGeneration = 0
+let disposeTrayQuotaIpc: (() => void) | null = null
 let closeWindowPromptOpen = false
 let checkpointCleanupTimer: ReturnType<typeof setInterval> | null = null
+const extensionViewSessions = new ExtensionViewSessionRegistry()
+const extensionExternalBrowsers = new ExtensionExternalBrowserManager(extensionViewSessions)
+let protectedCredentialSurface: ProtectedCredentialSurfaceController | null = null
+let bindExtensionMainWindow: ((window: BrowserWindow) => void) | undefined
 
 type GuiUpdaterModule = typeof import('./gui-updater')
 
@@ -244,27 +360,57 @@ function stopCheckpointCleanupTimer(): void {
   }
 }
 
-async function runCheckpointCleanupIfDue(settings: AppSettingsV1): Promise<void> {
-  if (!settings.checkpointCleanup.enabled) return
-  const runtime = resolveKunRuntimeSettings(settings)
-  const dataDir = resolveKunDataDir(runtime)
-  const intervalDays = settings.checkpointCleanup.intervalDays
+function isAppQuitInProgress(): boolean {
+  return runtimeShutdown.isQuitInProgress
+}
+
+function setUpdateInstallQuitting(active: boolean): void {
+  runtimeShutdown.setUpdateInstallQuit(active)
+}
+
+async function runCheckpointCleanup(
+  settings: AppSettingsV1,
+  options: { force?: boolean; reason?: string } = {}
+): Promise<void> {
   try {
-    const cleanup = await cleanupUnusedGitCheckpointsIfDue({ dataDir, intervalDays })
+    assertCanonicalRuntimeMigrationReady()
+    const force = options.force === true
+    const reason = options.reason ?? (force ? 'forced' : 'interval')
+    // Startup / upgrade retention always runs. The settings toggle only gates the
+    // periodic background timer so a previous "cleanup off" cannot leave gigabytes
+    // of stale checkpoints behind after relaunch or app update.
+    if (!force && !settings.checkpointCleanup.enabled) return
+    const runtime = resolveKunRuntimeSettings(settings)
+    const dataDir = resolveKunDataDir(runtime)
+    const intervalDays = settings.checkpointCleanup.intervalDays
+    const checkpointsRoot = settings.checkpointCleanup.directory?.trim()
+      ? expandHomePath(settings.checkpointCleanup.directory.trim())
+      : undefined
+    const maxPerThread = settings.checkpointCleanup.maxPerThread
+    const cleanup = await cleanupUnusedGitCheckpointsIfDue({
+      dataDir,
+      intervalDays,
+      appVersion: app.getVersion(),
+      ...(force ? { force: true } : {}),
+      ...(checkpointsRoot ? { checkpointsRoot } : {}),
+      ...(maxPerThread !== undefined ? { maxPerThread } : {})
+    })
     if (!cleanup.due) return
     const { result } = cleanup
     console.info(
-      `[kun-gui] git checkpoint cleanup scanned=${result.scanned} deleted=${result.deleted} kept=${result.kept} failed=${result.failed}`
+      `[kun-gui] git checkpoint cleanup reason=${reason} scanned=${result.scanned} deleted=${result.deleted} kept=${result.kept} failed=${result.failed}`
     )
     if (result.failed > 0) {
       logWarn('git-checkpoint-cleanup', 'failed to delete some unused checkpoints', {
         failed: result.failed,
-        failedIds: result.failedIds
+        failedIds: result.failedIds,
+        reason
       })
     }
   } catch (error) {
     logWarn('git-checkpoint-cleanup', 'failed to clean unused checkpoints', {
-      message: error instanceof Error ? error.message : String(error)
+      message: error instanceof Error ? error.message : String(error),
+      reason: options.reason ?? (options.force ? 'forced' : 'interval')
     })
   }
 }
@@ -273,34 +419,38 @@ function syncCheckpointCleanupTimer(settings: AppSettingsV1): void {
   stopCheckpointCleanupTimer()
   if (!settings.checkpointCleanup.enabled) return
   const intervalMs = settings.checkpointCleanup.intervalDays * 24 * 60 * 60 * 1_000
-  const run = (): void => {
-    void runCheckpointCleanupIfDue(settings)
-  }
-  run()
-  checkpointCleanupTimer = setInterval(run, intervalMs)
+  // Interval / version-upgrade passes only. The forced startup pass is scheduled
+  // earlier in app.whenReady so retention does not wait on the interval gate.
+  checkpointCleanupTimer = setInterval(() => {
+    void runCheckpointCleanup(settings, { reason: 'interval' })
+  }, intervalMs)
   checkpointCleanupTimer.unref?.()
 }
 
-async function stopManagedRuntimesForQuit(): Promise<void> {
-  if (managedRuntimesStoppedForQuit) return
-  await stopManagedRuntimes()
-  managedRuntimesStoppedForQuit = true
+const runtimeShutdown = new ManagedRuntimeShutdownCoordinator(async () => {
+  await scheduleRuntime?.stop()
+  await workflowRuntime?.stop()
+  await Promise.all([
+    clawRuntime?.stop(),
+    telegramRuntime?.stop()
+  ])
+  await stopWeixinBridgeRuntime()
+  await shutdownLocalWhisperService()
+  // The shared Kun service outlives ordinary GUI/TUI clients. Only an update
+  // install must stop it so old application files can be replaced safely.
+  if (runtimeShutdown.isUpdateInstallQuit) {
+    const settings = await store.load()
+    await kunRuntimeAdapter.stopSharedAndWait(settings)
+  }
+  await stopBrowserUseHost()
+})
+
+function stopManagedRuntimesForQuit(): Promise<void> {
+  return runtimeShutdown.stopForQuit()
 }
 
-async function stopManagedRuntimes(): Promise<void> {
-  if (!managedRuntimesStopPromise) {
-    managedRuntimesStopPromise = (async () => {
-      scheduleRuntime?.stop()
-      workflowRuntime?.stop()
-      clawRuntime?.stop()
-      telegramRuntime?.stop()
-      stopWeixinBridgeRuntime()
-      await kunRuntimeAdapter.stopAndWait()
-    })().finally(() => {
-      managedRuntimesStopPromise = null
-    })
-  }
-  return managedRuntimesStopPromise
+function stopManagedRuntimes(): Promise<void> {
+  return runtimeShutdown.stop()
 }
 
 async function loadGuiUpdaterModule(): Promise<GuiUpdaterModule> {
@@ -312,7 +462,8 @@ async function loadGuiUpdaterModule(): Promise<GuiUpdaterModule> {
             () => mainWindow,
             async () => (await store.load()).guiUpdate.channel,
             stopManagedRuntimesForQuit,
-            async () => (await store.load()).locale
+            async () => (await store.load()).locale,
+            setUpdateInstallQuitting
           )
           guiUpdaterInitialized = true
         }
@@ -341,48 +492,87 @@ async function readGuiUpdateState(): Promise<GuiUpdateState> {
 }
 
 
-function installDevPreviewWebviewGuards(): void {
-  app.on('web-contents-created', (_, contents) => {
-    contents.on('will-attach-webview', (event, webPreferences, params) => {
-      const src = typeof params.src === 'string' ? params.src : ''
-      // Prototype embeds are file:// pages the renderer authorized through
-      // write:authorize-prototype right before attaching.
-      if (!isAllowedDevPreviewUrl(src) && !isAuthorizedPrototypeFileUrl(src)) {
-        event.preventDefault()
-        return
-      }
-
-      delete webPreferences.preload
-      delete (webPreferences as { preloadURL?: string }).preloadURL
-      webPreferences.nodeIntegration = false
-      webPreferences.contextIsolation = true
-      webPreferences.sandbox = true
-      webPreferences.webSecurity = true
-      webPreferences.allowRunningInsecureContent = false
-    })
-
-    contents.on('will-navigate', (event, navigationUrl) => {
-      if (contents.getType() !== 'webview') return
-      if (!isAllowedDevPreviewUrl(navigationUrl)) event.preventDefault()
-    })
-
-    contents.setWindowOpenHandler(({ url }) => {
-      if (contents.getType() !== 'webview') return { action: 'allow' }
-      return isAllowedDevPreviewUrl(url) ? { action: 'allow' } : { action: 'deny' }
-    })
+function installDevPreviewWebviewGuards(options: {
+  viewProtocols: ExtensionViewProtocolRegistry
+}): void {
+  installWebviewSecurityGuards({
+    app,
+    sessions: extensionViewSessions,
+    extensionPreloadPath: resolveNamedPreloadPath(__dirname, 'extension-view'),
+    assertExtensionPartitionPrepared: (record) => options.viewProtocols.assertPrepared(record),
+    isPreparedExtensionNavigation: (contents, url) =>
+      options.viewProtocols.isPreparedInitialNavigation(contents.session.protocol, url),
+    isTrustedWorkbench: (contents) => Boolean(
+      mainWindow && !mainWindow.isDestroyed() && contents.id === mainWindow.webContents.id
+    ),
+    isAllowedDevPreviewUrl,
+    isAuthorizedPrototypeFileUrl,
+    onDenied: ({ code }) => {
+      logWarn('extension-webview', 'Denied extension Webview operation.', { code })
+    }
   })
 }
 
 
 const appIconSource = process.platform === 'win32' ? kunMacLogoPng : kunLogoPng
 const appIcon = createAppIcon(appIconSource)
-const trayIcon = createAppIcon(kunTrayPng)
+const trayIcon = process.platform === 'darwin'
+  ? createMultiScaleIcon(kunTrayMacPng, kunTrayMacRetinaPng)
+  : createAppIcon(kunTrayPng)
 traceStartup('app icon loaded', { source: appIconSource.startsWith('data:') ? 'data-url' : 'path' })
 const gotSingleInstanceLock = runningClawScheduleMcpServer || app.requestSingleInstanceLock()
 traceStartup('single instance lock checked', {
   gotSingleInstanceLock,
   skippedForClawScheduleMcpServer: runningClawScheduleMcpServer
 })
+const startupMigrationLog = (message: string, detail?: unknown): void => {
+  console.warn(`[kun-gui] ${message}`, detail ?? '')
+}
+const canonicalRuntimeMigration = gotSingleInstanceLock && !runningClawScheduleMcpServer
+  ? runCanonicalKunRuntimeDataMigration({
+      userDataPath: app.getPath('userData'),
+      homeDir: homedir(),
+      log: startupMigrationLog,
+      assertLegacyRuntimeInactive: (sourcePath) =>
+        assertNoActiveKunRuntimeUsingDataDir(sourcePath)
+    })
+  : null
+const remainingHomeMappings = HOME_DATA_MIGRATION_MAPPINGS.filter(
+  (mapping) => mapping.legacySegments.join('/') !== '.deepseekgui/kun'
+)
+const remainingHomeMigration = gotSingleInstanceLock && !runningClawScheduleMcpServer
+  ? migrateLegacyHomeDataDirs({
+      homeDir: homedir(),
+      mappings: remainingHomeMappings,
+      log: startupMigrationLog
+    })
+  : []
+const remainingSettingsRewritten = gotSingleInstanceLock && !runningClawScheduleMcpServer
+  ? rewriteLegacyPathsInSettingsFile({
+      userDataPath: app.getPath('userData'),
+      homeDir: homedir(),
+      mappings: remainingHomeMigration
+        .filter((entry) => entry.rewriteSafe)
+        .map((entry) => entry.mapping),
+      log: startupMigrationLog
+    })
+  : false
+traceStartup('post-lock legacy home migration checked', {
+  runtimeStatus: canonicalRuntimeMigration?.status ?? 'skipped',
+  runtimeBackupPath: canonicalRuntimeMigration?.destinationBackupPath,
+  runtimeMessage: canonicalRuntimeMigration?.message,
+  remainingSettingsRewritten
+})
+
+function assertCanonicalRuntimeMigrationReady(): void {
+  if (canonicalRuntimeMigration?.status !== 'blocked') return
+  throw runtimeJsonError(
+    'policy_blocked',
+    `Kun Runtime data migration could not finish safely. Historical data was preserved and ` +
+    `managed Runtime writes are blocked until recovery succeeds. ` +
+    `${canonicalRuntimeMigration.message ?? `See ${canonicalRuntimeMigration.journalPath}.`}`
+  )
+}
 
 function windowCloseLabels(locale: AppSettingsV1['locale']): {
   title: string
@@ -472,7 +662,7 @@ function showRendererContextMenu(window: BrowserWindow, params: ContextMenuParam
 }
 
 function quitFromTray(): void {
-  isQuitting = true
+  runtimeShutdown.requestQuit()
   app.quit()
 }
 
@@ -489,8 +679,143 @@ function createTrayMenu(settings: AppSettingsV1, threads: TrayThreadSummary[]): 
   }))
 }
 
+const TRAY_QUOTA_WINDOW_WIDTH = 420
+const TRAY_QUOTA_WINDOW_HEIGHT = 660
+const TRAY_QUOTA_WINDOW_MARGIN = 8
+
+function positionTrayQuotaWindow(window: BrowserWindow): void {
+  if (!tray || tray.isDestroyed() || window.isDestroyed()) return
+  const trayBounds = resolveTrayQuotaAnchorBounds(
+    tray.getBounds(),
+    screen.getCursorScreenPoint()
+  )
+  const display = screen.getDisplayMatching(trayBounds)
+  const width = Math.max(1, Math.min(
+    TRAY_QUOTA_WINDOW_WIDTH,
+    display.workArea.width - TRAY_QUOTA_WINDOW_MARGIN * 2
+  ))
+  const height = Math.max(1, Math.min(
+    TRAY_QUOTA_WINDOW_HEIGHT,
+    display.workArea.height - TRAY_QUOTA_WINDOW_MARGIN * 2
+  ))
+  window.setSize(width, height, false)
+  const position = resolveTrayQuotaPopoverPosition({
+    trayBounds,
+    windowSize: { width, height },
+    workArea: display.workArea,
+    margin: TRAY_QUOTA_WINDOW_MARGIN
+  })
+  window.setPosition(position.x, position.y, false)
+}
+
+async function ensureTrayQuotaWindow(): Promise<BrowserWindow> {
+  if (trayQuotaWindow && !trayQuotaWindow.isDestroyed()) {
+    await trayQuotaWindowReady
+    return trayQuotaWindow
+  }
+
+  const window = new BrowserWindow({
+    width: TRAY_QUOTA_WINDOW_WIDTH,
+    height: TRAY_QUOTA_WINDOW_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: true,
+    roundedCorners: true,
+    ...(process.platform === 'darwin' ? { type: 'panel' as const } : {}),
+    webPreferences: {
+      preload: resolveNamedPreloadPath(__dirname, 'tray-quota'),
+      contextIsolation: true,
+      sandbox: true
+    }
+  })
+  trayQuotaWindow = window
+  positionTrayQuotaWindow(window)
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  window.webContents.on('will-navigate', (event) => event.preventDefault())
+  window.webContents.on('preload-error', (_event, preloadPath, error) => {
+    logError('tray-quota', 'Failed to load tray quota preload.', {
+      preloadPath,
+      message: error instanceof Error ? error.message : String(error)
+    })
+  })
+  window.on('blur', () => {
+    if (!window.webContents.isDevToolsOpened()) window.hide()
+  })
+  window.on('closed', () => {
+    if (trayQuotaWindow === window) {
+      trayQuotaWindow = null
+      trayQuotaWindowReady = null
+    }
+  })
+
+  const devUrl = devServerHintUrl()
+  trayQuotaWindowReady = devUrl
+    ? (() => {
+        const target = new URL(devUrl)
+        target.pathname = '/tray-quota.html'
+        target.search = ''
+        target.hash = ''
+        return window.loadURL(target.toString())
+      })()
+    : window.loadFile(join(__dirname, '../renderer/tray-quota.html'))
+  try {
+    await trayQuotaWindowReady
+  } catch (error) {
+    if (!window.isDestroyed()) window.destroy()
+    throw error
+  }
+  return window
+}
+
+function hideTrayQuotaPopover(): void {
+  trayQuotaToggleGeneration += 1
+  if (trayQuotaWindow && !trayQuotaWindow.isDestroyed()) trayQuotaWindow.hide()
+}
+
+function destroyTrayQuotaPopover(): void {
+  trayQuotaToggleGeneration += 1
+  if (trayQuotaWindow && !trayQuotaWindow.isDestroyed()) trayQuotaWindow.destroy()
+  trayQuotaWindow = null
+  trayQuotaWindowReady = null
+}
+
+function notifyTrayQuotaRefresh(): void {
+  const window = trayQuotaWindow
+  if (!window || window.isDestroyed() || window.webContents.isLoadingMainFrame()) return
+  window.webContents.send(TRAY_PROVIDER_QUOTA_CHANNELS.refresh)
+}
+
+async function toggleTrayQuotaPopover(): Promise<void> {
+  if (trayQuotaWindow?.isVisible()) {
+    hideTrayQuotaPopover()
+    return
+  }
+  const generation = ++trayQuotaToggleGeneration
+  const window = await ensureTrayQuotaWindow()
+  if (
+    generation !== trayQuotaToggleGeneration ||
+    window.isDestroyed() ||
+    !tray ||
+    tray.isDestroyed()
+  ) return
+  positionTrayQuotaWindow(window)
+  window.webContents.send(TRAY_PROVIDER_QUOTA_CHANNELS.refresh)
+  window.show()
+  window.focus()
+}
+
 async function loadTrayThreads(settings: AppSettingsV1): Promise<TrayThreadSummary[]> {
   try {
+    await kunRuntimeAdapter.resolveConnection(settings)
     const response = await fetch(`${getRuntimeBaseUrlForSettings(settings)}/v1/threads?limit=20`, {
       headers: runtimeAuthHeaders(settings),
       signal: AbortSignal.timeout(1_000)
@@ -506,6 +831,7 @@ async function loadTrayThreads(settings: AppSettingsV1): Promise<TrayThreadSumma
 
 function showTrayMenu(): void {
   if (!tray || trayMenuOpenPromise) return
+  hideTrayQuotaPopover()
   const currentTray = tray
   trayMenuOpenPromise = (async () => {
     const settings = await store.load()
@@ -521,6 +847,7 @@ function showTrayMenu(): void {
 function syncTray(settings: AppSettingsV1): void {
   appBehavior = settings.appBehavior
   if (appBehavior.closeAction === 'quit') {
+    destroyTrayQuotaPopover()
     if (tray) {
       tray.destroy()
       tray = null
@@ -534,14 +861,24 @@ function syncTray(settings: AppSettingsV1): void {
     // 托盘图加载失败时回退到主应用图,这样不会看到 electron 默认占位。
     const traySource = prepareTrayIcon(pickTrayIcon(trayIcon, appIcon))
     tray = new Tray(traySource.isEmpty() ? nativeImage.createEmpty() : traySource)
-    tray.on('click', showTrayMenu)
-    tray.on('double-click', revealMainWindow)
+    tray.on('click', () => {
+      void toggleTrayQuotaPopover().catch((error) => {
+        logWarn('tray-quota', 'Failed to toggle tray quota popover.', {
+          message: error instanceof Error ? error.message : String(error)
+        })
+      })
+    })
+    tray.on('double-click', () => {
+      hideTrayQuotaPopover()
+      revealMainWindow()
+    })
     tray.on('right-click', showTrayMenu)
   }
 
   tray.setToolTip('Kun')
   trayMenu = createTrayMenu(settings, [])
   tray.setContextMenu(null)
+  notifyTrayQuotaRefresh()
 }
 
 async function saveWindowCloseActionPreference(closeAction: WindowCloseAction): Promise<void> {
@@ -579,7 +916,7 @@ async function promptWindowCloseAction(window: BrowserWindow): Promise<void> {
       if (result.checkboxChecked) {
         await saveWindowCloseActionPreference('quit')
       }
-      isQuitting = true
+      runtimeShutdown.requestQuit()
       app.quit()
     }
   } catch (error) {
@@ -592,11 +929,15 @@ async function promptWindowCloseAction(window: BrowserWindow): Promise<void> {
 }
 
 function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): void {
-  if (isQuitting) return
-  if (appBehavior.closeAction === 'quit') return
+  const decision = resolveMainWindowCloseDecision({
+    closeAction: appBehavior.closeAction,
+    isQuitting: runtimeShutdown.isQuitRequested,
+    isUpdateInstallQuitting: runtimeShutdown.isUpdateInstallQuit
+  })
+  if (decision === 'allow') return
 
   event.preventDefault()
-  if (appBehavior.closeAction === 'tray') {
+  if (decision === 'hide-to-tray') {
     window.hide()
     return
   }
@@ -608,18 +949,16 @@ function normalizeNotificationText(raw: string | undefined, fallback: string, ma
   return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value
 }
 
-type TurnCompleteNotificationPayload = {
-  threadId?: string
-  title?: string
-  body?: string
-}
-
 async function showTurnCompleteNotification(
   payload: TurnCompleteNotificationPayload
 ): Promise<{ ok: true; shown: boolean; reason?: string } | { ok: false; message: string }> {
   const settings = await store.load()
-  if (!settings.notifications.turnComplete) {
-    return { ok: true, shown: false, reason: 'disabled' }
+  const disabledReason = turnCompleteNotificationDisabledReason(
+    settings.notifications,
+    payload.source
+  )
+  if (disabledReason) {
+    return { ok: true, shown: false, reason: disabledReason }
   }
   if (!Notification.isSupported()) {
     return { ok: true, shown: false, reason: 'unsupported' }
@@ -632,7 +971,7 @@ async function showTurnCompleteNotification(
     const notification = new Notification({
       title,
       body,
-      icon: appIcon.isEmpty() ? undefined : appIcon
+      ...notificationIconOptions(appIcon)
     })
     notification.on('click', () => {
       revealMainWindow()
@@ -688,58 +1027,11 @@ async function probeThreadApi(settings: AppSettingsV1): Promise<
   }
 }
 
-async function waitForKunHealth(settings: AppSettingsV1, timeoutMs: number): Promise<boolean> {
-  const base = getRuntimeBaseUrlForSettings(settings)
-  const deadline = Date.now() + timeoutMs
-  let lastError = ''
-
-  while (Date.now() <= deadline) {
-    const remaining = Math.max(1, deadline - Date.now())
-    const result = await probeKunHealthOnce(settings, base, remaining)
-    if (result.healthy) return true
-    if (result.error !== lastError) {
-      lastError = result.error
-      logWarn('health-probe', `${base}/health: ${result.error}`)
-    }
-    await sleep(150)
-  }
-
-  logWarn('health-probe', `gave up after ${timeoutMs}ms, last error: ${lastError}`)
-  return false
-}
-
-type KunHealthProbeResult = { healthy: boolean; error: string }
-const kunHealthProbeInFlight = new Map<string, Promise<KunHealthProbeResult>>()
-
-function probeKunHealthOnce(
-  settings: AppSettingsV1,
-  base: string,
-  remainingMs: number
-): Promise<KunHealthProbeResult> {
-  const existing = kunHealthProbeInFlight.get(base)
-  if (existing) return existing
-
-  let task: Promise<KunHealthProbeResult>
-  task = (async () => {
-    try {
-      const res = await fetch(`${base}/health`, {
-        headers: runtimeAuthHeaders(settings),
-        signal: AbortSignal.timeout(Math.max(250, Math.min(1_000, remainingMs)))
-      })
-      const healthy = res.ok && isKunHealthResponseBody(await res.text())
-      return { healthy, error: healthy ? '' : `unexpected status ${res.status}` }
-    } catch (error) {
-      return {
-        healthy: false,
-        error: error instanceof Error ? error.message : String(error)
-      }
-    }
-  })().finally(() => {
-    if (kunHealthProbeInFlight.get(base) === task) kunHealthProbeInFlight.delete(base)
-  })
-  kunHealthProbeInFlight.set(base, task)
-  return task
-}
+const kunRuntimeHealthMonitor = new KunRuntimeHealthMonitor<AppSettingsV1>({
+  runtimeBaseUrl: getRuntimeBaseUrlForSettings,
+  runtimeHeaders: runtimeAuthHeaders,
+  warn: (source, message) => logWarn(source, message)
+})
 
 async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted || ms <= 0) return
@@ -757,14 +1049,6 @@ async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
-let runtimeEnsurePromise: Promise<AppSettingsV1> | null = null
-let runtimeEnsureFingerprint: string | null = null
-let runtimeRestartPromise: Promise<void> | null = null
-let runtimeSettingsApplyPromise: Promise<void> | null = null
-let lastAppliedSettings: AppSettingsV1 | null = null
-
-const RUNTIME_WATCHDOG_INTERVAL_MS = 30_000
-const RUNTIME_WATCHDOG_FAILURE_THRESHOLD = 3
 /**
  * How long a managed child that failed the initial health probe gets to prove
  * it is merely busy (e.g. a long synchronous step) rather than hung, before the
@@ -772,231 +1056,231 @@ const RUNTIME_WATCHDOG_FAILURE_THRESHOLD = 3
  * slow-but-alive runtime would cost the user their in-flight turn (#621).
  */
 const RUNTIME_HUNG_CONFIRM_MS = 10_000
-const runtimeRestartBudget = new RestartBudget({ windowMs: 60_000, maxRestarts: 3 })
-let lastRuntimeStatus: KunRuntimeStatus | null = null
-let supervisedRestartInFlight = false
-let runtimeWatchdogTimer: NodeJS.Timeout | null = null
-let runtimeWatchdogFailures = 0
-let runtimeWatchdogTickInFlight = false
+let runtimeSettingsSyncGeneration = 0
+let runtimeSettingsSyncStatus: KunRuntimeSettingsSyncStatusPayload = {
+  state: 'idle',
+  generation: 0,
+  at: new Date().toISOString()
+}
+
+function publishRuntimeSettingsSyncStatus(
+  status: Omit<KunRuntimeSettingsSyncStatusPayload, 'at'>
+): void {
+  const full = { ...status, at: new Date().toISOString() }
+  runtimeSettingsSyncStatus = full
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('runtime:settings-sync-status', full)
+  }
+}
+
+const runtimeSupervisor = new KunRuntimeSupervisor<AppSettingsV1>({
+  deps: {
+    loadSettings: () => store.load(),
+    canAutoRestart: managedKunHostCanAutoStart,
+    ensureRuntime: (settings) => ensureRuntime(settings),
+    restartRuntime: (settings) => restartRuntime(settings),
+    checkHealth: async (settings, timeoutMs) => {
+      await kunRuntimeAdapter.resolveConnection(settings)
+      return kunRuntimeHealthMonitor.waitForHealthy(settings, timeoutMs)
+    },
+    isChildRunning: () => kunRuntimeAdapter.isChildRunning(),
+    isStopped: () => runtimeShutdown.isStoppedForQuit || isAppQuitInProgress(),
+    publish: (full) => {
+      logWarn('runtime-status', `${full.state} (${full.source})${full.message ? `: ${full.message}` : ''}`)
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send('runtime:status', full)
+      }
+    },
+    warn: (source, message, details) => logWarn(source, message, details),
+    error: (source, message, details) => logError(source, message, details)
+  }
+})
 
 function publishRuntimeStatus(status: Omit<KunRuntimeStatus, 'at'>): void {
-  const full: KunRuntimeStatus = { ...status, at: new Date().toISOString() }
-  lastRuntimeStatus = full
-  logWarn('runtime-status', `${full.state} (${full.source})${full.message ? `: ${full.message}` : ''}`)
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) win.webContents.send('runtime:status', full)
+  runtimeSupervisor.publish(status)
+}
+
+let runtimeMigrationVerificationPromise: Promise<void> | null = null
+let runtimeMigrationVerificationCompleted = false
+
+async function verifyRuntimeMigrationHistory(): Promise<void> {
+  const settings = await store.load()
+  const headers = runtimeAuthHeaders(settings)
+  headers.set('Accept', 'application/json')
+  const response = await fetch(
+    `${getRuntimeBaseUrlForSettings(settings)}/v1/threads?include_archived=true&include=side`,
+    {
+      headers,
+      signal: AbortSignal.timeout(15_000)
+    }
+  )
+  if (!response.ok) {
+    throw new Error(`Runtime thread inventory returned HTTP ${response.status}`)
   }
+  const payload = JSON.parse(await response.text()) as { threads?: unknown }
+  if (!Array.isArray(payload.threads)) {
+    throw new Error('Runtime thread inventory response has no threads array')
+  }
+  const visibleThreadIds = payload.threads.flatMap((thread) =>
+    thread &&
+    typeof thread === 'object' &&
+    typeof (thread as { id?: unknown }).id === 'string'
+      ? [(thread as { id: string }).id]
+      : []
+  )
+  const result = markCanonicalKunRuntimeMigrationRuntimeVerified(
+    app.getPath('userData'),
+    visibleThreadIds
+  )
+  runtimeMigrationVerificationCompleted = result.status !== 'incomplete'
+  if (result.status === 'incomplete') {
+    logWarn(
+      'runtime-data-migration',
+      'Runtime is healthy but its thread API does not expose every migrated thread; verification remains pending.',
+      {
+        expectedThreadCount: result.expectedThreadCount,
+        visibleThreadCount: result.visibleThreadCount,
+        missingThreadCount: result.missingThreadIds.length,
+        missingThreadIds: result.missingThreadIds.slice(0, 20)
+      }
+    )
+  }
+}
+
+function scheduleRuntimeMigrationHistoryVerification(): void {
+  if (runtimeMigrationVerificationCompleted || runtimeMigrationVerificationPromise) return
+  runtimeMigrationVerificationPromise = verifyRuntimeMigrationHistory()
+    .catch((error) => {
+      logWarn('runtime-data-migration', 'Could not verify migrated Runtime history through the thread API.', {
+        message: error instanceof Error ? error.message : String(error)
+      })
+    })
+    .finally(() => {
+      runtimeMigrationVerificationPromise = null
+    })
 }
 
 /** Record a healthy runtime: reset the crash budget and watchdog, announce recovery. */
 function noteRuntimeHealthy(source: string): void {
-  runtimeRestartBudget.reset()
-  runtimeWatchdogFailures = 0
-  startRuntimeWatchdog()
-  if (lastRuntimeStatus && lastRuntimeStatus.state !== 'running') {
-    publishRuntimeStatus({ state: 'running', source })
-  }
+  scheduleRuntimeMigrationHistoryVerification()
+  runtimeSupervisor.noteHealthy(source)
 }
 
 function handleUnexpectedKunExit(info: KunUnexpectedExitInfo): void {
-  void superviseKunCrash(info).catch((error: unknown) => {
-    logError('kun-supervisor', 'supervised restart crashed', {
-      message: error instanceof Error ? error.message : String(error)
-    })
-  })
-}
-
-async function superviseKunCrash(info: KunUnexpectedExitInfo): Promise<void> {
-  if (managedRuntimesStoppedForQuit || isQuitting) return
-  const exitLabel = info.signal ? `signal ${info.signal}` : `code ${info.code ?? 'unknown'}`
-  publishRuntimeStatus({
-    state: 'crashed',
-    source: 'supervisor',
-    message: `Kun exited unexpectedly (${exitLabel}).`,
-    stderrTail: info.stderrTail
-  })
-  if (supervisedRestartInFlight) return
-  supervisedRestartInFlight = true
-  try {
-    const settings = await store.load()
-    const runtime = getKunRuntimeSettings(settings)
-    if (!resolveConfiguredApiKey(settings) || !runtime.autoStart) {
-      publishRuntimeStatus({
-        state: 'stopped',
-        source: 'supervisor',
-        message: 'Kun exited and automatic restart is unavailable (missing API key or auto-start disabled).'
-      })
-      return
-    }
-    let lastError = ''
-    for (;;) {
-      if (managedRuntimesStoppedForQuit || isQuitting) return
-      const verdict = runtimeRestartBudget.note()
-      if (!verdict.allowed) {
-        publishRuntimeStatus({
-          state: 'failed',
-          source: 'supervisor',
-          message: lastError
-            ? `Kun keeps crashing; automatic restarts are paused. Last error: ${lastError}`
-            : 'Kun keeps crashing; automatic restarts are paused. Check the runtime logs, then retry.',
-          stderrTail: info.stderrTail
-        })
-        return
-      }
-      publishRuntimeStatus({
-        state: 'restarting',
-        source: 'supervisor',
-        attempt: verdict.attempt,
-        maxAttempts: 3,
-        message: `Restarting Kun automatically (attempt ${verdict.attempt}/3).`
-      })
-      await new Promise((resolve) => setTimeout(resolve, verdict.delayMs))
-      try {
-        await ensureRuntime(await store.load())
-        noteRuntimeHealthy('supervisor')
-        return
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        logWarn('kun-supervisor', `automatic restart attempt ${verdict.attempt} failed: ${lastError}`)
-      }
-    }
-  } finally {
-    supervisedRestartInFlight = false
-  }
+  void stopBrowserUseHost()
+  runtimeSupervisor.handleUnexpectedExit(info)
 }
 
 function startRuntimeWatchdog(): void {
-  if (runtimeWatchdogTimer) return
-  const timer = setInterval(() => {
-    void runtimeWatchdogTick().catch((error: unknown) => {
-      logWarn('kun-watchdog', 'watchdog tick failed', {
-        message: error instanceof Error ? error.message : String(error)
-      })
-    })
-  }, RUNTIME_WATCHDOG_INTERVAL_MS)
-  timer.unref()
-  runtimeWatchdogTimer = timer
+  runtimeSupervisor.startWatchdog()
 }
 
 function stopRuntimeWatchdog(): void {
-  if (runtimeWatchdogTimer) {
-    clearInterval(runtimeWatchdogTimer)
-    runtimeWatchdogTimer = null
-  }
-}
-
-/**
- * Post-startup liveness check for the GUI-managed kun child: the boot
- * probe only covers launch, so a runtime that hangs later (blocked
- * event loop, sqlite lock) would otherwise stay dead until the user
- * restarts the app.
- */
-async function runtimeWatchdogTick(): Promise<void> {
-  if (runtimeWatchdogTickInFlight) return
-  if (managedRuntimesStoppedForQuit || isQuitting) return
-  if (
-    supervisedRestartInFlight ||
-    runtimeRestartPromise ||
-    runtimeSettingsApplyPromise ||
-    runtimeEnsurePromise
-  ) {
-    return
-  }
-  if (!kunRuntimeAdapter.isChildRunning()) return
-  runtimeWatchdogTickInFlight = true
-  try {
-    const settings = await store.load()
-    const healthy = await waitForKunHealth(settings, 5_000)
-    if (healthy) {
-      runtimeWatchdogFailures = 0
-      return
-    }
-    runtimeWatchdogFailures += 1
-    logWarn(
-      'kun-watchdog',
-      `health probe failed (${runtimeWatchdogFailures}/${RUNTIME_WATCHDOG_FAILURE_THRESHOLD})`
-    )
-    if (runtimeWatchdogFailures < RUNTIME_WATCHDOG_FAILURE_THRESHOLD) return
-    runtimeWatchdogFailures = 0
-    publishRuntimeStatus({
-      state: 'restarting',
-      source: 'watchdog',
-      message: 'Kun stopped responding to health checks; restarting it.'
-    })
-    try {
-      await restartRuntime(settings)
-      noteRuntimeHealthy('watchdog')
-    } catch (error) {
-      publishRuntimeStatus({
-        state: 'failed',
-        source: 'watchdog',
-        message: `Kun is unresponsive and the automatic restart failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      })
-    }
-  } finally {
-    runtimeWatchdogTickInFlight = false
-  }
+  runtimeSupervisor.stopWatchdog()
 }
 
 function queueRuntimeSettingsApply(prev: AppSettingsV1, next: AppSettingsV1): void {
   // Always update the prev/next anchor so a later task diffs against
   // the settings that were actually applied last, not against the
   // original `prev` captured when this call was queued.
-  const anchor = lastAppliedSettings ?? prev
-  lastAppliedSettings = next
-  const startupConfigChanged = runtimeStartupConfigChanged(anchor, next)
-  if (!startupConfigChanged) return
+  const anchor = runtimeSupervisor.latestOr(prev)
+  runtimeSupervisor.noteLatest(next)
+  // 保留本地行为：provider/model 配置变更时直接重启 Runtime，而不是走热更新。
+  const providerSettingsChanged =
+    stableSettingsStringify(anchor.provider) !== stableSettingsStringify(next.provider)
+  const applyMode = runtimeSettingsApplyMode(anchor, next)
+  const effectiveApplyMode: RuntimeSettingsApplyMode = providerSettingsChanged ? 'restart' : applyMode
+  if (effectiveApplyMode === 'none') return
+  const generation = ++runtimeSettingsSyncGeneration
+  publishRuntimeSettingsSyncStatus({ state: 'syncing', generation })
 
-  const previousTask = runtimeSettingsApplyPromise ?? Promise.resolve()
-  const task = previousTask
-    .catch(() => undefined)
-    .then(async () => {
-      const current = lastAppliedSettings ?? next
-      await restartManagedRuntimeForSettingsChange(anchor, current)
+  const reportCurrent = (
+    outcome: Pick<KunRuntimeSettingsSyncStatusPayload, 'state' | 'message'>
+  ): void => {
+    if (generation !== runtimeSettingsSyncGeneration) return
+    publishRuntimeSettingsSyncStatus({
+      state: outcome.state,
+      generation,
+      ...(outcome.message ? { message: outcome.message } : {})
     })
-    .catch((error: unknown) => {
-      logWarn('settings-apply', 'Failed to apply Kun runtime settings in background', {
-        message: error instanceof Error ? error.message : String(error)
-      })
-    })
-    .finally(() => {
-      if (runtimeSettingsApplyPromise === task) {
-        runtimeSettingsApplyPromise = null
+  }
+
+  runtimeSupervisor.enqueueSettingsApply(
+    async () => {
+      if (generation !== runtimeSettingsSyncGeneration) return
+      const current = runtimeSupervisor.latestOr(next)
+      const currentProviderChanged =
+        stableSettingsStringify(anchor.provider) !== stableSettingsStringify(current.provider)
+      const currentMode = runtimeSettingsApplyMode(anchor, current)
+      const effectiveCurrentMode: RuntimeSettingsApplyMode = currentProviderChanged ? 'restart' : currentMode
+      if (effectiveCurrentMode === 'restart') {
+        reportCurrent(await restartManagedRuntimeForSettingsChange(anchor, current))
+      } else if (effectiveCurrentMode === 'hot') {
+        const result = await applyManagedRuntimeSettingsHot(current, 'settings-apply')
+        if (result === 'restart_required') {
+          reportCurrent(await restartManagedRuntimeForSettingsChange(anchor, current, true))
+        } else if (result === 'applied') {
+          reportCurrent({ state: 'synced' })
+        } else {
+          reportCurrent({ state: 'unavailable', message: 'Kun Runtime is not running.' })
+        }
+      } else {
+        reportCurrent({ state: 'synced' })
       }
-    })
-
-  runtimeSettingsApplyPromise = task
+    },
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      reportCurrent({ state: 'failed', message })
+      logWarn('settings-apply', 'Failed to apply Kun runtime settings in background', {
+        message
+      })
+    }
+  )
 }
 
 function queueRuntimeMcpConfigApply(settings: AppSettingsV1): void {
-  lastAppliedSettings = settings
-
-  const previousTask = runtimeSettingsApplyPromise ?? Promise.resolve()
-  const task = previousTask
-    .catch(() => undefined)
-    .then(async () => {
-      const current = lastAppliedSettings ?? settings
-      await restartManagedRuntimeForMcpConfigChange(current)
+  runtimeSupervisor.noteLatest(settings)
+  const settingsGeneration = runtimeSettingsSyncStatus.state === 'syncing'
+    ? runtimeSettingsSyncGeneration
+    : null
+  const reportSettingsOutcome = (outcome: ManagedRuntimeSettingsApplyOutcome): void => {
+    if (
+      settingsGeneration === null ||
+      settingsGeneration !== runtimeSettingsSyncGeneration ||
+      runtimeSettingsSyncStatus.state !== 'syncing'
+    ) return
+    publishRuntimeSettingsSyncStatus({
+      state: outcome.state,
+      generation: settingsGeneration,
+      ...(outcome.message ? { message: outcome.message } : {})
     })
-    .catch((error: unknown) => {
+  }
+  runtimeSupervisor.enqueueSettingsApply(
+    async () => {
+      const current = runtimeSupervisor.latestOr(settings)
+      const result = await applyManagedRuntimeSettingsHot(current, 'mcp-config')
+      if (result === 'restart_required') {
+        reportSettingsOutcome(await restartManagedRuntimeForMcpConfigChange(current))
+      } else if (result === 'applied') {
+        reportSettingsOutcome({ state: 'synced' })
+      } else {
+        reportSettingsOutcome({ state: 'unavailable', message: 'Kun Runtime is not running.' })
+      }
+    },
+    (error: unknown) => {
+      reportSettingsOutcome({
+        state: 'failed',
+        message: error instanceof Error ? error.message : String(error)
+      })
       logWarn('mcp-config', 'Failed to apply Kun MCP config change in background', {
         message: error instanceof Error ? error.message : String(error)
       })
-    })
-    .finally(() => {
-      if (runtimeSettingsApplyPromise === task) {
-        runtimeSettingsApplyPromise = null
-      }
-    })
-
-  runtimeSettingsApplyPromise = task
+    }
+  )
 }
 
 async function waitForQueuedRuntimeSettingsApply(): Promise<void> {
-  if (!runtimeSettingsApplyPromise) return
-  await runtimeSettingsApplyPromise
+  await runtimeSupervisor.waitForSettingsApply()
 }
 
 /**
@@ -1011,43 +1295,16 @@ function runtimeFingerprint(settings: AppSettingsV1): string {
 }
 
 async function ensureRuntime(settings: AppSettingsV1): Promise<AppSettingsV1> {
-  const restart = runtimeRestartPromise
-  if (restart) {
-    try {
-      await restart
+  assertCanonicalRuntimeMigrationReady()
+  try {
+    if (await runtimeSupervisor.waitForRestart()) {
       return store.load()
-    } catch {
-      /* fall through to a normal ensure so callers see the latest state */
     }
+  } catch {
+    /* fall through to a normal ensure so callers see the latest state */
   }
   const fingerprint = runtimeFingerprint(settings)
-  const pending = runtimeEnsurePromise
-  const pendingFingerprint = runtimeEnsureFingerprint
-  if (pending) {
-    // Wait for the in-flight ensure, then re-evaluate against the
-    // fingerprint so callers don't inherit a stale result.
-    try {
-      const ensuredSettings = await pending
-      if (pendingFingerprint === fingerprint) return ensuredSettings
-    } catch {
-      /* fall through to retry with the current settings */
-    }
-  }
-  const task = ensureRuntimeOnce(settings)
-  let trackedTask: Promise<AppSettingsV1>
-  trackedTask = task.finally(() => {
-    if (runtimeEnsurePromise === trackedTask) {
-      runtimeEnsurePromise = null
-      runtimeEnsureFingerprint = null
-    }
-  })
-  runtimeEnsurePromise = trackedTask
-  runtimeEnsureFingerprint = fingerprint
-  try {
-    return await trackedTask
-  } finally {
-    /* cleanup runs via the .finally above */
-  }
+  return runtimeSupervisor.ensure(fingerprint, () => ensureRuntimeOnce(settings))
 }
 
 async function ensureRuntimeOnce(settings: AppSettingsV1): Promise<AppSettingsV1> {
@@ -1057,42 +1314,30 @@ async function ensureRuntimeOnce(settings: AppSettingsV1): Promise<AppSettingsV1
 
 async function resolveManagedKunLaunchSettings(
   settings: AppSettingsV1,
-  source: string
+  _source: string
 ): Promise<AppSettingsV1> {
-  const runtime = getKunRuntimeSettings(settings)
-  const resolved = await kunRuntimeAdapter.resolveAvailablePort(runtime.port)
-  if (!resolved.changed) return settings
-
-  const next = await store.patch({ agents: { kun: { port: resolved.port } } })
-  lastAppliedSettings = next
-  logWarn(source, `Kun port ${runtime.port} is unavailable; using ${resolved.port} for the managed runtime`, {
-    previousPort: runtime.port,
-    port: resolved.port,
-    message: resolved.message
-  })
-  return next
+  // Shared runtimes bind an ephemeral loopback port while holding the
+  // data-directory election lock. The configured port is a legacy preference,
+  // not the address or bearer token of the currently resolved daemon.
+  return settings
 }
 
 async function ensureKunRuntime(settings: AppSettingsV1): Promise<AppSettingsV1> {
-  const runtime = getKunRuntimeSettings(settings)
-  const hasApiKey = Boolean(resolveConfiguredApiKey(settings))
+  const currentSettings = settings
+  await kunRuntimeAdapter.resolveConnection(currentSettings)
 
-  const healthy = await waitForKunHealth(settings, 2_000)
+  const runtime = getKunRuntimeSettings(currentSettings)
+
+  const healthy = await kunRuntimeHealthMonitor.waitForHealthy(currentSettings, 2_000)
   if (healthy) {
-    const threadApi = await probeThreadApi(settings)
+    const threadApi = await probeThreadApi(currentSettings)
     if (threadApi.ok) {
       noteRuntimeHealthy('ensure')
-      return settings
+      return currentSettings
     }
     throw runtimeJsonError(threadApi.error, threadApi.message)
   }
 
-  if (!hasApiKey) {
-    throw runtimeJsonError(
-      'missing_api_key',
-      'DeepSeek API Key is required before the GUI can start Kun.'
-    )
-  }
   if (!runtime.autoStart) {
     throw runtimeJsonError(
       'runtime_offline',
@@ -1115,12 +1360,12 @@ async function ensureKunRuntime(settings: AppSettingsV1): Promise<AppSettingsV1>
     if (kunRuntimeAdapter.isChildRunning()) {
       // Give a merely-busy runtime a real chance to answer before judging it
       // hung, so one long synchronous step does not cost the user their turn.
-      const recovered = await waitForKunHealth(settings, RUNTIME_HUNG_CONFIRM_MS)
+      const recovered = await kunRuntimeHealthMonitor.waitForHealthy(currentSettings, RUNTIME_HUNG_CONFIRM_MS)
       if (recovered) {
-        const threadApi = await probeThreadApi(settings)
+        const threadApi = await probeThreadApi(currentSettings)
         if (threadApi.ok) {
           noteRuntimeHealthy('ensure')
-          return settings
+          return currentSettings
         }
         throw runtimeJsonError(threadApi.error, threadApi.message)
       }
@@ -1128,11 +1373,11 @@ async function ensureKunRuntime(settings: AppSettingsV1): Promise<AppSettingsV1>
         'runtime-start',
         `managed Kun child stopped responding on port ${runtime.port}; restarting it in place`
       )
-      await kunRuntimeAdapter.stopAndWait()
+      await kunRuntimeAdapter.stopSharedAndWait(currentSettings)
     }
   }
 
-  const launchSettings = await resolveManagedKunLaunchSettings(settings, 'runtime-start')
+  const launchSettings = await resolveManagedKunLaunchSettings(currentSettings, 'runtime-start')
   const adapter = kunRuntimeAdapter
   try {
     await adapter.ensureRunning(launchSettings)
@@ -1140,7 +1385,7 @@ async function ensureKunRuntime(settings: AppSettingsV1): Promise<AppSettingsV1>
     console.error('[kun-gui] failed to start kun:', e)
     throw e
   }
-  const started = await waitForKunHealth(launchSettings, 20_000)
+  const started = await kunRuntimeHealthMonitor.waitForHealthy(launchSettings, 20_000)
   if (!started) {
     throw runtimeJsonError(
       'runtime_unhealthy',
@@ -1157,20 +1402,11 @@ async function ensureKunRuntime(settings: AppSettingsV1): Promise<AppSettingsV1>
 }
 
 async function restartRuntime(settings: AppSettingsV1): Promise<void> {
-  if (runtimeRestartPromise) return runtimeRestartPromise
-  const task = restartRuntimeOnce(settings)
-    .finally(() => {
-      if (runtimeRestartPromise === task) {
-        runtimeRestartPromise = null
-      }
-    })
-  runtimeRestartPromise = task
-  runtimeEnsurePromise = null
-  runtimeEnsureFingerprint = null
-  return task
+  return runtimeSupervisor.restart(() => restartRuntimeOnce(settings))
 }
 
 async function restartRuntimeOnce(settings: AppSettingsV1): Promise<void> {
+  assertCanonicalRuntimeMigrationReady()
   await waitForQueuedRuntimeSettingsApply()
   // Don't tear down a child that is still completing its startup; wait for it
   // to settle so a restart trigger that races a boot doesn't reset the clock
@@ -1178,12 +1414,6 @@ async function restartRuntimeOnce(settings: AppSettingsV1): Promise<void> {
   await waitForKunStartupSettled()
   const runtime = getKunRuntimeSettings(settings)
 
-  if (!resolveConfiguredApiKey(settings)) {
-    throw runtimeJsonError(
-      'missing_api_key',
-      'DeepSeek API Key is required before the GUI can start Kun.'
-    )
-  }
   if (!runtime.autoStart) {
     throw runtimeJsonError(
       'runtime_offline',
@@ -1192,7 +1422,7 @@ async function restartRuntimeOnce(settings: AppSettingsV1): Promise<void> {
   }
 
   const adapter = kunRuntimeAdapter
-  await adapter.stopAndWait()
+  await adapter.stopSharedAndWait(settings)
   const launchSettings = await resolveManagedKunLaunchSettings(settings, 'runtime-restart')
 
   try {
@@ -1202,7 +1432,7 @@ async function restartRuntimeOnce(settings: AppSettingsV1): Promise<void> {
     throw e
   }
 
-  const healthy = await waitForKunHealth(launchSettings, 20_000)
+  const healthy = await kunRuntimeHealthMonitor.waitForHealthy(launchSettings, 20_000)
   if (!healthy) {
     throw runtimeJsonError(
       'runtime_unhealthy',
@@ -1221,7 +1451,7 @@ function createWindow(options: { suppressInitialShow?: boolean } = {}): void {
   traceStartup('createWindow:start')
   const preloadPath = resolvePreloadPath(__dirname)
   const usesDesktopTitleBar = process.platform === 'win32' || process.platform === 'linux'
-  mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 960,
@@ -1240,48 +1470,137 @@ function createWindow(options: { suppressInitialShow?: boolean } = {}): void {
       additionalArguments: [`--kun-home-dir=${homedir()}`]
     }
   })
+  mainWindow = window
+  bindExtensionMainWindow?.(window)
   if (usesDesktopTitleBar) {
-    mainWindow.setMenu(null)
-    mainWindow.setMenuBarVisibility(false)
+    window.setMenu(null)
+    window.setMenuBarVisibility(false)
   }
-  mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
+  const recoveryBudget = new MainWindowRendererRecoveryBudget()
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null
+  let rendererProcessId = 0
+  const scheduleRendererRecovery = (trigger: string, detail: unknown): void => {
+    if (
+      recoveryTimer ||
+      isAppQuitInProgress() ||
+      window.isDestroyed() ||
+      window.webContents.isDestroyed()
+    ) return
+
+    const attempt = recoveryBudget.reserve()
+    if (attempt === null) {
+      logError('renderer', 'Automatic main-window recovery stopped after repeated failures.', {
+        trigger,
+        detail,
+        maxAttempts: MAIN_WINDOW_RENDERER_RECOVERY_MAX_ATTEMPTS,
+        windowMs: MAIN_WINDOW_RENDERER_RECOVERY_WINDOW_MS
+      })
+      return
+    }
+
+    logWarn('renderer', 'Scheduling a main-window reload after renderer failure.', {
+      trigger,
+      detail,
+      attempt,
+      maxAttempts: MAIN_WINDOW_RENDERER_RECOVERY_MAX_ATTEMPTS
+    })
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null
+      if (
+        isAppQuitInProgress() ||
+        window.isDestroyed() ||
+        window.webContents.isDestroyed()
+      ) return
+      logWarn('renderer', 'Reloading the main window after renderer failure.', {
+        trigger,
+        attempt
+      })
+      reloadRenderer(window.webContents, devServerHintUrl())
+    }, MAIN_WINDOW_RENDERER_RECOVERY_DELAY_MS)
+    recoveryTimer.unref?.()
+  }
+
+  window.webContents.on('preload-error', (_event, preloadPath, error) => {
     const message = error instanceof Error ? error.message : String(error)
     console.error(`[kun-gui] failed to load preload ${preloadPath}:`, error)
     logError('preload', 'Failed to load preload script', { preloadPath, message })
   })
-  mainWindow.webContents.on('context-menu', (event, params) => {
+  window.webContents.on('render-process-gone', (_event, details) => {
+    if (isAppQuitInProgress() || !shouldRecoverRendererProcess(details.reason)) return
+    const detail = {
+      reason: details.reason,
+      exitCode: details.exitCode,
+      rendererProcessId
+    }
+    console.error('[kun-gui] main renderer process exited unexpectedly:', detail)
+    logError('renderer', 'Main renderer process exited unexpectedly.', detail)
+    scheduleRendererRecovery('render-process-gone', detail)
+  })
+  window.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame, frameProcessId) => {
+      if (
+        isAppQuitInProgress() ||
+        !shouldRecoverMainFrameLoad(errorCode, isMainFrame)
+      ) return
+      const detail = {
+        errorCode,
+        errorDescription,
+        validatedURL,
+        frameProcessId
+      }
+      console.error('[kun-gui] main renderer failed to load:', detail)
+      logError('renderer', 'Main renderer failed to load.', detail)
+      scheduleRendererRecovery('did-fail-load', detail)
+    }
+  )
+  window.webContents.on('unresponsive', () => {
+    if (isAppQuitInProgress()) return
+    logWarn('renderer', 'Main renderer became unresponsive.', { rendererProcessId })
+  })
+  window.webContents.on('responsive', () => {
+    logInfo('renderer', `Main renderer became responsive again (pid=${rendererProcessId}).`)
+  })
+  window.webContents.on('context-menu', (event, params) => {
     event.preventDefault()
-    const window = mainWindow
-    if (!window || window.isDestroyed()) return
+    if (window.isDestroyed()) return
     showRendererContextMenu(window, params)
   })
   const showWindow = (): void => {
     if (options.suppressInitialShow) return
-    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isVisible()) return
-    mainWindow.show()
+    if (window.isDestroyed() || window.isVisible()) return
+    window.show()
   }
-  mainWindow.on('close', (event) => {
-    if (!mainWindow || mainWindow.isDestroyed()) return
-    handleMainWindowClose(mainWindow, event)
+  window.on('close', (event) => {
+    if (window.isDestroyed()) return
+    handleMainWindowClose(window, event)
   })
-  mainWindow.on('closed', () => {
-    mainWindow = null
+  window.on('closed', () => {
+    if (recoveryTimer) {
+      clearTimeout(recoveryTimer)
+      recoveryTimer = null
+    }
+    if (mainWindow === window) mainWindow = null
   })
   const devUrl = devServerHintUrl()
   traceStartup('createWindow:load', { devUrl: devUrl ?? 'file' })
   if (devUrl) {
-    mainWindow.loadURL(devUrl)
+    void window.loadURL(devUrl)
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    void window.loadFile(join(__dirname, '../renderer/index.html'))
   }
-  mainWindow.once('ready-to-show', () => {
+  window.once('ready-to-show', () => {
     traceStartup('window:ready-to-show')
     showWindow()
   })
-  mainWindow.webContents.once('did-finish-load', () => {
+  window.webContents.on('did-finish-load', () => {
     traceStartup('window:did-finish-load')
-    if (lastRuntimeStatus && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('runtime:status', lastRuntimeStatus)
+    rendererProcessId = window.webContents.getOSProcessId()
+    if (runtimeSupervisor.lastStatus && !window.isDestroyed()) {
+      window.webContents.send('runtime:status', runtimeSupervisor.lastStatus)
+    }
+    if (!window.isDestroyed()) {
+      window.webContents.send('runtime:settings-sync-status', runtimeSettingsSyncStatus)
     }
     showWindow()
   })
@@ -1292,47 +1611,13 @@ function createWindow(options: { suppressInitialShow?: boolean } = {}): void {
 }
 
 /**
- * Stable equality for the Kun runtime settings. Most fields are flat,
- * but GUI-managed capability options can be nested, so compare values
- * structurally while still surviving future field additions.
+ * 检测是否需要因为设置变更而重启 Kun Runtime。
+ * 保留本地行为：provider/model 配置变更时强制重启，同时也覆盖 runtime 与 claw/MCP 启动项变更。
  */
-function kunRuntimeConfigChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
-  const a = resolveKunRuntimeSettings(prev)
-  const b = resolveKunRuntimeSettings(next)
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)] as Array<keyof typeof a>)
-  for (const key of keys) {
-    if (!stableSettingsValueEqual(a[key], b[key])) return true
-  }
-  return false
-}
-
-function stableSettingsValueEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true
-  return stableSettingsStringify(a) === stableSettingsStringify(b)
-}
-
-function stableSettingsStringify(value: unknown): string {
-  return JSON.stringify(canonicalSettingsValue(value))
-}
-
-function canonicalSettingsValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalSettingsValue)
-  if (!value || typeof value !== 'object') return value
-  const out: Record<string, unknown> = {}
-  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    out[key] = canonicalSettingsValue((value as Record<string, unknown>)[key])
-  }
-  return out
-}
-
-function modelProviderSettingsChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
-  return !stableSettingsValueEqual(prev.provider, next.provider)
-}
-
 function runtimeStartupConfigChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
   return (
     kunRuntimeConfigChanged(prev, next) ||
-    modelProviderSettingsChanged(prev, next) ||
+    stableSettingsStringify(prev.provider) !== stableSettingsStringify(next.provider) ||
     clawScheduleMcpSettingsChanged(prev, next)
   )
 }
@@ -1360,11 +1645,107 @@ function validateRuntimeSettingsForApply(next: AppSettingsV1): string | null {
   return null
 }
 
+function preserveRuntimeTokenForFullSettingsSnapshot(
+  prev: AppSettingsV1,
+  partial: AppSettingsPatch
+): AppSettingsPatch {
+  const incomingKun = partial.agents?.kun
+  if (!incomingKun || !isFullSettingsSnapshotPatch(partial)) return partial
+  if (typeof incomingKun.runtimeToken !== 'string' || incomingKun.runtimeToken.trim()) return partial
+
+  const currentToken = getKunRuntimeSettings(prev).runtimeToken.trim()
+  if (!currentToken) return partial
+
+  return {
+    ...partial,
+    agents: {
+      ...partial.agents,
+      kun: {
+        ...incomingKun,
+        runtimeToken: currentToken
+      }
+    }
+  }
+}
+
+function isFullSettingsSnapshotPatch(partial: AppSettingsPatch): boolean {
+  return partial.version !== undefined &&
+    partial.provider !== undefined &&
+    partial.agents?.kun !== undefined &&
+    partial.log !== undefined &&
+    partial.checkpointCleanup !== undefined &&
+    partial.notifications !== undefined &&
+    partial.appBehavior !== undefined &&
+    partial.keyboardShortcuts !== undefined &&
+    partial.write !== undefined &&
+    partial.claw !== undefined &&
+    partial.schedule !== undefined &&
+    partial.workflow !== undefined &&
+    partial.terminal !== undefined &&
+    partial.guiUpdate !== undefined
+}
+
+type ManagedRuntimeHotApplyResult = 'applied' | 'skipped' | 'restart_required'
+type ManagedRuntimeSettingsApplyOutcome = Pick<
+  KunRuntimeSettingsSyncStatusPayload,
+  'state' | 'message'
+>
+
+async function applyManagedRuntimeSettingsHot(
+  settings: AppSettingsV1,
+  source: string
+): Promise<ManagedRuntimeHotApplyResult> {
+  assertCanonicalRuntimeMigrationReady()
+  await waitForKunStartupSettled()
+  const adapter = kunRuntimeAdapter
+  if (!adapter.isChildRunning()) return 'skipped'
+
+  const runtime = resolveKunRuntimeSettings(settings)
+  const dataDir = resolveKunDataDir(runtime)
+  const config = await syncGuiManagedKunConfig(dataDir, runtime, {
+    scheduleMcp: {
+      settings,
+      launch: getClawScheduleMcpLaunchConfig()
+    }
+  })
+  const body = buildManagedRuntimeHotApplyBody(settings, config)
+
+  const headers = runtimeAuthHeaders(settings)
+  headers.set('content-type', 'application/json')
+  try {
+    const response = await fetch(
+      `${getRuntimeBaseUrlForSettings(settings)}/v1/runtime/config/apply`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      }
+    )
+    const text = await response.text()
+    const outcome = classifyManagedRuntimeHotApplyResponse(response.status, response.ok, text)
+    if (outcome.result === 'applied') {
+      noteRuntimeHealthy(source)
+      return 'applied'
+    }
+    if (outcome.result === 'restart_required') {
+      logWarn(source, `Kun hot config apply requested restart: ${outcome.message}`)
+      return 'restart_required'
+    }
+    throw new Error(outcome.message)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logWarn(source, `Kun hot config apply failed; falling back to restart: ${message}`)
+    return 'restart_required'
+  }
+}
+
 async function restartManagedRuntimeForSettingsChange(
   prev: AppSettingsV1,
-  next: AppSettingsV1
-): Promise<void> {
-  if (!runtimeStartupConfigChanged(prev, next)) return
+  next: AppSettingsV1,
+  force = false
+): Promise<ManagedRuntimeSettingsApplyOutcome> {
+  // 使用 runtimeStartupConfigChanged，确保 provider/model 配置变更也会触发重启。
+  if (!force && !runtimeStartupConfigChanged(prev, next)) return { state: 'synced' }
 
   // Let any in-flight boot launch finish (or fail) before we read liveness
   // and stop the child. Killing a kun that is still inside its startup window
@@ -1377,50 +1758,35 @@ async function restartManagedRuntimeForSettingsChange(
   const adapter = kunRuntimeAdapter
   const wasRunning = adapter.isChildRunning()
 
-  if (!wasRunning) return
-
-  // Decide BEFORE stopping the child. Stranding a healthy runtime is exactly
-  // issue #329: a partial/transient save (e.g. the active providerId moved to
-  // a profile whose key lives elsewhere) can momentarily resolve to "no API
-  // key" even though the user clearly has one configured. If the runtime we
-  // are about to restart was healthy and the previous settings had a usable
-  // key, don't kill it on the strength of a key check the new settings fail —
-  // leave it running on its current config; the next save with a resolvable
-  // key restarts cleanly.
-  const nextHasApiKey = Boolean(resolveConfiguredApiKey(next))
-  if (!nextHasApiKey && Boolean(resolveConfiguredApiKey(prev))) {
-    logWarn(
-      'settings-apply',
-      'Skipping Kun restart: the new settings resolve to no API key but the running runtime had one — leaving the healthy runtime in place.'
-    )
-    return
-  }
+  if (!wasRunning) return { state: 'unavailable', message: 'Kun Runtime is not running.' }
 
   await waitForManagedRuntimeReadyBeforeStop(prev, 'settings-apply')
-  await adapter.stopAndWait()
-  if (!nextHasApiKey || !runtime.autoStart) {
+  await adapter.stopSharedAndWait(prev)
+  if (!runtime.autoStart) {
     publishRuntimeStatus({
       state: 'stopped',
       source: 'settings-apply',
-      message: 'Kun was stopped: the new settings have no API key or auto-start is disabled.'
+      message: 'Kun was stopped because automatic startup is disabled.'
     })
-    return
+    return { state: 'unavailable', message: 'Kun Runtime is stopped by the current settings.' }
   }
 
   publishRuntimeStatus({ state: 'restarting', source: 'settings-apply' })
   try {
     const launchSettings = await resolveManagedKunLaunchSettings(next, 'settings-apply')
     await adapter.ensureRunning(launchSettings)
-    const healthy = await waitForKunHealth(launchSettings, 20_000)
+    const healthy = await kunRuntimeHealthMonitor.waitForHealthy(launchSettings, 20_000)
     if (!healthy) {
       throw new Error('Kun did not become healthy after the settings change')
     }
     noteRuntimeHealthy('settings-apply')
     publishRuntimeStatus({ state: 'running', source: 'settings-apply' })
+    return { state: 'synced' }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     logWarn('settings-apply', `Kun restart failed after settings change: ${message}`)
-    await rollbackRuntimeSettingsAfterFailedApply(prev, message)
+    await rollbackRuntimeSettingsAfterFailedApply(prev, next, message)
+    return { state: 'failed', message }
   }
 }
 
@@ -1432,22 +1798,23 @@ async function restartManagedRuntimeForSettingsChange(
  */
 async function rollbackRuntimeSettingsAfterFailedApply(
   prev: AppSettingsV1,
+  desired: AppSettingsV1,
   failureMessage: string
 ): Promise<void> {
   const adapter = kunRuntimeAdapter
   let base: AppSettingsV1 = prev
   try {
-    base = await store.patch({
-      agents: { kun: getKunRuntimeSettings(prev) },
-      provider: prev.provider
-    })
-    lastAppliedSettings = base
+    // Route definitions are durable user intent, not process-critical launch
+    // settings. Keep the newest routes repairable while restoring the previous
+    // Runtime/provider transport configuration.
+    base = await store.patch(runtimeSettingsRollbackPatch(prev, desired))
+    runtimeSupervisor.noteLatest(base)
   } catch (error) {
     logWarn('settings-apply', 'failed to restore previous runtime settings on disk', {
       message: error instanceof Error ? error.message : String(error)
     })
   }
-  if (!resolveConfiguredApiKey(base) || !getKunRuntimeSettings(base).autoStart) {
+  if (!getKunRuntimeSettings(base).autoStart) {
     publishRuntimeStatus({
       state: 'stopped',
       source: 'settings-apply',
@@ -1459,7 +1826,7 @@ async function rollbackRuntimeSettingsAfterFailedApply(
   try {
     const launchSettings = await resolveManagedKunLaunchSettings(base, 'settings-apply-rollback')
     await adapter.ensureRunning(launchSettings)
-    const healthy = await waitForKunHealth(launchSettings, 20_000)
+    const healthy = await kunRuntimeHealthMonitor.waitForHealthy(launchSettings, 20_000)
     if (!healthy) {
       throw new Error('previous configuration did not become healthy')
     }
@@ -1482,7 +1849,9 @@ async function rollbackRuntimeSettingsAfterFailedApply(
   }
 }
 
-async function restartManagedRuntimeForMcpConfigChange(settings: AppSettingsV1): Promise<void> {
+async function restartManagedRuntimeForMcpConfigChange(
+  settings: AppSettingsV1
+): Promise<ManagedRuntimeSettingsApplyOutcome> {
   // See restartManagedRuntimeForSettingsChange: never interrupt an in-flight
   // boot launch (#544 restart storm).
   await waitForKunStartupSettled()
@@ -1491,21 +1860,24 @@ async function restartManagedRuntimeForMcpConfigChange(settings: AppSettingsV1):
   const adapter = kunRuntimeAdapter
   const wasRunning = adapter.isChildRunning()
 
-  if (!wasRunning) return
+  if (!wasRunning) return { state: 'unavailable', message: 'Kun Runtime is not running.' }
   await waitForManagedRuntimeReadyBeforeStop(settings, 'mcp-config')
-  await adapter.stopAndWait()
-  if (!resolveConfiguredApiKey(settings) || !runtime.autoStart) return
+  await adapter.stopSharedAndWait(settings)
+  if (!runtime.autoStart) {
+    return { state: 'unavailable', message: 'Kun Runtime is stopped by the current settings.' }
+  }
 
   publishRuntimeStatus({ state: 'restarting', source: 'mcp-config' })
   try {
     const launchSettings = await resolveManagedKunLaunchSettings(settings, 'mcp-config')
     await adapter.ensureRunning(launchSettings)
-    const healthy = await waitForKunHealth(launchSettings, 20_000)
+    const healthy = await kunRuntimeHealthMonitor.waitForHealthy(launchSettings, 20_000)
     if (!healthy) {
       throw new Error('Kun did not become healthy after the MCP config change')
     }
     noteRuntimeHealthy('mcp-config')
     publishRuntimeStatus({ state: 'running', source: 'mcp-config' })
+    return { state: 'synced' }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     logWarn('mcp-config', `Kun restart failed after MCP config change: ${message}`)
@@ -1514,6 +1886,7 @@ async function restartManagedRuntimeForMcpConfigChange(settings: AppSettingsV1):
       source: 'mcp-config',
       message: `Kun failed to restart after the MCP config change: ${message}. Check the MCP config file, then retry.`
     })
+    return { state: 'failed', message }
   }
 }
 
@@ -1521,7 +1894,7 @@ async function waitForManagedRuntimeReadyBeforeStop(
   settings: AppSettingsV1,
   source: string
 ): Promise<void> {
-  const healthy = await waitForKunHealth(settings, 20_000)
+  const healthy = await kunRuntimeHealthMonitor.waitForHealthy(settings, 20_000)
   if (!healthy) {
     logWarn(source, 'Kun did not become healthy before a managed restart; stopping it anyway')
     return
@@ -1537,7 +1910,7 @@ async function waitForManagedRuntimeReadyBeforeStop(
 async function runtimeRequest(
   settings: AppSettingsV1,
   pathAndQuery: string,
-  init: { method?: string; body?: string; headers?: Record<string, string> }
+  init: RuntimeRequestInit
 ): Promise<{ ok: boolean; status: number; body: string }> {
   try {
     return await runtimeRequestViaHost(settings, pathAndQuery, init, ensureRuntime)
@@ -1562,19 +1935,143 @@ app.whenReady().then(async () => {
   traceStartup('app.whenReady:start')
   if (!gotSingleInstanceLock) return
 
-  traceStartup('install webview guards:start')
-  installDevPreviewWebviewGuards()
-  traceStartup('install webview guards:done')
+  try {
+    const cleared = await clearDevelopmentRendererHttpCache(
+      session.defaultSession,
+      devServerHintUrl()
+    )
+    if (cleared) traceStartup('development renderer HTTP cache cleared')
+  } catch (error) {
+    console.warn('[kun-gui] failed to clear the development renderer HTTP cache:', error)
+  }
 
   if (process.platform === 'darwin') {
     const macDockIcon = createAppIcon(kunMacLogoPng)
-    app.dock.setIcon(macDockIcon.isEmpty() ? appIcon : macDockIcon)
+    app.dock?.setIcon(macDockIcon.isEmpty() ? appIcon : macDockIcon)
   }
 
-  store = new JsonSettingsStore(app.getPath('userData'))
+  const credentialMigration = canonicalRuntimeMigration?.status === 'blocked'
+    ? undefined
+    : new LegacyProviderSettingsMigrationCoordinator()
+  store = credentialMigration
+    ? new JsonSettingsStore(app.getPath('userData'), { credentialMigration })
+    : new JsonSettingsStore(app.getPath('userData'), {
+        rejectPlaintextCredentials: canonicalRuntimeMigration?.status === 'blocked'
+      })
   traceStartup('settings load:start')
   const initial = await store.load()
+  disposeTrayQuotaIpc = registerTrayQuotaIpc({
+    ipcMain,
+    getWindow: () => trayQuotaWindow,
+    list: async () => listProviderQuotas(await store.load()),
+    context: async () => {
+      const settings = await store.load()
+      return {
+        locale: settings.locale,
+        platform: process.platform === 'darwin'
+          ? 'darwin'
+          : process.platform === 'win32'
+            ? 'win32'
+            : 'linux',
+        colorMode: settings.theme === 'dark' ||
+          (settings.theme === 'system' && nativeTheme.shouldUseDarkColors)
+          ? 'dark'
+          : 'light'
+      }
+    },
+    action: (action) => {
+      hideTrayQuotaPopover()
+      if (action === 'new-chat') dispatchTrayAction({ type: 'new-chat' })
+      else if (action === 'open-app') revealMainWindow()
+    },
+    openExternal: (url) => shell.openExternal(url)
+  })
+  const browserUseManager = configureBrowserUseHost({
+    settings: initial,
+    getMainWindow: () => mainWindow
+  })
   traceStartup('settings load:done')
+  // Retention always runs at startup (and again after version upgrades inside
+  // IfDue). Fire-and-forget: must not block window creation.
+  void runCheckpointCleanup(initial, { force: true, reason: 'startup' })
+  traceStartup('git checkpoint cleanup scheduled')
+  const extensionDescriptors = new ExtensionDescriptorResolver(async (path, method, body) => {
+    const settings = await store.load()
+    return runtimeRequest(settings, path, { method, body })
+  })
+  const registerExtensionProtocol = (targetProtocol: typeof protocol): void => {
+    registerKunExtensionProtocol({
+      protocol: targetProtocol,
+      resolveDescriptor: (extensionId) => extensionDescriptors.resolveResourceDescriptor(extensionId),
+      onDenied: ({ extensionId, code }) => {
+        logWarn('extension-protocol', 'Denied extension resource request.', { extensionId, code })
+      }
+    })
+  }
+  registerExtensionProtocol(protocol)
+  const workspacePreviewProtocols = new WorkspacePreviewProtocolRegistry()
+  workspacePreviewProtocols.register(protocol)
+
+  const extensionProtocolForPartition = (partition: string) => session.fromPartition(partition).protocol
+  const extensionMediaProtocols = new ExtensionMediaProtocolRegistry({
+    sessions: extensionViewSessions,
+    protocolForPartition: extensionProtocolForPartition,
+    onDenied: ({ extensionId, sessionId, code }) => {
+      logWarn('extension-media-protocol', 'Denied isolated View media request.', {
+        extensionId,
+        sessionId,
+        code
+      })
+    }
+  })
+  const extensionViewProtocols = new ExtensionViewProtocolRegistry(
+    extensionProtocolForPartition,
+    ({ extensionId, code, sessionId }) => {
+      logWarn('extension-protocol', 'Denied isolated View resource request.', {
+        extensionId,
+        code,
+        sessionId
+      })
+    },
+    extensionMediaProtocols
+  )
+
+  traceStartup('install webview guards:start')
+  installDevPreviewWebviewGuards({
+    viewProtocols: extensionViewProtocols
+  })
+  traceStartup('install webview guards:done')
+  const extensionConsentTokens = new ExtensionConsentTokenService()
+  protectedCredentialSurface = new ProtectedCredentialSurfaceController(
+    resolveNamedPreloadPath(__dirname, 'extension-protected-surface')
+  )
+  protectedCredentialSurface.register()
+  const protectedExtensionActions = new ProtectedExtensionActionService(
+    extensionConsentTokens,
+    async (binding, copy) => {
+      const settings = await store.load()
+      const prompt = localizeProtectedExtensionPrompt(binding, copy, settings.locale)
+      const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined
+      return protectedCredentialSurface!.promptConsent(parent ?? null, {
+        ...prompt,
+        extensionValue: `${binding.extensionId} ${binding.extensionVersion}`,
+        operationValue: binding.operationKind,
+        ...(binding.workspaceRoot ? { workspaceValue: binding.workspaceRoot } : {})
+      })
+    }
+  )
+  const extensionContentScripts = new ExtensionContentScriptController(extensionDescriptors, {
+    onDiagnostic: (diagnostic) => {
+      logWarn('extension-content-script', diagnostic.message, {
+        code: diagnostic.code,
+        extensionId: diagnostic.extensionId,
+        extensionVersion: diagnostic.extensionVersion,
+        contributionId: diagnostic.contributionId,
+        workspaceScope: diagnostic.workspaceScope,
+        at: diagnostic.at
+      })
+    }
+  })
   setKunUnexpectedExitHandler(handleUnexpectedKunExit)
   appBehavior = initial.appBehavior
   syncLoginItemSettings(initial)
@@ -1632,32 +2129,42 @@ app.whenReady().then(async () => {
   syncWeixinBridgeRuntime(initial)
 
   traceStartup('ipc registration:start')
+  let publishExtensionWorkbenchEnvironmentChanged = async (): Promise<void> => undefined
+  const requestExtensionWorkbenchEnvironmentPublish = (): void => {
+    void publishExtensionWorkbenchEnvironmentChanged().catch((error) => {
+      logWarn('extension-workbench', 'Failed to publish extension workbench environment.', {
+        message: error instanceof Error ? error.message : String(error)
+      })
+    })
+  }
   const applySettingsPatch = async (partial: AppSettingsPatch): Promise<AppSettingsV1> => {
     const prev = await store.load()
-    const { agents: agentsPatch, provider: providerPatch, ...restPatch } = partial
+    const effectivePartial = preserveRuntimeTokenForFullSettingsSnapshot(prev, partial)
+    const { agents: agentsPatch, provider: providerPatch, ...restPatch } = effectivePartial
     const next = normalizeAppSettings({
       ...applyKunRuntimePatch(prev, agentsPatch?.kun),
       ...restPatch,
       provider: mergeModelProviderSettings(prev.provider, providerPatch),
-      log: { ...prev.log, ...(partial.log ?? {}) },
+      log: { ...prev.log, ...(effectivePartial.log ?? {}) },
       checkpointCleanup: normalizeCheckpointCleanupSettings({
         ...prev.checkpointCleanup,
-        ...(partial.checkpointCleanup ?? {})
+        ...(effectivePartial.checkpointCleanup ?? {})
       }),
-      notifications: { ...prev.notifications, ...(partial.notifications ?? {}) },
-      appBehavior: mergeAppBehaviorSettings(prev.appBehavior, partial.appBehavior),
+      notifications: { ...prev.notifications, ...(effectivePartial.notifications ?? {}) },
+      appBehavior: mergeAppBehaviorSettings(prev.appBehavior, effectivePartial.appBehavior),
       keyboardShortcuts: normalizeKeyboardShortcuts({
         bindings: {
           ...prev.keyboardShortcuts.bindings,
-          ...(partial.keyboardShortcuts?.bindings ?? {})
+          ...(effectivePartial.keyboardShortcuts?.bindings ?? {})
         }
       }),
-      write: mergeWriteSettings(prev.write, partial.write),
-      claw: mergeClawSettings(prev.claw, partial.claw),
-      schedule: mergeScheduleSettings(prev.schedule, partial.schedule),
-      workflow: mergeWorkflowSettings(prev.workflow, partial.workflow),
-      terminal: mergeTerminalSettings(prev.terminal, partial.terminal),
-      guiUpdate: { ...prev.guiUpdate, ...(partial.guiUpdate ?? {}) }
+      write: mergeWriteSettings(prev.write, effectivePartial.write),
+      claw: mergeClawSettings(prev.claw, effectivePartial.claw),
+      schedule: mergeScheduleSettings(prev.schedule, effectivePartial.schedule),
+      workflow: mergeWorkflowSettings(prev.workflow, effectivePartial.workflow),
+      design: mergeDesignSettings(prev.design, effectivePartial.design),
+      terminal: mergeTerminalSettings(prev.terminal, effectivePartial.terminal),
+      guiUpdate: { ...prev.guiUpdate, ...(effectivePartial.guiUpdate ?? {}) }
     })
     if (prev.log.enabled !== next.log.enabled || prev.log.retentionDays !== next.log.retentionDays) {
       configureLogger({ enabled: next.log.enabled, retentionDays: next.log.retentionDays })
@@ -1666,7 +2173,8 @@ app.whenReady().then(async () => {
     if (runtimeValidationError) {
       throw new Error(`Invalid runtime settings: ${runtimeValidationError}`)
     }
-    const saved = await store.patch(partial)
+    const saved = await store.patch(effectivePartial)
+    updateBrowserUseHostSettings(saved)
     await syncClawScheduleMcpConfig(saved, getClawScheduleMcpLaunchConfig()).catch((error) => {
       console.error('[claw-schedule-mcp] failed to sync config after settings change:', error)
     })
@@ -1687,17 +2195,29 @@ app.whenReady().then(async () => {
     syncLoginItemSettings(saved)
     syncTray(saved)
     syncCheckpointCleanupTimer(saved)
+    requestExtensionWorkbenchEnvironmentPublish()
     return saved
   }
 
   const fetchModels = async () => {
     const settings = await store.load()
+    const shared = await runtimeRequest(settings, '/v1/model-connections', { method: 'GET' })
+    if (shared.ok) {
+      try {
+        const live = modelListFromSharedConnections(JSON.parse(shared.body) as unknown)
+        if (live) return live
+      } catch {
+        // Fall back to the compatibility settings projection below.
+      }
+    }
     const key = resolveConfiguredApiKey(settings)
     return fetchUpstreamModelIds(settings, key)
   }
 
   const saveSettingsPatch = async (partial: AppSettingsPatch): Promise<AppSettingsV1> => {
-    return store.patch(partial)
+    const saved = await store.patch(preserveRuntimeTokenForFullSettingsSnapshot(await store.load(), partial))
+    requestExtensionWorkbenchEnvironmentPublish()
+    return saved
   }
 
   registerAppIpcHandlers({
@@ -1705,10 +2225,23 @@ app.whenReady().then(async () => {
     getMainWindow: () => mainWindow,
     applySettingsPatch,
     saveSettingsPatch,
-    runtimeRequest: async (path, method, body) => {
-      const settings = await store.load()
-      return runtimeRequest(settings, path, { method, body })
+    resetUnreadableCredentials: async () => {
+      assertCanonicalRuntimeMigrationReady()
+      const dataDir = resolveSettingsDataDir(await store.load())
+      const result = await resetUnreadableWindowsCredentials(dataDir)
+      credentialMigration?.invalidateRuntime(dataDir)
+      return { reset: true as const, ...result }
     },
+    runtimeRequest: async (path, method, body, headers) => {
+      const settings = await store.load()
+      const result = await runtimeRequest(settings, path, { method, body, headers })
+      const cleanup = result.ok
+        ? browserUseCleanupForRuntimeRequest({ path, method, body })
+        : undefined
+      if (cleanup) await browserUseManager.clear(cleanup.threadId, cleanup.reason)
+      return result
+    },
+    getRuntimeSettingsSyncStatus: () => runtimeSettingsSyncStatus,
     restartRuntime: async () => {
       const settings = await store.load()
       await restartRuntime(settings)
@@ -1726,12 +2259,114 @@ app.whenReady().then(async () => {
       const settings = await store.load()
       queueRuntimeMcpConfigApply(settings)
     },
+    onKunProjectConfigChanged: async () => {
+      const settings = await store.load()
+      queueRuntimeMcpConfigApply(settings)
+    },
     showTurnCompleteNotification,
     getAppVersion: () => app.getVersion(),
     readGuiUpdateState,
     loadGuiUpdaterModule,
     resolveLogDirectory: () => resolveLogDirectory(app),
+    logError,
+    workspacePreviewProtocols
+  })
+  const disposeBrowserUseIpc = registerBrowserUseIpc({
+    ipcMain,
+    manager: browserUseManager,
+    getMainWindow: () => mainWindow
+  })
+  const dataMigrationController = new DataMigrationController({
+    userDataPath: app.getPath('userData'),
+    store,
+    getMainWindow: () => mainWindow,
+    runtimeFetch: async (path, init = {}) => {
+      const settings = await store.load()
+      const ensured = await ensureRuntime(settings)
+      const requestSettings = ensured ?? settings
+      const headers = runtimeAuthHeaders(requestSettings)
+      new Headers(init.headers).forEach((value, key) => headers.set(key, value))
+      const normalizedPath = path.startsWith('/') ? path : `/${path}`
+      return fetch(`${getRuntimeBaseUrlForSettings(requestSettings)}${normalizedPath}`, {
+        ...init,
+        headers
+      } as RequestInit)
+    },
+    sourceInstallationId: `installation_${createHash('sha256').update(app.getPath('userData')).digest('hex').slice(0, 24)}`,
+    sourceAppVersion: app.getVersion(),
+    sourceRuntimeVersion: app.getVersion(),
+    featureEnabled: resolveDataMigrationFeatureEnabled()
+  })
+  dataMigrationController.registerIpc()
+  const extensionIpcOptions: RegisterExtensionIpcHandlersOptions = {
+    getMainWindow: () => mainWindow,
+    runtimeRequest: async (path, method, body, headers) => {
+      const settings = await store.load()
+      return runtimeRequest(settings, path, { method, body, headers })
+    },
+    descriptors: extensionDescriptors,
+    viewSessions: extensionViewSessions,
+    viewProtocols: extensionViewProtocols,
+    externalBrowsers: extensionExternalBrowsers,
+    mediaProtocols: extensionMediaProtocols,
+    protectedActions: protectedExtensionActions,
+    credentialSurface: protectedCredentialSurface,
+    contentScripts: extensionContentScripts,
+    getWorkbenchEnvironment: async () => {
+      const settings = await store.load()
+      let reducedMotion = false
+      try {
+        reducedMotion = systemPreferences.getAnimationSettings().prefersReducedMotion
+      } catch {
+        // Some Linux desktop environments do not expose animation settings.
+      }
+      return createExtensionWorkbenchEnvironment({
+        themePreference: settings.theme,
+        systemDark: nativeTheme.shouldUseDarkColors,
+        highContrast: nativeTheme.shouldUseHighContrastColors,
+        zoomFactor: mainWindow && !mainWindow.isDestroyed()
+          ? mainWindow.webContents.getZoomFactor()
+          : 1,
+        reducedMotion,
+        locale: settings.locale
+      })
+    },
     logError
+  }
+  const extensionIpcRegistration = registerExtensionIpcHandlers(extensionIpcOptions)
+  publishExtensionWorkbenchEnvironmentChanged = () =>
+    extensionIpcRegistration.publishWorkbenchEnvironmentChanged()
+  const onNativeThemeUpdated = (): void => {
+    requestExtensionWorkbenchEnvironmentPublish()
+    notifyTrayQuotaRefresh()
+  }
+  const onWorkbenchZoomChanged = (): void => {
+    requestExtensionWorkbenchEnvironmentPublish()
+  }
+  bindExtensionMainWindow = (window) => {
+    extensionIpcRegistration.bindMainWindow(window)
+    window.webContents.on('zoom-changed', onWorkbenchZoomChanged)
+  }
+  nativeTheme.on('updated', onNativeThemeUpdated)
+  requestExtensionWorkbenchEnvironmentPublish()
+  const stopSecretRevealConsentPump = startExtensionSecretRevealConsentPump(
+    extensionIpcOptions
+  )
+  const stopExtensionNotificationPump = startExtensionNotificationPump(
+    extensionIpcOptions
+  )
+  app.once('before-quit', () => {
+    disposeTrayQuotaIpc?.()
+    disposeTrayQuotaIpc = null
+    destroyTrayQuotaPopover()
+    disposeBrowserUseIpc()
+    stopSecretRevealConsentPump()
+    stopExtensionNotificationPump()
+    extensionIpcRegistration.dispose()
+    extensionExternalBrowsers.destroy()
+    bindExtensionMainWindow = undefined
+    nativeTheme.removeListener('updated', onNativeThemeUpdated)
+    mainWindow?.webContents.removeListener('zoom-changed', onWorkbenchZoomChanged)
   })
 
   void loadGuiUpdaterModule().catch((error) => {
@@ -1739,6 +2374,8 @@ app.whenReady().then(async () => {
   })
 
   registerRuntimeSseIpc({ ipcMain, store, ensureRuntime, logError })
+  registerCliInstallIpc(ipcMain)
+
   registerTerminalPtyIpc({
     ipcMain,
     getMainWindow: () => mainWindow,
@@ -1748,6 +2385,9 @@ app.whenReady().then(async () => {
   traceStartup('ipc registration:done')
 
   createWindow({ suppressInitialShow: shouldStartHidden(initial) })
+  void maybePromptCliInstall(() => mainWindow).catch((error) => {
+    console.warn('[kun-gui] CLI install prompt failed:', error)
+  })
   traceStartup('createWindow:returned')
   void loadGuiUpdaterModule()
     .then((module) => module.showPostUpdateReleaseNotes())
@@ -1759,12 +2399,24 @@ app.whenReady().then(async () => {
     console.warn('[kun-gui] prune logs:', err)
   })
 
-  if (resolveConfiguredApiKey(initial)) {
+  if (managedKunHostCanAutoStart(initial)) {
     setTimeout(() => {
-      void kunRuntimeAdapter.resolveExecutable(initial).catch((err) => {
-        console.warn('[kun-gui] prewarm Kun binary:', err)
-      })
+      void ensureRuntime(initial)
+        .then(async (current) => {
+          const applied = await applyManagedRuntimeSettingsHot(current, 'startup-settings')
+          if (applied === 'restart_required') {
+            logWarn(
+              'startup-settings',
+              'Kun attached successfully, but the configured default model could not be hot-applied.'
+            )
+          }
+        })
+        .catch((err) => {
+          console.warn('[kun-gui] failed to start, attach, or configure the shared Kun runtime:', err)
+        })
     }, 1500)
+  } else {
+    void kunRuntimeAdapter.resolveConnection(initial)
   }
 
   app.on('second-instance', () => {
@@ -1772,7 +2424,7 @@ app.whenReady().then(async () => {
   })
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) createWindow()
     else revealMainWindow()
   })
 }).catch((error) => {
@@ -1793,15 +2445,15 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', (event) => {
-  isQuitting = true
+  runtimeShutdown.requestQuit()
+  protectedCredentialSurface?.dispose()
   stopRuntimeWatchdog()
   stopCheckpointCleanupTimer()
-  if (managedRuntimesStoppedForQuit) return
+  if (runtimeShutdown.isStoppedForQuit) return
   event.preventDefault()
   void stopManagedRuntimesForQuit()
     .catch((error) => {
       console.warn('[kun-gui] failed to stop Kun runtime:', error)
-      managedRuntimesStoppedForQuit = true
     })
     .finally(() => {
       app.quit()

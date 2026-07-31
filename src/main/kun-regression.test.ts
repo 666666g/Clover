@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   DEFAULT_DEEPSEEK_BASE_URL,
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -113,6 +114,8 @@ describe('Kun single-agent regression', () => {
       locale: 'en',
       theme: 'system',
       uiFontScale: 0.82,
+      chatContentMaxWidthPx: 896,
+      composerSendKey: 'enter',
       provider: defaultModelProviderSettings(),
       agents: {
         kun: defaultKunRuntimeSettings(19000)
@@ -120,7 +123,7 @@ describe('Kun single-agent regression', () => {
       workspaceRoot: '/tmp',
       conversationWorkspaceRoot: '~/Documents/Kun',
       log: { enabled: true, retentionDays: 7 },
-      checkpointCleanup: { enabled: false, intervalDays: 3 },
+      checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
       notifications: { turnComplete: true },
       appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
       keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -128,6 +131,7 @@ describe('Kun single-agent regression', () => {
       claw: defaultClawSettings(),
       schedule: defaultScheduleSettings(),
       workflow: defaultWorkflowSettings(),
+      design: defaultDesignSettings(),
       terminal: defaultTerminalSettings(),
       guiUpdate: { channel: 'stable' },
       codePromptPrefix: '',

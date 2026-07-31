@@ -18,6 +18,12 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
+        input: {
+          index: resolve('src/preload/index.ts'),
+          'extension-view': resolve('src/preload/extension-view.ts'),
+          'extension-protected-surface': resolve('src/preload/extension-protected-surface.ts'),
+          'tray-quota': resolve('src/preload/tray-quota.ts')
+        },
         output: {
           format: 'cjs',
           entryFileNames: '[name].cjs'
@@ -30,6 +36,17 @@ export default defineConfig({
       alias: {
         '@renderer': resolve('src/renderer/src'),
         '@shared': resolve('src/shared')
+      }
+    },
+    server: {
+      host: '127.0.0.1'
+    },
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/renderer/index.html'),
+          'tray-quota': resolve('src/renderer/tray-quota.html')
+        }
       }
     },
     plugins: [react()]

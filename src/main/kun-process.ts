@@ -4,27 +4,29 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import {
-  defaultKunTokenEconomySettings,
   isKunRuntimeInsecure,
   getKunRuntimeSettings,
   getModelProviderSettings,
   resolveModelProviderProxyUrl,
   resolveKunRuntimeSettings,
-  type ModelProviderModelProfileV1,
   type ModelProviderProfileV1,
   type KunRuntimeSettingsV1,
-  type KunSubagentsSettingsV1,
   type AppSettingsV1
 } from '../shared/app-settings'
 import {
   buildKunServeArgs,
-  resolveKunExecutable
+  resolveKunExecutable,
+  resolveKunRuntimeBuildId,
+  shouldRunKunServeAsElectronChild
 } from './resolve-kun-binary'
+import { resolveCodexOAuthApiKey } from './codex-auth'
+import { ensureFreshGrokCredentials } from './grok-auth'
 import {
   KunConfigSchema,
+  type KunConfig,
   KunServeConfigSchema,
   ModelConfigSchema,
   ContextCompactionConfigSchema,
@@ -37,6 +39,7 @@ import {
   AttachmentsCapabilityConfig,
   ComputerUseCapabilityConfig,
   ImageGenCapabilityConfig,
+  InstructionsCapabilityConfig,
   McpCapabilityConfig,
   McpServerConfig,
   MemoryCapabilityConfig,
@@ -48,43 +51,68 @@ import {
   WebCapabilityConfig
 } from '../../kun/src/contracts/capabilities.js'
 import {
-  buildClawScheduleMcpArgs,
-  GUI_SCHEDULE_MCP_SERVER_NAME,
   resolveClawScheduleMcpCommand,
   resolveKunMcpJsonPath,
   type ClawScheduleMcpLaunchConfig
 } from './claw-schedule-mcp-config'
 import { defaultKunDataDir } from './runtime/kun-adapter'
-import { isKunHealthResponseBody } from './kun-health'
 import { resolveClaudeBinary } from './agent-sdk-installer'
+import { resolveAntigravityCliBinary } from './antigravity-cli'
 import { appendManagedLogLine } from './logger'
 import {
-  comparableSkillRootPath,
-  guiSkillManagedComparablePaths,
-  guiSkillWorkspaceRootsForRuntime,
-  guiSkillRootsForRuntime,
-  isCodexPluginCacheRoot,
-  normalizeSkillRootPath
-} from './services/skill-service'
+  KunProcessController,
+  type KunUnexpectedExitInfo
+} from './runtime/kun-process-controller'
+import {
+  waitForKunStartup
+} from './runtime/kun-runtime-health-monitor'
+import {
+  contextCompactionConfigForRuntime,
+  modelConfigForRuntime,
+  providersConfigForRuntime,
+  rolesConfigForRuntime,
+  storageConfigForRuntime,
+  tokenEconomyConfigForRuntime,
+  toolOutputLimitsConfigForRuntime
+} from './runtime/kun-runtime-model-config'
+import {
+  computerUseConfigForRuntime,
+  imageGenConfigForRuntime,
+  musicGenConfigForRuntime,
+  qualityConfigForRuntime,
+  runtimeTuningConfigForRuntime,
+  speechGenConfigForRuntime,
+  videoGenConfigForRuntime
+} from './runtime/kun-runtime-capability-config'
+import {
+  KUN_BROWSER_USE_APPROVAL_SIGNING_KEY_ENV,
+  KUN_BROWSER_USE_BRIDGE_TOKEN_ENV,
+  KUN_BROWSER_USE_BRIDGE_URL_ENV
+} from '../../kun/src/contracts/browser-use.js'
+import { prepareBrowserUseHostForKunLaunch } from './browser-use/browser-use-host'
+import {
+  buildGuiScheduleKunMcpServer,
+  GUI_SCHEDULE_MCP_SERVER_NAME,
+  readGuiManagedMcpServers,
+  readJsonObjectIfExists,
+  skillCapabilityConfigForRuntime
+} from './runtime/kun-runtime-mcp-config'
+import { availableBundledExtensionsDirectory } from './bundled-extension-resources'
+import { resolveOfficeCliBinary } from './officecli-resources'
+import { subagentProfilesForRuntime } from './runtime/kun-runtime-subagent-config'
+import { syncGuiManagedKunConfig } from './runtime/kun-runtime-config-service'
+import { assertManagedKunDataDirIsCurrent } from './kun-data-dir-paths'
+import {
+  ensureSharedRuntime,
+  resolveSharedRuntime,
+  type SharedRuntimeConnection
+} from '../../kun/src/cli/shared-runtime.js'
 
-let child: ChildProcess | null = null
-let childPort: number | null = null
-let childLogCapture: KunChildLogCapture | null = null
-let lastResolvedBinary: string | null = null
-let kunStartPromise: Promise<void> | null = null
-let childStderrTail = ''
-/** Children killed on purpose (stop/quit/settings restart) — their exit is not a crash. */
-const intentionalStops = new WeakSet<ChildProcess>()
-/** Children that completed the ready handshake — only their exits count as runtime crashes. */
-const readyChildren = new WeakSet<ChildProcess>()
+export { subagentProfilesForRuntime } from './runtime/kun-runtime-subagent-config'
+export { syncGuiManagedKunConfig } from './runtime/kun-runtime-config-service'
 
-export type KunUnexpectedExitInfo = {
-  code: number | null
-  signal: NodeJS.Signals | null
-  stderrTail: string
-}
-
-let onUnexpectedKunExit: ((info: KunUnexpectedExitInfo) => void) | null = null
+export type { KunUnexpectedExitInfo } from './runtime/kun-process-controller'
+export { resolveKunStartupTimeoutMs } from './runtime/kun-runtime-health-monitor'
 
 /**
  * Called when a READY kun child exits without the GUI asking for it.
@@ -94,82 +122,14 @@ let onUnexpectedKunExit: ((info: KunUnexpectedExitInfo) => void) | null = null
 export function setKunUnexpectedExitHandler(
   handler: ((info: KunUnexpectedExitInfo) => void) | null
 ): void {
-  onUnexpectedKunExit = handler
+  processController.setUnexpectedExitHandler(handler)
 }
 
 const execFileAsync = promisify(execFile)
-const KUN_READY_PREFIX = 'KUN_READY '
-const KUN_STARTUP_TIMEOUT_FLOOR_MS = 15_000
-const KUN_STARTUP_TIMEOUT_CEILING_MS = 600_000
-
-/**
- * How long to wait for a freshly spawned kun to report ready before giving
- * up and killing it. kun emits its ready marker only after the HTTP server
- * is actually listening, which it does only after sqlite opens, the thread
- * store finishes its backfill, usage carryover replays every thread's
- * events, and the MCP fast-connect race runs. On a slow disk (Windows +
- * antivirus scans) with a large history this routinely exceeds 45s, leaving
- * the runtime stuck in a "did not report ready within 45000ms" → SIGTERM →
- * respawn loop (#188, #544).
- *
- * A generous ceiling is free on fast machines: the parallel /health probe
- * in waitForKunStartup settles the moment the server responds, and a process
- * that actually crashes rejects immediately via its exit event rather than
- * waiting out the timeout. Only a slow-but-progressing boot uses the extra
- * runway. Windows gets the larger default; everything is overridable via the
- * KUN_STARTUP_TIMEOUT_MS env var (milliseconds, clamped to 15s–10min) for
- * extreme cases without a rebuild.
- */
-export function resolveKunStartupTimeoutMs(
-  platform: NodeJS.Platform,
-  env: NodeJS.ProcessEnv
-): number {
-  const raw = env.KUN_STARTUP_TIMEOUT_MS
-  if (raw && raw.trim()) {
-    const parsed = Number(raw)
-    if (Number.isFinite(parsed)) {
-      return Math.min(
-        KUN_STARTUP_TIMEOUT_CEILING_MS,
-        Math.max(KUN_STARTUP_TIMEOUT_FLOOR_MS, Math.floor(parsed))
-      )
-    }
-  }
-  return platform === 'win32' ? 90_000 : 60_000
-}
-
-const KUN_STARTUP_TIMEOUT_MS = resolveKunStartupTimeoutMs(process.platform, process.env)
-const KUN_STARTUP_HEALTH_POLL_MS = 500
-const KUN_STARTUP_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const KUN_STOP_GRACE_MS = 5_000
 const KUN_STOP_FORCE_MS = 1_000
 const STDERR_TAIL_MAX_CHARS = 32_768
-const GUI_SCHEDULE_MCP_TIMEOUT_MS = 5_000
 const MAX_TCP_PORT = 65_535
-const DEFAULT_KUN_MODEL_PROFILES: Record<string, Record<string, unknown>> = {
-  'deepseek-v4-pro': {
-    contextWindowTokens: 1_000_000,
-    contextCompaction: {
-      softThreshold: 980_000,
-      hardThreshold: 990_000
-    },
-    inputModalities: ['text'],
-    outputModalities: ['text'],
-    supportsToolCalling: true,
-    messageParts: ['text']
-  },
-  'deepseek-v4-flash': {
-    aliases: ['deepseek-chat', 'deepseek-reasoner'],
-    contextWindowTokens: 1_000_000,
-    contextCompaction: {
-      softThreshold: 980_000,
-      hardThreshold: 990_000
-    },
-    inputModalities: ['text'],
-    outputModalities: ['text'],
-    supportsToolCalling: true,
-    messageParts: ['text']
-  }
-}
 
 type KunLogStream = 'stdout' | 'stderr' | 'lifecycle'
 type KunChildLogCapture = {
@@ -178,6 +138,8 @@ type KunChildLogCapture = {
   logLifecycle: (message: string) => void
   close: () => Promise<void>
 }
+
+const processController = new KunProcessController<KunChildLogCapture>()
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -281,8 +243,9 @@ function resolveNodeScriptCommand(command: string): string {
 
 export function resolveKunDataDir(runtime: { dataDir: string }): string {
   const trimmed = runtime.dataDir?.trim()
-  if (trimmed) return expandHomePath(trimmed)
-  return defaultKunDataDir()
+  const dataDir = trimmed ? expandHomePath(trimmed) : defaultKunDataDir()
+  assertManagedKunDataDirIsCurrent(dataDir)
+  return dataDir
 }
 
 function expandHomePath(path: string): string {
@@ -294,11 +257,11 @@ function expandHomePath(path: string): string {
 }
 
 export function isKunChildRunning(): boolean {
-  return child !== null && child.exitCode === null && child.signalCode === null
+  return processController.isRunning()
 }
 
 function isCurrentKunChildPid(pid: number): boolean {
-  return Boolean(child?.pid === pid && isKunChildRunning())
+  return processController.isCurrentPid(pid)
 }
 
 /**
@@ -313,30 +276,95 @@ function isCurrentKunChildPid(pid: number): boolean {
  * never be the thing that launch is itself waiting on.
  */
 export function waitForKunStartupSettled(): Promise<void> {
-  return kunStartPromise ? kunStartPromise.catch(() => undefined) : Promise.resolve()
+  return processController.waitForStartupSettled()
 }
 
 export function startKunChild(settings: AppSettingsV1): Promise<void> {
-  if (kunStartPromise) return kunStartPromise
-  const runtime = resolveKunRuntimeSettings(settings)
-  if (isKunChildRunning()) return Promise.resolve()
-  if (!runtime.autoStart) return Promise.resolve()
-  let promise: Promise<void>
-  promise = startKunChildOnce(settings, runtime).finally(() => {
-    if (kunStartPromise === promise) kunStartPromise = null
+  return processController.start(async () => {
+    const runtime = resolveKunRuntimeSettings(settings)
+    if (isKunChildRunning() || !runtime.autoStart) return
+    await startKunChildOnce(settings, runtime)
   })
-  kunStartPromise = promise
-  return promise
 }
 
-async function startKunChildOnce(
-  settings: AppSettingsV1,
-  runtime: KunRuntimeSettingsV1
-): Promise<void> {
-  if (childLogCapture) {
-    await childLogCapture.close()
-    childLogCapture = null
+/**
+ * Start (or attach to) the data-dir scoped runtime used by both the GUI and
+ * terminal clients. Unlike the legacy child controller, this process is
+ * detached and writes directly to its own log, so closing Electron does not
+ * terminate active turns or disconnect other clients.
+ */
+export async function startKunSharedRuntime(
+  settings: AppSettingsV1
+): Promise<SharedRuntimeConnection | null> {
+  const runtime = resolveKunRuntimeSettings(settings)
+  if (!runtime.autoStart) return null
+  const dataDir = resolveKunDataDir(runtime)
+  if (await hasUnpublishedKunWriter(runtime, dataDir)) {
+    throw new Error(
+      'An older GUI-private Kun runtime is already writing this data directory without shared discovery. Close or update that GUI once before starting the shared runtime.'
+    )
   }
+  // A shared runtime is elected under the data-directory start lock. Let the
+  // elected server bind an ephemeral loopback port and publish the real
+  // port/token through discovery instead of treating the GUI preference as a
+  // live connection contract.
+  const launch = await prepareKunLaunch(settings, runtime, { port: 0 })
+  return ensureSharedRuntime({
+    dataDir: launch.dataDir,
+    ...(launch.expectedBuildId ? { expectedBuildId: launch.expectedBuildId } : {}),
+    launch: {
+      command: launch.command,
+      args: launch.args,
+      env: launch.env,
+      runAsNode: launch.runAsNode
+    }
+  })
+}
+
+async function hasUnpublishedKunWriter(
+  runtime: KunRuntimeSettingsV1,
+  dataDir: string
+): Promise<boolean> {
+  if (await resolveSharedRuntime(dataDir).catch(() => null)) return false
+  try {
+    const headers = new Headers()
+    if (runtime.runtimeToken.trim()) {
+      headers.set('authorization', `Bearer ${runtime.runtimeToken.trim()}`)
+    }
+    const response = await fetch(`http://127.0.0.1:${runtime.port}/v1/runtime/info`, {
+      headers,
+      signal: AbortSignal.timeout(2_000)
+    })
+    if (!response.ok) return false
+    const body = await response.json() as { dataDir?: unknown }
+    return typeof body.dataDir === 'string' && sameRuntimePath(body.dataDir, dataDir)
+  } catch {
+    return false
+  }
+}
+
+function sameRuntimePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left)
+  const normalizedRight = resolve(right)
+  return process.platform === 'win32'
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight
+}
+
+type PreparedKunLaunch = {
+  command: string
+  args: string[]
+  env: NodeJS.ProcessEnv
+  dataDir: string
+  runAsNode: boolean
+  expectedBuildId?: string
+}
+
+async function prepareKunLaunch(
+  settings: AppSettingsV1,
+  runtime: KunRuntimeSettingsV1,
+  options: { port?: number } = {}
+): Promise<PreparedKunLaunch> {
   const root = appRoot()
   const resolution = resolveKunExecutable(root, runtime.binaryPath)
   if (resolution.command === process.execPath && !existsSync(resolution.args[0])) {
@@ -344,6 +372,7 @@ async function startKunChildOnce(
       `Kun runtime build is missing at ${resolution.args[0]}. Run \`npm run build:kun\` before starting the GUI.`
     )
   }
+  const expectedBuildId = await resolveKunRuntimeBuildId(resolution)
   const dataDir = resolveKunDataDir(runtime)
   await syncGuiManagedKunConfig(dataDir, runtime, {
     scheduleMcp: {
@@ -355,87 +384,130 @@ async function startKunChildOnce(
       }
     }
   })
-  lastResolvedBinary = resolution.command === process.execPath
+  processController.lastResolvedBinary = resolution.command === process.execPath
     ? resolution.args.join(' ')
     : resolution.command
   const args = buildKunServeArgs({
     resolution,
     host: '127.0.0.1',
-    port: runtime.port,
+    port: options.port ?? runtime.port,
     dataDir,
-    baseUrl: runtime.baseUrl,
-    modelProxyUrl: resolveModelProviderProxyUrl(settings),
-    endpointFormat: runtime.endpointFormat,
-    model: runtime.model,
     approvalPolicy: runtime.approvalPolicy,
     sandboxMode: runtime.sandboxMode,
+    approvalReviewer: runtime.approvalReviewer,
     tokenEconomyMode: runtime.tokenEconomyMode,
     insecure: isKunRuntimeInsecure(runtime)
   })
-  // On macOS, libnut links AppKit and calls `[NSApplication sharedApplication]`
-  // on its first screen-grab/mouse/keyboard call. That promotes a pure-Node
-  // (ELECTRON_RUN_AS_NODE) child to a regular Cocoa app and a second Kun icon
-  // appears in the Dock. When computer-use is enabled we instead spawn kun as
-  // a real Electron instance so it can call `app.dock.hide()` itself (see
-  // kun/src/cli/serve-entry.ts). The extra Chromium overhead is only paid
-  // when the user actually opted into host control.
-  const runAsElectron = process.platform === 'darwin' && runtime.computerUse?.enabled === true
+  const runAsElectron = shouldRunKunServeAsElectronChild({
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+    computerUseEnabled: runtime.computerUse?.enabled === true
+  })
   const command = runAsElectron ? resolution.command : resolveNodeScriptCommand(resolution.command)
-  // When the runtime's own (default) provider is the Claude subscription, tell
-  // the runtime so its dispatch routes default-provider turns (thread.providerId
-  // absent or equal to it) to the embedded SDK instead of the HTTP default.
+  const runtimeApiKey = (await ensureFreshGrokCredentials(runtime.apiKey)).apiKey
+  const defaultClientApiKey = resolveCodexOAuthApiKey(runtimeApiKey).apiKey
   const activeProviderKind = (getModelProviderSettings(settings).providers as ModelProviderProfileV1[]).find(
     (provider) => provider.id?.trim() === getKunRuntimeSettings(settings).providerId.trim()
   )?.kind
-  // Point the runtime at the on-demand Claude Code binary (the ~222MB binary is
-  // not bundled; it's downloaded into userData). Absent in dev when it's still
-  // resolvable from kun/node_modules — the SDK auto-resolves it there.
   const claudeBinary = resolveClaudeBinary(app.getPath('userData'), [join(appRoot(), 'kun')])
-  const childEnv: NodeJS.ProcessEnv = {
+  const antigravityBinary = resolveAntigravityCliBinary(app.getPath('userData'))
+  const officeCliBinary = resolveOfficeCliBinary({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appRoot: root,
+    explicitPath: process.env.KUN_OFFICECLI_BINARY
+  })
+  const browserUseBridge = runtime.browserUse.enabled
+    ? await prepareBrowserUseHostForKunLaunch()
+    : undefined
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
-    KUN_RUNTIME_TOKEN: runtime.runtimeToken,
-    DEEPSEEK_API_KEY: runtime.apiKey || process.env.DEEPSEEK_API_KEY || '',
-    ...(activeProviderKind === 'agent-sdk' ? { KUN_RUNTIME_PROVIDER_KIND: 'agent-sdk' } : {}),
-    ...(claudeBinary ? { KUN_CLAUDE_BINARY: claudeBinary } : {})
+    DEEPSEEK_API_KEY: defaultClientApiKey || process.env.DEEPSEEK_API_KEY || '',
+    ...(activeProviderKind ? { KUN_RUNTIME_PROVIDER_KIND: activeProviderKind } : {}),
+    ...(claudeBinary ? { KUN_CLAUDE_BINARY: claudeBinary } : {}),
+    ...(antigravityBinary ? { KUN_ANTIGRAVITY_BINARY: antigravityBinary } : {}),
+    ...(officeCliBinary ? { KUN_OFFICECLI_BINARY: officeCliBinary } : {}),
+    ...(browserUseBridge
+      ? {
+          [KUN_BROWSER_USE_BRIDGE_URL_ENV]: browserUseBridge.url,
+          [KUN_BROWSER_USE_BRIDGE_TOKEN_ENV]: browserUseBridge.token,
+          [KUN_BROWSER_USE_APPROVAL_SIGNING_KEY_ENV]:
+            browserUseBridge.approvalSigningKey
+        }
+      : {})
   }
-  if (!runAsElectron) childEnv.ELECTRON_RUN_AS_NODE = '1'
-  else delete childEnv.ELECTRON_RUN_AS_NODE
-  child = spawn(command, args, {
-    env: childEnv,
+  if (!browserUseBridge) {
+    delete env[KUN_BROWSER_USE_BRIDGE_URL_ENV]
+    delete env[KUN_BROWSER_USE_BRIDGE_TOKEN_ENV]
+    delete env[KUN_BROWSER_USE_APPROVAL_SIGNING_KEY_ENV]
+  }
+  const bundledExtensionsDirectory = availableBundledExtensionsDirectory({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appRoot: root
+  })
+  if (bundledExtensionsDirectory) env.KUN_BUNDLED_EXTENSIONS_DIR = bundledExtensionsDirectory
+  if (!runAsElectron) env.ELECTRON_RUN_AS_NODE = '1'
+  else delete env.ELECTRON_RUN_AS_NODE
+  return {
+    command,
+    args,
+    env,
+    dataDir,
+    runAsNode: !runAsElectron,
+    ...(expectedBuildId ? { expectedBuildId } : {})
+  }
+}
+
+async function startKunChildOnce(
+  settings: AppSettingsV1,
+  runtime: KunRuntimeSettingsV1
+): Promise<void> {
+  if (processController.logCapture) {
+    await processController.logCapture.close()
+    processController.logCapture = null
+  }
+  const launch = await prepareKunLaunch(settings, runtime)
+  processController.child = spawn(launch.command, launch.args, {
+    env: {
+      ...launch.env,
+      KUN_RUNTIME_TOKEN: runtime.runtimeToken,
+      KUN_RUNTIME_LAUNCH_MODE: 'gui'
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false
   })
-  const startedChild = child
-  childPort = runtime.port
+  const startedChild = processController.child
+  processController.childPort = runtime.port
   const startedLogCapture = createKunChildLogCapture(startedChild.pid)
-  childLogCapture = startedLogCapture
-  childStderrTail = ''
-  startedLogCapture.logLifecycle(`spawned on port ${runtime.port} using data dir ${dataDir}`)
+  processController.logCapture = startedLogCapture
+  processController.stderrTail = ''
+  startedLogCapture.logLifecycle(`spawned on port ${runtime.port} using data dir ${launch.dataDir}`)
   startedChild.stdout?.on('data', startedLogCapture.captureStdout)
   startedChild.stderr?.on('data', (chunk: Buffer | string) => {
-    childStderrTail = appendTail(childStderrTail, normalizeCapturedChunk(chunk))
+    processController.stderrTail = appendTail(
+      processController.stderrTail,
+      normalizeCapturedChunk(chunk)
+    )
     startedLogCapture.captureStderr(chunk)
   })
-  child.on('exit', (code, signal) => {
+  startedChild.on('exit', (code, signal) => {
     startedLogCapture.logLifecycle(
       signal
         ? `exited with signal ${signal}`
         : `exited with code ${code ?? 'unknown'}`
     )
     void startedLogCapture.close()
-    if (child === startedChild) {
-      child = null
-      childPort = null
-    }
-    if (readyChildren.has(startedChild) && !intentionalStops.has(startedChild)) {
-      onUnexpectedKunExit?.({
+    processController.clearChild(startedChild)
+    if (processController.shouldReportUnexpectedExit(startedChild)) {
+      processController.reportUnexpectedExit({
         code: code ?? null,
         signal: signal ?? null,
-        stderrTail: childStderrTail
+        stderrTail: processController.stderrTail
       })
     }
   })
-  child.on('error', (error) => {
+  startedChild.on('error', (error) => {
     startedLogCapture.logLifecycle(
       `process error: ${error instanceof Error ? error.message : String(error)}`
     )
@@ -445,877 +517,28 @@ async function startKunChildOnce(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     startedLogCapture.logLifecycle(`startup failed before ready: ${message}`)
-    if (child === startedChild) {
+    if (processController.child === startedChild) {
       await stopKunChildAndWait()
     }
     throw error
   }
-  readyChildren.add(startedChild)
+  processController.markReady(startedChild)
   startedLogCapture.logLifecycle(`ready marker received on port ${runtime.port}`)
 }
 
-export async function syncGuiManagedKunConfig(
-  dataDir: string,
-  runtime: Pick<
-    KunRuntimeSettingsV1,
-    | 'mcpSearch'
-    | 'tokenEconomy'
-    | 'storage'
-    | 'contextCompaction'
-    | 'runtimeTuning'
-    | 'imageGeneration'
-    | 'textToSpeech'
-    | 'musicGeneration'
-    | 'videoGeneration'
-    | 'computerUse'
-    | 'modelProfiles'
-    | 'memoryEnabled'
-    | 'quality'
-    | 'subagents'
-    | 'smallModel'
-    | 'smallModelProviderId'
-    | 'titleModel'
-    | 'titleProviderId'
-    | 'summaryModel'
-    | 'summaryProviderId'
-    | 'codeReviewModel'
-    | 'codeReviewProviderId'
-  >,
-  options?: {
-    scheduleMcp?: {
-      settings: AppSettingsV1
-      launch: ClawScheduleMcpLaunchConfig
-    }
-    mcpConfigPath?: string
-  }
-): Promise<void> {
-  const configPath = join(dataDir, 'config.json')
-  const existing = sanitizeKunConfigSections(await readJsonObjectIfExists(configPath))
-  const importedMcpServers = await readGuiManagedMcpServers(
-    options?.mcpConfigPath ?? resolveKunMcpJsonPath()
-  )
-  const hasImportedEnabledMcpServer = Object.values(importedMcpServers).some(
-    (server) => objectValue(server).enabled !== false
-  )
-
-  const serve = objectValue(existing?.serve)
-  const existingTokenEconomy = objectValue(serve.tokenEconomy)
-  const existingContextCompaction = objectValue(existing?.contextCompaction)
-  const existingModels = objectValue(existing?.models)
-  const existingRuntimeTuning = objectValue(existing?.runtime)
-  const existingQuality = objectValue(existing?.quality)
-  const capabilities = objectValue(existing?.capabilities)
-  const mcp = objectValue(capabilities.mcp)
-  const search = objectValue(mcp.search)
-  const attachments = objectValue(capabilities.attachments)
-  const memory = objectValue(capabilities.memory)
-  const web = objectValue(capabilities.web)
-  const skills = objectValue(capabilities.skills)
-  const imageGen = objectValue(capabilities.imageGen)
-  const speechGen = objectValue(capabilities.speechGen)
-  const musicGen = objectValue(capabilities.musicGen)
-  const videoGen = objectValue(capabilities.videoGen)
-  const computerUse = objectValue(capabilities.computerUse)
-  const storage = storageConfigForRuntime(runtime.storage)
-  const mcpSearch = runtime.mcpSearch
-  const skillCapability = await skillCapabilityConfigForRuntime(skills, options?.scheduleMcp?.settings)
-  const workflowHookEntries = buildWorkflowHookEntries(options?.scheduleMcp?.settings.workflow)
-  // Mirror every configured GUI provider (apiKey + baseUrl + endpointFormat)
-  // into the kun config so the runtime's MultiProviderModelClient can route
-  // per-request `providerId` overrides (workflow / scheduled task / IM
-  // bridge) without restart. Empty when no GUI settings are reachable, in
-  // which case the runtime stays single-provider.
-  const providers = options?.scheduleMcp?.settings
-    ? providersConfigForRuntime(options.scheduleMcp.settings)
-    : undefined
-  const next = {
-    serve: {
-      ...serve,
-      storage,
-      tokenEconomy: tokenEconomyConfigForRuntime(runtime.tokenEconomy, existingTokenEconomy),
-      ...(providers && Object.keys(providers).length ? { providers } : {})
-    },
-    models: modelConfigForRuntime(existingModels, runtime.modelProfiles),
-    contextCompaction: contextCompactionConfigForRuntime(runtime.contextCompaction, existingContextCompaction),
-    runtime: runtimeTuningConfigForRuntime(runtime.runtimeTuning, existingRuntimeTuning),
-    quality: qualityConfigForRuntime(runtime.quality, existingQuality),
-    ...(() => {
-      const roles = rolesConfigForRuntime(runtime)
-      return Object.keys(roles).length ? { roles } : {}
-    })(),
-    capabilities: {
-      ...capabilities,
-      attachments: {
-        ...attachments,
-        enabled: attachments.enabled === false ? false : true
-      },
-      web: {
-        ...web,
-        enabled: web.enabled === false ? false : true,
-        fetchEnabled: web.fetchEnabled === false ? false : true
-      },
-      skills: skillCapability,
-      imageGen: imageGenConfigForRuntime(runtime.imageGeneration, imageGen),
-      speechGen: speechGenConfigForRuntime(runtime.textToSpeech, speechGen),
-      musicGen: musicGenConfigForRuntime(runtime.musicGeneration, musicGen),
-      videoGen: videoGenConfigForRuntime(runtime.videoGeneration, videoGen),
-      computerUse: computerUseConfigForRuntime(runtime.computerUse, computerUse),
-      memory: {
-        ...memory,
-        enabled: runtime.memoryEnabled
-      },
-      subagents: subagentProfilesForRuntime(runtime.subagents ?? { enabled: true, profiles: [] }),
-      mcp: {
-        ...mcp,
-        ...(options?.scheduleMcp || mcpSearch.enabled || hasImportedEnabledMcpServer
-          ? { enabled: mcp.enabled === false ? false : true }
-          : {}),
-        servers: {
-          ...objectValue(mcp.servers),
-          ...importedMcpServers,
-          ...(options?.scheduleMcp
-          ? {
-              [GUI_SCHEDULE_MCP_SERVER_NAME]: buildGuiScheduleKunMcpServer(
-                options.scheduleMcp.settings,
-                options.scheduleMcp.launch
-              )
-            }
-          : {})
-        },
-        search: {
-          ...search,
-          enabled: mcpSearch.enabled,
-          mode: mcpSearch.mode,
-          autoThresholdToolCount: mcpSearch.autoThresholdToolCount,
-          topKDefault: mcpSearch.topKDefault,
-          topKMax: mcpSearch.topKMax,
-          minScore: mcpSearch.minScore
-        }
-      }
-    },
-    ...(workflowHookEntries.length ? { hooks: workflowHookEntries } : {})
-  }
-  const parsedNext = KunConfigSchema.safeParse(next)
-  if (!parsedNext.success) {
-    throw new Error(
-      `Refusing to write invalid GUI-managed Kun config at ${configPath}: ${JSON.stringify(parsedNext.error.issues, null, 2)}`
-    )
-  }
-  const nextText = `${JSON.stringify(next, null, 2)}\n`
-  if (existing && nextText === `${JSON.stringify(existing, null, 2)}\n`) return
-  await mkdir(dirname(configPath), { recursive: true })
-  await writeFile(configPath, nextText, 'utf8')
-}
-
-function buildGuiScheduleKunMcpServer(
-  settings: AppSettingsV1,
-  launch: ClawScheduleMcpLaunchConfig
-): Record<string, unknown> {
-  return {
-    enabled: true,
-    transport: 'stdio',
-    command: resolveClawScheduleMcpCommand(launch),
-    args: buildClawScheduleMcpArgs(settings, launch),
-    env: {
-      ELECTRON_RUN_AS_NODE: '1'
-    },
-    trustScope: 'user',
-    timeoutMs: GUI_SCHEDULE_MCP_TIMEOUT_MS
-  }
-}
-
-async function skillCapabilityConfigForRuntime(
-  existing: Record<string, unknown>,
-  settings?: AppSettingsV1
-): Promise<Record<string, unknown>> {
-  // Carry over only the roots a user added by hand to the Kun config file.
-  // Drop previously-persisted GUI-managed roots so disabling a directory in
-  // settings actually removes it — otherwise a toggled-off root would stick
-  // around forever via `existing.roots`.
-  // GUI-managed roots are dropped from the carried-over set and rebuilt fresh
-  // below. Besides the common/extra candidates, auto-discovered Codex plugin
-  // caches count as managed too — otherwise old version directories from a
-  // plugin upgrade stay in `roots` forever (#392).
-  const managed = guiSkillManagedComparablePaths(settings)
-  const manualExisting = stringArrayValue(existing.roots)
-    .map(normalizeSkillRootPath)
-    .filter((path) =>
-      path.length > 0 &&
-      !managed.has(comparableSkillRootPath(path)) &&
-      !isCodexPluginCacheRoot(path))
-  const roots = uniqueStrings([
-    ...manualExisting,
-    ...(await guiSkillRootsForRuntime(settings)).map((root) => root.path)
-  ])
-  return {
-    ...existing,
-    // Auto-enable once we discover skill roots. There is no user-facing skills
-    // enable toggle, so a persisted `enabled: false` is only ever the schema
-    // default leaking onto disk — it must not permanently suppress discovered
-    // skills. An explicit `true` still forces on even with no roots.
-    enabled: roots.length > 0 || existing.enabled === true,
-    roots,
-    workspaceRoots: guiSkillWorkspaceRootsForRuntime(settings),
-    // #149: Pass global skill roots from settings (e.g. ~/.kun/skills)
-    globalRoots: existing.globalRoots ?? [],
-    // Skills the user disabled in the GUI. Forwarded so the runtime drops them
-    // from discovery — without this they stay loadable via load_skill and keep
-    // appearing in the catalog despite the GUI toggle (#392).
-    disabledIds: settings?.disabledSkillIds ?? stringArrayValue(existing.disabledIds),
-    legacySkillMd: existing.legacySkillMd === false ? false : true
-  }
-}
-
-function stringArrayValue(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : []
-}
-
-function uniqueStrings(values: string[]): string[] {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const value of values) {
-    if (!value || seen.has(value)) continue
-    seen.add(value)
-    out.push(value)
-  }
-  return out
-}
-
-async function readGuiManagedMcpServers(path: string): Promise<Record<string, Record<string, unknown>>> {
-  const parsed = await readJsonObjectIfExists(path)
-  if (!parsed) return {}
-
-  const rawServers = mcpServersFromGuiConfig(parsed)
-  const normalizedEntries = Object.entries(rawServers)
-    .map(([serverId, server]) => {
-      const normalized = normalizeGuiManagedMcpServer(server)
-      return normalized ? [serverId, normalized] as const : null
-    })
-    .filter((entry): entry is readonly [string, Record<string, unknown>] => entry !== null)
-
-  return Object.fromEntries(normalizedEntries)
-}
-
-function mcpServersFromGuiConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const directServers = objectValue(config.servers)
-  if (Object.keys(directServers).length > 0) return directServers
-
-  const capabilities = objectValue(config.capabilities)
-  const mcp = objectValue(capabilities.mcp)
-  return objectValue(mcp.servers)
-}
-
-function normalizeGuiManagedMcpServer(server: unknown): Record<string, unknown> | null {
-  const raw = objectValue(server)
-  const command = scalarStringValue(raw.command)
-  const cwd = scalarStringValue(raw.cwd)?.trim()
-  const url = scalarStringValue(raw.url)
-  const args = stringArrayValue(raw.args)
-  const headers = stringRecordValue(raw.headers)
-  const env = stringRecordValue(raw.env)
-  const transport = normalizeMcpTransport(raw.transport, command, url)
-  if (!transport) return null
-
-  const workspaceRoots = stringArrayValue(raw.workspaceRoots)
-  const trustedWorkspaceRoots = stringArrayValue(raw.trustedWorkspaceRoots)
-  const trustScope = normalizeMcpTrustScope(raw.trustScope, trustedWorkspaceRoots)
-  if (trustScope === 'workspace' && trustedWorkspaceRoots.length === 0) return null
-
-  const timeoutMs = positiveIntegerValue(raw.timeoutMs)
-  const parsed = McpServerConfig.safeParse({
-    enabled: raw.enabled === false || raw.disabled === true ? false : true,
-    transport,
-    ...(command ? { command } : {}),
-    ...(transport === 'stdio' && cwd ? { cwd } : {}),
-    ...(args.length > 0 ? { args } : {}),
-    ...(url ? { url } : {}),
-    ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    ...(Object.keys(env).length > 0 ? { env } : {}),
-    ...(workspaceRoots.length > 0 ? { workspaceRoots } : {}),
-    trustScope,
-    ...(trustedWorkspaceRoots.length > 0 ? { trustedWorkspaceRoots } : {}),
-    ...(timeoutMs ? { timeoutMs } : {})
-  })
-
-  return parsed.success ? objectValue(parsed.data) : null
-}
-
-function normalizeMcpTransport(
-  value: unknown,
-  command: string | undefined,
-  url: string | undefined
-): 'stdio' | 'streamable-http' | 'sse' | null {
-  if (value === 'stdio' || value === 'streamable-http' || value === 'sse') return value
-  if (command) return 'stdio'
-  if (url) return 'streamable-http'
-  return null
-}
-
-function normalizeMcpTrustScope(
-  value: unknown,
-  trustedWorkspaceRoots: string[]
-): 'user' | 'workspace' {
-  if (value === 'user' || value === 'workspace') return value
-  return trustedWorkspaceRoots.length > 0 ? 'workspace' : 'user'
-}
-
-function scalarStringValue(value: unknown): string | undefined {
-  return typeof value === 'string'
-    ? value
-    : typeof value === 'number' || typeof value === 'boolean'
-      ? String(value)
-      : undefined
-}
-
-function stringRecordValue(value: unknown): Record<string, string> {
-  const record = objectValue(value)
-  const next: Record<string, string> = {}
-  for (const [key, item] of Object.entries(record)) {
-    const normalized = scalarStringValue(item)
-    if (normalized !== undefined) next[key] = normalized
-  }
-  return next
-}
-
-function positiveIntegerValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined
-}
-
-function modelConfigForRuntime(
-  existing: Record<string, unknown>,
-  guiModelProfiles: Record<string, ModelProviderModelProfileV1> = {}
-): Record<string, unknown> {
-  const existingProfiles = objectValue(existing.profiles)
-  const guiProfiles = modelConfigProfilesFromProviderProfiles(guiModelProfiles)
-  const profileDefaults = {
-    ...DEFAULT_KUN_MODEL_PROFILES,
-    ...guiProfiles
-  }
-  const profiles: Record<string, unknown> = {}
-  for (const modelId of new Set([
-    ...Object.keys(profileDefaults),
-    ...Object.keys(existingProfiles)
-  ])) {
-    const defaultProfile = objectValue(profileDefaults[modelId])
-    const existingProfile = objectValue(existingProfiles[modelId])
-    const guiProfile = objectValue(guiProfiles[modelId])
-    profiles[modelId] = {
-      ...defaultProfile,
-      ...existingProfile,
-      ...guiProfile,
-      contextCompaction: {
-        ...objectValue(defaultProfile.contextCompaction),
-        ...objectValue(existingProfile.contextCompaction),
-        ...objectValue(guiProfile.contextCompaction)
-      }
-    }
-  }
-  return {
-    ...existing,
-    profiles
-  }
-}
-
-function modelConfigProfilesFromProviderProfiles(
-  profiles: Record<string, ModelProviderModelProfileV1>
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {}
-  for (const [modelId, profile] of Object.entries(profiles)) {
-    const trimmed = modelId.trim()
-    if (!trimmed) continue
-    out[trimmed] = {
-      ...(profile.aliases?.length ? { aliases: profile.aliases } : {}),
-      ...(profile.contextWindowTokens ? { contextWindowTokens: profile.contextWindowTokens } : {}),
-      ...(profile.maxOutputTokens ? { maxOutputTokens: profile.maxOutputTokens } : {}),
-      inputModalities: profile.inputModalities,
-      outputModalities: profile.outputModalities,
-      supportsToolCalling: profile.supportsToolCalling,
-      messageParts: profile.messageParts,
-      ...(profile.reasoning ? { reasoning: profile.reasoning } : {}),
-      ...(profile.endpointFormat ? { endpointFormat: profile.endpointFormat } : {})
-    }
-  }
-  return out
-}
-
-/**
- * Mirror every configured GUI provider (apiKey + baseUrl + endpointFormat
- * + per-provider proxy) into the kun config's `serve.providers` map so the
- * runtime's MultiProviderModelClient can route a workflow / scheduled-task
- * / IM-bridge turn to a non-runtime provider per request. Skips entries
- * whose baseUrl is empty — those couldn't be reached anyway.
- *
- * The kun runtime's own bound provider is included too; the wrapper's
- * default client handles it identically, so duplicate entries are
- * idempotent.
- */
-function providersConfigForRuntime(settings: AppSettingsV1): Record<string, Record<string, unknown>> {
-  const out: Record<string, Record<string, unknown>> = {}
-  const runtimeProviderId = getKunRuntimeSettings(settings).providerId.trim()
-  const proxyUrl = resolveModelProviderProxyUrl(settings)
-  for (const provider of getModelProviderSettings(settings).providers as ModelProviderProfileV1[]) {
-    const id = provider.id?.trim()
-    const baseUrl = provider.baseUrl?.trim()
-    const isAgentSdk = provider.kind === 'agent-sdk'
-    if (!id) continue
-    // agent-sdk providers carry no usable HTTP endpoint; everyone else needs one.
-    if (!baseUrl && !isAgentSdk) continue
-    // The runtime's own provider is already wired via the default CLI args, so
-    // we normally skip it here — EXCEPT agent-sdk: its turns must be routable to
-    // the embedded SDK via `serve.providers`, otherwise they fall back to the
-    // HTTP default client and 401 on api.anthropic.com (invalid x-api-key).
-    if (id === runtimeProviderId && !isAgentSdk) continue
-    out[id] = {
-      apiKey: provider.apiKey?.trim() ?? '',
-      ...(baseUrl ? { baseUrl } : {}),
-      ...(provider.kind ? { kind: provider.kind } : {}),
-      ...(provider.endpointFormat ? { endpointFormat: provider.endpointFormat } : {}),
-      ...(proxyUrl ? { modelProxyUrl: proxyUrl } : {})
-    }
-  }
-  return out
-}
-
-function tokenEconomyConfigForRuntime(
-  tokenEconomy: Pick<KunRuntimeSettingsV1, 'tokenEconomy'>['tokenEconomy'] | undefined,
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  const defaults = defaultKunTokenEconomySettings()
-  const normalized = {
-    ...defaults,
-    ...(tokenEconomy ?? {}),
-    historyHygiene: {
-      ...defaults.historyHygiene,
-      ...(tokenEconomy?.historyHygiene ?? {})
-    }
-  }
-  const existingHistoryHygiene = objectValue(existing.historyHygiene)
-  return {
-    ...existing,
-    enabled: normalized.enabled,
-    compressToolDescriptions: normalized.compressToolDescriptions,
-    compressToolResults: normalized.compressToolResults,
-    conciseResponses: normalized.conciseResponses,
-    historyHygiene: {
-      ...existingHistoryHygiene,
-      maxToolResultLines: normalized.historyHygiene.maxToolResultLines,
-      maxToolResultBytes: normalized.historyHygiene.maxToolResultBytes,
-      maxToolResultTokens: normalized.historyHygiene.maxToolResultTokens,
-      maxToolArgumentStringBytes: normalized.historyHygiene.maxToolArgumentStringBytes,
-      maxToolArgumentStringTokens: normalized.historyHygiene.maxToolArgumentStringTokens,
-      maxArrayItems: normalized.historyHygiene.maxArrayItems
-    }
-  }
-}
-
-function storageConfigForRuntime(
-  storage: Pick<KunRuntimeSettingsV1, 'storage'>['storage']
-): Record<string, unknown> {
-  const sqlitePath = storage.sqlitePath.trim()
-  return {
-    backend: storage.backend,
-    ...(sqlitePath ? { sqlitePath } : {})
-  }
-}
-
-function contextCompactionConfigForRuntime(
-  contextCompaction: Pick<KunRuntimeSettingsV1, 'contextCompaction'>['contextCompaction'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  return {
-    ...existing,
-    defaultSoftThreshold: contextCompaction.defaultSoftThreshold,
-    defaultHardThreshold: contextCompaction.defaultHardThreshold,
-    summaryMode: contextCompaction.summaryMode,
-    summaryTimeoutMs: contextCompaction.summaryTimeoutMs,
-    summaryMaxTokens: contextCompaction.summaryMaxTokens,
-    summaryInputMaxBytes: contextCompaction.summaryInputMaxBytes,
-    ...(contextCompaction.summaryModel ? { summaryModel: contextCompaction.summaryModel } : {}),
-    ...(contextCompaction.summaryProviderId ? { summaryProviderId: contextCompaction.summaryProviderId } : {})
-  }
-}
-
-/**
- * Build the kun `roles` config (internal-LLM model routing) from GUI settings.
- * Only non-empty fields are emitted so the strict RolesConfigSchema accepts the
- * result and a cleared field removes itself from config.json.
- */
-function rolesConfigForRuntime(
-  runtime: Pick<
-    KunRuntimeSettingsV1,
-    | 'smallModel'
-    | 'smallModelProviderId'
-    | 'titleModel'
-    | 'titleProviderId'
-    | 'summaryModel'
-    | 'summaryProviderId'
-    | 'codeReviewModel'
-    | 'codeReviewProviderId'
-    | 'titleReasoningEffort'
-    | 'summaryReasoningEffort'
-    | 'codeReviewReasoningEffort'
-  >
-): Record<string, string> {
-  const out: Record<string, string> = {}
-  const put = (key: string, value: string | undefined): void => {
-    const trimmed = typeof value === 'string' ? value.trim() : ''
-    if (trimmed) out[key] = trimmed
-  }
-  put('smallModel', runtime.smallModel)
-  put('smallModelProviderId', runtime.smallModelProviderId)
-  put('titleModel', runtime.titleModel)
-  put('titleProviderId', runtime.titleProviderId)
-  put('summaryModel', runtime.summaryModel)
-  put('summaryProviderId', runtime.summaryProviderId)
-  put('codeReviewModel', runtime.codeReviewModel)
-  put('codeReviewProviderId', runtime.codeReviewProviderId)
-  // Per-role reasoning depth. 'off' is the default and is intentionally omitted
-  // by the normalizer, so only an opted-in level (low/medium/high/max) is emitted.
-  put('titleReasoningEffort', runtime.titleReasoningEffort)
-  put('summaryReasoningEffort', runtime.summaryReasoningEffort)
-  put('codeReviewReasoningEffort', runtime.codeReviewReasoningEffort)
-  return out
-}
-
-function computerUseConfigForRuntime(
-  computerUse: Pick<KunRuntimeSettingsV1, 'computerUse'>['computerUse'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  // GUI owns enabled/mode/limits. `existing` was already passed through the
-  // strict ComputerUseCapabilityConfig sanitizer, so unknown hand-edited keys
-  // were dropped before reaching here; the spread only carries known fields.
-  return {
-    ...existing,
-    enabled: computerUse.enabled,
-    mode: computerUse.mode,
-    maxImageDimension: computerUse.maxImageDimension,
-    maxActionsPerTurn: computerUse.maxActionsPerTurn
-  }
-}
-
-function imageGenConfigForRuntime(
-  imageGeneration: Pick<KunRuntimeSettingsV1, 'imageGeneration'>['imageGeneration'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  // GUI settings own these fields: cleared values must be removed from the
-  // config (the zod schema rejects empty strings), while unknown hand-edited
-  // keys like maxReferenceImages are preserved via the spread.
-  const next: Record<string, unknown> = {
-    ...existing,
-    enabled: imageGeneration.enabled,
-    timeoutMs: imageGeneration.timeoutMs
-  }
-  const fields = {
-    protocol: imageGeneration.protocol,
-    baseUrl: imageGeneration.baseUrl,
-    apiKey: imageGeneration.apiKey,
-    model: imageGeneration.model,
-    defaultSize: imageGeneration.defaultSize
-  }
-  for (const [key, value] of Object.entries(fields)) {
-    const trimmed = value.trim()
-    if (trimmed) next[key] = trimmed
-    else delete next[key]
-  }
-  return next
-}
-
-function speechGenConfigForRuntime(
-  textToSpeech: Pick<KunRuntimeSettingsV1, 'textToSpeech'>['textToSpeech'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  const next: Record<string, unknown> = {
-    ...existing,
-    enabled: textToSpeech.enabled,
-    timeoutMs: textToSpeech.timeoutMs,
-    format: textToSpeech.format
-  }
-  const fields = {
-    protocol: textToSpeech.protocol,
-    baseUrl: textToSpeech.baseUrl,
-    apiKey: textToSpeech.apiKey,
-    model: textToSpeech.model,
-    voice: textToSpeech.voice
-  }
-  for (const [key, value] of Object.entries(fields)) {
-    const trimmed = value.trim()
-    if (trimmed) next[key] = trimmed
-    else delete next[key]
-  }
-  return next
-}
-
-function musicGenConfigForRuntime(
-  musicGeneration: Pick<KunRuntimeSettingsV1, 'musicGeneration'>['musicGeneration'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  const next: Record<string, unknown> = {
-    ...existing,
-    enabled: musicGeneration.enabled,
-    timeoutMs: musicGeneration.timeoutMs,
-    format: musicGeneration.format
-  }
-  const fields = {
-    protocol: musicGeneration.protocol,
-    baseUrl: musicGeneration.baseUrl,
-    apiKey: musicGeneration.apiKey,
-    model: musicGeneration.model
-  }
-  for (const [key, value] of Object.entries(fields)) {
-    const trimmed = value.trim()
-    if (trimmed) next[key] = trimmed
-    else delete next[key]
-  }
-  return next
-}
-
-function videoGenConfigForRuntime(
-  videoGeneration: Pick<KunRuntimeSettingsV1, 'videoGeneration'>['videoGeneration'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  const next: Record<string, unknown> = {
-    ...existing,
-    enabled: videoGeneration.enabled,
-    defaultDuration: videoGeneration.defaultDuration,
-    timeoutMs: videoGeneration.timeoutMs,
-    pollIntervalMs: videoGeneration.pollIntervalMs
-  }
-  const fields = {
-    protocol: videoGeneration.protocol,
-    baseUrl: videoGeneration.baseUrl,
-    apiKey: videoGeneration.apiKey,
-    model: videoGeneration.model,
-    defaultResolution: videoGeneration.defaultResolution
-  }
-  for (const [key, value] of Object.entries(fields)) {
-    const trimmed = value.trim()
-    if (trimmed) next[key] = trimmed
-    else delete next[key]
-  }
-  return next
-}
-
-function runtimeTuningConfigForRuntime(
-  runtimeTuning: Pick<KunRuntimeSettingsV1, 'runtimeTuning'>['runtimeTuning'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  const existingToolStorm = objectValue(existing.toolStorm)
-  const existingToolArgumentRepair = objectValue(existing.toolArgumentRepair)
-  return {
-    ...existing,
-    streamIdleTimeoutMs: runtimeTuning.streamIdleTimeoutMs,
-    toolStorm: {
-      ...existingToolStorm,
-      enabled: runtimeTuning.toolStorm.enabled,
-      windowSize: runtimeTuning.toolStorm.windowSize,
-      threshold: runtimeTuning.toolStorm.threshold
-    },
-    toolArgumentRepair: {
-      ...existingToolArgumentRepair,
-      maxStringBytes: runtimeTuning.toolArgumentRepair.maxStringBytes
-    }
-  }
-}
-
-function qualityConfigForRuntime(
-  quality: Pick<KunRuntimeSettingsV1, 'quality'>['quality'],
-  existing: Record<string, unknown>
-): Record<string, unknown> {
-  return {
-    ...existing,
-    enabled: quality.enabled,
-    strictness: quality.strictness,
-    ignoreRules: [...quality.ignoreRules],
-    ignoreFiles: [...quality.ignoreFiles],
-    maxFindings: quality.maxFindings
-  }
-}
-
-const VALID_PROFILE_REASONING = new Set(['auto', 'low', 'medium', 'high', 'max'])
-
-/**
- * Remove optional fields the runtime schema rejects when blank: empty/whitespace
- * strings (every optional string there is `.min(1)`) and empty arrays. Leaving
- * them in throws on SubagentsCapabilityConfig.parse and stops the runtime from
- * starting; dropping them lets the field fall back to its server default.
- */
-function stripBlankProfileFields(profile: Record<string, unknown>): Record<string, unknown> {
-  const next: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(profile)) {
-    if (typeof value === 'string' && value.trim() === '') continue
-    if (Array.isArray(value) && value.length === 0) continue
-    next[key] = value
-  }
-  return next
-}
-
-export function subagentProfilesForRuntime(subagents: KunSubagentsSettingsV1): SubagentsCapabilityConfig {
-  const profiles: Record<string, unknown> = {}
-  for (const profile of subagents.profiles) {
-    if (!profile.enabled) continue
-    const { id: _id, enabled: _enabled, name, reasoningEffort, ...rest } = profile
-    // Coerce the per-profile reasoning enum so a hand-edited invalid value can't
-    // throw SubagentsCapabilityConfig.parse below ('off'/invalid → omitted).
-    const effort = typeof reasoningEffort === 'string' && VALID_PROFILE_REASONING.has(reasoningEffort)
-      ? { reasoningEffort }
-      : {}
-    // Built-in profiles carry an empty `name` (the GUI localizes their display
-    // labels rather than storing them), and the user can blank any optional
-    // field in the editor. The runtime schema marks every optional string as
-    // `.min(1)`, so forwarding an empty string throws and the runtime never
-    // connects. Drop blank strings / empty arrays so they fall back to defaults.
-    profiles[profile.id] = stripBlankProfileFields({ name, ...rest, ...effort })
-  }
-  const candidate = {
-    // Subagents are a first-class feature with no GUI "enable" toggle; default ON
-    // (only an explicit `false` disables) so delegate_task + the built-in profiles
-    // (design-reviewer / over-engineering-reviewer) are always offered to the model.
-    // maxParallel/maxChildRuns MUST be >=1 or DelegationRuntime can never run a child.
-    enabled: subagents.enabled !== false,
-    maxParallel: subagents.maxParallel && subagents.maxParallel > 0 ? subagents.maxParallel : 3,
-    maxChildRuns: subagents.maxChildRuns && subagents.maxChildRuns > 0 ? subagents.maxChildRuns : 12,
-    ...(subagents.defaultToolPolicy ? { defaultToolPolicy: subagents.defaultToolPolicy } : {}),
-    ...(subagents.defaultProfile ? { defaultProfile: subagents.defaultProfile } : {}),
-    profiles
-  }
-  // A single malformed profile must never brick the whole runtime connection.
-  // If the GUI somehow persisted a value the schema rejects, drop the custom
-  // profiles and fall back to a minimal valid block — the runtime still merges
-  // in the built-in reviewers, so subagents keep working.
-  const parsed = SubagentsCapabilityConfig.safeParse(candidate)
-  if (parsed.success) return parsed.data
-  void appendManagedLogLine(
-    'kun',
-    formatKunLogLine(
-      'lifecycle',
-      undefined,
-      `[settings] dropped invalid subagent profiles: ${JSON.stringify(parsed.error.issues)}`
-    )
-  )
-  return SubagentsCapabilityConfig.parse({
-    enabled: candidate.enabled,
-    maxParallel: candidate.maxParallel,
-    maxChildRuns: candidate.maxChildRuns,
-    ...(subagents.defaultToolPolicy ? { defaultToolPolicy: subagents.defaultToolPolicy } : {})
-  })
-}
-
-async function readJsonObjectIfExists(path: string): Promise<Record<string, unknown> | null> {
-  try {
-    const text = await readFile(path, 'utf8')
-    const parsed = JSON.parse(text) as unknown
-    return objectValue(parsed)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    if (error instanceof SyntaxError) return null
-    throw error
-  }
-}
-
-type SafeParseSchema = {
-  safeParse: (value: unknown) =>
-    | { success: true; data: unknown }
-    | { success: false }
-}
-
-function parseKunConfigSection(
-  schema: SafeParseSchema,
-  value: unknown
-): Record<string, unknown> {
-  const parsed = schema.safeParse(objectValue(value))
-  return parsed.success ? objectValue(parsed.data) : {}
-}
-
-function sanitizeKunCapabilitiesConfig(value: unknown): Record<string, unknown> {
-  const raw = objectValue(value)
-  const next: Record<string, unknown> = {}
-  if ('mcp' in raw) next.mcp = parseKunConfigSection(McpCapabilityConfig, raw.mcp)
-  if ('web' in raw) next.web = parseKunConfigSection(WebCapabilityConfig, raw.web)
-  if ('skills' in raw) next.skills = parseKunConfigSection(SkillsCapabilityConfig, raw.skills)
-  if ('subagents' in raw) {
-    next.subagents = parseKunConfigSection(SubagentsCapabilityConfig, raw.subagents)
-  }
-  if ('attachments' in raw) {
-    next.attachments = parseKunConfigSection(AttachmentsCapabilityConfig, raw.attachments)
-  }
-  if ('memory' in raw) next.memory = parseKunConfigSection(MemoryCapabilityConfig, raw.memory)
-  if ('imageGen' in raw) next.imageGen = parseKunConfigSection(ImageGenCapabilityConfig, raw.imageGen)
-  if ('speechGen' in raw) next.speechGen = parseKunConfigSection(SpeechGenCapabilityConfig, raw.speechGen)
-  if ('musicGen' in raw) next.musicGen = parseKunConfigSection(MusicGenCapabilityConfig, raw.musicGen)
-  if ('videoGen' in raw) next.videoGen = parseKunConfigSection(VideoGenCapabilityConfig, raw.videoGen)
-  if ('computerUse' in raw) {
-    next.computerUse = parseKunConfigSection(ComputerUseCapabilityConfig, raw.computerUse)
-  }
-  return next
-}
-
-/** Validate the GUI-managed `hooks` array (workflow + command entries). Array, not an object. */
-function parseKunHooksSection(value: unknown): unknown[] {
-  const parsed = HooksConfigSchema.safeParse(Array.isArray(value) ? value : [])
-  return parsed.success ? parsed.data : []
-}
-
-/** Build kun `hooks` entries from the GUI's workflow hook triggers (workflow-backed hooks). */
-function buildWorkflowHookEntries(workflow: AppSettingsV1['workflow'] | undefined): unknown[] {
-  if (!workflow) return []
-  const baseUrl = `http://127.0.0.1:${workflow.webhookPort}`
-  const secret = workflow.webhookSecret.trim()
-  return (workflow.hookTriggers ?? [])
-    .filter((trigger) => trigger.enabled && trigger.workflowId)
-    .map((trigger) => ({
-      phase: trigger.phase,
-      ...(trigger.toolNames.length ? { toolNames: trigger.toolNames } : {}),
-      workflow: trigger.workflowId,
-      mode: trigger.mode,
-      baseUrl,
-      ...(secret ? { secret } : {}),
-      ...(trigger.timeoutMs > 0 ? { timeoutMs: trigger.timeoutMs } : {})
-    }))
-}
-
-function sanitizeKunConfigSections(
-  existing: Record<string, unknown> | null
-): Record<string, unknown> | null {
-  if (!existing) return null
-  const hooks = parseKunHooksSection(existing.hooks)
-  return {
-    serve: parseKunConfigSection(KunServeConfigSchema, existing.serve),
-    models: parseKunConfigSection(ModelConfigSchema, existing.models),
-    contextCompaction: parseKunConfigSection(
-      ContextCompactionConfigSchema,
-      existing.contextCompaction
-    ),
-    runtime: parseKunConfigSection(RuntimeTuningConfigSchema, existing.runtime),
-    quality: parseKunConfigSection(QualityConfigSchema, existing.quality),
-    capabilities: sanitizeKunCapabilitiesConfig(existing.capabilities),
-    ...('roles' in existing
-      ? { roles: parseKunConfigSection(RolesConfigSchema, existing.roles) }
-      : {}),
-    ...(hooks.length ? { hooks } : {})
-  }
-}
-
-function objectValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-}
-
 export async function stopKunChildAndWait(): Promise<void> {
-  if (!child) {
-    if (childLogCapture) {
-      const capture = childLogCapture
-      childLogCapture = null
+  if (!processController.child) {
+    if (processController.logCapture) {
+      const capture = processController.logCapture
+      processController.logCapture = null
       await capture.close()
     }
     return
   }
-  const stoppingChild = child
-  intentionalStops.add(stoppingChild)
-  const pid = child.pid
-  const capture = childLogCapture
+  const stoppingChild = processController.child
+  processController.markIntentionalStop(stoppingChild)
+  const pid = stoppingChild.pid
+  const capture = processController.logCapture
   if (stoppingChild.exitCode === null && stoppingChild.signalCode === null) {
     try {
       stoppingChild.kill('SIGTERM')
@@ -1332,12 +555,9 @@ export async function stopKunChildAndWait(): Promise<void> {
     }
     await waitForChildExit(stoppingChild, KUN_STOP_FORCE_MS)
   }
-  if (child === stoppingChild) {
-    child = null
-    childPort = null
-  }
+  processController.clearChild(stoppingChild)
   if (capture) {
-    childLogCapture = null
+    processController.logCapture = null
     await capture.close()
   }
 }
@@ -1380,7 +600,7 @@ export async function resolveAvailableKunPort(
     // A temporarily unresponsive managed child still owns its configured
     // endpoint. Moving settings to another port here strands the live child
     // and makes every concurrent request launch/probe a port with no server.
-    if (isKunChildRunning() && childPort === preferredPort) {
+    if (isKunChildRunning() && processController.childPort === preferredPort) {
       return { port: preferredPort, changed: false }
     }
     if (await canBindTcpPort(preferredPort, '127.0.0.1')) {
@@ -1594,133 +814,4 @@ function allocateTcpPort(host: string): Promise<number> {
       })
     })
   })
-}
-
-async function waitForKunStartup(startedChild: ChildProcess, port?: number): Promise<void> {
-  if (startedChild.exitCode !== null) {
-    throw new Error(describeKunExit(startedChild.exitCode, null))
-  }
-  await new Promise<void>((resolve, reject) => {
-    let settled = false
-    let stdoutBuffer = ''
-    let stderrTail = ''
-    let healthProbeInFlight = false
-    let healthConfirmed = false
-    let readyMarkerSeen = false
-    const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error(describeKunStartupTimeout(stderrTail, readyMarkerSeen && Boolean(port))))
-    }, KUN_STARTUP_TIMEOUT_MS)
-    // The stdout ready marker can lag behind the actual server (pipe
-    // buffering) or get lost in unusual spawn environments; the HTTP
-    // health endpoint is the ground truth, so poll it in parallel.
-    // A passing health probe alone is enough to settle (it proves the
-    // server responds). The stdout marker alone is NOT enough — it only
-    // proves the process started, not that the HTTP server can serve.
-    const healthTimer = port
-      ? setInterval(() => {
-          if (settled || healthProbeInFlight) return
-          healthProbeInFlight = true
-          void probeKunHealth(port)
-            .then((healthy) => {
-              if (healthy) {
-                healthConfirmed = true
-                settleReady()
-              }
-            })
-            .finally(() => {
-              healthProbeInFlight = false
-            })
-        }, KUN_STARTUP_HEALTH_POLL_MS)
-      : null
-    const cleanup = (): void => {
-      clearTimeout(timer)
-      if (healthTimer) clearInterval(healthTimer)
-      startedChild.removeListener('exit', onExit)
-      startedChild.removeListener('error', onError)
-      startedChild.stdout?.removeListener('data', onStdout)
-      startedChild.stderr?.removeListener('data', onStderr)
-    }
-    const tryParseReady = (): boolean => {
-      const markerIndex = stdoutBuffer.indexOf(KUN_READY_PREFIX)
-      if (markerIndex < 0) return false
-      const afterPrefix = stdoutBuffer.slice(markerIndex + KUN_READY_PREFIX.length)
-      const newlineIndex = afterPrefix.indexOf('\n')
-      if (newlineIndex < 0) return false
-      const jsonLine = afterPrefix.slice(0, newlineIndex).trim()
-      if (!jsonLine) return false
-      try {
-        const parsed = JSON.parse(jsonLine) as { service?: string; mode?: string; port?: number }
-        return parsed.service === 'kun' && parsed.mode === 'serve' && typeof parsed.port === 'number'
-      } catch {
-        return false
-      }
-    }
-    const settleReady = (): void => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolve()
-    }
-    const onStdout = (chunk: Buffer | string): void => {
-      stdoutBuffer = appendTail(stdoutBuffer, String(chunk), STDERR_TAIL_MAX_CHARS * 2)
-      if (!tryParseReady()) return
-      readyMarkerSeen = true
-      if (healthConfirmed || !healthTimer) {
-        settleReady()
-      }
-    }
-    const onStderr = (chunk: Buffer | string): void => {
-      stderrTail = appendTail(stderrTail, String(chunk))
-    }
-    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error(describeKunExit(code, signal, stderrTail)))
-    }
-    const onError = (error: Error): void => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(error)
-    }
-    startedChild.stdout?.on('data', onStdout)
-    startedChild.stderr?.on('data', onStderr)
-    startedChild.once('exit', onExit)
-    startedChild.once('error', onError)
-  })
-}
-
-function describeKunExit(
-  code: number | null,
-  signal: NodeJS.Signals | null,
-  stderrTail = ''
-): string {
-  const suffix = stderrTail.trim() ? `\n${stderrTail.trim()}` : ''
-  if (signal) return `Kun exited during startup with signal ${signal}${suffix}`
-  if (typeof code === 'number') return `Kun exited during startup with code ${code}${suffix}`
-  return `Kun exited during startup${suffix}`
-}
-
-function describeKunStartupTimeout(stderrTail: string, sawReadyMarker = false): string {
-  const suffix = stderrTail.trim() ? `\n${stderrTail.trim()}` : ''
-  if (sawReadyMarker) {
-    return `Kun reported ready but did not pass health checks within ${KUN_STARTUP_TIMEOUT_MS}ms${suffix}`
-  }
-  return `Kun did not report ready within ${KUN_STARTUP_TIMEOUT_MS}ms${suffix}`
-}
-
-async function probeKunHealth(port: number): Promise<boolean> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/health`, {
-      signal: AbortSignal.timeout(KUN_STARTUP_HEALTH_REQUEST_TIMEOUT_MS)
-    })
-    if (!response.ok) return false
-    return isKunHealthResponseBody(await response.text())
-  } catch {
-    return false
-  }
 }

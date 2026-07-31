@@ -8,6 +8,8 @@ import {
   resolveWriteInlineCompletionApiKey,
   resolveWriteInlineCompletionBaseUrl,
   resolveWriteInlineCompletionModel,
+  resolveWriteInlineCompletionProviderProfile,
+  modelProviderModelProfile,
   resolveModelEndpointFormat,
   type ModelEndpointFormat,
   type AppSettingsV1
@@ -31,6 +33,12 @@ import {
   type WriteRetrievalSnippet
 } from './write-retrieval-service'
 import { fetchWithOptionalProxy } from '../proxy-fetch'
+import {
+  codexResponsesLiteInput,
+  resolveCodexResponsesRequestAuth,
+  usesCodexResponsesLite,
+  withCodexResponsesLiteHeader
+} from '../codex-responses-lite'
 
 const INLINE_COMPLETION_TIMEOUT_MS = 12_000
 const MAX_INLINE_COMPLETION_DEBUG_ENTRIES = 120
@@ -482,7 +490,12 @@ function isVersionSegment(value: string): boolean {
   return true
 }
 
-function buildProviderHeaders(apiKey: string, responseFormat: WriteInlineProviderResponseFormat): Record<string, string> {
+function buildProviderHeaders(
+  apiKey: string,
+  responseFormat: WriteInlineProviderResponseFormat,
+  extraHeaders: Record<string, string> = {},
+  responsesLite = false
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
     Authorization: `Bearer ${apiKey}`,
@@ -492,7 +505,7 @@ function buildProviderHeaders(apiKey: string, responseFormat: WriteInlineProvide
     headers['x-api-key'] = apiKey
     headers['anthropic-version'] = '2023-06-01'
   }
-  return headers
+  return withCodexResponsesLiteHeader({ ...headers, ...extraHeaders }, responsesLite)
 }
 
 function buildAnthropicMessages(messages: ChatCompletionMessage[]): {
@@ -518,6 +531,7 @@ function buildProviderRequestBody(input: {
   prompt: string
   suffix: string
   maxTokens: number
+  responsesLite?: boolean
 }): Record<string, unknown> {
   if (input.responseFormat === 'fim_completions') {
     return {
@@ -540,12 +554,30 @@ function buildProviderRequestBody(input: {
     }
   }
   if (input.responseFormat === 'responses') {
+    const responseInput = messages.map((message) => ({
+      role: message.role,
+      content: message.content
+    }))
+    if (input.responsesLite) {
+      const systemPrompt = messages
+        .filter((message) => message.role === 'system')
+        .map((message) => message.content)
+        .join('\n\n')
+      return {
+        model: input.model,
+        input: codexResponsesLiteInput(
+          systemPrompt,
+          responseInput.filter((message) => message.role !== 'system')
+        ),
+        store: false,
+        tool_choice: 'auto',
+        parallel_tool_calls: false,
+        reasoning: { context: 'all_turns' }
+      }
+    }
     return {
       model: input.model,
-      input: messages.map((message) => ({
-        role: message.role,
-        content: message.content
-      })),
+      input: responseInput,
       max_output_tokens: input.maxTokens
     }
   }
@@ -798,8 +830,8 @@ export async function requestWriteInlineCompletion(
     return { ok: false, message: 'Inline completion is disabled.' }
   }
 
-  const apiKey = resolveWriteInlineCompletionApiKey(settings)
-  if (!apiKey) {
+  const rawApiKey = resolveWriteInlineCompletionApiKey(settings)
+  if (!rawApiKey) {
     appendInlineCompletionPreflightFailure(startedAt, settings, request, 'Missing API key for inline completion.')
     return { ok: false, message: 'Missing API key for inline completion.' }
   }
@@ -809,6 +841,16 @@ export async function requestWriteInlineCompletion(
   const actionMayEdit = Boolean(request.editCandidate && request.recentEdits?.length)
   const useChatCompletions = mode === 'edit' || actionMayEdit
   const baseUrl = resolveWriteInlineCompletionBaseUrl(settings)
+  const provider = resolveWriteInlineCompletionProviderProfile(settings)
+  const responsesLite = usesCodexResponsesLite(
+    baseUrl,
+    modelProviderModelProfile(provider, model)?.responsesMode
+  )
+  const auth = resolveCodexResponsesRequestAuth(baseUrl, rawApiKey)
+  if (!auth.apiKey) {
+    appendInlineCompletionPreflightFailure(startedAt, settings, request, 'Missing API key for inline completion.')
+    return { ok: false, message: 'Missing API key for inline completion.' }
+  }
   const configuredEndpointFormat = resolveWriteInlineCompletionEndpointFormat(settings)
   const endpointFormat = resolveModelEndpointFormat(configuredEndpointFormat, baseUrl)
   if (!endpointFormat) {
@@ -862,11 +904,12 @@ export async function requestWriteInlineCompletion(
       messages,
       prompt,
       suffix: request.suffix,
-      maxTokens
+      maxTokens,
+      responsesLite
     })
     const response = await fetchWithOptionalProxy(url, {
       method: 'POST',
-      headers: buildProviderHeaders(apiKey, responseFormat),
+      headers: buildProviderHeaders(auth.apiKey, responseFormat, auth.headers, responsesLite),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(INLINE_COMPLETION_TIMEOUT_MS)
     }, resolveModelProviderProxyUrl(settings))

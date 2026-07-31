@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   DEFAULT_SCHEDULE_MODEL,
@@ -24,7 +24,7 @@ export type RuntimeRequestResult = { ok: boolean; status: number; body: string }
 export type RuntimeRequestFn = (
   settings: AppSettingsV1,
   pathAndQuery: string,
-  init: { method?: string; body?: string; headers?: Record<string, string> }
+  init: { method?: string; body?: string; headers?: Record<string, string>; signal?: AbortSignal }
 ) => Promise<RuntimeRequestResult>
 
 export type PowerSaveBlockerLike = {
@@ -80,6 +80,7 @@ export type RunPromptOptions = {
   clawChannel?: ClawImChannelV1 | null
   waitForResult: boolean
   responseTimeoutMs: number
+  signal?: AbortSignal
 }
 
 export const SCHEDULER_INTERVAL_MS = 30_000
@@ -147,8 +148,20 @@ function threadItems(detail: ThreadDetailJson): TurnItemJson[] {
   return [...topLevelItems, ...turnItems]
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted || ms <= 0) return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 export function normalizeTaskModel(model: string): string | undefined {
@@ -338,6 +351,7 @@ export type RunPromptViaRuntimeOptions = {
   mode: ScheduleRunMode
   waitForResult: boolean
   responseTimeoutMs: number
+  signal?: AbortSignal
 }
 
 export async function runPromptViaRuntime(
@@ -345,14 +359,22 @@ export async function runPromptViaRuntime(
   settings: AppSettingsV1,
   options: RunPromptViaRuntimeOptions
 ): Promise<ScheduleRunResult> {
+  options.signal?.throwIfAborted()
   const workspace = options.workspaceRoot.trim()
   if (workspace) {
-    await mkdir(workspace, { recursive: true })
+    try {
+      if (!(await stat(workspace)).isDirectory()) {
+        return { ok: false, message: `Workspace is not a directory: ${workspace}` }
+      }
+    } catch {
+      return { ok: false, message: `Workspace directory is unavailable: ${workspace}` }
+    }
   }
   const model = normalizeTaskModel(options.model) ?? (settings.agents.kun.model.trim() || DEFAULT_SCHEDULE_MODEL)
   const providerId = options.providerId?.trim()
   const create = await deps.runtimeRequest(settings, '/v1/threads', {
     method: 'POST',
+    ...(options.signal ? { signal: options.signal } : {}),
     body: JSON.stringify({
       workspace,
       model,
@@ -367,6 +389,7 @@ export async function runPromptViaRuntime(
   const turnBody: Record<string, unknown> = {
     prompt: options.prompt,
     mode: options.mode,
+    clientSurface: 'api',
     // Headless turns — nobody can answer a user_input prompt; a turn that asks
     // one hangs until the response timeout.
     disableUserInput: true
@@ -376,7 +399,11 @@ export async function runPromptViaRuntime(
   const turn = await deps.runtimeRequest(
     settings,
     `/v1/threads/${encodeURIComponent(thread.id)}/turns`,
-    { method: 'POST', body: JSON.stringify(turnBody) }
+    {
+      method: 'POST',
+      body: JSON.stringify(turnBody),
+      ...(options.signal ? { signal: options.signal } : {})
+    }
   )
   if (!turn.ok) return { ok: false, message: runtimeErrorMessage(turn, 'Failed to start turn.') }
 
@@ -389,7 +416,14 @@ export async function runPromptViaRuntime(
     return { ok: true, threadId: thread.id, turnId, message: 'Started' }
   }
 
-  const text = await waitForAssistantTextViaRuntime(deps, settings, thread.id, turnId, options.responseTimeoutMs)
+  const text = await waitForAssistantTextViaRuntime(
+    deps,
+    settings,
+    thread.id,
+    turnId,
+    options.responseTimeoutMs,
+    options.signal
+  )
   return { ok: true, threadId: thread.id, turnId, text, message: text || 'Completed' }
 }
 
@@ -398,17 +432,20 @@ export async function waitForAssistantTextViaRuntime(
   settings: AppSettingsV1,
   threadId: string,
   turnId: string,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs
   let lastText = ''
   while (Date.now() < deadline) {
-    await sleep(1_500)
+    await sleep(1_500, signal)
+    signal?.throwIfAborted()
     const detailRes = await deps.runtimeRequest(
       settings,
       `/v1/threads/${encodeURIComponent(threadId)}`,
-      { method: 'GET' }
+      { method: 'GET', ...(signal ? { signal } : {}) }
     )
+    signal?.throwIfAborted()
     if (!detailRes.ok) {
       throw new Error(runtimeErrorMessage(detailRes, 'Failed to read thread result.'))
     }

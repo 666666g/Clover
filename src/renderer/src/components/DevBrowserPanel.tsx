@@ -101,6 +101,15 @@ type LoadOptions = {
   keepAutoFollow?: boolean
 }
 
+export type DevBrowserPanelProps = {
+  blocks: ChatBlock[]
+  preferredUrl?: string | null
+  className?: string
+  onCollapse: () => void
+  embedded?: boolean
+  onTitleChange?: (title: string) => void
+}
+
 export function resolveInitialDevBrowserUrl(input: {
   normalizedPreferredUrl?: string | null
   storedUrl?: string | null
@@ -116,17 +125,18 @@ export function canUseElectronWebviewEnvironment(input: {
   return input.openExternalAvailable && /\bElectron\//.test(input.userAgent)
 }
 
-export function DevBrowserPanel({
+export function DevBrowserPanel(props: DevBrowserPanelProps): ReactElement {
+  return <DevPreviewPanel {...props} />
+}
+
+function DevPreviewPanel({
   blocks,
   preferredUrl,
   className,
-  onCollapse
-}: {
-  blocks: ChatBlock[]
-  preferredUrl?: string | null
-  className?: string
-  onCollapse: () => void
-}): ReactElement {
+  onCollapse,
+  embedded = false,
+  onTitleChange
+}: DevBrowserPanelProps): ReactElement {
   const { t } = useTranslation('common')
   const webviewRef = useRef<DevWebviewTag | null>(null)
   const iframeLoadedUrlRef = useRef<string | null>(null)
@@ -393,12 +403,16 @@ export function DevBrowserPanel({
     ? pageTitle || formatDevPreviewUrlLabel(activeUrl)
     : t('browserNewTab')
 
+  useEffect(() => {
+    onTitleChange?.(tabLabel)
+  }, [onTitleChange, tabLabel])
+
   return (
     <aside
-      className={`ds-no-drag flex min-h-0 flex-col border-l border-ds-border-muted bg-white backdrop-blur-xl dark:bg-ds-canvas ${className ?? ''}`}
+      className={`ds-sidebar-surface ds-no-drag flex min-h-0 flex-col border-l border-ds-border-muted backdrop-blur-xl ${className ?? ''}`}
     >
-      <div className="shrink-0 border-b border-ds-border-muted bg-white/92 dark:bg-ds-card">
-        <div className="flex h-10 min-w-0 items-center gap-2 border-b border-ds-border-muted/70 bg-ds-surface-subtle/55 px-3 dark:bg-white/[0.035]">
+      <div className="ds-sidebar-surface-chrome shrink-0 border-b border-ds-border-muted">
+        {!embedded ? <div className="flex h-10 min-w-0 items-center gap-2 border-b border-ds-border-muted/70 bg-ds-surface-subtle/55 px-3 dark:bg-white/[0.035]">
           <div className="flex h-8 min-w-0 max-w-[15rem] items-center gap-2 rounded-[8px] bg-white px-2.5 pl-3 text-[12px] font-semibold text-ds-ink shadow-[0_1px_0_rgba(20,47,95,0.04)] dark:bg-white/[0.09]">
             <Globe2 className="h-3.5 w-3.5 shrink-0 text-ds-muted" strokeWidth={1.75} />
             <span className="min-w-0 flex-1 truncate">{tabLabel}</span>
@@ -421,9 +435,9 @@ export function DevBrowserPanel({
           >
             <Plus className="h-3.5 w-3.5" strokeWidth={1.8} />
           </button>
-        </div>
+        </div> : null}
         <form onSubmit={submitUrl} className="flex h-12 min-w-0 items-center gap-2 px-3">
-          <button
+          {!embedded ? <button
             type="button"
             onClick={onCollapse}
             className="ds-sidebar-toggle-button shrink-0"
@@ -431,7 +445,7 @@ export function DevBrowserPanel({
             title={t('rightPanelCollapse')}
           >
             <PanelRightClose className="h-4 w-4" strokeWidth={1.85} />
-          </button>
+          </button> : null}
 
           <div className="flex shrink-0 items-center gap-1 rounded-full bg-ds-surface-subtle p-0.5 dark:bg-white/[0.08]">
             <button
@@ -553,7 +567,7 @@ export function DevBrowserPanel({
         </div>
       ) : null}
 
-      <div className="relative min-h-0 flex-1 bg-white dark:bg-ds-canvas">
+      <div className="ds-sidebar-surface-body relative min-h-0 flex-1">
         {!activeUrl ? (
           <div className="flex h-full flex-col items-center justify-center px-6 text-center">
             <Globe2 className="h-16 w-16 text-zinc-400 dark:text-zinc-500" strokeWidth={1.45} />

@@ -29,7 +29,7 @@
 .ds-markdown h2,
 .ds-markdown h3 {
   margin: 0 0 0.42rem;
-  font-family: 'SF Pro Display', 'PingFang SC', 'Noto Sans SC', sans-serif;
+  font-family: 'SF Pro Display', 'Segoe UI', 'Noto Sans', 'PingFang SC', 'Noto Sans SC', sans-serif;
   font-weight: 600;
   letter-spacing: 0;
   line-height: 1.2;
@@ -361,7 +361,46 @@ html[data-theme='dark'] .ds-markdown .ds-code-block-html > pre span {
   --ds-code-sidebar-editor-bg: #fbfcff;
   --ds-code-sidebar-gutter-bg: #f3f6fb;
   --ds-code-sidebar-active-line-bg: rgba(59, 130, 216, 0.13);
+  container-type: inline-size;
+  background: var(--ds-sidebar-surface-bg);
+}
+
+.ds-file-preview-reading-backdrop {
+  display: none;
+}
+
+.ds-file-preview-reading-backdrop.is-visible {
+  position: fixed;
+  inset: var(--ds-windows-titlebar-height, 0px) 0 0;
+  z-index: 68;
+  display: block;
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: color-mix(in srgb, var(--ds-bg-main) 78%, transparent);
+  backdrop-filter: blur(10px);
+  cursor: default;
+}
+
+.ds-code-sidebar.is-reading {
+  position: fixed;
+  top: calc(
+    var(--ds-windows-titlebar-height, 0px) + var(--ds-window-controls-safe-block) + 10px
+  );
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  z-index: 69;
+  width: auto !important;
+  height: auto !important;
+  min-width: 0 !important;
+  max-height: none !important;
+  overflow: hidden;
+  border: 1px solid var(--ds-border-strong);
+  border-radius: 16px;
   background: var(--ds-bg-canvas);
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.3);
 }
 
 html[data-theme='dark'] .ds-code-sidebar {
@@ -378,8 +417,28 @@ html[data-theme='dark'] .ds-code-sidebar {
   justify-content: space-between;
   gap: 0.75rem;
   border-bottom: 1px solid var(--ds-border-muted);
-  background: color-mix(in srgb, var(--ds-bg-canvas) 92%, var(--ds-surface-subtle));
+  background: var(--ds-sidebar-surface-chrome-bg);
   padding: 0 0.75rem;
+}
+
+@container (max-width: 420px) {
+  .ds-code-sidebar-topbar {
+    min-height: 78px;
+    flex-wrap: wrap;
+    align-content: center;
+    gap: 0.35rem;
+    padding: 0.4rem 0.55rem;
+  }
+
+  .ds-code-sidebar-tabs,
+  .ds-code-sidebar-actions {
+    flex-basis: 100%;
+    width: 100%;
+  }
+
+  .ds-code-sidebar-actions {
+    justify-content: flex-end;
+  }
 }
 
 .ds-code-sidebar-tabs {
@@ -390,11 +449,26 @@ html[data-theme='dark'] .ds-code-sidebar {
   gap: 0.35rem;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: none;
+  scrollbar-color: color-mix(in srgb, var(--ds-text-faint) 42%, transparent) transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
 }
 
 .ds-code-sidebar-tabs::-webkit-scrollbar {
-  display: none;
+  height: 6px;
+}
+
+.ds-code-sidebar-tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.ds-code-sidebar-tabs::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ds-text-faint) 34%, transparent);
+}
+
+.ds-code-sidebar-tabs::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--ds-text-faint) 56%, transparent);
 }
 
 .ds-code-sidebar-tab {
@@ -419,6 +493,34 @@ html[data-theme='dark'] .ds-code-sidebar {
 .ds-code-sidebar-tab.is-active {
   border-color: var(--ds-border-strong);
   background: var(--ds-card-strong);
+}
+
+.ds-code-sidebar-tab:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--ds-accent) 58%, transparent);
+  outline-offset: 1px;
+}
+
+.ds-code-sidebar-tab-selector {
+  display: inline-flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.55rem;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.ds-code-sidebar-tab-selector:focus {
+  outline: none;
+}
+
+.ds-code-sidebar-tab-selector:disabled {
+  cursor: default;
 }
 
 .ds-code-sidebar-tab:disabled {
@@ -495,9 +597,60 @@ html[data-theme='dark'] .ds-code-sidebar {
   color: var(--ds-text);
 }
 
+.ds-code-sidebar-icon-button.is-active {
+  background: color-mix(in srgb, var(--ds-accent) 12%, var(--ds-surface-hover));
+  color: var(--ds-accent);
+}
+
 .ds-code-sidebar-icon-button:disabled {
   cursor: default;
   opacity: 0.45;
+}
+
+.ds-file-preview-workspace {
+  position: relative;
+  display: flex;
+  overflow: hidden;
+  container-type: inline-size;
+  background: var(--ds-sidebar-surface-bg);
+}
+
+.ds-file-preview-explorer {
+  position: relative;
+  z-index: 2;
+  width: 320px;
+  min-width: 240px;
+  max-width: 42%;
+  flex: 0 0 320px;
+  overflow: hidden;
+  border-right: 1px solid var(--ds-border-muted);
+  background: var(--ds-sidebar-surface-bg);
+}
+
+.ds-file-preview-explorer-backdrop {
+  display: none;
+}
+
+@container (max-width: 720px) {
+  .ds-file-preview-explorer {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 20;
+    width: min(320px, calc(100% - 48px));
+    min-width: min(240px, calc(100% - 48px));
+    max-width: none;
+    box-shadow: 16px 0 36px rgba(15, 23, 42, 0.18);
+  }
+
+  .ds-file-preview-explorer-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 19;
+    display: block;
+    border: 0;
+    background: color-mix(in srgb, var(--ds-bg-main) 38%, transparent);
+    backdrop-filter: blur(2px);
+  }
 }
 
 .ds-code-sidebar-breadcrumbs {
@@ -507,7 +660,7 @@ html[data-theme='dark'] .ds-code-sidebar {
   align-items: center;
   gap: 0.85rem;
   border-bottom: 1px solid var(--ds-border-muted);
-  background: var(--ds-bg-canvas);
+  background: var(--ds-sidebar-surface-bg);
   padding: 0 0.75rem;
   font-size: 12px;
 }
@@ -518,7 +671,19 @@ html[data-theme='dark'] .ds-code-sidebar {
 }
 
 .ds-file-preview-markdown {
-  background: var(--ds-bg-canvas);
+  background: var(--ds-sidebar-surface-bg);
+}
+
+.ds-file-preview-svg,
+.ds-file-preview-image {
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, #eef0f3 25%, transparent 25%),
+    linear-gradient(-45deg, #eef0f3 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #eef0f3 75%),
+    linear-gradient(-45deg, transparent 75%, #eef0f3 75%);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
 }
 
 .ds-file-preview-code-surface {

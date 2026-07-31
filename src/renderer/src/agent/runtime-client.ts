@@ -1,5 +1,6 @@
 import type { AppSettingsPatch, AppSettingsV1 } from '@shared/app-settings'
 import type {
+  CredentialRecoveryResetResult,
   RuntimeRequestResult,
   RuntimeUploadAttachmentPayload,
   SseEndPayload,
@@ -34,6 +35,12 @@ class RendererRuntimeClient {
     return settings
   }
 
+  async resetUnreadableCredentials(): Promise<CredentialRecoveryResetResult> {
+    const result = await window.kunGui.resetUnreadableCredentials()
+    if (result.reset) this.invalidateSettings()
+    return result
+  }
+
   invalidateSettings(): void {
     this.cachedSettings = null
     this.settingsPromise = null
@@ -55,12 +62,21 @@ class RendererRuntimeClient {
     return window.kunGui.restartRuntime()
   }
 
-  startSse(threadId: string, sinceSeq: number, streamId?: string): Promise<{ streamId: string }> {
-    return window.kunGui.startSse(threadId, sinceSeq, streamId)
+  startSse(
+    threadId: string,
+    sinceSeq: number,
+    streamId?: string,
+    options?: { acknowledgedBatches?: boolean }
+  ): Promise<{ streamId: string }> {
+    return window.kunGui.startSse(threadId, sinceSeq, streamId, options)
   }
 
   stopSse(streamId: string): Promise<boolean> {
     return window.kunGui.stopSse(streamId)
+  }
+
+  ackSse(streamId: string, batchId: string): Promise<boolean> {
+    return window.kunGui.ackSse(streamId, batchId)
   }
 
   onSseEvent(handler: (payload: SseEventPayload) => void): () => void {

@@ -80,6 +80,10 @@ export class ScheduleRuntime {
   private worktreeLeases = new Map<string, { projectPath: string; poolIndex: number }>()
   private drainingQueue = false
   private powerSaveBlockerId: number | null = null
+  private readonly stopController = new AbortController()
+  private readonly activeTasks = new Set<Promise<unknown>>()
+  private stopped = false
+  private stopPromise: Promise<void> | null = null
 
   constructor(deps: ScheduleRuntimeDeps) {
     this.deps = deps
@@ -97,19 +101,34 @@ export class ScheduleRuntime {
   }
 
   sync(settings: AppSettingsV1): void {
+    if (this.stopped) return
     this.syncInternalServer(settings)
     this.startScheduler()
     this.syncPowerSaveBlocker(settings)
     void this.ensureNextRuns(settings).then(() => this.drainQueue())
   }
 
-  stop(): void {
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise
+    this.stopped = true
+    this.stopController.abort()
     if (this.scheduler) {
       clearInterval(this.scheduler)
       this.scheduler = null
     }
     this.closeInternalServer()
     this.stopPowerSaveBlocker()
+    this.queuedTaskIds.clear()
+    this.queuedTaskModes.clear()
+    for (const taskId of [...this.taskCompletions.keys()]) {
+      this.resolveTaskCompletion(taskId, { ok: false, message: 'Schedule runtime stopped.' })
+    }
+    this.stopPromise = (async () => {
+      await Promise.allSettled([...this.activeTasks])
+      await Promise.allSettled([...this.worktreeLeases.keys()].map((taskId) => this.releaseTaskWorktree(taskId)))
+      this.runningTaskIds.clear()
+    })()
+    return this.stopPromise
   }
 
   async status(): Promise<ScheduleRuntimeStatus> {
@@ -124,6 +143,7 @@ export class ScheduleRuntime {
   }
 
   async runTask(taskId: string): Promise<ScheduleRunResult> {
+    if (this.stopped) return { ok: false, message: 'Schedule runtime stopped.' }
     const settings = await this.deps.store.load()
     const task = settings.schedule.tasks.find((item) => item.id === taskId)
     if (!task) return { ok: false, message: 'Task not found.' }
@@ -367,6 +387,7 @@ export class ScheduleRuntime {
   }
 
   private async tick(): Promise<void> {
+    if (this.stopped) return
     const settings = await this.deps.store.load()
     if (!settings.schedule.enabled) return
     await this.ensureNextRuns(settings)
@@ -386,6 +407,7 @@ export class ScheduleRuntime {
   }
 
   private async ensureNextRuns(settings: AppSettingsV1): Promise<void> {
+    if (this.stopped) return
     if (!settings.schedule.enabled) {
       this.syncPowerSaveBlocker(settings)
       return
@@ -447,6 +469,7 @@ export class ScheduleRuntime {
   }
 
   private async enqueueTask(task: ScheduledTaskV1, scheduled: boolean): Promise<void> {
+    if (this.stopped) return
     this.queuedTaskIds.add(task.id)
     this.queuedTaskModes.set(task.id, scheduled)
     await this.updateTask(task.id, (current) => ({
@@ -459,10 +482,11 @@ export class ScheduleRuntime {
   }
 
   private async drainQueue(): Promise<void> {
-    if (this.drainingQueue) return
+    if (this.drainingQueue || this.stopped) return
     this.drainingQueue = true
     try {
       while (
+        !this.stopped &&
         this.runningTaskIds.size < MAX_CONCURRENT_BACKGROUND_TASKS &&
         this.queuedTaskIds.size > 0
       ) {
@@ -532,7 +556,9 @@ export class ScheduleRuntime {
         // double-running, but reserving here is what makes the size check at
         // the top of the loop correct under back-to-back drains.
         this.runningTaskIds.add(dequeued.id)
-        void this.runTaskInternal(dequeued, scheduled, { slotReserved: true })
+        const task = this.runTaskInternal(dequeued, scheduled, { slotReserved: true })
+        this.trackTask(task)
+        void task
           .then((result) => {
             this.resolveTaskCompletion(dequeued.id, result)
           })
@@ -554,6 +580,7 @@ export class ScheduleRuntime {
     scheduled: boolean,
     options: { slotReserved?: boolean } = {}
   ): Promise<ScheduleRunResult> {
+    if (this.stopped) return { ok: false, message: 'Schedule runtime stopped.' }
     const { slotReserved = false } = options
     if (!slotReserved && this.runningTaskIds.has(task.id)) {
       return { ok: false, message: 'Task is already running.' }
@@ -631,8 +658,10 @@ export class ScheduleRuntime {
         mode: task.mode,
         clawChannel,
         waitForResult: false,
-        responseTimeoutMs: TASK_RESPONSE_TIMEOUT_MS
+        responseTimeoutMs: TASK_RESPONSE_TIMEOUT_MS,
+        signal: this.stopController.signal
       })
+      if (this.stopped) return { ok: false, message: 'Schedule runtime stopped.' }
       if (!result.ok) {
         const finishedAt = new Date()
         await this.updateTask(task.id, (current) => ({
@@ -660,9 +689,10 @@ export class ScheduleRuntime {
         lastThreadId: result.threadId,
         updatedAt: startedAt.toISOString()
       }))
-      void this.monitorTaskTurn(task.id, result.threadId, result.turnId ?? '')
+      this.trackTask(Promise.resolve(this.monitorTaskTurn(task.id, result.threadId, result.turnId ?? '')))
       return result
     } catch (error) {
+      if (this.stopped) return { ok: false, message: 'Schedule runtime stopped.' }
       const message = error instanceof Error ? error.message : String(error)
       const finishedAt = new Date()
       await this.updateTask(task.id, (current) => ({
@@ -689,8 +719,10 @@ export class ScheduleRuntime {
         threadId,
         turnId,
         TASK_RESPONSE_TIMEOUT_MS,
-        task?.workspaceRoot || this.resolveDefaultWorkspaceRoot(settings)
+        task?.workspaceRoot || this.resolveDefaultWorkspaceRoot(settings),
+        this.stopController.signal
       )
+      if (this.stopped) return
       const finishedAt = new Date()
       await this.updateTask(taskId, (current) => ({
         ...current,
@@ -702,6 +734,7 @@ export class ScheduleRuntime {
         updatedAt: finishedAt.toISOString()
       }))
     } catch (error) {
+      if (this.stopped) return
       const message = error instanceof Error ? error.message : String(error)
       const finishedAt = new Date()
       await this.updateTask(taskId, (current) => ({
@@ -746,7 +779,8 @@ export class ScheduleRuntime {
       reasoningEffort: options.reasoningEffort,
       mode: options.mode,
       waitForResult: options.waitForResult,
-      responseTimeoutMs: options.responseTimeoutMs
+      responseTimeoutMs: options.responseTimeoutMs,
+      ...(options.signal ? { signal: options.signal } : {})
     })
   }
 
@@ -755,10 +789,20 @@ export class ScheduleRuntime {
     threadId: string,
     turnId: string,
     timeoutMs: number,
-    workspaceRoot?: string
+    workspaceRoot?: string,
+    signal?: AbortSignal
   ): Promise<string> {
     void workspaceRoot
-    return waitForAssistantTextViaRuntime(this.deps, settings, threadId, turnId, timeoutMs)
+    return waitForAssistantTextViaRuntime(this.deps, settings, threadId, turnId, timeoutMs, signal)
+  }
+
+  private trackTask<T>(task: Promise<T>): Promise<T> {
+    this.activeTasks.add(task)
+    void task.then(
+      () => this.activeTasks.delete(task),
+      () => this.activeTasks.delete(task)
+    )
+    return task
   }
 
   private resolveDefaultWorkspaceRoot(settings: AppSettingsV1): string {

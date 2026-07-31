@@ -15,6 +15,7 @@ import type {
 } from '../shared/gui-update'
 import { nextGuiUpdateCheckDelay } from '../shared/gui-update-schedule'
 import { DEFAULT_GUI_UPDATE_CHANNEL, normalizeGuiUpdateChannel } from '../shared/gui-update'
+import type { AppLocale } from '../shared/app-locales'
 
 // R2 prefix 保持旧值:线上还在运行的 DeepSeek GUI 老版本轮询的
 // 就是 `deepseek-gui/channels/<channel>/latest/`,prefix 一改老客户端
@@ -41,16 +42,18 @@ let configuredChannel: GuiUpdateChannel = normalizeGuiUpdateChannel(
 )
 let configuredFeedUrl = ''
 let getSelectedChannel: (() => GuiUpdateChannel | Promise<GuiUpdateChannel>) | null = null
-let getSelectedLocale: (() => 'en' | 'zh' | Promise<'en' | 'zh'>) | null = null
+let getSelectedLocale: (() => AppLocale | Promise<AppLocale>) | null = null
 let beforeInstallUpdate: (() => void | Promise<void>) | null = null
 let beforeInstallUpdatePromise: Promise<void> | null = null
+let setUpdateInstallQuitting: ((active: boolean) => void) | null = null
 let pendingVersionStateWrite: Promise<void> | null = null
 let backgroundCheckTimer: NodeJS.Timeout | null = null
 let backgroundCheckPromise: Promise<void> | null = null
 
 const GUI_UPDATE_SCHEDULE_FILE = 'gui-update-schedule.json'
 const GUI_VERSION_STATE_FILE = 'gui-version-state.json'
-const DEFAULT_CHANGELOG_URL = 'https://deepseek-gui.com/changelog'
+const DEFAULT_CHANGELOG_DIRECTORY_URL = 'https://github.com/KunAgent/Kun/tree/master/release'
+const DEFAULT_CHANGELOG_FILE_BASE_URL = 'https://github.com/KunAgent/Kun/blob/master/release'
 
 type GuiVersionState = {
   lastSeenVersion?: string
@@ -165,8 +168,20 @@ async function writeGuiVersionState(state: GuiVersionState): Promise<void> {
   await writeFile(path, JSON.stringify(state, null, 2), 'utf8')
 }
 
-function changelogUrl(): string {
-  return envWithLegacyFallback('KUN_CHANGELOG_URL', 'DEEPSEEK_GUI_CHANGELOG_URL') || DEFAULT_CHANGELOG_URL
+function normalizeChangelogVersion(version: string): string {
+  const cleaned = version.trim().replace(/^v/i, '')
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(cleaned) ? `v${cleaned}` : ''
+}
+
+function changelogUrl(version?: string): string {
+  const normalizedVersion = normalizeChangelogVersion(version ?? '')
+  const configured = envWithLegacyFallback('KUN_CHANGELOG_URL', 'DEEPSEEK_GUI_CHANGELOG_URL')
+  if (configured) {
+    return normalizedVersion ? configured.replace(/\{version\}/g, normalizedVersion) : configured
+  }
+  return normalizedVersion
+    ? `${DEFAULT_CHANGELOG_FILE_BASE_URL}/release-${encodeURIComponent(normalizedVersion)}.md`
+    : DEFAULT_CHANGELOG_DIRECTORY_URL
 }
 
 function normalizeReleaseNotes(value: unknown): string | undefined {
@@ -403,6 +418,10 @@ function runBeforeInstallUpdate(): Promise<void> {
   return beforeInstallUpdatePromise
 }
 
+function markUpdateInstallQuitting(active: boolean): void {
+  setUpdateInstallQuitting?.(active)
+}
+
 function clearBackgroundCheckTimer(): void {
   if (backgroundCheckTimer) {
     clearTimeout(backgroundCheckTimer)
@@ -544,12 +563,14 @@ export function initializeGuiUpdater(
   windowGetter: () => BrowserWindow | null,
   channelGetter?: () => GuiUpdateChannel | Promise<GuiUpdateChannel>,
   beforeInstall?: () => void | Promise<void>,
-  localeGetter?: () => 'en' | 'zh' | Promise<'en' | 'zh'>
+  localeGetter?: () => AppLocale | Promise<AppLocale>,
+  updateInstallQuittingSetter?: (active: boolean) => void
 ): void {
   getMainWindow = windowGetter
   getSelectedChannel = channelGetter ?? null
   beforeInstallUpdate = beforeInstall ?? null
   getSelectedLocale = localeGetter ?? null
+  setUpdateInstallQuitting = updateInstallQuittingSetter ?? null
   if (initialized) return
   initialized = true
 
@@ -608,6 +629,7 @@ export function initializeGuiUpdater(
   })
 
   nativeAutoUpdater?.on?.('before-quit-for-update', () => {
+    markUpdateInstallQuitting(true)
     void runBeforeInstallUpdate().catch((error) => {
       console.warn('[kun-gui updater] failed to stop runtimes before update quit:', error)
     })
@@ -617,6 +639,8 @@ export function initializeGuiUpdater(
 }
 
 export async function showPostUpdateReleaseNotes(): Promise<void> {
+  if (!app.isPackaged) return
+
   const currentVersion = app.getVersion().trim()
   const state = await readGuiVersionState()
   if (!state.lastSeenVersion) {
@@ -624,6 +648,7 @@ export async function showPostUpdateReleaseNotes(): Promise<void> {
     return
   }
   if (state.lastSeenVersion === currentVersion) return
+  if (!isVersionGreater(currentVersion, state.lastSeenVersion)) return
 
   const pendingUpdate =
     state.pendingUpdate?.version === currentVersion ? state.pendingUpdate : undefined
@@ -651,7 +676,7 @@ export async function showPostUpdateReleaseNotes(): Promise<void> {
       ? await dialog.showMessageBox(window, options)
       : await dialog.showMessageBox(options)
   if (result.response === 0) {
-    await shell.openExternal(changelogUrl())
+    await shell.openExternal(changelogUrl(currentVersion))
   }
 }
 
@@ -741,6 +766,7 @@ export async function downloadGuiUpdate(channel?: GuiUpdateChannel): Promise<Gui
 }
 
 export async function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
+  let updateInstallQuitMarked = false
   try {
     if (!downloaded) {
       return {
@@ -752,9 +778,17 @@ export async function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
     }
     emitGuiUpdateState({ status: 'installing', info: lastInfo ?? undefined })
     await Promise.all([pendingVersionStateWrite, runBeforeInstallUpdate()])
-    autoUpdater.quitAndInstall(false, true)
+    markUpdateInstallQuitting(true)
+    updateInstallQuitMarked = true
+    // In-app updates must stay silent on Windows. The assisted NSIS UI can
+    // surface its old-uninstaller retry dialog even though our overwrite
+    // fallback can safely continue; silent mode applies that dialog's default
+    // cancel action instead of asking the user to make the counter-intuitive
+    // choice. Manually launched installers remain interactive.
+    autoUpdater.quitAndInstall(true, true)
     return { ok: true }
   } catch (e) {
+    if (updateInstallQuitMarked) markUpdateInstallQuitting(false)
     const message = e instanceof Error ? e.message : String(e)
     emitGuiUpdateState({ status: 'error', info: lastInfo ?? undefined, message, code: 'install_failed' })
     return {

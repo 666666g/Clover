@@ -17,6 +17,7 @@ describe('format runtime error', () => {
     const view = describeRuntimeError(error)
 
     expect(view.summary).toBe(i18n.t('common:runtimeMissingApiKey'))
+    expect(view.message).toBe('api-key=<redacted> is missing')
     expect(view.code).toBe('missing_api_key')
     expect(view.settingsAction).toBe('agents')
     expect(view.detail).toContain('<redacted>')
@@ -63,6 +64,7 @@ describe('format runtime error', () => {
     const view = describeRuntimeError(error)
 
     expect(view.summary).toBe(message)
+    expect(view.message).toBe(message)
     expect(view.detail).toContain('Code: http_400')
     expect(view.detail).toContain('Severity: error')
     expect(view.detail).toContain(`Message:\n${message}`)

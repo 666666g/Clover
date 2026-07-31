@@ -13,6 +13,7 @@ import {
 import {
   createGuiPlanArtifact,
   guiPlanMatchesContext,
+  readRememberedGuiPlan,
   useGuiPlanStore,
   type GuiPlanArtifact
 } from '../plan/plan-store'
@@ -22,7 +23,9 @@ import {
   planFeatureNameFromRequest
 } from '../plan/plan-path'
 import { extractPlanMetadataFromBlock } from '../plan/plan-tool'
+import type { PlanBuildOrchestration } from '../plan/plan-build'
 import type { RightPanelMode } from './chat/WorkbenchTopBar'
+import { BUILTIN_RIGHT_PANEL_IDS } from '../extensions/contribution-ids'
 import type { GuiPlanMessageContext, SendMessageOverrides } from '../store/chat-store-types'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
 
@@ -33,7 +36,14 @@ type PlanResultMatch = {
 
 type PlanTurnOverrides = Pick<
   SendMessageOverrides,
-  'attachmentIds' | 'attachments' | 'displayText' | 'fileReferences' | 'guiPlan' | 'model' | 'reasoningEffort'
+  | 'attachmentIds'
+  | 'attachments'
+  | 'displayText'
+  | 'fileReferences'
+  | 'guiPlan'
+  | 'model'
+  | 'providerId'
+  | 'reasoningEffort'
 > & {
   workspaceRoot?: string
 }
@@ -73,6 +83,17 @@ export function resolvePlanTurnWorkspaceRoot(
 
 function normalizePlanWorkspaceRoot(value: string | undefined): string {
   return normalizeWorkspaceRoot(value).replaceAll('\\', '/').replace(/\/+$/, '')
+}
+
+export function resolveAssociatedGuiPlan(
+  activePlan: GuiPlanArtifact | null,
+  rememberedPlan: GuiPlanArtifact | null,
+  workspaceRoot: string,
+  activeThreadId: string | null
+): GuiPlanArtifact | null {
+  if (activePlan && guiPlanMatchesContext(activePlan, workspaceRoot, activeThreadId)) return activePlan
+  if (rememberedPlan && guiPlanMatchesContext(rememberedPlan, workspaceRoot, activeThreadId)) return rememberedPlan
+  return null
 }
 
 export function buildGuiPlanTurnOverrides(
@@ -158,7 +179,7 @@ export function useWorkbenchPlanController({
 
   const openGuiPlanPanel = useCallback((): void => {
     setRightSidebarWidth((width) => Math.max(width, CODE_PANEL_PREFERRED))
-    setRightPanelMode('plan')
+    setRightPanelMode(BUILTIN_RIGHT_PANEL_IDS.plan)
   }, [setRightPanelMode, setRightSidebarWidth])
 
   const savePlanContentToDisk = async (
@@ -225,16 +246,21 @@ export function useWorkbenchPlanController({
       return false
     }
     const { workspaceRoot: _workspaceRoot, ...messageOverrides } = overrides ?? {}
-    // Default to draft: an explicit guiPlan override (e.g. from SDD upgrade)
-    // takes priority; otherwise we always start a fresh plan. Previously the
-    // active plan was auto-detected as operation: 'refine', which caused new
-    // composer requests to be treated as refinements of an old plan.
-    const guiPlan = messageOverrides.guiPlan ?? buildDraftGuiPlanTurnOverrides({
-      request: text,
-      workspaceRoot: targetWorkspaceRoot,
-      activeThreadId: currentChatState.activeThreadId,
-      existingRelativePaths: await readExistingPlanRelativePaths(targetWorkspaceRoot)
-    }).guiPlan
+    const activeThreadId = currentChatState.activeThreadId
+    const associatedPlan = resolveAssociatedGuiPlan(
+      currentPlan,
+      readRememberedGuiPlan(targetWorkspaceRoot, activeThreadId),
+      targetWorkspaceRoot,
+      activeThreadId
+    )
+    const guiPlan = messageOverrides.guiPlan
+      ?? buildGuiPlanTurnOverrides(associatedPlan, targetWorkspaceRoot, activeThreadId)?.guiPlan
+      ?? buildDraftGuiPlanTurnOverrides({
+        request: text,
+        workspaceRoot: targetWorkspaceRoot,
+        activeThreadId,
+        existingRelativePaths: await readExistingPlanRelativePaths(targetWorkspaceRoot)
+      }).guiPlan
     // Tag the in-flight plan turn with the thread it belongs to BEFORE awaiting
     // sendMessage. A fast response can land a create_plan block in `blocks`
     // before this Promise resolves; if we tagged only after the await, the
@@ -281,20 +307,32 @@ export function useWorkbenchPlanController({
     if (shouldOpen) openGuiPlanPanel()
   }, [openGuiPlanPanel])
 
-  const buildGuiPlan = async (): Promise<void> => {
+  const buildGuiPlan = async (orchestration: PlanBuildOrchestration): Promise<void> => {
     const snapshot = useGuiPlanStore.getState()
     const plan = snapshot.activePlan
     if (!plan) return
-    if (useChatStore.getState().busy) {
+    const chatState = useChatStore.getState()
+    if (chatState.runtimeConnection !== 'ready') {
+      setError(t('runtimeActionNeedsConnection'))
+      return
+    }
+    if (chatState.busy) {
       setError(t('composerQueuePlaceholder'))
+      return
+    }
+    if (snapshot.saveStatus === 'saving') return
+    if (orchestration === 'graph' && !chatState.graphEnabled) {
+      setError(t('graphModeDisabledHint'))
       return
     }
     const saved = await savePlanContentToDisk(plan, snapshot.content)
     if (!saved) return
     setComposerMode('agent')
-    const prompt = buildPlanBuildPrompt(plan.relativePath)
+    const prompt = buildPlanBuildPrompt(plan.relativePath, snapshot.content, orchestration)
+    const labelKey = orchestration === 'graph' ? 'planBuildGraph' : 'planBuildDirect'
     const sent = await sendMessage(prompt, 'agent', {
-      displayText: `${t('planBuild')}: ${plan.relativePath}`
+      displayText: `${t(labelKey)}: ${plan.relativePath}`,
+      orchestration
     })
     if (sent) {
       await onPlanBuildStarted?.(plan)

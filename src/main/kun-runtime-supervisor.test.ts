@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { MAX_RESTART_DELAY_MS, RestartBudget } from './kun-runtime-supervisor'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  KunRuntimeSupervisor,
+  MAX_RESTART_DELAY_MS,
+  RestartBudget,
+  type KunRuntimeStatus
+} from './kun-runtime-supervisor'
 
 function budgetAt(times: { value: number }): RestartBudget {
   return new RestartBudget({
@@ -87,5 +92,95 @@ describe('RestartBudget', () => {
     })
 
     expect(budget.note()).toEqual({ allowed: true, attempt: 1, delayMs: 1_000 })
+  })
+})
+
+describe('KunRuntimeSupervisor', () => {
+  function harness(overrides: {
+    healthy?: boolean
+    restartError?: Error
+    stopped?: boolean
+  } = {}) {
+    const statuses: KunRuntimeStatus[] = []
+    const settings = { autoStart: true }
+    const deps = {
+      loadSettings: async () => settings,
+      canAutoRestart: () => true,
+      ensureRuntime: async () => settings,
+      restartRuntime: async () => {
+        if (overrides.restartError) throw overrides.restartError
+      },
+      checkHealth: async () => overrides.healthy ?? false,
+      isChildRunning: () => true,
+      isStopped: () => overrides.stopped ?? false,
+      publish: (status: KunRuntimeStatus) => { statuses.push(status) },
+      warn: () => undefined,
+      error: () => undefined,
+      sleep: async () => undefined
+    }
+    const supervisor = new KunRuntimeSupervisor({
+      deps,
+      watchdogFailureThreshold: 2,
+      restartBudget: new RestartBudget({ windowMs: 60_000, maxRestarts: 3, baseDelayMs: 0 })
+    })
+    return { supervisor, statuses, deps }
+  }
+
+  it('restarts after the configured consecutive watchdog failures', async () => {
+    const h = harness()
+    await h.supervisor.watchdogTick()
+    expect(h.statuses).toEqual([])
+    await h.supervisor.watchdogTick()
+    expect(h.statuses.map((status) => status.state)).toEqual(['restarting', 'running'])
+  })
+
+  it('does not recover or restart after shutdown begins', async () => {
+    const h = harness({ stopped: true })
+    h.supervisor.handleUnexpectedExit({ code: 1, signal: null, stderrTail: 'failed' })
+    await Promise.resolve()
+    await h.supervisor.watchdogTick()
+    expect(h.statuses).toEqual([])
+  })
+
+  it('publishes failed when watchdog restart fails', async () => {
+    const h = harness({ restartError: new Error('restart failed') })
+    await h.supervisor.watchdogTick()
+    await h.supervisor.watchdogTick()
+    expect(h.statuses.at(-1)).toMatchObject({ state: 'failed', source: 'watchdog' })
+  })
+
+  it('owns single-flight ensure operations for one runtime fingerprint', async () => {
+    const h = harness()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const operation = vi.fn(async () => {
+      await gate
+      return { autoStart: true }
+    })
+
+    const first = h.supervisor.ensure('fingerprint', operation)
+    const second = h.supervisor.ensure('fingerprint', operation)
+    release()
+
+    await expect(first).resolves.toEqual({ autoStart: true })
+    await expect(second).resolves.toEqual({ autoStart: true })
+    expect(operation).toHaveBeenCalledOnce()
+  })
+
+  it('serializes settings apply and suppresses watchdog recovery while it is pending', async () => {
+    const h = harness()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const onError = vi.fn()
+    h.supervisor.enqueueSettingsApply(() => gate, onError)
+
+    await vi.waitFor(() => expect(h.supervisor.hasPendingOperation()).toBe(true))
+    await h.supervisor.watchdogTick()
+    expect(h.statuses).toEqual([])
+
+    release()
+    await h.supervisor.waitForSettingsApply()
+    expect(h.supervisor.hasPendingOperation()).toBe(false)
+    expect(onError).not.toHaveBeenCalled()
   })
 })

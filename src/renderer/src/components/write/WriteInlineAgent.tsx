@@ -41,7 +41,12 @@ import { WRITE_BLOCK_TYPES, type WriteBlockType } from '../../write/block-type'
 import type { WriteInlineFormatKind } from '../../write/inline-format'
 import type { ResolvedWriteQuickAction } from '../../write/quick-actions'
 import type { ResolvedWriteAgentPreset } from '../../write/agent-presets'
-import { clamp, INLINE_AGENT_GAP, type WriteInlineAgentPosition } from './write-workspace-view-utils'
+import { writeFocusModeFloatingLayerClassName } from '../../write/write-focus-mode'
+import {
+  inlineAgentPlacement,
+  type WriteInlineAgentPlacement,
+  type WriteInlineAgentPosition
+} from './write-workspace-view-utils'
 
 type Props = {
   action: WriteInlineAgentPosition
@@ -87,6 +92,8 @@ type Props = {
   onTextareaFocus?: () => void
   /** Called when the AI-edit textarea loses focus so the parent can unfreeze. */
   onTextareaBlur?: () => void
+  /** Raises the selection surface above Write's distraction-free shell. */
+  focusMode?: boolean
 }
 
 /**
@@ -192,11 +199,16 @@ export function WriteInlineAgent({
   onGeneratePrototype,
   imageMode = false,
   onTextareaFocus,
-  onTextareaBlur
+  onTextareaBlur,
+  focusMode = false
 }: Props): ReactElement {
   const { t } = useTranslation('common')
   const menuRef = useRef<HTMLDivElement | null>(null)
-  const [placement, setPlacement] = useState<{ top: number; origin: 'top-center' | 'bottom-center' } | null>(null)
+  const [placement, setPlacement] = useState<WriteInlineAgentPlacement | null>(null)
+  const [viewport, setViewport] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight
+  }))
   const [blockMenuOpen, setBlockMenuOpen] = useState(false)
 
   const showBlockSelector = !imageMode && formattingEnabled && Boolean(onSetBlockType)
@@ -212,24 +224,38 @@ export function WriteInlineAgent({
   const activeBlock = BLOCK_TYPE_META[blockType] ?? BLOCK_TYPE_META.paragraph
   const ActiveBlockIcon = activeBlock.icon
 
-  // Measure the rendered menu and place it below the selection, flipping above
-  // when there isn't enough room. Runs before paint so there is no flash.
+  useLayoutEffect(() => {
+    const updateViewport = (): void => {
+      setViewport({ width: window.innerWidth, height: window.innerHeight })
+    }
+    window.addEventListener('resize', updateViewport)
+    return () => window.removeEventListener('resize', updateViewport)
+  }, [])
+
+  // Measure before paint, then choose a non-overlapping side of the selection.
   useLayoutEffect(() => {
     const el = menuRef.current
     if (!el) return
-    const height = el.offsetHeight
-    const viewportHeight = window.innerHeight
-    const below = action.anchorBottom + INLINE_AGENT_GAP
-    const above = action.anchorTop - height - INLINE_AGENT_GAP
-    const canPlaceAbove = above >= 16
-    const placeAbove = preferAbove
-      ? canPlaceAbove
-      : below + height > viewportHeight - 16 && canPlaceAbove
-    const top = clamp(placeAbove ? above : below, 16, Math.max(16, viewportHeight - height - 16))
-    setPlacement({ top, origin: placeAbove ? 'bottom-center' : 'top-center' })
+    setPlacement(inlineAgentPlacement({
+      left: action.left,
+      width: action.width,
+      anchorLeft: action.anchorLeft,
+      anchorRight: action.anchorRight,
+      coordinateScale: action.coordinateScale,
+      anchorTop: action.anchorTop,
+      anchorBottom: action.anchorBottom
+    }, {
+      menuHeight: el.scrollHeight,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      preferAbove
+    }))
   }, [
     action.anchorTop,
     action.anchorBottom,
+    action.anchorLeft,
+    action.anchorRight,
+    action.coordinateScale,
     action.left,
     action.width,
     value,
@@ -243,7 +269,9 @@ export function WriteInlineAgent({
     showComposer,
     blockMenuOpen,
     quickActions.length,
-    preferAbove
+    preferAbove,
+    viewport.height,
+    viewport.width
   ])
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
@@ -253,15 +281,17 @@ export function WriteInlineAgent({
       onValueChange('')
       return
     }
-    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+    if (
+      event.key !== 'Enter' ||
+      event.shiftKey ||
+      event.nativeEvent.isComposing ||
+      (!event.metaKey && !event.ctrlKey)
+    ) return
     event.preventDefault()
-    // Enter rewrites editable selections in place; read-only selections such
-    // as PDFs send the prompt to the sidebar assistant instead.
+    // A multiline composer must keep plain Enter available for writing.
+    // Command/Ctrl + Enter runs the primary action: rewrite editable text in
+    // place, or ask the sidebar assistant for read-only selections.
     if (askOnly) {
-      onSubmitPrompt(value)
-      return
-    }
-    if (event.metaKey || event.ctrlKey) {
       onSubmitPrompt(value)
       return
     }
@@ -270,17 +300,26 @@ export function WriteInlineAgent({
 
   return (
     <div
-      className="write-inline-agent fixed z-50"
+      className={`write-inline-agent fixed ${writeFocusModeFloatingLayerClassName(focusMode, 'z-50')}`}
       data-origin={placement?.origin ?? 'top-center'}
       data-selection-ignore="true"
       style={{
-        left: action.left,
-        top: placement?.top ?? action.anchorBottom + INLINE_AGENT_GAP,
+        left: placement?.left ?? action.left,
+        top: placement?.top ?? action.anchorBottom,
         width: action.width,
+        maxHeight: placement?.maxHeight,
+        transformOrigin: placement?.origin.replace('-', ' '),
         visibility: placement ? 'visible' : 'hidden'
       }}
     >
-      <div ref={menuRef} className="write-inline-agent-menu">
+      <div
+        ref={menuRef}
+        className="write-inline-agent-menu"
+        style={{
+          maxHeight: placement?.maxHeight,
+          overflowY: placement?.constrained ? 'auto' : 'visible'
+        }}
+      >
         {showBlockSelector ? (
           <div className="write-inline-agent-block">
             <button
@@ -499,17 +538,18 @@ export function WriteInlineAgent({
             }
           }}
         >
-          {askOnly ? (
-            <MessageSquareQuote className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.9} />
-          ) : (
-            <Sparkles className="h-4 w-4 shrink-0 text-accent" strokeWidth={1.9} />
-          )}
+          <div className="write-inline-agent-edit-header">
+            <span className="write-inline-agent-edit-icon">
+              <Sparkles className="h-4 w-4" strokeWidth={1.9} />
+            </span>
+            <span className="write-inline-agent-edit-title">{t('writeInlineAgentAskAi')}</span>
+          </div>
           <textarea
             ref={textareaRef}
-            rows={1}
+            rows={4}
             value={value}
-            placeholder={t(askOnly ? 'writeInlineAgentPlaceholder' : 'writeInlineAgentEditHint')}
-            aria-label={t(askOnly ? 'writeInlineAgentPlaceholder' : 'writeInlineAgentEditHint')}
+            placeholder={t('writeInlineAgentPlaceholder')}
+            aria-label={t('writeInlineAgentPlaceholder')}
             spellCheck={false}
             className="write-inline-agent-input"
             disabled={inFlight}
@@ -518,33 +558,42 @@ export function WriteInlineAgent({
             onFocus={onTextareaFocus}
             onBlur={onTextareaBlur}
           />
-          {!askOnly ? (
-            <button
-              type="button"
-              className="write-inline-agent-secondary"
-              aria-label={t('writeInlineAgentSend')}
-              title={t('writeInlineAgentSend')}
-              disabled={!value.trim() || inFlight}
-              onClick={() => onSubmitPrompt(value)}
-            >
-              <MessageSquareQuote className="h-4 w-4" strokeWidth={1.9} />
-            </button>
-          ) : null}
-          <button
-            type="submit"
-            className="write-inline-agent-submit"
-            aria-label={inFlight ? t('writeInlineEditApplying') : t(askOnly ? 'writeInlineAgentSend' : 'writeInlineEditApply')}
-            title={inFlight ? t('writeInlineEditApplying') : t(askOnly ? 'writeInlineAgentSend' : 'writeInlineEditApply')}
-            disabled={!value.trim() || inFlight}
-          >
-            {inFlight ? (
-              <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
-            ) : askOnly ? (
-              <MessageSquareQuote className="h-4 w-4" strokeWidth={2} />
-            ) : (
-              <Sparkles className="h-4 w-4" strokeWidth={2} />
-            )}
-          </button>
+          <div className="write-inline-agent-edit-footer">
+            <span className="write-inline-agent-selection-chip">
+              <MessageSquareQuote className="h-3.5 w-3.5 shrink-0" strokeWidth={1.85} />
+              <span className="truncate">{t('writeSelectionNoLineInfo')}</span>
+            </span>
+            <div className="write-inline-agent-footer-actions">
+              <span className="write-inline-agent-shortcut" aria-hidden="true">⌘/Ctrl ↵</span>
+              {!askOnly ? (
+                <button
+                  type="button"
+                  className="write-inline-agent-secondary"
+                  aria-label={t('writeInlineAgentSend')}
+                  title={t('writeInlineAgentSend')}
+                  disabled={!value.trim() || inFlight}
+                  onClick={() => onSubmitPrompt(value)}
+                >
+                  <MessageSquareQuote className="h-4 w-4" strokeWidth={1.9} />
+                </button>
+              ) : null}
+              <button
+                type="submit"
+                className="write-inline-agent-submit"
+                aria-label={inFlight ? t('writeInlineEditApplying') : t(askOnly ? 'writeInlineAgentSend' : 'writeInlineEditApply')}
+                title={inFlight ? t('writeInlineEditApplying') : t(askOnly ? 'writeInlineAgentSend' : 'writeInlineEditApply')}
+                disabled={!value.trim() || inFlight}
+              >
+                {inFlight ? (
+                  <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+                ) : askOnly ? (
+                  <MessageSquareQuote className="h-4 w-4" strokeWidth={2} />
+                ) : (
+                  <Sparkles className="h-4 w-4" strokeWidth={2} />
+                )}
+              </button>
+            </div>
+          </div>
         </form>
         ) : null}
       </div>

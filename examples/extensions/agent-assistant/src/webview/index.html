@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <title>Agent Assistant</title>
+  </head>
+  <body>
+    <main>
+      <h1>Agent Assistant</h1>
+      <form id="prompt-form">
+        <label for="prompt">Ask Kun</label>
+        <textarea id="prompt" required rows="4">Summarize the current task and suggest one next step.</textarea>
+        <div class="actions">
+          <button type="submit">Start run</button>
+          <button id="cancel" type="button" disabled>Cancel</button>
+          <button id="history" type="button">Own history</button>
+        </div>
+      </form>
+      <p id="status" role="status">Ready</p>
+      <ol id="events" aria-live="polite"></ol>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

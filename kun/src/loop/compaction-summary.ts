@@ -20,7 +20,14 @@ export const DEFAULT_COMPACTION_SUMMARY_INPUT_MAX_BYTES = 96 * 1024
 export const COMPACTION_SYSTEM_PROMPT = [
   'You are summarizing a long coding-agent conversation so the work can continue past the context window.',
   '',
-  'Provide a detailed but concise summary. Focus on information that would be helpful for continuing the work, including:',
+  'Write a structured handoff summary with these sections:',
+  '## Goal',
+  '## Durable Context',
+  '## Completed and Decisions',
+  '## Files, Commands, and Results',
+  '## Open Issues and Next Steps',
+  '',
+  'Focus on information that would be helpful for continuing the work, including:',
   '- What was requested and the overall goal',
   '- What has been done and the decisions that were made (and why)',
   '- Which files are being created, edited, or inspected (with their paths)',
@@ -28,6 +35,7 @@ export const COMPACTION_SYSTEM_PROMPT = [
   '- What still needs to be done next',
   '- User requests, constraints, and preferences that must persist',
   '',
+  'If the conversation contains a numbered or bulleted list of issues, tasks, TODOs, problems, requirements, or user findings, preserve every item that is still relevant. Do not collapse middle items into a range, "etc.", or an omitted-count line.',
   'Preserve concrete identifiers verbatim: file paths, function and variable names, commands, URLs, IDs, and error messages.',
   'Do not invent facts and do not add generic advice. Write in the same language as the conversation.',
   'Your summary should be comprehensive enough to provide full context but concise enough to be quickly understood.'
@@ -40,18 +48,28 @@ export const COMPACTION_SYSTEM_PROMPT = [
  * write a self-contained handoff. Optional pinned constraints are appended so
  * durable rules survive even in the free-form summary text.
  */
-export function buildCompactionContinuationMessage(pinnedConstraints?: readonly string[]): string {
+export function buildCompactionContinuationMessage(
+  pinnedConstraints?: readonly string[],
+  pinnedSkillPins?: readonly string[]
+): string {
   const lines = [
     'Provide a detailed summary of our conversation above, written so a new session with no access to ' +
       'this history can continue the work seamlessly. Cover what we set out to do, what has been done, ' +
       'which files and locations are involved, the key findings and decisions, and what remains to be done next. ' +
-      'Preserve concrete identifiers (file paths, function/variable names, commands, URLs, IDs, error messages) verbatim.'
+      'Preserve concrete identifiers (file paths, function/variable names, commands, URLs, IDs, error messages) verbatim. ' +
+      'If there are numbered or bulleted issue/task/problem/TODO/requirement lists, keep every still-relevant item rather than summarizing them as a range or omitted middle.'
   ]
   const pins = (pinnedConstraints ?? []).map((pin) => pin.trim()).filter((pin) => pin.length > 0)
   if (pins.length > 0) {
     lines.push('')
     lines.push('Durable constraints that MUST be preserved in your summary:')
     for (const pin of pins) lines.push(`- ${pin}`)
+  }
+  const skills = (pinnedSkillPins ?? []).map((pin) => pin.trim()).filter((pin) => pin.length > 0)
+  if (skills.length > 0) {
+    lines.push('')
+    lines.push('Active skill pins that MUST be preserved in your summary:')
+    for (const skill of skills) lines.push(`- ${skill}`)
   }
   return lines.join('\n')
 }
@@ -64,16 +82,83 @@ export function buildCompactionContinuationMessage(pinnedConstraints?: readonly 
  * it does NOT drop to the small model — a faithful handoff summary wants the
  * same capability as the conversation it is folding.
  */
+export type CompactionModelBinding = {
+  model: string
+  providerId?: string
+  accountId?: string
+  /** A fail-closed binding error that must prevent the history request. */
+  bindingError?: string
+}
+
+/**
+ * Resolve a turn override over its thread binding without borrowing an account
+ * from a different provider. A turn may override only the account while it
+ * keeps the thread provider, or override provider+account together.
+ */
+export function resolveCoherentProviderAccount(input: {
+  turnProviderId?: string
+  turnAccountId?: string
+  threadProviderId?: string
+  threadAccountId?: string
+}): { providerId?: string; accountId?: string } {
+  const turnProviderId = input.turnProviderId?.trim()
+  const turnAccountId = input.turnAccountId?.trim()
+  const threadProviderId = input.threadProviderId?.trim()
+  const threadAccountId = input.threadAccountId?.trim()
+  const providerId = turnProviderId || threadProviderId
+  const canInheritThreadAccount =
+    !turnProviderId ||
+    Boolean(threadProviderId && turnProviderId.toLowerCase() === threadProviderId.toLowerCase())
+  const accountId = turnAccountId || (canInheritThreadAccount ? threadAccountId : undefined)
+  return {
+    ...(providerId ? { providerId } : {}),
+    ...(accountId ? { accountId } : {})
+  }
+}
+
 export function resolveCompactionModel(input: {
   contextCompaction?: ContextCompactionConfig
   fallbackModel: string
-}): { model: string; providerId?: string } {
-  const override = input.contextCompaction?.summaryModel?.trim()
-  if (override) {
-    const providerId = input.contextCompaction?.summaryProviderId?.trim()
-    return { model: override, ...(providerId ? { providerId } : {}) }
+  fallbackProviderId?: string
+  fallbackAccountId?: string
+}): CompactionModelBinding {
+  const model = input.contextCompaction?.summaryModel?.trim() || input.fallbackModel
+  const explicitProviderId = input.contextCompaction?.summaryProviderId?.trim()
+  const fallbackProviderId = input.fallbackProviderId?.trim()
+  const fallbackAccountId = input.fallbackAccountId?.trim()
+
+  if (explicitProviderId) {
+    if (
+      fallbackAccountId &&
+      (!fallbackProviderId || explicitProviderId.toLowerCase() !== fallbackProviderId.toLowerCase())
+    ) {
+      return {
+        model,
+        providerId: explicitProviderId,
+        bindingError:
+          'Configured compaction summary provider does not match the active account binding; using heuristic summary.'
+      }
+    }
+    return {
+      model,
+      providerId: explicitProviderId,
+      ...(fallbackAccountId ? { accountId: fallbackAccountId } : {})
+    }
   }
-  return { model: input.fallbackModel }
+
+  if (fallbackAccountId && !fallbackProviderId) {
+    return {
+      model,
+      bindingError:
+        'Active compaction account binding has no provider; using heuristic summary.'
+    }
+  }
+
+  return {
+    model,
+    ...(fallbackProviderId ? { providerId: fallbackProviderId } : {}),
+    ...(fallbackAccountId ? { accountId: fallbackAccountId } : {})
+  }
 }
 
 /**
@@ -89,16 +174,30 @@ export async function summarizeCompactionWithModel(input: {
   model: string
   /** Optional per-provider routing id paired with `model`. */
   providerId?: string
+  /** Opaque account id paired with `providerId`; never credential material. */
+  accountId?: string
+  serviceTier?: 'priority'
   modelClient: ModelClient
   prefix: ImmutablePrefix
   contextCompaction?: ContextCompactionConfig
   items: TurnItem[]
+  pinnedSkillPins?: readonly string[]
   heuristicSummary: string
   signal: AbortSignal
   recordUsage?: (usage: UsageSnapshot) => Promise<void> | void
   recordFallback?: (message: string) => Promise<void> | void
 }): Promise<string | undefined> {
   if (input.signal.aborted) return undefined
+  let fallbackRecorded = false
+  const recordFallback = async (message: string): Promise<void> => {
+    if (fallbackRecorded || input.signal.aborted) return
+    fallbackRecorded = true
+    await input.recordFallback?.(message)
+  }
+  if (input.accountId && !input.providerId) {
+    await recordFallback('Model compaction summary has an account without a provider; using heuristic summary.')
+    return undefined
+  }
   const timeoutMs = Math.max(
     1,
     Math.floor(input.contextCompaction?.summaryTimeoutMs ?? DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS)
@@ -107,12 +206,6 @@ export async function summarizeCompactionWithModel(input: {
   const onAbort = (): void => controller.abort()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   input.signal.addEventListener('abort', onAbort, { once: true })
-  let fallbackRecorded = false
-  const recordFallback = async (message: string): Promise<void> => {
-    if (fallbackRecorded || input.signal.aborted) return
-    fallbackRecorded = true
-    await input.recordFallback?.(message)
-  }
   try {
     // Feed the real conversation as model messages (compaction mode), not a
     // serialized transcript. Trailing tool calls without results are dropped
@@ -127,7 +220,7 @@ export async function summarizeCompactionWithModel(input: {
       createdAt: new Date().toISOString(),
       finishedAt: new Date().toISOString(),
       kind: 'user_message' as const,
-      text: buildCompactionContinuationMessage(input.prefix.pinnedConstraints)
+      text: buildCompactionContinuationMessage(input.prefix.pinnedConstraints, input.pinnedSkillPins)
     }
     let text = ''
     for await (const chunk of input.modelClient.stream({
@@ -135,6 +228,8 @@ export async function summarizeCompactionWithModel(input: {
       turnId: input.turnId,
       model: input.model,
       ...(input.providerId ? { providerId: input.providerId } : {}),
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
       // Dedicated compaction-mode system prompt; the main agent prefix and
       // few-shots are intentionally dropped so this is a clean summarizer turn.
       systemPrompt: COMPACTION_SYSTEM_PROMPT,

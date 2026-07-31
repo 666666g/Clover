@@ -1,76 +1,33 @@
-import { mkdir, open, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import type { Database as BetterSqliteDatabase, Statement } from 'better-sqlite3'
-import type {
-  ThreadGoal,
-  ThreadMode,
-  ThreadRecord,
-  ThreadRelation,
-  ThreadStatus,
-  ThreadTodoList,
-  ThreadSummary
+import {
+  ThreadSchema,
+  type ThreadRecord,
+  type ThreadSummary
 } from '../../contracts/threads.js'
-import { ThreadSchema } from '../../contracts/threads.js'
 import type { RuntimeEvent } from '../../contracts/events.js'
 import type { TurnItem } from '../../contracts/items.js'
-import type { Turn } from '../../contracts/turns.js'
-import type { ApprovalPolicy, SandboxMode } from '../../contracts/policy.js'
 import type { ThreadStore, ThreadStoreListOptions } from '../../ports/thread-store.js'
 import type { SessionLatestUsageSnapshot, SessionUsageRecord } from '../../ports/session-store.js'
 import { toThreadSummary } from '../../domain/thread.js'
+import { assertSafeThreadId, isSafeThreadId } from '../../contracts/thread-id.js'
 import { readJsonl } from '../file/file-thread-store.js'
 import {
   emptyUsageSnapshot,
   UsageSnapshotSchema,
   type UsageSnapshot
 } from '../../contracts/usage.js'
-
-type ThreadMetadataLine = {
-  kind: 'thread_metadata'
-  version: 1
-  timestamp: string
-  thread: ThreadRecord
-}
-
-type ThreadRow = {
-  id: string
-  title: string
-  workspace: string
-  model: string
-  mode: ThreadMode
-  status: ThreadStatus
-  approval_policy: ApprovalPolicy
-  sandbox_mode: SandboxMode
-  cost_budget_usd: number | null
-  cost_budget_warning_sent: number | null
-  relation: ThreadRelation
-  parent_thread_id: string | null
-  forked_from_thread_id: string | null
-  forked_from_title: string | null
-  forked_at: string | null
-  forked_from_message_count: number | null
-  forked_from_turn_count: number | null
-  goal_json: string | null
-  todos_json: string | null
-  created_at: string
-  updated_at: string
-  created_at_ms: number
-  updated_at_ms: number
-  preview: string | null
-  message_count: number
-  event_seq_high_water: number
-  metadata_path: string
-  messages_path: string
-  events_path: string
-  search_text: string
-}
-
-type ThreadIndexRecord = {
-  thread: ThreadRecord
-  messageCount: number
-  eventSeqHighWater: number
-  preview: string
-}
+import { stripThreadItemBodies, type ThreadMetadataLine } from './hybrid-thread-projection.js'
+import { HybridThreadDocumentRepository } from './hybrid-thread-documents.js'
+import {
+  filterThreadSummaries,
+  summaryFromRow,
+  type ThreadIndexRecord,
+  type ThreadRow
+} from './hybrid-thread-index-mapping.js'
+import { HybridThreadIndexRepository } from './hybrid-thread-index.js'
+import { HybridThreadBackfillCoordinator } from './hybrid-thread-backfill.js'
 
 type UsageRuntimeEvent = Extract<RuntimeEvent, { kind: 'usage' }>
 
@@ -94,23 +51,20 @@ export class HybridThreadStore implements ThreadStore {
   private readonly nowIso: () => string
   private readonly readyPromise: Promise<void>
   private readonly metadataQueues = new Map<string, Promise<void>>()
-  private backfillPromise: Promise<void> | null = null
+  private backfill: HybridThreadBackfillCoordinator<UsageRuntimeEvent> | null = null
   private db: BetterSqliteDatabase | null = null
+  private index: HybridThreadIndexRepository | null = null
   // Prepared-statement cache for the per-event hot paths; better-sqlite3
   // re-compiles the SQL on every prepare() call otherwise.
   private readonly statementCache = new Map<string, Statement>()
-  // Reconstructed thread records keyed by the file signatures they were built
-  // from. Thread detail requests re-read multi-megabyte JSONL files otherwise.
-  private readonly threadRecordCache = new Map<
-    string,
-    { metadataSig: string; itemsSig: string; record: ThreadRecord }
-  >()
+  private readonly documents: HybridThreadDocumentRepository
   // Per-thread floor that keeps metadata compaction from re-running on every
   // append when a single snapshot is already larger than the threshold.
   private readonly metadataCompactFloor = new Map<string, number>()
 
   constructor(options: { dataDir: string; sqlitePath?: string; nowIso?: () => string }) {
     this.dataDir = resolve(options.dataDir, 'threads')
+    this.documents = new HybridThreadDocumentRepository(options.dataDir)
     this.sqlitePath = resolve(options.sqlitePath ?? join(options.dataDir, 'index.sqlite3'))
     this.nowIso = options.nowIso ?? (() => new Date().toISOString())
     this.readyPromise = this.initialize()
@@ -121,20 +75,34 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   close(): void {
+    this.backfill?.stop()
     try {
       this.db?.close()
     } finally {
       this.db = null
+      this.index = null
+      this.statementCache.clear()
     }
+  }
+
+  async shutdown(): Promise<void> {
+    await this.ready()
+    this.backfill?.stop()
+    await this.backfill?.wait()
+    this.close()
   }
 
   async waitForBackfill(): Promise<void> {
     await this.ready()
-    await this.backfillPromise
+    await this.backfill?.wait()
   }
 
   async list(options: ThreadStoreListOptions = {}): Promise<ThreadSummary[]> {
     await this.ready()
+    // Missing or intentionally discarded SQLite indexes are rebuilt from the
+    // canonical JSONL metadata before the first list response. Usage/event
+    // backfill remains in the background so large histories stay responsive.
+    await this.backfill?.waitForIndex()
     if (this.db) {
       try {
         const rows = this.queryThreadRows(options)
@@ -155,6 +123,7 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   async get(threadId: string): Promise<ThreadRecord | null> {
+    if (!isSafeThreadId(threadId)) return null
     await this.ready()
     if (this.db) {
       const row = this.findRow(threadId)
@@ -171,15 +140,18 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   async upsert(thread: ThreadRecord): Promise<ThreadRecord> {
+    const normalized = ThreadSchema.parse(thread)
+    assertSafeThreadId(normalized.id)
     await this.ready()
-    await this.appendMetadata(thread)
+    await this.appendMetadata(normalized)
     if (this.db) {
-      this.upsertIndexBestEffort(this.indexRecordForThread(thread))
+      this.upsertIndexBestEffort(this.indexRecordForThread(normalized))
     }
-    return thread
+    return normalized
   }
 
   async delete(threadId: string): Promise<boolean> {
+    if (!isSafeThreadId(threadId)) return false
     await this.ready()
     const dir = this.threadDir(threadId)
     const existed = await pathExists(dir)
@@ -189,7 +161,7 @@ export class HybridThreadStore implements ThreadStore {
     }
     await rm(dir, { recursive: true, force: true })
     this.deleteIndexRow(threadId)
-    this.threadRecordCache.delete(threadId)
+    this.documents.invalidate(threadId)
     this.metadataCompactFloor.delete(threadId)
     return true
   }
@@ -314,7 +286,28 @@ export class HybridThreadStore implements ThreadStore {
       this.db.pragma('busy_timeout = 5000')
       this.db.pragma('foreign_keys = ON')
       this.migrate()
-      this.startBackfill()
+      this.index = new HybridThreadIndexRepository(this.db, (threadId) => ({
+        metadataPath: this.metadataPath(threadId), messagesPath: this.messagesPath(threadId),
+        eventsPath: this.eventsPath(threadId)
+      }), warnSqlite)
+      this.backfill = new HybridThreadBackfillCoordinator({
+        indexedRows: () => this.db!.prepare('SELECT id, usage_backfilled FROM threads').all() as Array<{ id: string; usage_backfilled?: number }>,
+        filesystemThreadIds: () => this.threadIdsFromFilesystem(),
+        readMissingThread: async (threadId) => Boolean(await this.readThreadFromDisk(threadId)),
+        scanEvents: (threadId) => this.scanEventsForBackfill(threadId),
+        upsertMissing: async (threadId, highWater) => {
+          const thread = await this.readThreadFromDisk(threadId)
+          if (thread) this.upsertIndexBestEffort({ ...this.indexRecordForThread(thread), eventSeqHighWater: highWater })
+        },
+        noteExistingHighWater: (threadId, highWater) => this.noteEventHighWaterSync(threadId, highWater),
+        insertUsage: (threadId, usage) => this.insertUsageEventsChunked(threadId, usage),
+        markUsageBackfilled: (threadId) => this.markUsageBackfilled(threadId),
+        threadDirectoryExists: (threadId) => pathExists(this.threadDir(threadId)),
+        deleteIndexRow: (threadId) => this.deleteIndexRow(threadId),
+        yieldToEventLoop,
+        warn: warnSqlite
+      })
+      this.backfill.start()
     } catch (error) {
       warnSqlite('initialize', error)
       try {
@@ -323,6 +316,8 @@ export class HybridThreadStore implements ThreadStore {
         // Ignore close errors while falling back to JSONL scanning.
       }
       this.db = null
+      this.index = null
+      this.backfill = null
     }
   }
 
@@ -338,6 +333,8 @@ export class HybridThreadStore implements ThreadStore {
         status TEXT NOT NULL,
         approval_policy TEXT NOT NULL,
         sandbox_mode TEXT NOT NULL,
+        approval_reviewer TEXT NOT NULL DEFAULT 'user',
+        model_request_capture_enabled INTEGER NOT NULL DEFAULT 0,
         cost_budget_usd REAL,
         cost_budget_warning_sent INTEGER,
         relation TEXT NOT NULL,
@@ -349,6 +346,7 @@ export class HybridThreadStore implements ThreadStore {
         forked_from_turn_count INTEGER,
         goal_json TEXT,
         todos_json TEXT,
+        extension_metadata_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL,
@@ -384,6 +382,9 @@ export class HybridThreadStore implements ThreadStore {
         ON usage_events(timestamp);
     `)
     addColumnIfMissing(this.db, 'threads', 'todos_json TEXT')
+    addColumnIfMissing(this.db, 'threads', 'extension_metadata_json TEXT')
+    addColumnIfMissing(this.db, 'threads', 'model_request_capture_enabled INTEGER NOT NULL DEFAULT 0')
+    addColumnIfMissing(this.db, 'threads', "approval_reviewer TEXT NOT NULL DEFAULT 'user'")
     addColumnIfMissing(this.db, 'threads', 'usage_backfilled INTEGER NOT NULL DEFAULT 0')
   }
 
@@ -395,54 +396,6 @@ export class HybridThreadStore implements ThreadStore {
       this.statementCache.set(sql, statement)
     }
     return statement
-  }
-
-  private startBackfill(): void {
-    if (this.backfillPromise) return
-    this.backfillPromise = this.backfill().catch((error) => {
-      warnSqlite('background backfill', error)
-    })
-  }
-
-  private async backfill(): Promise<void> {
-    if (!this.db) return
-    const rows = this.db
-      .prepare('SELECT id, usage_backfilled FROM threads')
-      .all() as Array<{ id: string; usage_backfilled?: number }>
-    const indexed = new Map(rows.map((row) => [row.id, row.usage_backfilled === 1]))
-    for (const threadId of await this.threadIdsFromFilesystem()) {
-      const usageBackfilled = indexed.get(threadId)
-      // Threads marked as backfilled never need their events.jsonl re-read;
-      // without the marker every startup re-scanned the full event history
-      // of threads that simply have no usage events.
-      if (usageBackfilled === true) continue
-      if (usageBackfilled === undefined) {
-        const thread = await this.readThreadFromDisk(threadId)
-        if (!thread) continue
-        const scan = await this.scanEventsForBackfill(threadId)
-        this.upsertIndexBestEffort({
-          ...this.indexRecordForThread(thread),
-          eventSeqHighWater: scan.highWater
-        })
-        await this.insertUsageEventsChunked(threadId, scan.usage)
-      } else {
-        const scan = await this.scanEventsForBackfill(threadId)
-        this.noteEventHighWaterSync(threadId, scan.highWater)
-        await this.insertUsageEventsChunked(threadId, scan.usage)
-      }
-      this.markUsageBackfilled(threadId)
-      await yieldToEventLoop()
-    }
-
-    try {
-      for (const row of rows) {
-        if (!(await pathExists(this.threadDir(row.id)))) {
-          this.deleteIndexRow(row.id)
-        }
-      }
-    } catch (error) {
-      warnSqlite('backfill cleanup', error)
-    }
   }
 
   /** Single pass over events.jsonl: high-water mark plus usage events. */
@@ -504,121 +457,19 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   private queryThreadRows(options: ThreadStoreListOptions): ThreadRow[] {
-    if (!this.db) return []
-    const where: string[] = []
-    const params: Record<string, unknown> = {}
-    if (options.archivedOnly) {
-      where.push('status = @archivedStatus')
-      params.archivedStatus = 'archived'
-    } else if (!options.includeArchived) {
-      where.push("status NOT IN ('archived', 'deleted')")
-    }
-    if (!options.includeSide) {
-      where.push("relation != 'side'")
-    }
-    const search = options.search?.trim().toLowerCase()
-    if (search) {
-      where.push("search_text LIKE @search ESCAPE '\\'")
-      params.search = `%${escapeLike(search)}%`
-    }
-    const limit = typeof options.limit === 'number' ? Math.max(1, Math.floor(options.limit)) : undefined
-    if (limit !== undefined) {
-      params.limit = limit
-    }
-    const sql = `
-      SELECT * FROM threads
-      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY updated_at_ms DESC, id DESC
-      ${limit !== undefined ? 'LIMIT @limit' : ''}
-    `
-    return this.db.prepare(sql).all(params) as ThreadRow[]
+    return this.index?.query(options) ?? []
   }
 
   private findRow(threadId: string): ThreadRow | null {
-    if (!this.db) return null
-    try {
-      return (this.db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId) as ThreadRow | undefined) ?? null
-    } catch (error) {
-      warnSqlite('find row', error)
-      return null
-    }
+    return this.index?.find(threadId) ?? null
   }
 
   private upsertIndexBestEffort(record: ThreadIndexRecord): void {
-    if (!this.db) return
-    try {
-      const row = rowFromIndexRecord(record, {
-        metadataPath: this.metadataPath(record.thread.id),
-        messagesPath: this.messagesPath(record.thread.id),
-        eventsPath: this.eventsPath(record.thread.id)
-      })
-      this.db
-        .prepare(`
-          INSERT INTO threads (
-            id, title, workspace, model, mode, status, approval_policy, sandbox_mode,
-            cost_budget_usd, cost_budget_warning_sent, relation, parent_thread_id,
-            forked_from_thread_id, forked_from_title, forked_at, forked_from_message_count,
-            forked_from_turn_count, goal_json, todos_json, created_at, updated_at, created_at_ms,
-            updated_at_ms, preview, message_count, event_seq_high_water, metadata_path,
-            messages_path, events_path, search_text
-          )
-          VALUES (
-            @id, @title, @workspace, @model, @mode, @status, @approval_policy, @sandbox_mode,
-            @cost_budget_usd, @cost_budget_warning_sent, @relation, @parent_thread_id,
-            @forked_from_thread_id, @forked_from_title, @forked_at, @forked_from_message_count,
-            @forked_from_turn_count, @goal_json, @todos_json, @created_at, @updated_at, @created_at_ms,
-            @updated_at_ms, @preview, @message_count, @event_seq_high_water, @metadata_path,
-            @messages_path, @events_path, @search_text
-          )
-          ON CONFLICT(id) DO UPDATE SET
-            title = excluded.title,
-            workspace = excluded.workspace,
-            model = excluded.model,
-            mode = excluded.mode,
-            status = excluded.status,
-            approval_policy = excluded.approval_policy,
-            sandbox_mode = excluded.sandbox_mode,
-            cost_budget_usd = excluded.cost_budget_usd,
-            cost_budget_warning_sent = excluded.cost_budget_warning_sent,
-            relation = excluded.relation,
-            parent_thread_id = excluded.parent_thread_id,
-            forked_from_thread_id = excluded.forked_from_thread_id,
-            forked_from_title = excluded.forked_from_title,
-            forked_at = excluded.forked_at,
-            forked_from_message_count = excluded.forked_from_message_count,
-            forked_from_turn_count = excluded.forked_from_turn_count,
-            goal_json = excluded.goal_json,
-            todos_json = excluded.todos_json,
-            created_at = excluded.created_at,
-            updated_at = excluded.updated_at,
-            created_at_ms = excluded.created_at_ms,
-            updated_at_ms = excluded.updated_at_ms,
-            preview = excluded.preview,
-            message_count = excluded.message_count,
-            event_seq_high_water = CASE
-              WHEN threads.event_seq_high_water > excluded.event_seq_high_water
-                THEN threads.event_seq_high_water
-              ELSE excluded.event_seq_high_water
-            END,
-            metadata_path = excluded.metadata_path,
-            messages_path = excluded.messages_path,
-            events_path = excluded.events_path,
-            search_text = excluded.search_text
-        `)
-        .run(row)
-    } catch (error) {
-      warnSqlite('upsert index', error)
-    }
+    this.index?.upsert(record)
   }
 
   private deleteIndexRow(threadId: string): void {
-    if (!this.db) return
-    try {
-      this.db.prepare('DELETE FROM threads WHERE id = ?').run(threadId)
-      this.db.prepare('DELETE FROM usage_events WHERE thread_id = ?').run(threadId)
-    } catch (error) {
-      warnSqlite('delete index row', error)
-    }
+    this.index?.delete(threadId)
   }
 
   private async appendMetadata(thread: ThreadRecord): Promise<void> {
@@ -702,74 +553,11 @@ export class HybridThreadStore implements ThreadStore {
   }
 
   private async readThreadFromDisk(threadId: string): Promise<ThreadRecord | null> {
-    const [metadataSig, itemsSig] = await Promise.all([
-      fileSignature(this.metadataPath(threadId)),
-      fileSignature(this.messagesPath(threadId))
-    ])
-    const cached = this.threadRecordCache.get(threadId)
-    if (cached && cached.metadataSig === metadataSig && cached.itemsSig === itemsSig) {
-      // Refresh LRU position.
-      this.threadRecordCache.delete(threadId)
-      this.threadRecordCache.set(threadId, cached)
-      return cached.record
-    }
-    const metadata = await this.readLatestMetadata(threadId)
-    const legacy = metadata ? null : await this.readLegacyThread(threadId)
-    const source = metadata ?? legacy
-    if (!source) return null
-    const items = await this.loadItems(threadId)
-    // Records are treated as immutable by all callers (updates flow through
-    // upsert with fresh objects), so caching the reference is safe.
-    const record = hydrateThreadItems(source, items, {
-      preserveExistingItemsWhenNoFileItems: Boolean(legacy)
-    })
-    this.threadRecordCache.set(threadId, { metadataSig, itemsSig, record })
-    while (this.threadRecordCache.size > THREAD_RECORD_CACHE_LIMIT) {
-      const oldest = this.threadRecordCache.keys().next().value
-      if (!oldest) break
-      this.threadRecordCache.delete(oldest)
-    }
-    return record
+    return this.documents.readThread(threadId)
   }
 
   private async readLatestMetadata(threadId: string): Promise<ThreadRecord | null> {
-    const entries = await readJsonl<ThreadMetadataLine>(this.metadataPath(threadId))
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index]
-      if (entry?.kind !== 'thread_metadata' || entry.thread?.id !== threadId) continue
-      const parsed = ThreadSchema.safeParse(entry.thread)
-      if (parsed.success) {
-        return normalizeThreadMetadata(parsed.data, entries.slice(0, index + 1))
-      }
-    }
-    return null
-  }
-
-  private async readLegacyThread(threadId: string): Promise<ThreadRecord | null> {
-    try {
-      const raw = await readFile(this.legacyThreadPath(threadId), 'utf-8')
-      const parsed = ThreadSchema.safeParse(JSON.parse(raw))
-      return parsed.success ? parsed.data : null
-    } catch {
-      return null
-    }
-  }
-
-  private async loadItems(threadId: string): Promise<TurnItem[]> {
-    const raw = await readJsonl<TurnItem>(this.messagesPath(threadId))
-    const latestById = new Map<string, TurnItem>()
-    for (const item of raw) {
-      latestById.set(item.id, item)
-    }
-    const seen = new Set<string>()
-    const ordered: TurnItem[] = []
-    for (let index = raw.length - 1; index >= 0; index -= 1) {
-      const item = raw[index]
-      if (!item || seen.has(item.id)) continue
-      seen.add(item.id)
-      ordered.unshift(latestById.get(item.id)!)
-    }
-    return ordered
+    return this.documents.readLatestMetadata(threadId)
   }
 
   private async noteEventHighWater(threadId: string, seq: number): Promise<void> {
@@ -805,337 +593,53 @@ export class HybridThreadStore implements ThreadStore {
   private async threadIdsFromFilesystem(): Promise<string[]> {
     try {
       const entries = await readdir(this.dataDir, { withFileTypes: true })
-      return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+      return entries.filter((entry) => entry.isDirectory() && isSafeThreadId(entry.name)).map((entry) => entry.name)
     } catch {
       return []
     }
   }
 
   private async rowHasReadableJsonl(row: ThreadRow): Promise<boolean> {
-    if (row.metadata_path !== this.metadataPath(row.id)) return false
-    if (row.messages_path !== this.messagesPath(row.id)) return false
-    if (row.events_path !== this.eventsPath(row.id)) return false
+    if (!isSafeThreadId(row.id)) return false
     if (!(await pathExists(this.threadDir(row.id)))) return false
-    return (await pathExists(this.metadataPath(row.id))) || (await pathExists(this.legacyThreadPath(row.id)))
+    const readable =
+      (await pathExists(this.metadataPath(row.id))) ||
+      (await pathExists(this.legacyThreadPath(row.id)))
+    if (!readable) return false
+    if (
+      row.metadata_path !== this.metadataPath(row.id) ||
+      row.messages_path !== this.messagesPath(row.id) ||
+      row.events_path !== this.eventsPath(row.id)
+    ) {
+      // JSONL is canonical and the SQLite paths are derived. Moving a Runtime
+      // data directory (including the GUI's legacy migration) must not make a
+      // valid thread disappear merely because its cached absolute paths still
+      // point at the previous root.
+      this.index?.repairPaths(row.id)
+    }
+    return true
   }
 
   private threadDir(threadId: string): string {
-    return join(this.dataDir, threadId)
+    assertSafeThreadId(threadId)
+    return this.documents.threadDir(threadId)
   }
 
   private metadataPath(threadId: string): string {
-    return join(this.threadDir(threadId), 'metadata.jsonl')
+    return this.documents.metadataPath(threadId)
   }
 
   private legacyThreadPath(threadId: string): string {
-    return join(this.threadDir(threadId), 'thread.json')
+    return this.documents.legacyThreadPath(threadId)
   }
 
   private messagesPath(threadId: string): string {
-    return join(this.threadDir(threadId), 'messages.jsonl')
+    return this.documents.messagesPath(threadId)
   }
 
   private eventsPath(threadId: string): string {
-    return join(this.threadDir(threadId), 'events.jsonl')
+    return this.documents.eventsPath(threadId)
   }
-}
-
-function stripThreadItemBodies(thread: ThreadRecord): ThreadRecord {
-  return {
-    ...thread,
-    turns: thread.turns.map((turn) => ({ ...turn, prompt: '', items: [] }))
-  }
-}
-
-function hydrateThreadItems(
-  thread: ThreadRecord,
-  items: TurnItem[],
-  options: { preserveExistingItemsWhenNoFileItems: boolean }
-): ThreadRecord {
-  if (items.length === 0) {
-    return options.preserveExistingItemsWhenNoFileItems ? thread : stripThreadItemBodies(thread)
-  }
-  const itemsByTurn = new Map<string, TurnItem[]>()
-  for (const item of items) {
-    const list = itemsByTurn.get(item.turnId) ?? []
-    list.push(item)
-    itemsByTurn.set(item.turnId, list)
-  }
-
-  const knownTurnIds = new Set(thread.turns.map((turn) => turn.id))
-  const turns = thread.turns.map((turn): Turn => {
-    const turnItems = itemsByTurn.get(turn.id) ?? []
-    const attachmentIds = turn.attachmentIds.length > 0
-      ? turn.attachmentIds
-      : attachmentIdsFromItems(turnItems)
-    return {
-      ...turn,
-      prompt: promptFromItems(turnItems) || turn.prompt,
-      attachmentIds,
-      items: turnItems
-    }
-  })
-  for (const [turnId, turnItems] of itemsByTurn) {
-    if (knownTurnIds.has(turnId)) continue
-    turns.push(turnFromItems(thread.id, turnId, turnItems, thread.updatedAt))
-  }
-  turns.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-  return { ...thread, turns }
-}
-
-function normalizeThreadMetadata(thread: ThreadRecord, entries: ThreadMetadataLine[]): ThreadRecord {
-  const recovery = collectTurnMetadata(entries, thread.id)
-  const mergedById = new Map<string, Turn>()
-  const order: string[] = []
-  for (const turn of thread.turns) {
-    if (!mergedById.has(turn.id)) order.push(turn.id)
-    const existing = mergedById.get(turn.id)
-    mergedById.set(turn.id, existing ? mergeTurnMetadata(existing, turn) : turn)
-  }
-  const turns = order.map((turnId) => applyRecoveredTurnMetadata(mergedById.get(turnId)!, recovery.get(turnId)))
-  return turns.length === thread.turns.length && turns.every((turn, index) => turn === thread.turns[index])
-    ? thread
-    : { ...thread, turns }
-}
-
-type RecoveredTurnMetadata = {
-  attachmentIds: string[]
-  model?: string
-  mode?: Turn['mode']
-  guiPlan?: Turn['guiPlan']
-}
-
-function collectTurnMetadata(entries: ThreadMetadataLine[], threadId: string): Map<string, RecoveredTurnMetadata> {
-  const recovered = new Map<string, RecoveredTurnMetadata>()
-  for (const entry of entries) {
-    if (entry?.kind !== 'thread_metadata' || entry.thread?.id !== threadId) continue
-    const parsed = ThreadSchema.safeParse(entry.thread)
-    if (!parsed.success) continue
-    for (const turn of parsed.data.turns) {
-      const current = recovered.get(turn.id) ?? { attachmentIds: [] }
-      recovered.set(turn.id, {
-        attachmentIds: mergeStringArrays(current.attachmentIds, turn.attachmentIds),
-        ...(turn.model ? { model: turn.model } : current.model ? { model: current.model } : {}),
-        ...(turn.mode ? { mode: turn.mode } : current.mode ? { mode: current.mode } : {}),
-        ...(turn.guiPlan ? { guiPlan: turn.guiPlan } : current.guiPlan ? { guiPlan: current.guiPlan } : {})
-      })
-    }
-  }
-  return recovered
-}
-
-function mergeTurnMetadata(previous: Turn, next: Turn): Turn {
-  return {
-    ...previous,
-    ...next,
-    prompt: next.prompt || previous.prompt,
-    attachmentIds: mergeStringArrays(previous.attachmentIds, next.attachmentIds),
-    activeSkillIds: mergeStringArrays(previous.activeSkillIds, next.activeSkillIds),
-    injectedMemoryIds: mergeStringArrays(previous.injectedMemoryIds, next.injectedMemoryIds),
-    items: mergeTurnItems(previous.items, next.items)
-  }
-}
-
-function applyRecoveredTurnMetadata(turn: Turn, recovered: RecoveredTurnMetadata | undefined): Turn {
-  if (!recovered) return turn
-  const attachmentIds = turn.attachmentIds.length > 0 ? turn.attachmentIds : recovered.attachmentIds
-  return {
-    ...turn,
-    attachmentIds,
-    ...(turn.model || !recovered.model ? {} : { model: recovered.model }),
-    ...(turn.mode || !recovered.mode ? {} : { mode: recovered.mode }),
-    ...(turn.guiPlan || !recovered.guiPlan ? {} : { guiPlan: recovered.guiPlan })
-  }
-}
-
-function mergeTurnItems(previous: TurnItem[], next: TurnItem[]): TurnItem[] {
-  if (previous.length === 0) return next
-  if (next.length === 0) return previous
-  const byId = new Map<string, TurnItem>()
-  for (const item of previous) byId.set(item.id, item)
-  for (const item of next) byId.set(item.id, item)
-  return [...byId.values()]
-}
-
-function turnFromItems(threadId: string, turnId: string, items: TurnItem[], fallbackTime: string): Turn {
-  const prompt = promptFromItems(items) || `Turn ${turnId}`
-  const createdAt = items[0]?.createdAt ?? fallbackTime
-  const hasOpenItem = items.some((item) => item.status === 'pending' || item.status === 'running')
-  const hasFailedItem = items.some((item) => item.status === 'failed' || item.status === 'aborted')
-  return {
-    id: turnId,
-    threadId,
-    status: hasOpenItem ? 'running' : hasFailedItem ? 'failed' : 'completed',
-    prompt,
-    steering: [],
-    attachmentIds: attachmentIdsFromItems(items),
-    activeSkillIds: [],
-    injectedMemoryIds: [],
-    createdAt,
-    finishedAt: hasOpenItem ? undefined : items[items.length - 1]?.finishedAt ?? fallbackTime,
-    items
-  }
-}
-
-function promptFromItems(items: TurnItem[]): string {
-  return items.find((item): item is Extract<TurnItem, { kind: 'user_message' }> => item.kind === 'user_message')
-    ?.text ?? ''
-}
-
-function attachmentIdsFromItems(items: TurnItem[]): string[] {
-  const ids = new Set<string>()
-  for (const item of items) {
-    if (item.kind !== 'user_message') continue
-    for (const id of item.attachmentIds ?? []) {
-      const trimmed = id.trim()
-      if (trimmed) ids.add(trimmed)
-    }
-  }
-  return [...ids]
-}
-
-function mergeStringArrays(first: readonly string[], second: readonly string[]): string[] {
-  const values = new Set<string>()
-  for (const value of [...first, ...second]) {
-    const trimmed = value.trim()
-    if (trimmed) values.add(trimmed)
-  }
-  return [...values]
-}
-
-function rowFromIndexRecord(
-  record: ThreadIndexRecord,
-  paths: { metadataPath: string; messagesPath: string; eventsPath: string }
-): ThreadRow {
-  const thread = record.thread
-  return {
-    id: thread.id,
-    title: thread.title,
-    workspace: thread.workspace,
-    model: thread.model,
-    mode: thread.mode,
-    status: thread.status,
-    approval_policy: thread.approvalPolicy,
-    sandbox_mode: thread.sandboxMode,
-    cost_budget_usd: thread.costBudgetUsd ?? null,
-    cost_budget_warning_sent: thread.costBudgetWarningSent === undefined
-      ? null
-      : thread.costBudgetWarningSent
-        ? 1
-        : 0,
-    relation: thread.relation ?? 'primary',
-    parent_thread_id: thread.parentThreadId ?? null,
-    forked_from_thread_id: thread.forkedFromThreadId ?? null,
-    forked_from_title: thread.forkedFromTitle ?? null,
-    forked_at: thread.forkedAt ?? null,
-    forked_from_message_count: thread.forkedFromMessageCount ?? null,
-    forked_from_turn_count: thread.forkedFromTurnCount ?? null,
-    goal_json: thread.goal ? JSON.stringify(thread.goal) : null,
-    todos_json: thread.todos ? JSON.stringify(thread.todos) : null,
-    created_at: thread.createdAt,
-    updated_at: thread.updatedAt,
-    created_at_ms: isoToMillis(thread.createdAt),
-    updated_at_ms: isoToMillis(thread.updatedAt),
-    preview: record.preview || null,
-    message_count: record.messageCount,
-    event_seq_high_water: record.eventSeqHighWater,
-    metadata_path: paths.metadataPath,
-    messages_path: paths.messagesPath,
-    events_path: paths.eventsPath,
-    search_text: searchTextForThread(thread, record.preview)
-  }
-}
-
-function summaryFromRow(row: ThreadRow): ThreadSummary {
-  const goal = parseGoal(row.goal_json)
-  const todos = parseTodos(row.todos_json)
-  return {
-    id: row.id,
-    title: row.title,
-    workspace: row.workspace,
-    model: row.model,
-    mode: row.mode,
-    status: row.status,
-    approvalPolicy: row.approval_policy,
-    sandboxMode: row.sandbox_mode,
-    ...(row.cost_budget_usd !== null ? { costBudgetUsd: row.cost_budget_usd } : {}),
-    ...(row.cost_budget_warning_sent !== null ? { costBudgetWarningSent: Boolean(row.cost_budget_warning_sent) } : {}),
-    relation: row.relation,
-    ...(row.parent_thread_id ? { parentThreadId: row.parent_thread_id } : {}),
-    ...(row.forked_from_thread_id ? { forkedFromThreadId: row.forked_from_thread_id } : {}),
-    ...(row.forked_from_title ? { forkedFromTitle: row.forked_from_title } : {}),
-    ...(row.forked_at ? { forkedAt: row.forked_at } : {}),
-    ...(row.forked_from_message_count !== null ? { forkedFromMessageCount: row.forked_from_message_count } : {}),
-    ...(row.forked_from_turn_count !== null ? { forkedFromTurnCount: row.forked_from_turn_count } : {}),
-    ...(goal ? { goal } : {}),
-    ...(todos ? { todos } : {}),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  }
-}
-
-function parseGoal(raw: string | null): ThreadGoal | null {
-  if (!raw) return null
-  try {
-    return JSON.parse(raw) as ThreadGoal
-  } catch {
-    return null
-  }
-}
-
-function parseTodos(raw: string | null): ThreadTodoList | null {
-  if (!raw) return null
-  try {
-    return JSON.parse(raw) as ThreadTodoList
-  } catch {
-    return null
-  }
-}
-
-function filterThreadSummaries(
-  summaries: ThreadSummary[],
-  options: ThreadStoreListOptions
-): ThreadSummary[] {
-  const query = options.search?.trim().toLowerCase()
-  let out = summaries
-  if (options.archivedOnly) {
-    out = out.filter((thread) => thread.status === 'archived')
-  } else if (!options.includeArchived) {
-    out = out.filter((thread) => thread.status !== 'archived' && thread.status !== 'deleted')
-  }
-  if (!options.includeSide) {
-    out = out.filter((thread) => (thread.relation ?? 'primary') !== 'side')
-  }
-  if (query) {
-    out = out.filter((thread) => searchTextForSummary(thread).includes(query))
-  }
-  return typeof options.limit === 'number' ? out.slice(0, options.limit) : out
-}
-
-function searchTextForThread(thread: ThreadRecord, _preview: string): string {
-  return [
-    thread.id,
-    thread.title,
-    thread.workspace,
-    thread.model,
-    thread.mode,
-    thread.forkedFromTitle,
-    thread.forkedFromThreadId,
-    ...(thread.todos?.items.map((item) => item.content) ?? [])
-  ].filter(Boolean).join('\n').toLowerCase()
-}
-
-function searchTextForSummary(thread: ThreadSummary): string {
-  return [
-    thread.id,
-    thread.title,
-    thread.workspace,
-    thread.model,
-    thread.mode,
-    thread.forkedFromTitle,
-    thread.forkedFromThreadId,
-    ...(thread.todos?.items.map((item) => item.content) ?? [])
-  ].filter(Boolean).join('\n').toLowerCase()
 }
 
 function previewFromItems(items: TurnItem[]): string {
@@ -1296,15 +800,6 @@ function hasUsage(usage: UsageSnapshot): boolean {
     || (usage.tokenEconomySavingsCny ?? 0) > 0
 }
 
-function isoToMillis(value: string): number {
-  const millis = Date.parse(value)
-  return Number.isFinite(millis) ? millis : 0
-}
-
-function escapeLike(value: string): string {
-  return value.replace(/[%_]/g, (match) => `\\${match}`)
-}
-
 function addColumnIfMissing(db: BetterSqliteDatabase, table: string, columnSql: string): void {
   const column = columnSql.trim().split(/\s+/)[0]
   if (!column) return
@@ -1317,17 +812,7 @@ function addColumnIfMissing(db: BetterSqliteDatabase, table: string, columnSql: 
   }
 }
 
-const THREAD_RECORD_CACHE_LIMIT = 8
 const METADATA_COMPACT_MIN_BYTES = 1_000_000
-
-async function fileSignature(path: string): Promise<string> {
-  try {
-    const stats = await stat(path)
-    return `${stats.size}:${stats.mtimeMs}`
-  } catch {
-    return 'missing'
-  }
-}
 
 async function appendJsonlLine(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true })

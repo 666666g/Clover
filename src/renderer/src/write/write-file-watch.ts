@@ -17,6 +17,7 @@ type TextSnapshot = {
   truncated?: boolean
   message?: string
   animate: boolean
+  reviewAsDiff: boolean
 }
 
 type StartWriteFileWatchOptions = {
@@ -37,10 +38,17 @@ export function startWriteWorkspaceFileWatch(options: StartWriteFileWatchOptions
     void options.api.unwatchWorkspaceFile(id).catch(() => undefined)
   }
 
-  const handleTextSnapshot = (snapshot: Omit<TextSnapshot, 'animate'> & { animate?: boolean }): void => {
+  const handleTextSnapshot = (
+    snapshot: Omit<TextSnapshot, 'animate' | 'reviewAsDiff'> & { animate?: boolean }
+  ): void => {
+    const animate = snapshot.animate ?? true
     options.onTextSnapshot({
       ...snapshot,
-      animate: snapshot.animate ?? true
+      animate,
+      // The watcher start result is the file-open baseline. Subsequent events
+      // may be assistant/external edits and should enter review unless the
+      // store recognizes them as an echo from its own save queue.
+      reviewAsDiff: animate
     })
   }
 

@@ -1,13 +1,14 @@
 import type i18next from 'i18next'
-import type { AppSettingsV1 } from '@shared/app-settings'
+import type { AppSettingsV1, ModelReasoningEffort } from '@shared/app-settings'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import { rendererRuntimeClient } from '../agent/runtime-client'
+import { extensionWorkbenchClient } from '../extensions/extension-workbench-client'
 import type { ChatState, ChatStoreGet, ChatStoreSet, InitialSetupMode, PluginHostRoute, SettingsRouteSection } from './chat-store-types'
 import type { ComposerPlanMode } from './chat-store-helpers'
 import {
-  canSwitchComposerModel,
-  conversationHasVisionAttachments,
   composerModelSelectable,
   composerModeForThread,
+  composerReasoningEffortForSelection,
   persistComposerMode,
   persistComposerProviderId,
   providerIdForComposerModel,
@@ -18,21 +19,31 @@ import {
   rememberThreadComposerSelection,
   readStoredComposerProviderId
 } from './chat-store-helpers'
-
 type CreateAppActionsOptions = {
   set: ChatStoreSet
   get: ChatStoreGet
   i18n: typeof i18next
   persistComposerModel: (model: string) => void
   persistComposerMode: (mode: ComposerPlanMode) => void
+  persistComposerReasoningEffort: (
+    modelId: string,
+    providerId: string,
+    effort: ModelReasoningEffort
+  ) => void
+  persistComposerFastMode: (enabled: boolean) => void
   rememberThreadComposerMode: (threadId: string, mode: ComposerPlanMode) => void
   readStoredComposerModel: (allowedIds: readonly string[]) => string
   mergeComposerPickList: (upstreamOk: boolean, upstreamIds: string[]) => string[]
-  fallbackComposerModel: (pickList: readonly string[], runtimeDefault: string) => string
+  fallbackComposerModel: (
+    pickList: readonly string[],
+    runtimeDefault: string,
+    modelGroups?: readonly ModelProviderModelGroup[]
+  ) => string
   getComposerModelLoadPromise: () => Promise<void> | null
   setComposerModelLoadPromise: (promise: Promise<void> | null) => void
   applyTheme: (theme: AppSettingsV1['theme']) => void
   applyUiFontScale: (scale: AppSettingsV1['uiFontScale']) => void
+  applyChatContentMaxWidth: (widthPx: AppSettingsV1['chatContentMaxWidthPx']) => void
   applyCursorSpotlight: (enabled: boolean) => void
   applyCursorSpotlightColor: (color: AppSettingsV1['cursorSpotlightColor']) => void
   applyWriteTypography: (typography: AppSettingsV1['write']['typography']) => void
@@ -45,7 +56,10 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
   ChatState,
   | 'setError'
   | 'setComposerMode'
+  | 'setComposerOrchestration'
   | 'setComposerModel'
+  | 'setComposerReasoningEffort'
+  | 'setComposerFastMode'
   | 'setComposerAgentId'
   | 'loadComposerModels'
   | 'setRoute'
@@ -55,6 +69,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
   | 'openClaw'
   | 'openSchedule'
   | 'openWorkflow'
+  | 'openDesign'
   | 'openImageEdit'
   | 'openInitialSetup'
   | 'closeInitialSetup'
@@ -68,6 +83,8 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     i18n,
     persistComposerModel,
     persistComposerMode,
+    persistComposerReasoningEffort,
+    persistComposerFastMode,
     rememberThreadComposerMode,
     readStoredComposerModel,
     mergeComposerPickList,
@@ -76,6 +93,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     setComposerModelLoadPromise,
     applyTheme,
     applyUiFontScale,
+    applyChatContentMaxWidth,
     applyCursorSpotlight,
     applyCursorSpotlightColor,
     applyWriteTypography,
@@ -83,6 +101,10 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     workspaceLabelFromPath,
     normalizeWorkspaceRoot
   } = options
+  // Settings may finish saving while the startup model read is still in
+  // flight. Keep one follow-up read so the composer does not retain the
+  // stale provider list returned by that earlier request.
+  let queuedComposerModelReload: Promise<void> | null = null
 
   return {
     setError: (message) => set({ error: message }),
@@ -97,23 +119,13 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
       set({ composerMode: mode })
     },
 
+    setComposerOrchestration: (mode) => {
+      set({ composerOrchestration: mode })
+    },
+
     setComposerModel: (modelId, providerId) => {
       const nextProviderId = providerId?.trim() || providerIdForComposerModel(get().composerModelGroups, modelId)
       const state = get()
-      const lockVisionToTextSwitch =
-        state.route === 'chat' &&
-        Array.isArray(state.blocks) &&
-        conversationHasVisionAttachments(state.blocks)
-      if (!canSwitchComposerModel(
-        lockVisionToTextSwitch,
-        state.composerModelGroups,
-        state.composerModel,
-        state.composerProviderId,
-        modelId,
-        nextProviderId
-      )) {
-        return
-      }
       const activeThreadId = state.activeThreadId
       if (activeThreadId) {
         rememberThreadComposerSelection(activeThreadId, modelId, nextProviderId)
@@ -121,11 +133,45 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
         persistComposerModel(modelId)
         persistComposerProviderId(nextProviderId)
       }
-      set({ composerModel: modelId, composerProviderId: nextProviderId })
+      set({
+        composerModel: modelId,
+        composerProviderId: nextProviderId,
+        composerReasoningEffort: composerReasoningEffortForSelection(
+          state.composerModelGroups,
+          modelId,
+          nextProviderId
+        )
+      })
       const trimmed = modelId.trim()
-      if (!activeThreadId && trimmed && trimmed.toLowerCase() !== 'auto' && typeof window.kunGui !== 'undefined') {
-        void window.kunGui.saveSettingsSilent({ agents: { kun: { model: trimmed } } })
+      const extensionProvider = state.composerModelGroups.find(
+        (group) => group.providerId === nextProviderId
+      )?.extensionProvider
+      if (
+        !activeThreadId &&
+        !extensionProvider &&
+        trimmed &&
+        trimmed.toLowerCase() !== 'auto' &&
+        typeof window.kunGui !== 'undefined'
+      ) {
+        void window.kunGui.saveSettingsSilent({
+          agents: { kun: { model: trimmed, providerId: nextProviderId } }
+        })
       }
+    },
+
+    setComposerReasoningEffort: (effort) => {
+      const state = get()
+      persistComposerReasoningEffort(
+        state.composerModel,
+        state.composerProviderId,
+        effort
+      )
+      set({ composerReasoningEffort: effort })
+    },
+
+    setComposerFastMode: (enabled) => {
+      persistComposerFastMode(enabled)
+      set({ composerFastMode: enabled })
     },
 
     setComposerAgentId: (agentId) => {
@@ -133,13 +179,79 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     },
 
     loadComposerModels: async () => {
-      if (getComposerModelLoadPromise()) return getComposerModelLoadPromise()!
+      const existingLoad = getComposerModelLoadPromise()
+      if (existingLoad) {
+        if (!queuedComposerModelReload) {
+          queuedComposerModelReload = existingLoad
+            .catch(() => undefined)
+            .then(() => get().loadComposerModels())
+            .finally(() => {
+              queuedComposerModelReload = null
+            })
+        }
+        return queuedComposerModelReload
+      }
       if (typeof window.kunGui === 'undefined') return
       const task = (async () => {
-        const res = await window.kunGui.fetchUpstreamModels()
-        const pick = mergeComposerPickList(res.ok, res.ok ? res.modelIds : [])
-        const groups = res.ok ? res.modelGroups ?? [] : []
-        const runtimeDefault = res.ok ? res.defaultModelId?.trim() ?? '' : ''
+        const [res, extensionProviders] = await Promise.all([
+          window.kunGui.fetchUpstreamModels(),
+          extensionWorkbenchClient.listModelProviders(get().workspaceRoot || undefined).catch(() => [])
+        ])
+        const extensionGroups: ModelProviderModelGroup[] = extensionProviders.flatMap((provider) => {
+          if (!provider.binding?.valid) return []
+          const model = provider.models.find((candidate) => candidate.id === provider.binding?.modelId)
+          if (!model) return []
+          const inputModalities = [
+            'text' as const,
+            ...(model.capabilities.input.includes('image') ? ['image' as const] : [])
+          ]
+          return [{
+            providerId: provider.providerId,
+            label: `${provider.displayName} · ${provider.extensionDisplayName}`,
+            modelIds: [model.id],
+            accountId: provider.binding.accountId,
+            extensionProvider: {
+              extensionId: provider.extensionId,
+              extensionVersion: provider.extensionVersion,
+              localProviderId: provider.localProviderId
+            },
+            modelProfiles: {
+              [model.id]: {
+                inputModalities,
+                outputModalities: ['text'],
+                supportsToolCalling: model.capabilities.tools,
+                messageParts: model.capabilities.input.includes('image')
+                  ? ['text', 'image_url', 'input_image']
+                  : ['text'],
+                ...(model.capabilities.maxContextTokens
+                  ? { contextWindowTokens: model.capabilities.maxContextTokens }
+                  : {}),
+                ...(model.capabilities.maxOutputTokens
+                  ? { maxOutputTokens: model.capabilities.maxOutputTokens }
+                  : {}),
+                ...(model.capabilities.reasoning ? {
+                  reasoning: {
+                    supportedEfforts: ['low', 'medium', 'high'],
+                    defaultEffort: 'medium',
+                    requestProtocol: 'none'
+                  }
+                } : {})
+              }
+            }
+          }]
+        })
+        const upstreamGroups = res.ok ? res.modelGroups ?? [] : []
+        const groups = [...upstreamGroups, ...extensionGroups]
+        const pick = mergeComposerPickList(
+          res.ok || extensionGroups.length > 0,
+          [...(res.ok ? res.modelIds : []), ...extensionGroups.flatMap((group) => group.modelIds)]
+        )
+        const runtimeDefault = res.ok
+          ? res.defaultModel?.modelId.trim() || res.defaultModelId?.trim() || ''
+          : ''
+        const runtimeDefaultProviderId = res.ok
+          ? res.defaultModel?.providerId.trim() ?? ''
+          : ''
         set((state) => {
           const isSelectable = (model: string): boolean => composerModelSelectable(pick, groups, model)
           const activeThread = state.activeThreadId
@@ -149,37 +261,64 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
           const currentModel = state.composerModel.trim()
           const normalizedCurrentModel = currentModel.toLowerCase() === 'auto' ? '' : currentModel
           const storedModel = readStoredComposerModel(pick)
-          let model = activeThread
-            ? threadSelection?.model?.trim() || activeThread.model.trim()
-            : normalizedCurrentModel
-          let shouldPersist = !activeThread && model !== state.composerModel
-          if (model === '' || !isSelectable(model)) {
-            model = activeThread ? '' : storedModel
-            shouldPersist = false
-          }
-          if (model === '' || !isSelectable(model)) {
-            model = fallbackComposerModel(pick, runtimeDefault)
-            shouldPersist = false
-          }
-          if (shouldPersist) persistComposerModel(model)
+          const selectableRuntimeDefault = composerModelSelectable(
+            pick,
+            groups,
+            runtimeDefault,
+            runtimeDefaultProviderId
+          )
+            ? runtimeDefault
+            : runtimeDefaultProviderId
+              ? ''
+              : isSelectable(runtimeDefault)
+                ? runtimeDefault
+                : ''
+          const threadHasUserMessages = activeThread
+            ? state.blocks.some((block) => block.kind === 'user')
+            : false
+          const preserveThreadSelection =
+            threadHasUserMessages || threadSelection?.source === 'user'
+          const candidates = activeThread
+            ? preserveThreadSelection
+              ? [threadSelection?.model ?? '', activeThread.model, selectableRuntimeDefault]
+              : [selectableRuntimeDefault, activeThread.model, threadSelection?.model ?? '']
+            : [selectableRuntimeDefault, normalizedCurrentModel, storedModel]
+          const model = candidates.find(isSelectable) ??
+            fallbackComposerModel(pick, runtimeDefault, groups)
+          const selectedStoredModel =
+            threadSelection?.model.trim().toLowerCase() === model.trim().toLowerCase()
           const threadProviderId =
-            threadSelection && providerIdMatchesComposerModel(groups, threadSelection.providerId, model)
+            threadSelection && selectedStoredModel &&
+              providerIdMatchesComposerModel(groups, threadSelection.providerId, model)
               ? threadSelection.providerId
               : ''
-          const storedProviderId = activeThread ? '' : readStoredComposerProviderId(groups, model)
-          const providerId = threadProviderId || storedProviderId || providerIdForComposerModel(groups, model)
+          const storedProviderId = activeThread || selectableRuntimeDefault
+            ? ''
+            : readStoredComposerProviderId(groups, model)
+          const runtimeProviderId =
+            selectableRuntimeDefault &&
+            model.trim().toLowerCase() === selectableRuntimeDefault.trim().toLowerCase() &&
+            providerIdMatchesComposerModel(groups, runtimeDefaultProviderId, model)
+              ? runtimeDefaultProviderId
+              : ''
+          const providerId =
+            threadProviderId ||
+            runtimeProviderId ||
+            storedProviderId ||
+            providerIdForComposerModel(groups, model)
           if (!activeThread && providerId !== state.composerProviderId) persistComposerProviderId(providerId)
           if (
             activeThread &&
             (!threadSelection || threadSelection.model !== model || threadSelection.providerId !== providerId) &&
             composerModelSelectable(pick, groups, model)
           ) {
-            rememberThreadComposerSelection(activeThread.id, model, providerId)
+            rememberThreadComposerSelection(activeThread.id, model, providerId, 'default')
           }
           return {
             composerPickList: pick,
             composerModel: model,
             composerProviderId: providerId,
+            composerReasoningEffort: composerReasoningEffortForSelection(groups, model, providerId),
             composerModelGroups: groups
           }
         })
@@ -221,6 +360,9 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
     openWorkflow: () => {
       set({ route: 'workflow' })
     },
+    openDesign: () => {
+      set({ route: 'design' })
+    },
 
     openImageEdit: () => {
       set({ route: 'image-edit' })
@@ -244,6 +386,7 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
       const workspaceRoot = normalizeWorkspaceRoot(settings.workspaceRoot)
       applyTheme(settings.theme)
       applyUiFontScale(settings.uiFontScale)
+      applyChatContentMaxWidth(settings.chatContentMaxWidthPx)
       applyCursorSpotlight(settings.cursorSpotlight !== false)
       applyCursorSpotlightColor(settings.cursorSpotlightColor)
       if (settings.write?.typography) applyWriteTypography(settings.write.typography)
@@ -252,6 +395,11 @@ export function createAppActions(options: CreateAppActionsOptions): Pick<
         workspaceLabel: workspaceLabelFromPath(workspaceRoot),
         conversationWorkspaceRoot: settings.conversationWorkspaceRoot || '',
         disabledSkillIds: settings.disabledSkillIds,
+        graphEnabled: settings.agents.kun.graph?.enabled === true,
+        composerOrchestration:
+          settings.agents.kun.graph?.enabled === true && get().composerOrchestration === 'graph'
+            ? 'graph'
+            : 'direct',
         clawChannels: settings.claw.channels,
         activeClawChannelId: settings.claw.channels.some(
           (channel) => channel.id === get().activeClawChannelId && channel.enabled

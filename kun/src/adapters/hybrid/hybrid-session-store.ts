@@ -2,6 +2,8 @@ import type { RuntimeEvent } from '../../contracts/events.js'
 import type { TurnItem } from '../../contracts/items.js'
 import type { AgentSession } from '../../domain/session.js'
 import type {
+  ItemHistoryCommit,
+  ItemHistorySnapshot,
   SessionLatestUsageSnapshot,
   SessionStore,
   SessionUsageRecord
@@ -43,12 +45,32 @@ export class HybridSessionStore implements SessionStore {
     await this.delegate.rewriteItems(threadId, items)
   }
 
+  async loadItemSnapshot(threadId: string): Promise<ItemHistorySnapshot> {
+    return this.delegate.loadItemSnapshot(threadId)
+  }
+
+  async rewriteItemsIfRevision(
+    threadId: string,
+    expectedRevision: number,
+    items: TurnItem[]
+  ): Promise<ItemHistoryCommit> {
+    return this.delegate.rewriteItemsIfRevision(threadId, expectedRevision, items)
+  }
+
   async updateItem(threadId: string, itemId: string, patch: Partial<TurnItem>): Promise<TurnItem | null> {
     return this.delegate.updateItem(threadId, itemId, patch)
   }
 
   async loadEventsSince(threadId: string, sinceSeq: number): Promise<RuntimeEvent[]> {
     return this.delegate.loadEventsSince(threadId, sinceSeq)
+  }
+
+  iterateEventsSince(
+    threadId: string,
+    sinceSeq: number,
+    options?: { maxRecordBytes?: number }
+  ): AsyncIterable<RuntimeEvent> {
+    return this.delegate.iterateEventsSince(threadId, sinceSeq, options)
   }
 
   async loadItems(threadId: string): Promise<TurnItem[]> {
@@ -64,9 +86,16 @@ export class HybridSessionStore implements SessionStore {
   }
 
   async highestSeq(threadId: string): Promise<number> {
-    const indexed = await this.index.getEventSeqHighWater(threadId)
-    if (indexed !== null) return indexed
-    return this.delegate.highestSeq(threadId)
+    // JSONL is the canonical event log. An interruption after its append but
+    // before the best-effort SQLite note leaves the index behind; trusting the
+    // index alone would reuse that sequence and make SSE skip the durable
+    // event. Keep the index as a fast hint, but never let it lower the file
+    // high-water mark.
+    const [indexed, durable] = await Promise.all([
+      this.index.getEventSeqHighWater(threadId).catch(() => null),
+      this.delegate.highestSeq(threadId)
+    ])
+    return Math.max(indexed ?? 0, durable)
   }
 
   async loadUsageRecords(options?: { threadId?: string }): Promise<SessionUsageRecord[]> {
@@ -79,5 +108,9 @@ export class HybridSessionStore implements SessionStore {
 
   async resetMemory(): Promise<void> {
     await this.delegate.resetMemory()
+  }
+
+  clearThreadMemory(threadId: string): void {
+    this.delegate.clearThreadMemory(threadId)
   }
 }

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import type { ToolCallLike, ToolHostContext } from '../ports/tool-host.js'
-import { terminateSpawnTree } from '../adapters/tool/builtin-tool-utils.js'
+import { shellSpawnEnv, terminateSpawnTree } from '../adapters/tool/builtin-tool-utils.js'
+import type { TurnClientSurface } from '../contracts/turns.js'
 
 /**
  * Hook phases. Tool phases run inside the tool host around every tool
@@ -21,7 +22,13 @@ export type HookPhase = (typeof HOOK_PHASES)[number]
 
 export type ToolHookContext = Pick<
   ToolHostContext,
-  'threadId' | 'turnId' | 'workspace' | 'threadMode' | 'approvalPolicy' | 'sandboxMode'
+  | 'threadId'
+  | 'turnId'
+  | 'workspace'
+  | 'threadMode'
+  | 'approvalPolicy'
+  | 'sandboxMode'
+  | 'clientSurface'
 >
 
 export type ToolHookResultPayload = {
@@ -32,8 +39,22 @@ export type ToolHookResultPayload = {
 export type HookInvocation =
   | { phase: 'PreToolUse'; call: ToolCallLike; context: ToolHookContext }
   | { phase: 'PostToolUse'; call: ToolCallLike; context: ToolHookContext; result: ToolHookResultPayload }
-  | { phase: 'UserPromptSubmit'; threadId: string; turnId: string; prompt: string; workspace?: string }
-  | { phase: 'TurnStart'; threadId: string; turnId: string; prompt: string; workspace?: string }
+  | {
+      phase: 'UserPromptSubmit'
+      threadId: string
+      turnId: string
+      prompt: string
+      workspace?: string
+      clientSurface?: TurnClientSurface
+    }
+  | {
+      phase: 'TurnStart'
+      threadId: string
+      turnId: string
+      prompt: string
+      workspace?: string
+      clientSurface?: TurnClientSurface
+    }
   | {
       phase: 'TurnEnd'
       threadId: string
@@ -41,8 +62,17 @@ export type HookInvocation =
       status: 'completed' | 'failed' | 'aborted'
       error?: string
       workspace?: string
+      clientSurface?: TurnClientSurface
     }
-  | { phase: 'PreCompact'; threadId: string; turnId: string; reason: string; mode?: string; workspace?: string }
+  | {
+      phase: 'PreCompact'
+      threadId: string
+      turnId: string
+      reason: string
+      mode?: string
+      workspace?: string
+      clientSurface?: TurnClientSurface
+    }
 
 export type HookResult = {
   /**
@@ -74,6 +104,8 @@ export type ResolvedHook =
       matcher?: string
       /** Exact tool-name allow-list. Matches when either this or `matcher` matches. */
       toolNames?: readonly string[]
+      /** Optional client-surface scope. Omitted means every client surface. */
+      clientSurfaces?: readonly TurnClientSurface[]
       timeoutMs?: number
       run: (invocation: HookInvocation) => Promise<HookResult | void> | HookResult | void
     }
@@ -81,6 +113,7 @@ export type ResolvedHook =
       phase: HookPhase
       matcher?: string
       toolNames?: readonly string[]
+      clientSurfaces?: readonly TurnClientSurface[]
       timeoutMs?: number
       command: string
       cwd?: string
@@ -190,7 +223,13 @@ export async function runPostToolUseHooks(
  */
 export async function runUserPromptSubmitHooks(
   hooks: readonly ResolvedHook[] | undefined,
-  input: { threadId: string; turnId: string; prompt: string; workspace?: string }
+  input: {
+    threadId: string
+    turnId: string
+    prompt: string
+    workspace?: string
+    clientSurface?: TurnClientSurface
+  }
 ): Promise<UserPromptSubmitOutcome> {
   const additionalContext: string[] = []
   const warnings: string[] = []
@@ -263,12 +302,22 @@ export function hookMatchesTool(
   return false
 }
 
+export const MAX_HOOK_MATCHER_CACHE_ENTRIES = 256
 const matcherCache = new Map<string, RegExp>()
+
+export const hookMatcherCacheForTesting = {
+  clear: (): void => matcherCache.clear(),
+  size: (): number => matcherCache.size
+}
 
 /** Compile a glob matcher: `*` matches any run of characters, `|` separates alternatives. */
 function compileMatcher(pattern: string): RegExp {
   const cached = matcherCache.get(pattern)
-  if (cached) return cached
+  if (cached) {
+    matcherCache.delete(pattern)
+    matcherCache.set(pattern, cached)
+    return cached
+  }
   const alternatives = pattern
     .split('|')
     .map((part) => part.trim())
@@ -276,6 +325,11 @@ function compileMatcher(pattern: string): RegExp {
     .map((part) => part.replace(/[.+?^${}()[\]\\]/g, '\\$&').replaceAll('*', '.*'))
   const regex = new RegExp(`^(?:${alternatives.join('|') || '$.'})$`)
   matcherCache.set(pattern, regex)
+  while (matcherCache.size > MAX_HOOK_MATCHER_CACHE_ENTRIES) {
+    const oldest = matcherCache.keys().next().value
+    if (oldest === undefined) break
+    matcherCache.delete(oldest)
+  }
   return regex
 }
 
@@ -286,6 +340,10 @@ type HookExecutionOutcome = {
 }
 
 async function executeHook(hook: ResolvedHook, invocation: HookInvocation): Promise<HookExecutionOutcome> {
+  const surface = clientSurfaceOf(invocation)
+  if (hook.clientSurfaces?.length && (!surface || !hook.clientSurfaces.includes(surface))) {
+    return {}
+  }
   if ('run' in hook) {
     const result = await withTimeout(
       Promise.resolve(hook.run(invocation)),
@@ -295,6 +353,13 @@ async function executeHook(hook: ResolvedHook, invocation: HookInvocation): Prom
     return result ? { result } : {}
   }
   return runCommandHook(hook, invocation)
+}
+
+function clientSurfaceOf(invocation: HookInvocation): TurnClientSurface | undefined {
+  if (invocation.phase === 'PreToolUse' || invocation.phase === 'PostToolUse') {
+    return invocation.context.clientSurface
+  }
+  return invocation.clientSurface
 }
 
 /**
@@ -315,6 +380,7 @@ async function runCommandHook(
   const payload = JSON.stringify(invocation)
   const child = spawn(hook.command, {
     cwd: hook.cwd || workspaceOf(invocation) || undefined,
+    env: shellSpawnEnv(),
     shell: true,
     stdio: ['pipe', 'pipe', 'pipe']
   })

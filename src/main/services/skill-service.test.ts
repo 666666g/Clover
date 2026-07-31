@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -64,6 +65,52 @@ describe('skill-service', () => {
       description: 'Implement tasks from an OpenSpec change.',
       scope: 'project'
     }))
+  })
+
+  it('discovers project Kun skills from .kun/skills and exposes the root to runtime', async () => {
+    const workspaceRoot = join(tempRoot, 'workspace-kun')
+    const skillRoot = join(workspaceRoot, '.kun', 'skills')
+    const pmSkill = join(skillRoot, 'pm')
+    await mkdir(pmSkill, { recursive: true })
+    await writeFile(
+      join(pmSkill, 'skill.json'),
+      JSON.stringify({
+        id: 'pm',
+        name: 'Project Manager',
+        description: 'Coordinate staged project work.',
+        triggers: { commands: ['/pm'] }
+      }),
+      'utf8'
+    )
+    await writeFile(join(pmSkill, 'SKILL.md'), '# PM\n\nCoordinate staged work.', 'utf8')
+
+    const settings = createSettings(workspaceRoot)
+    const result = await listGuiSkills(settings, workspaceRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.skills).toContainEqual(expect.objectContaining({
+      id: 'pm',
+      name: 'Project Manager',
+      description: 'Coordinate staged project work.',
+      scope: 'project'
+    }))
+
+    const roots = await listGuiSkillRoots(settings, workspaceRoot)
+    expect(roots.ok).toBe(true)
+    if (!roots.ok) return
+    const kunRoot = roots.roots.find((root) => root.id === 'workspace-kun')
+    expect(kunRoot).toMatchObject({
+      path: skillRoot,
+      labelKey: 'pluginSkillRootWorkspaceKun',
+      scope: 'project',
+      source: 'common',
+      exists: true,
+      enabled: true,
+      skillCount: 1
+    })
+    expect((await guiSkillRootsForRuntime(settings, workspaceRoot)).map((root) => comparable(root.path)))
+      .toContain(comparable(skillRoot))
   })
 
   it('keeps legacy SKILL.md entries with Chinese frontmatter names distinct', async () => {
@@ -290,12 +337,14 @@ describe('skill-service', () => {
       locale: 'en',
       theme: 'system',
       uiFontScale: 0.82,
+      chatContentMaxWidthPx: 896,
+      composerSendKey: 'enter',
       provider: defaultModelProviderSettings(),
       agents: { kun: defaultKunRuntimeSettings() },
       workspaceRoot,
       conversationWorkspaceRoot: '~/Documents/Kun',
       log: { enabled: false, retentionDays: 7 },
-      checkpointCleanup: { enabled: false, intervalDays: 3 },
+      checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
       notifications: { turnComplete: true },
       appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
       keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -303,6 +352,7 @@ describe('skill-service', () => {
       claw: defaultClawSettings(),
       schedule: defaultScheduleSettings(),
       workflow: defaultWorkflowSettings(),
+      design: defaultDesignSettings(),
       terminal: defaultTerminalSettings(),
       guiUpdate: { channel: 'stable' },
       codePromptPrefix: '',

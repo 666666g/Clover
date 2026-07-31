@@ -24,6 +24,33 @@ const labels: Record<string, string> = {
   memoryOff: 'Off',
   memoryRecords: 'Memory records',
   memoryRecordsDesc: 'Memory records description',
+  memoryImport: 'Import',
+  memoryExport: 'Export',
+  memoryExported: 'Memory exported',
+  memoryExportUnavailable: 'Export unavailable',
+  memoryImportTitle: 'Import Memory into Kun',
+  memoryImportStepPrompt: 'Copy prompt',
+  memoryImportCopy: 'Copy',
+  memoryImportCopied: 'Copied',
+  memoryImportStepPaste: 'Paste result',
+  memoryImportPastePlaceholder: 'Paste memory details',
+  memoryImportTargetPathPlaceholder: 'Workspace or project path',
+  memoryImportUserScopeHint: 'User memories are global.',
+  memoryImportTargetRequired: 'Path required.',
+  memoryImportParsedPrefix: 'Will import ',
+  memoryImportParsedSuffix: ' item(s)',
+  memoryImportMorePrefix: 'Plus ',
+  memoryImportMoreSuffix: ' more',
+  memoryImportAdd: 'Add to memory',
+  memoryImporting: 'Adding...',
+  memoryImportedPrefix: 'Imported ',
+  memoryImportedSuffix: ' memory item(s).',
+  memoryImportPartialPrefix: 'Imported ',
+  memoryImportPartialMiddle: ' item(s), failed ',
+  memoryImportPartialSuffix: '.',
+  memoryImportSkippedPrefix: 'Skipped ',
+  memoryImportSkippedSuffix: ' duplicate memory item(s).',
+  memoryImportAllDuplicate: 'No new memories to import.',
   memoryDisabledHint: 'Memory disabled',
   memoryScope_all: 'All',
   memoryScope_user: 'User',
@@ -37,11 +64,13 @@ const labels: Record<string, string> = {
   memoryConfidence: 'Confidence',
   memoryCancel: 'Cancel',
   memorySave: 'Save',
+  memorySaveFailed: 'Memory save failed',
   memoryEmpty: 'No memory records',
   memoryEdit: 'Edit',
   memoryDetails: 'Details',
   memoryClose: 'Close',
   memoryDisable: 'Disable',
+  memoryRestore: 'Restore',
   memoryDelete: 'Delete',
   memoryDisabled: 'Disabled',
   memoryProject: 'Project',
@@ -50,7 +79,11 @@ const labels: Record<string, string> = {
   memoryDiscardConfirm: 'Discard unsaved changes?',
   memoryDiscardConfirmDetail: 'Your edits will be lost.',
   memoryDiscardConfirmAction: 'Discard',
-  memoryDiscardCancel: 'Keep editing'
+  memoryDiscardCancel: 'Keep editing',
+  memoryDisableConfirm: 'Disable this memory?',
+  memoryDisableConfirmDetail: 'The assistant will stop using this memory.',
+  memoryDeleteConfirm: 'Delete this memory?',
+  memoryDeleteConfirmDetail: 'Deleted memories cannot be restored here.'
 }
 
 function baseCtx(overrides: Record<string, any> = {}): Record<string, any> {
@@ -68,6 +101,7 @@ function baseCtx(overrides: Record<string, any> = {}): Record<string, any> {
     createMemoryRecord: async () => true,
     updateMemoryRecord: async () => true,
     disableMemoryRecord: async () => undefined,
+    restoreMemoryRecord: async () => undefined,
     deleteMemoryRecord: async () => undefined,
     ...overrides
   }
@@ -111,6 +145,16 @@ describe('MemorySettingsSection', () => {
     expect(html).toContain('Project')
     expect(html).toContain(projectPath)
     expect(html).toContain('project-overview')
+  })
+
+  it('renders import and export actions in the memory toolbar', () => {
+    const html = renderToStaticMarkup(createElement(MemorySettingsSection, {
+      ctx: baseCtx()
+    }))
+
+    expect(html).toContain('Import')
+    expect(html).toContain('Export')
+    expect(html).toContain('New')
   })
 
   it('truncates long memory content in the default list view body (not in the title attribute)', () => {
@@ -165,6 +209,18 @@ describe('MemorySettingsSection', () => {
     const titleAttrPattern = /title="[^"]*this tail should only appear inside the details dialog[^"]*"/
     expect(html).toMatch(titleAttrPattern)
   })
+
+  it('offers restore instead of disable for a disabled memory', () => {
+    const html = renderToStaticMarkup(createElement(MemorySettingsSection, {
+      ctx: baseCtx({
+        memoryRecords: [sampleRecord({ disabledAt: '2026-07-02T00:00:00.000Z' })]
+      })
+    }))
+
+    expect(html).toContain('aria-label="Restore"')
+    expect(html).not.toContain('aria-label="Disable"')
+    expect(html).toContain('Disabled')
+  })
 })
 
 describe('serializeMemoryTags', () => {
@@ -187,7 +243,7 @@ describe('isMemoryDraftDirty', () => {
   it('returns false in view mode regardless of draft', () => {
     const record = sampleRecord()
     const dialog: MemoryDialogState = { mode: 'view', memory: record }
-    const draft: MemoryDraft = { content: 'totally different', scope: 'user', tags: 'x', confidence: 0 }
+    const draft: MemoryDraft = { content: 'totally different', scope: 'user', targetPath: '', tags: 'x', confidence: 0 }
     expect(isMemoryDraftDirty(dialog, draft)).toBe(false)
   })
 
@@ -197,6 +253,7 @@ describe('isMemoryDraftDirty', () => {
     const draft: MemoryDraft = {
       content: record.content,
       scope: record.scope,
+      targetPath: record.workspace ?? '',
       tags: 'summary, kook-bot',
       confidence: record.confidence ?? 1
     }
@@ -209,6 +266,7 @@ describe('isMemoryDraftDirty', () => {
     const baseline: MemoryDraft = {
       content: record.content,
       scope: record.scope,
+      targetPath: record.workspace ?? '',
       tags: 'summary',
       confidence: 1
     }
@@ -219,15 +277,15 @@ describe('isMemoryDraftDirty', () => {
 
   it('returns false in create mode for an empty draft on the default scope', () => {
     const dialog: MemoryDialogState = { mode: 'create' }
-    const draft: MemoryDraft = { content: '   ', scope: 'workspace', tags: '   ', confidence: 1 }
+    const draft: MemoryDraft = { content: '   ', scope: 'user', targetPath: '', tags: '   ', confidence: 1 }
     expect(isMemoryDraftDirty(dialog, draft)).toBe(false)
   })
 
   it('returns true in create mode when any field changes from the empty default', () => {
     const dialog: MemoryDialogState = { mode: 'create' }
-    expect(isMemoryDraftDirty(dialog, { content: 'hello', scope: 'workspace', tags: '', confidence: 1 })).toBe(true)
-    expect(isMemoryDraftDirty(dialog, { content: '', scope: 'workspace', tags: 'tag', confidence: 1 })).toBe(true)
-    expect(isMemoryDraftDirty(dialog, { content: '', scope: 'user', tags: '', confidence: 1 })).toBe(true)
+    expect(isMemoryDraftDirty(dialog, { content: 'hello', scope: 'user', targetPath: '', tags: '', confidence: 1 })).toBe(true)
+    expect(isMemoryDraftDirty(dialog, { content: '', scope: 'user', targetPath: '', tags: 'tag', confidence: 1 })).toBe(true)
+    expect(isMemoryDraftDirty(dialog, { content: '', scope: 'workspace', targetPath: '', tags: '', confidence: 1 })).toBe(true)
   })
 })
 
@@ -238,6 +296,7 @@ describe('attemptCloseMemoryDialog', () => {
     const draft: MemoryDraft = {
       content: record.content,
       scope: record.scope,
+      targetPath: record.workspace ?? '',
       tags: 'summary',
       confidence: 1
     }
@@ -254,7 +313,7 @@ describe('attemptCloseMemoryDialog', () => {
     const close = vi.fn()
     const result = await attemptCloseMemoryDialog({
       dialog: null,
-      draft: { content: 'anything', scope: 'workspace', tags: '', confidence: 1 },
+      draft: { content: 'anything', scope: 'workspace', targetPath: '', tags: '', confidence: 1 },
       confirm,
       close
     })
@@ -269,6 +328,7 @@ describe('attemptCloseMemoryDialog', () => {
     const draft: MemoryDraft = {
       content: 'EDITED content',
       scope: record.scope,
+      targetPath: record.workspace ?? '',
       tags: 'summary',
       confidence: 1
     }
@@ -285,6 +345,7 @@ describe('attemptCloseMemoryDialog', () => {
     const draft: MemoryDraft = {
       content: 'half-typed thought',
       scope: 'workspace',
+      targetPath: '',
       tags: '',
       confidence: 1
     }

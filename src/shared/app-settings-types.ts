@@ -1,9 +1,16 @@
+import type { AppLocale } from './app-locales'
 import type { GuiUpdateChannel } from './gui-update'
 import type { KeyboardShortcutsConfigV1 } from './keyboard-shortcuts'
 import type { LocalWhisperDownloadSourceId } from './local-whisper'
-import type { ApprovalPolicy, SandboxMode } from '../../kun/src/contracts/policy.js'
+import type {
+  ApprovalPolicy,
+  ApprovalReviewer,
+  SandboxMode
+} from '../../kun/src/contracts/policy.js'
 import type { ComputerUseMode } from '../../kun/src/contracts/capabilities.js'
+import type { BrowserUseMode } from './browser-use'
 import type { ModelEndpointFormat } from '../../kun/src/contracts/model-endpoint-format.js'
+import type { ToolOutputLimitsConfig } from '../../kun/src/contracts/tool-output-limits.js'
 export {
   DEFAULT_MODEL_ENDPOINT_FORMAT,
   inferModelEndpointFormatFromUrl,
@@ -16,13 +23,28 @@ export {
 } from '../../kun/src/contracts/model-endpoint-format.js'
 export { DEFAULT_GUI_UPDATE_CHANNEL, normalizeGuiUpdateChannel, type GuiUpdateChannel } from './gui-update'
 export {
+  APPROVAL_REVIEWERS,
+  DEFAULT_APPROVAL_REVIEWER,
   DEFAULT_APPROVAL_POLICY,
   DEFAULT_SANDBOX_MODE,
+  KUN_TOOL_PERMISSION_MODES,
+  ApprovalReviewerSchema,
+  isKunFullAccessSettings,
+  kunToolPermissionModeFromSettings,
+  kunToolPermissionModeSettings,
+  kunToolPermissionSettingsEqual,
   type ApprovalPolicy,
+  type ApprovalReviewer,
+  type KunToolPermissionMode,
+  type KunToolPermissionSettings,
+  type KunToolPermissionSettingsInput,
   type SandboxMode
 } from '../../kun/src/contracts/policy.js'
-export const KUN_TOOL_PERMISSION_MODES = ['always-ask', 'read-only', 'sensitive-ask', 'workspace-write', 'bypass'] as const
-export type KunToolPermissionMode = (typeof KUN_TOOL_PERMISSION_MODES)[number]
+export {
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
+  type ToolOutputLimitsConfig
+} from '../../kun/src/contracts/tool-output-limits.js'
 /**
  * Overall UI text scale factor (applied as `zoom` on the app shell).
  * Previously a fixed enum ('small' | 'medium' | 'large'); now a free numeric
@@ -43,6 +65,33 @@ export function normalizeUiFontScale(value: unknown): UiFontScale {
   if (!Number.isFinite(num)) return DEFAULT_UI_FONT_SCALE
   return Math.min(UI_FONT_SCALE_MAX, Math.max(UI_FONT_SCALE_MIN, Math.round(num * 100) / 100))
 }
+/** Max width of the main chat message column, in CSS pixels. */
+export type ChatContentMaxWidthPx = number
+export const CHAT_CONTENT_MAX_WIDTH_MIN = 640
+export const CHAT_CONTENT_MAX_WIDTH_MAX = 1200
+export const DEFAULT_CHAT_CONTENT_MAX_WIDTH_PX = 896
+export function normalizeChatContentMaxWidth(value: unknown): ChatContentMaxWidthPx {
+  const num = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(num)) return DEFAULT_CHAT_CONTENT_MAX_WIDTH_PX
+  return Math.min(
+    CHAT_CONTENT_MAX_WIDTH_MAX,
+    Math.max(CHAT_CONTENT_MAX_WIDTH_MIN, Math.round(num / 8) * 8)
+  )
+}
+/** Which key combination sends from the chat composer. The other inserts a newline. */
+export const COMPOSER_SEND_KEYS = ['enter', 'shiftEnter'] as const
+export type ComposerSendKey = (typeof COMPOSER_SEND_KEYS)[number]
+export const DEFAULT_COMPOSER_SEND_KEY: ComposerSendKey = 'enter'
+export function normalizeComposerSendKey(value: unknown): ComposerSendKey {
+  return value === 'shiftEnter' ? 'shiftEnter' : DEFAULT_COMPOSER_SEND_KEY
+}
+export function isComposerSendHotkey(
+  event: { key: string; shiftKey: boolean; metaKey: boolean; ctrlKey: boolean },
+  sendKey: ComposerSendKey = DEFAULT_COMPOSER_SEND_KEY
+): boolean {
+  if (event.key !== 'Enter' || event.metaKey || event.ctrlKey) return false
+  return sendKey === 'shiftEnter' ? event.shiftKey : !event.shiftKey
+}
 export type ScheduleRunMode = 'agent' | 'plan'
 export type ScheduleKind = 'manual' | 'interval' | 'daily' | 'at'
 export type ScheduleTaskStatus = 'idle' | 'queued' | 'running' | 'success' | 'error'
@@ -56,11 +105,30 @@ export type ClawModel = 'auto' | ScheduleModel
 
 export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 export const CUSTOM_IMAGE_GENERATION_PROVIDER_ID = 'custom'
-export const IMAGE_GENERATION_PROTOCOLS = ['openai-images', 'minimax-image', 'agnes-image'] as const
+export const IMAGE_GENERATION_PROTOCOLS = [
+  'openai-images',
+  'minimax-image',
+  'agnes-image',
+  'codex-responses-image',
+  'grok-imagine-image',
+  'volcengine-ark-image'
+] as const
 export type ImageGenerationProtocol = (typeof IMAGE_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_IMAGE_GENERATION_PROTOCOL: ImageGenerationProtocol = 'openai-images'
+export const IMAGE_GENERATION_RESOLUTIONS = ['auto', '1K', '2K', '3K', '4K'] as const
+export type ImageGenerationResolution = (typeof IMAGE_GENERATION_RESOLUTIONS)[number]
+export const DEFAULT_IMAGE_GENERATION_RESOLUTION: ImageGenerationResolution = '1K'
+export const IMAGE_GENERATION_QUALITIES = ['auto', 'low', 'medium', 'high'] as const
+export type ImageGenerationQuality = (typeof IMAGE_GENERATION_QUALITIES)[number]
 export const CUSTOM_SPEECH_TO_TEXT_PROVIDER_ID = 'custom'
-export const SPEECH_TO_TEXT_PROTOCOLS = ['openai-transcriptions', 'mimo-asr', 'local-whisper'] as const
+export const SPEECH_TO_TEXT_PROTOCOLS = [
+  'openai-transcriptions',
+  'mimo-asr',
+  'xai-stt',
+  'gemini-audio',
+  'gemini-cli-audio',
+  'local-whisper'
+] as const
 export type SpeechToTextProtocol = (typeof SPEECH_TO_TEXT_PROTOCOLS)[number]
 export const DEFAULT_SPEECH_TO_TEXT_PROTOCOL: SpeechToTextProtocol = 'openai-transcriptions'
 export const CUSTOM_TEXT_TO_SPEECH_PROVIDER_ID = 'custom'
@@ -72,11 +140,17 @@ export const MUSIC_GENERATION_PROTOCOLS = ['minimax-music'] as const
 export type MusicGenerationProtocol = (typeof MUSIC_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_MUSIC_GENERATION_PROTOCOL: MusicGenerationProtocol = 'minimax-music'
 export const CUSTOM_VIDEO_GENERATION_PROVIDER_ID = 'custom'
-export const VIDEO_GENERATION_PROTOCOLS = ['minimax-video', 'agnes-video'] as const
+export const VIDEO_GENERATION_PROTOCOLS = [
+  'minimax-video',
+  'agnes-video',
+  'grok-imagine-video',
+  'volcengine-ark-video'
+] as const
 export type VideoGenerationProtocol = (typeof VIDEO_GENERATION_PROTOCOLS)[number]
 export const DEFAULT_VIDEO_GENERATION_PROTOCOL: VideoGenerationProtocol = 'minimax-video'
 export const DEFAULT_CLAW_MODEL = 'auto'
 export const CLAW_MODEL_IDS = ['auto', 'deepseek-v4-pro', 'deepseek-v4-flash'] as const
+export const DEFAULT_CLAW_RECENT_THREAD_LIST_LIMIT = 5
 export const DEFAULT_SCHEDULE_MODEL = 'deepseek-v4-flash'
 export const SCHEDULE_MODEL_IDS = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const
 export const DEFAULT_SCHEDULE_REASONING_EFFORT = 'medium'
@@ -92,6 +166,13 @@ export const DEFAULT_WRITE_WORKSPACE_ROOT = '~/.kun/write_workspace'
 // (defaultConversationWorkspaceRoot)各自按平台推导。
 export const DEFAULT_KUN_DATA_DIR = '~/.kun/data'
 export const DEFAULT_KUN_MODEL = 'deepseek-v4-pro'
+export const DEFAULT_PROMPT_OPTIMIZATION_PROMPT = [
+  'You rewrite rough spoken or typed instructions into a clear prompt for a coding agent.',
+  'Keep the user intent, constraints, names, paths, and concrete details intact.',
+  'Make the prompt actionable, concise, and well structured.',
+  'Do not add requirements the user did not ask for.',
+  'Return only the rewritten prompt text. Do not add markdown fences or explanations.'
+].join('\n')
 export const DEFAULT_WRITE_INLINE_COMPLETION_BASE_URL = 'https://api.deepseek.com/beta'
 export const DEFAULT_WRITE_INLINE_COMPLETION_MODEL = 'deepseek-v4-flash'
 export const WRITE_INLINE_COMPLETION_MODEL_IDS = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const
@@ -101,14 +182,20 @@ export const DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS = 96
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_DEBOUNCE_MS = 2_800
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_MIN_ACCEPT_SCORE = 0.36
 export const DEFAULT_WRITE_INLINE_LONG_COMPLETION_MAX_TOKENS = 256
+export const MIN_WRITE_AUTOSAVE_DELAY_MS = 5_000
+export const MAX_WRITE_AUTOSAVE_DELAY_MS = 1_800_000
+export const DEFAULT_WRITE_AUTOSAVE_DELAY_MS = 180_000
 export const DEFAULT_KUN_PORT = 18899
 export const DEFAULT_LOG_RETENTION_DAYS = 3
 export const CHECKPOINT_CLEANUP_INTERVAL_DAYS = [1, 2, 3, 5, 10] as const
 export type CheckpointCleanupIntervalDays = (typeof CHECKPOINT_CLEANUP_INTERVAL_DAYS)[number]
 export const DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS: CheckpointCleanupIntervalDays = 3
-// Checkpoint cleanup deletes data, so it is opt-in: disabled until the user
-// explicitly enables it in settings.
-export const DEFAULT_CHECKPOINT_CLEANUP_ENABLED = false
+// Checkpoint cleanup is enabled by default so stale Git checkpoint directories
+// do not accumulate. Users who want to keep every checkpoint can opt out in settings.
+export const DEFAULT_CHECKPOINT_CLEANUP_ENABLED = true
+/** Create Git checkpoints on send unless the user explicitly opts out. */
+export const DEFAULT_GIT_CHECKPOINT_CREATE_ENABLED = true
+export const DEFAULT_GIT_BRANCH_PREFIX = 'codex/'
 export const DEFAULT_CURSOR_SPOTLIGHT_COLOR = '#85c1f1'
 export const DEFAULT_WEIXIN_BRIDGE_RPC_URL = 'http://127.0.0.1:18790/api/v1/admin/rpc'
 export const DEFAULT_MODEL_PROVIDER_ID = 'deepseek'
@@ -119,17 +206,31 @@ export type NetworkProxySettingsV1 = {
   url: string
 }
 export type { ModelEndpointFormat }
+/** Number of retries after the initial model-provider request. */
+export const DEFAULT_MODEL_REQUEST_RETRY_MAX_ATTEMPTS = 5
+export const DEFAULT_MODEL_REQUEST_RETRY_INITIAL_DELAY_MS = 3_000
+export const DEFAULT_MODEL_REQUEST_RETRY_HTTP_STATUS_CODES = [429, 503] as const
+export type ModelRequestRetrySettingsV1 = {
+  maxAttempts: number
+  initialDelayMs: number
+  httpStatusCodes: number[]
+}
 export const MODEL_PROVIDER_INPUT_MODALITIES = ['text', 'image'] as const
 export type ModelProviderInputModality = (typeof MODEL_PROVIDER_INPUT_MODALITIES)[number]
 export const MODEL_PROVIDER_MESSAGE_PARTS = ['text', 'image_url', 'input_image'] as const
 export type ModelProviderMessagePartSupport = (typeof MODEL_PROVIDER_MESSAGE_PARTS)[number]
 export const MODEL_REASONING_EFFORTS = ['auto', 'off', 'low', 'medium', 'high', 'max'] as const
 export type ModelReasoningEffort = (typeof MODEL_REASONING_EFFORTS)[number]
+export const MODEL_SERVICE_TIERS = ['priority', 'flex'] as const
+export type ModelServiceTier = (typeof MODEL_SERVICE_TIERS)[number]
 export const MODEL_REASONING_REQUEST_PROTOCOLS = [
   'none',
   'deepseek-chat-completions',
   'glm-chat-completions',
   'mimo-chat-completions',
+  'openai-chat-completions',
+  'qwen-chat-completions',
+  'thinking-toggle-chat-completions',
   'openai-responses',
   'anthropic-thinking'
 ] as const
@@ -148,8 +249,15 @@ export type ModelProviderModelProfileV1 = {
   supportsToolCalling: boolean
   messageParts: ModelProviderMessagePartSupport[]
   reasoning?: ModelProviderReasoningCapabilityV1
+  /** Provider-advertised request service tiers supported by this model. */
+  serviceTiers?: ModelServiceTier[]
   /** Per-model wire-format override. Omitted means "inherit the provider's endpointFormat". */
   endpointFormat?: ModelEndpointFormat
+  /**
+   * Codex Responses Lite transport. Omitted means the standard Responses
+   * request shape; this is preset metadata rather than a user-facing toggle.
+   */
+  responsesMode?: 'lite'
 }
 export type ModelProviderImageCapabilityV1 = {
   protocol: ImageGenerationProtocol
@@ -176,18 +284,34 @@ export type ModelProviderVideoCapabilityV1 = {
   baseUrl: string
   models: string[]
 }
+export type ModelProviderPresetMode = 'api' | 'token-plan'
+export type ModelProviderPresetSourceV1 = {
+  presetId: string
+  mode: ModelProviderPresetMode
+}
 export type ModelProviderProfileV1 = {
   id: string
   name: string
+  /** Stable built-in preset identity, independent from a multi-account profile id/name. */
+  presetSource?: ModelProviderPresetSourceV1
   apiKey: string
   baseUrl: string
   endpointFormat: ModelEndpointFormat
+  /** 模型请求遇到临时失败或限流响应时使用的 HTTP 重试策略。 */
+  retry?: ModelRequestRetrySettingsV1
   /**
    * Transport kind. `agent-sdk` delegates whole turns to the embedded Claude
    * Agent SDK (Claude Pro/Max subscription); `apiKey` then carries the
-   * CLAUDE_CODE_OAUTH_TOKEN (empty => host Claude Code login). Absent = http.
+   * CLAUDE_CODE_OAUTH_TOKEN (empty => host Claude Code login).
+   * `antigravity-cli` delegates whole turns to Google's official Antigravity
+   * CLI, which uses the user's Gemini subscription login. `gemini-cli-api`
+   * reuses the official Gemini CLI OAuth login while Kun calls the Code Assist
+   * API directly. The retired `gemini-code-assist` value is accepted only for
+   * settings migration.
+   * `cursor-sdk` delegates whole turns to the official Cursor SDK and requires
+   * a Cursor API key in `apiKey`.
    */
-  kind?: 'http' | 'agent-sdk'
+  kind?: 'http' | 'agent-sdk' | 'antigravity-cli' | 'gemini-cli-api' | 'cursor-sdk' | 'gemini-code-assist'
   models: string[]
   modelProfiles: Record<string, ModelProviderModelProfileV1>
   image?: ModelProviderImageCapabilityV1
@@ -196,11 +320,59 @@ export type ModelProviderProfileV1 = {
   music?: ModelProviderMusicCapabilityV1
   video?: ModelProviderVideoCapabilityV1
 }
+export const MODEL_ROUTE_STRATEGIES = [
+  'priority',
+  'round-robin',
+  'weighted-round-robin',
+  'least-latency',
+  'adaptive'
+] as const
+export type ModelRouteStrategy = (typeof MODEL_ROUTE_STRATEGIES)[number]
+export type ModelRouteTargetV1 = {
+  id: string
+  providerId: string
+  modelId: string
+  enabled: boolean
+  weight: number
+}
+export type ModelRouteTargetReferenceStatus = 'valid' | 'provider-missing' | 'model-missing'
+export type ModelRouteTargetResolutionV1 = {
+  status: ModelRouteTargetReferenceStatus
+  provider?: ModelProviderProfileV1
+  modelId?: string
+}
+export type ModelRouteFailurePolicyV1 = {
+  failoverHttpStatusCodes: number[]
+  failoverOnNetworkError: boolean
+  failoverOnTimeout: boolean
+  failoverOnAuthError: boolean
+}
+export type ModelRouteHealthPolicyV1 = {
+  failureThreshold: number
+  cooldownMs: number
+  halfOpenMaxAttempts: number
+}
+export type ModelRoutePoolV1 = {
+  id: string
+  name: string
+  modelId: string
+  enabled: boolean
+  strategy: ModelRouteStrategy
+  targets: ModelRouteTargetV1[]
+  failurePolicy: ModelRouteFailurePolicyV1
+  healthPolicy: ModelRouteHealthPolicyV1
+}
+export type LocalModelGatewaySettingsV1 = {
+  enabled: boolean
+  name: string
+}
 export type ModelProviderSettingsV1 = {
   apiKey: string
   baseUrl: string
   proxy: NetworkProxySettingsV1
   providers: ModelProviderProfileV1[]
+  routePools: ModelRoutePoolV1[]
+  localGateway: LocalModelGatewaySettingsV1
 }
 
 export type ModelProviderImageCapabilityPatchV1 = Partial<ModelProviderImageCapabilityV1>
@@ -210,6 +382,7 @@ export type ModelProviderMusicCapabilityPatchV1 = Partial<ModelProviderMusicCapa
 export type ModelProviderVideoCapabilityPatchV1 = Partial<ModelProviderVideoCapabilityV1>
 export type ModelProviderModelProfilePatchV1 = Partial<ModelProviderModelProfileV1>
 export type ModelProviderProfilePatchV1 = Partial<Omit<ModelProviderProfileV1, 'image' | 'speech' | 'textToSpeech' | 'music' | 'video' | 'modelProfiles'>> & {
+  retry?: Partial<ModelRequestRetrySettingsV1>
   modelProfiles?: Record<string, ModelProviderModelProfilePatchV1 | null>
   image?: ModelProviderImageCapabilityPatchV1 | null
   speech?: ModelProviderSpeechCapabilityPatchV1 | null
@@ -218,11 +391,15 @@ export type ModelProviderProfilePatchV1 = Partial<Omit<ModelProviderProfileV1, '
   video?: ModelProviderVideoCapabilityPatchV1 | null
 }
 export type ModelProviderSettingsPatchV1 = Partial<
-  Omit<ModelProviderSettingsV1, 'providers' | 'proxy'>
+  Omit<ModelProviderSettingsV1, 'providers' | 'proxy' | 'routePools' | 'localGateway'>
 > & {
   proxy?: Partial<NetworkProxySettingsV1>
   providers?: ModelProviderProfilePatchV1[]
+  routePools?: Partial<ModelRoutePoolV1>[]
+  localGateway?: Partial<LocalModelGatewaySettingsV1>
 }
+
+export type KunSubagentSurfaceV1 = 'shared' | 'code' | 'write' | 'design'
 
 export type KunSubagentProfileV1 = {
   /** Stable key; becomes the Record key in kun SubagentsCapabilityConfig.profiles. */
@@ -234,6 +411,8 @@ export type KunSubagentProfileV1 = {
   color?: string
   /** 'subagent' = delegate_task only; 'primary' = session persona only; 'all' = both. */
   mode: 'subagent' | 'primary' | 'all'
+  /** `shared` is inherited by Code, Write, and Design. Empty disables routing. */
+  surfaces?: KunSubagentSurfaceV1[]
   model?: string
   providerId?: string
   /** Appended to the base system prompt (augment, not replace). */
@@ -256,11 +435,169 @@ export type KunSubagentProfileV1 = {
 
 export type KunSubagentsSettingsV1 = {
   enabled: boolean
+  /** Defaults to true when absent for settings written by older app versions. */
+  useExistingAgents?: boolean
   maxParallel?: number
   maxChildRuns?: number
   defaultToolPolicy?: 'readOnly' | 'inherit'
   defaultProfile?: string
   profiles: KunSubagentProfileV1[]
+}
+
+/**
+ * Partial settings patch for the subagent roster. Scalar fields merge with the
+ * current settings, while an explicitly supplied `profiles` array replaces the
+ * roster as a whole (so deleting a profile can be represented unambiguously).
+ */
+export type KunSubagentsSettingsPatchV1 = Partial<
+  Omit<KunSubagentsSettingsV1, 'profiles'>
+> & {
+  profiles?: KunSubagentProfileV1[]
+}
+
+export const KUN_GRAPH_ROLLOUT_STAGES = [
+  'experimental',
+  'alpha',
+  'beta',
+  'learning-preview',
+  'stable'
+] as const
+export type KunGraphRolloutStage = (typeof KUN_GRAPH_ROLLOUT_STAGES)[number]
+
+export const KUN_GRAPH_LEARNING_MODES = ['off', 'suggest', 'auto_candidate'] as const
+export type KunGraphLearningMode = (typeof KUN_GRAPH_LEARNING_MODES)[number]
+
+export type KunGraphSchedulerSettingsV1 = {
+  maxNodes: number
+  maxEdges: number
+  maxConcurrentRuns: number
+  maxConcurrentNodes: number
+  maxConcurrentNodesPerRun: number
+  maxAttemptsPerNode: number
+  maxRevisions: number
+  maxLoopIterations: number
+  maxRunWallTimeMs: number
+  maxNodeWallTimeMs: number
+  maxArtifactBytes: number
+  budgetWarningRatio: number
+}
+
+export type KunGraphContextSettingsV1 = {
+  maxWorkerContextBytes: number
+  maxDependencySummaryBytes: number
+  maxInputArtifacts: number
+  maxInputMessages: number
+  maxInlineEventBytes: number
+}
+
+export type KunGraphMailboxSettingsV1 = {
+  maxMessagesPerNode: number
+  maxMessagesPerRun: number
+  maxMessageBytes: number
+  maxArtifactRefsPerMessage: number
+  maxMessagesPerMinute: number
+  defaultTtlMs: number
+  blockingReplyTimeoutMs: number
+}
+
+export type KunGraphSupervisionSettingsV1 = {
+  enabled: boolean
+  autoStart: boolean
+  coalesceWindowMs: number
+  stallTimeoutMs: number
+  repeatedFailureThreshold: number
+  requireFinalReview: boolean
+  requireHumanForCriticalRisk: boolean
+}
+
+export type KunGraphWriteIsolationSettingsV1 = {
+  mode: 'serialize' | 'lease' | 'worktree'
+  allowWorktrees: boolean
+  leaseTtlMs: number
+  preserveFailedWorktrees: boolean
+}
+
+export type KunGraphRoutingSettingsV1 = {
+  recallLimit: number
+  minTaskFit: number
+  minConfidence: number
+  explorationRatio: number
+  dormantMissedOpportunityThreshold: number
+}
+
+export type KunGraphLearningSettingsV1 = {
+  mode: KunGraphLearningMode
+  minimumDistinctSessions: number
+  minimumVerifiedEpisodes: number
+  consolidationIntervalMs: number
+  maxEpisodesPerJob: number
+  probationMinimumRuns: number
+  allowReadOnlyExploration: boolean
+}
+
+export type KunGraphRetentionSettingsV1 = {
+  graphDays: number
+  artifactDays: number
+  episodeDays: number
+  auditDays: number
+  snapshotEveryEvents: number
+  compactAfterEvents: number
+}
+
+export type KunGraphWorkerModelSettingsV1 =
+  | {
+      mode: 'inherit'
+    }
+  | {
+      mode: 'fixed'
+      providerId: string
+      model: string
+      reasoningEffort?: ModelReasoningEffort
+    }
+
+export type KunGraphSettingsV1 = {
+  enabled: boolean
+  defaultStrategy: 'direct' | 'graph'
+  rolloutStage: KunGraphRolloutStage
+  workerModel: KunGraphWorkerModelSettingsV1
+  scheduler: KunGraphSchedulerSettingsV1
+  context: KunGraphContextSettingsV1
+  mailbox: KunGraphMailboxSettingsV1
+  supervision: KunGraphSupervisionSettingsV1
+  writeIsolation: KunGraphWriteIsolationSettingsV1
+  routing: KunGraphRoutingSettingsV1
+  learning: KunGraphLearningSettingsV1
+  retention: KunGraphRetentionSettingsV1
+}
+
+export type KunGraphSettingsPatchV1 = Partial<
+  Omit<
+    KunGraphSettingsV1,
+    | 'scheduler'
+    | 'context'
+    | 'mailbox'
+    | 'supervision'
+    | 'writeIsolation'
+    | 'routing'
+    | 'learning'
+    | 'retention'
+    | 'workerModel'
+  >
+> & {
+  workerModel?: {
+    mode?: 'inherit' | 'fixed'
+    providerId?: string
+    model?: string
+    reasoningEffort?: ModelReasoningEffort
+  }
+  scheduler?: Partial<KunGraphSchedulerSettingsV1>
+  context?: Partial<KunGraphContextSettingsV1>
+  mailbox?: Partial<KunGraphMailboxSettingsV1>
+  supervision?: Partial<KunGraphSupervisionSettingsV1>
+  writeIsolation?: Partial<KunGraphWriteIsolationSettingsV1>
+  routing?: Partial<KunGraphRoutingSettingsV1>
+  learning?: Partial<KunGraphLearningSettingsV1>
+  retention?: Partial<KunGraphRetentionSettingsV1>
 }
 
 export type KunRuntimeSettingsV1 = {
@@ -275,31 +612,42 @@ export type KunRuntimeSettingsV1 = {
   providerId: string
   /** Effective model request format. Resolved from the selected model provider. */
   endpointFormat: ModelEndpointFormat
+  /** 当前生效的模型请求重试策略,由所选模型供应商解析得到。 */
+  retry: ModelRequestRetrySettingsV1
   runtimeToken: string
   dataDir: string
   model: string
   approvalPolicy: ApprovalPolicy
   sandboxMode: SandboxMode
+  approvalReviewer: ApprovalReviewer
   /** Compress safe tool context before each model call. */
   tokenEconomyMode: boolean
   /** Detailed token-saving behavior used when building Kun model requests. */
   tokenEconomy: KunTokenEconomySettingsV1
+  /** Model-visible output caps for builtin read/bash-style tools. */
+  toolOutputLimits: KunToolOutputLimitsSettingsV1
   /** When true, the runtime skips bearer-token auth. Local dev only. */
   insecure: boolean
   /** GUI-managed MCP progressive discovery/search settings written into Kun config.json. */
   mcpSearch: KunMcpSearchSettingsV1
+  /** User-local, digest-bound grants for repository `.kun/project.json` MCP declarations. */
+  projectConfig: KunProjectConfigSettingsV1
   /** Persistent store backend used by Kun. */
   storage: KunStorageSettingsV1
   /** Fallback compaction thresholds and summary behavior. Per-model thresholds live in Kun config models.profiles. */
   contextCompaction: KunContextCompactionSettingsV1
   /** Low-level loop guards and model argument repair tuning. */
   runtimeTuning: KunRuntimeTuningSettingsV1
+  /** Local Agent Perspective capture defaults. */
+  llmDebug: KunLlmDebugSettingsV1
   /** OpenAI-compatible image generation provider shared by chat agents and Write image tools. */
   imageGeneration: KunImageGenerationSettingsV1
   /** Speech-to-text provider used for voice input in the composer. */
   speechToText: KunSpeechToTextSettingsV1
   /** Text-to-speech provider exposed to agents as generate_speech. */
   textToSpeech: KunTextToSpeechSettingsV1
+  /** Model + prompt used by the composer prompt optimization button. */
+  promptOptimization: KunPromptOptimizationSettingsV1
   /** Music generation provider exposed to agents as generate_music. */
   musicGeneration: KunMusicGenerationSettingsV1
   /** Video generation provider exposed to agents as generate_video. */
@@ -308,28 +656,45 @@ export type KunRuntimeSettingsV1 = {
   modelProfiles: Record<string, ModelProviderModelProfileV1>
   /** Whether long-term memory is enabled in the Kun runtime. */
   memoryEnabled: boolean
+  /** Native Kun AGENTS.md instructions injected into every turn. */
+  instructions: KunInstructionSettingsV1
   /** Host computer-use (screenshot + mouse/keyboard control) settings. */
   computerUse: KunComputerUseSettingsV1
+  /** Supervised temporary first-party browser automation settings. */
+  browserUse: KunBrowserUseSettingsV1
   /** First-party design-quality linter applied to frontend output. */
   quality: KunDesignQualitySettingsV1
   /** GUI-managed subagent profiles written into kun SubagentsCapabilityConfig. */
   subagents?: KunSubagentsSettingsV1
+  /** Host-owned Graph orchestration, project-agent routing, and learning policy. */
+  graph: KunGraphSettingsV1
   /** Global small-model slot. Title & Summary default to this. Empty = follow main model. */
   smallModel?: string
   /** Provider id paired with smallModel for per-provider routing. */
   smallModelProviderId?: string
+  /** Opaque account id paired with smallModelProviderId. */
+  smallModelAccountId?: string
   /** Optional model override for thread title generation. Empty = smallModel || main model. */
   titleModel?: string
   /** Provider id paired with titleModel. */
   titleProviderId?: string
+  titleAccountId?: string
   /** Optional model override for whole-session summary generation. Empty = smallModel || main model. */
   summaryModel?: string
   /** Provider id paired with summaryModel. */
   summaryProviderId?: string
+  summaryAccountId?: string
   /** Optional model override for the code-review subagent. Empty = smallModel || main model. */
   codeReviewModel?: string
   /** Provider id paired with codeReviewModel. */
   codeReviewProviderId?: string
+  codeReviewAccountId?: string
+  /** Optional model override for Plan-mode turns. Empty = the main conversation model. */
+  planModel?: string
+  /** Provider id paired with planModel. */
+  planProviderId?: string
+  /** Opaque account id paired with planProviderId. */
+  planAccountId?: string
   /** Reasoning depth for thread-title generation. Default 'off'. */
   titleReasoningEffort?: ModelReasoningEffort
   /** Reasoning depth for whole-session summary generation. Default 'off'. */
@@ -338,36 +703,8 @@ export type KunRuntimeSettingsV1 = {
   codeReviewReasoningEffort?: ModelReasoningEffort
 }
 
-export function kunToolPermissionModeSettings(
-  mode: KunToolPermissionMode
-): Pick<KunRuntimeSettingsV1, 'approvalPolicy' | 'sandboxMode'> {
-  switch (mode) {
-    case 'always-ask':
-      return { approvalPolicy: 'always', sandboxMode: 'danger-full-access' }
-    case 'read-only':
-      return { approvalPolicy: 'on-request', sandboxMode: 'danger-full-access' }
-    case 'sensitive-ask':
-      return { approvalPolicy: 'untrusted', sandboxMode: 'danger-full-access' }
-    case 'workspace-write':
-      return { approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }
-    case 'bypass':
-      return { approvalPolicy: 'auto', sandboxMode: 'danger-full-access' }
-  }
-}
-
-export function kunToolPermissionModeFromSettings(
-  settings: Pick<KunRuntimeSettingsV1, 'approvalPolicy' | 'sandboxMode'>
-): KunToolPermissionMode {
-  if (settings.approvalPolicy === 'always') return 'always-ask'
-  if (settings.approvalPolicy === 'untrusted') return 'sensitive-ask'
-  if (
-    settings.approvalPolicy === 'auto' &&
-    settings.sandboxMode === 'danger-full-access'
-  ) {
-    return 'bypass'
-  }
-  if (settings.sandboxMode === 'workspace-write') return 'workspace-write'
-  return 'read-only'
+export type KunInstructionSettingsV1 = {
+  enabled: boolean
 }
 
 /** Detection aggressiveness for the design-quality linter. */
@@ -400,6 +737,25 @@ export type KunComputerUseSettingsV1 = {
   maxActionsPerTurn: number
 }
 
+export type KunBrowserUseSettingsV1 = {
+  /** Master switch. Enabled by default; disabling removes browser_use. */
+  enabled: boolean
+  /** Public internet and exact-loopback development sessions never mix. */
+  mode: BrowserUseMode
+  /**
+   * `auto-safe` automatically grants public origins and executes validated
+   * low-risk interactions. `always-ask` preserves per-origin/per-action consent.
+   */
+  approvalMode: 'auto-safe' | 'always-ask'
+  maxTabs: number
+  maxObservationActionsPerTurn: number
+  maxInteractionActionsPerTurn: number
+  maxSnapshotNodes: number
+  maxSnapshotTextChars: number
+  maxImageDimension: number
+  idleTimeoutMs: number
+}
+
 export type KunImageGenerationSettingsV1 = {
   enabled: boolean
   /** Existing provider profile to use for image generation. Empty or "custom" uses the fields below. */
@@ -411,8 +767,12 @@ export type KunImageGenerationSettingsV1 = {
   /** Custom image API key override. Empty inherits the selected provider API key when providerId is set. */
   apiKey: string
   model: string
-  /** Default "WxH" or "auto" used when the model omits aspect ratio and size. Empty means provider default. */
+  /** Default resolution tier used when the model does not explicitly request one. */
+  defaultResolution: ImageGenerationResolution
+  /** Optional custom "WxH" override used when the model omits a resolution. Empty uses defaultResolution. */
   defaultSize: string
+  /** Provider quality/precision hint. "auto" lets the provider decide. */
+  quality: ImageGenerationQuality
   timeoutMs: number
 }
 
@@ -449,6 +809,17 @@ export type KunTextToSpeechSettingsV1 = {
   voice: string
   /** Default output audio format such as mp3 or wav. */
   format: string
+  timeoutMs: number
+}
+
+export type KunPromptOptimizationSettingsV1 = {
+  enabled: boolean
+  /** Existing provider profile to use. Empty means inherit the active Kun provider. */
+  providerId: string
+  /** Empty means smallModel || main conversation model. */
+  model: string
+  /** Empty means use DEFAULT_PROMPT_OPTIMIZATION_PROMPT. */
+  prompt: string
   timeoutMs: number
 }
 
@@ -492,6 +863,17 @@ export type KunMcpSearchSettingsV1 = {
   minScore: number
 }
 
+export type KunProjectConfigGrantV1 = {
+  /** Canonical real workspace path. Project files never persist this grant. */
+  workspaceRoot: string
+  /** SHA-256 of the normalized versioned `.kun/project.json` document. */
+  configDigest: string
+}
+
+export type KunProjectConfigSettingsV1 = {
+  grants: KunProjectConfigGrantV1[]
+}
+
 export type KunStorageBackend = 'hybrid' | 'file'
 
 export type KunStorageSettingsV1 = {
@@ -518,7 +900,11 @@ export type KunTokenEconomySettingsV1 = {
   historyHygiene: KunHistoryHygieneSettingsV1
 }
 
+export type KunToolOutputLimitsSettingsV1 = Required<ToolOutputLimitsConfig>
+
 export type KunContextCompactionSettingsV1 = {
+  /** Tracks one-time migrations when the product's context-window defaults change. */
+  defaultsVersion?: number
   defaultSoftThreshold: number
   defaultHardThreshold: number
   summaryMode: KunCompactionSummaryMode
@@ -542,6 +928,14 @@ export type KunToolArgumentRepairSettingsV1 = {
 }
 
 export type KunRuntimeTuningSettingsV1 = {
+  /** Tracks one-time migrations when runtime tuning defaults change. */
+  defaultsVersion: number
+  /** Global admission cap for concurrently active turns in one Kun runtime. */
+  maxConcurrentTurns: number
+  /**
+   * 单轮代理任务的总运行时长上限（毫秒），包含模型响应和工具执行。
+   */
+  maxWallTimeMs: number
   /**
    * Max idle gap (ms) between streaming chunks before a turn fails with
    * `stream_idle_timeout`. `0` disables the guard — useful for local LLM
@@ -550,6 +944,11 @@ export type KunRuntimeTuningSettingsV1 = {
   streamIdleTimeoutMs: number
   toolStorm: KunToolStormSettingsV1
   toolArgumentRepair: KunToolArgumentRepairSettingsV1
+}
+
+export type KunLlmDebugSettingsV1 = {
+  /** Initial Agent Perspective capture state for newly created conversations. */
+  defaultThreadCaptureEnabled: boolean
 }
 
 /**
@@ -565,6 +964,9 @@ export type KunSettingsEnvelopeV1 = {
 export type AgentRuntimeSettingsMapV1 = KunSettingsEnvelopeV1
 
 export type KunRuntimeTuningSettingsPatchV1 = {
+  defaultsVersion?: number
+  maxConcurrentTurns?: number
+  maxWallTimeMs?: number
   streamIdleTimeoutMs?: number
   toolStorm?: Partial<KunToolStormSettingsV1>
   toolArgumentRepair?: Partial<KunToolArgumentRepairSettingsV1>
@@ -579,22 +981,30 @@ export type KunTokenEconomySettingsPatchV1 = Partial<
 export type KunRuntimeSettingsPatchV1 = Partial<
   Omit<
     KunRuntimeSettingsV1,
-    'mcpSearch' | 'storage' | 'contextCompaction' | 'runtimeTuning' | 'tokenEconomy' | 'imageGeneration' | 'speechToText' | 'textToSpeech' | 'musicGeneration' | 'videoGeneration' | 'computerUse' | 'quality' | 'modelProfiles'
+    'mcpSearch' | 'projectConfig' | 'storage' | 'contextCompaction' | 'runtimeTuning' | 'llmDebug' | 'tokenEconomy' | 'toolOutputLimits' | 'imageGeneration' | 'speechToText' | 'textToSpeech' | 'promptOptimization' | 'musicGeneration' | 'videoGeneration' | 'instructions' | 'computerUse' | 'browserUse' | 'quality' | 'modelProfiles' | 'subagents' | 'graph'
   >
 > & {
   mcpSearch?: Partial<KunMcpSearchSettingsV1>
+  projectConfig?: Partial<KunProjectConfigSettingsV1>
   tokenEconomy?: KunTokenEconomySettingsPatchV1
+  toolOutputLimits?: Partial<KunToolOutputLimitsSettingsV1>
   storage?: Partial<KunStorageSettingsV1>
   contextCompaction?: Partial<KunContextCompactionSettingsV1>
   runtimeTuning?: KunRuntimeTuningSettingsPatchV1
+  llmDebug?: Partial<KunLlmDebugSettingsV1>
   imageGeneration?: Partial<KunImageGenerationSettingsV1>
   speechToText?: Partial<KunSpeechToTextSettingsV1>
   textToSpeech?: Partial<KunTextToSpeechSettingsV1>
+  promptOptimization?: Partial<KunPromptOptimizationSettingsV1>
   musicGeneration?: Partial<KunMusicGenerationSettingsV1>
   videoGeneration?: Partial<KunVideoGenerationSettingsV1>
+  instructions?: Partial<KunInstructionSettingsV1>
   computerUse?: Partial<KunComputerUseSettingsV1>
+  browserUse?: Partial<KunBrowserUseSettingsV1>
   quality?: Partial<KunDesignQualitySettingsV1>
   modelProfiles?: Record<string, ModelProviderModelProfilePatchV1 | null>
+  subagents?: KunSubagentsSettingsPatchV1
+  graph?: KunGraphSettingsPatchV1
 }
 
 export type KunSettingsEnvelopePatchV1 = {
@@ -607,12 +1017,39 @@ export type LogConfigV1 = {
 }
 
 export type CheckpointCleanupConfigV1 = {
+  /**
+   * Whether to create a Git checkpoint before each user turn.
+   * Defaults to off so checkpoint storage does not grow unless the user opts in.
+   */
+  createEnabled: boolean
+  /**
+   * Whether automatic cleanup runs. When enabled, unused checkpoints and
+   * checkpoints older than `intervalDays` are removed on that schedule.
+   */
   enabled: boolean
+  /**
+   * Cleanup cadence and age retention (default 3 days): scan on this interval
+   * and delete checkpoints older than this many days.
+   */
   intervalDays: CheckpointCleanupIntervalDays
+  /**
+   * Optional override for the Git checkpoint storage directory (issue #651).
+   * Lets users point checkpoints at another drive with more free space instead
+   * of filling the system drive under the Kun data dir. Absent = default
+   * (`<dataDir>/git-checkpoints`).
+   */
+  directory?: string
+  /** Keep at most this many checkpoints per thread (oldest pruned). Absent = default 5. */
+  maxPerThread?: number
 }
 
 export type NotificationConfigV1 = {
+  /** Master switch for native reply-completion notifications. */
   turnComplete: boolean
+  /** Main-agent completion notifications. Missing legacy values normalize to enabled. */
+  mainAgentTurnComplete?: boolean
+  /** Subagent side-session completion notifications. Missing legacy values normalize to disabled. */
+  subagentTurnComplete?: boolean
 }
 
 export const WINDOW_CLOSE_ACTIONS = ['ask', 'tray', 'quit'] as const
@@ -1403,6 +1840,7 @@ export type ClawImSettingsV1 = {
   model: string
   mode: ClawRunMode
   responseTimeoutMs: number
+  recentThreadListLimit: number
 }
 
 export type ClawTaskScheduleV1 = {
@@ -1475,6 +1913,10 @@ export type ClawImConversationV1 = {
   /** Kun thread id this conversation maps to. */
   localThreadId: string
   workspaceRoot: string
+  /** Model provider used by this IM conversation. Empty inherits channel/IM/global provider. */
+  providerId?: string
+  /** Model used by this IM conversation. Empty inherits channel/IM model. */
+  model?: string
   createdAt: string
   updatedAt: string
 }
@@ -1623,6 +2065,8 @@ export type WriteSettingsV1 = {
   defaultWorkspaceRoot: string
   activeWorkspaceRoot: string
   workspaces: string[]
+  autoSaveEnabled: boolean
+  autoSaveDelayMs: number
   inlineCompletion: WriteInlineCompletionSettingsV1
   selectionAssist: WriteSelectionAssistSettingsV1
   typography: WriteTypographySettingsV1
@@ -1654,6 +2098,80 @@ export type WriteSettingsPatchV1 = Partial<Omit<WriteSettingsV1, 'inlineCompleti
   /** Replaced wholesale when present. */
   agentPresets?: Array<Partial<WriteAgentPresetV1>>
 }
+
+export type DesignSystemPreset =
+  | 'none'
+  | 'shadcn'
+  | 'radix'
+  | 'material'
+  | 'ios'
+  | 'fluent'
+  | 'ant'
+  | 'chakra'
+  | 'carbon'
+  | 'polaris'
+  | 'bootstrap'
+  | 'geist'
+  | 'brutalism'
+  | 'editorial'
+export type DesignSurfaceSetting = '' | 'brand' | 'product'
+export type DesignRadiusSetting = '' | 'sharp' | 'soft' | 'rounded' | 'pill'
+export type DesignDensitySetting = '' | 'compact' | 'cozy' | 'spacious'
+export type DesignFontStyleSetting = '' | 'system' | 'geometric' | 'humanist' | 'serif' | 'mono'
+export type DesignViewportSetting = 'mobile' | 'tablet' | 'desktop'
+export type DesignCanvasViewSetting = 'preview' | 'code'
+export type DesignCanvasBackgroundSetting = 'light' | 'dark'
+
+export type DesignSettingsV1 = {
+  /** Workspace root for design artifacts; empty = fall back to the active code/write workspace. */
+  defaultWorkspaceRoot: string
+
+  // --- Design system (shared source of truth for design + code) ---
+  /** Anchor brand color (CSS color) injected into the design agent's context. */
+  brandColor: string
+  /** Free-form tone chips (e.g. 编辑风, 专业, 科技感). */
+  tone: string[]
+  /** Named design-system preset that seeds tokens/voice; 'none' = no preset. */
+  designSystemPreset: DesignSystemPreset
+  /** Default surface type for new designs; '' = unset. */
+  designType: DesignSurfaceSetting
+  /** Free-form additional design rules injected alongside the preset and written to DESIGN_SYSTEM.md. */
+  designGuidelines: string
+  /** Corner-radius token; '' = unset. */
+  radius: DesignRadiusSetting
+  /** Spacing-density token; '' = unset. */
+  density: DesignDensitySetting
+  /** Type-style token; '' = unset. */
+  fontStyle: DesignFontStyleSetting
+
+  // --- Design agent ---
+  /** Default model for design turns; '' = inherit runtime default. */
+  model: string
+  providerId: string
+  /** Reasoning effort for design turns; '' = default. */
+  reasoningEffort: string
+  /** Custom override of the single-file HTML generation contract; '' = built-in default. */
+  generationPrompt: string
+
+  // --- Design → code integration ---
+  /** Target stack hint for "implement this design", e.g. "React + Tailwind + shadcn". */
+  implementStackHint: string
+  /** Tell the coding agent to honor the published design system. */
+  injectIntoCode: boolean
+  /** Publish DESIGN_SYSTEM.md to the workspace when implementing. */
+  publishDesignSystem: boolean
+
+  // --- Canvas defaults ---
+  defaultViewport: DesignViewportSetting
+  defaultCanvasView: DesignCanvasViewSetting
+  canvasBackground: DesignCanvasBackgroundSetting
+  /** Auto-refresh the canvas as the agent writes. */
+  liveRefresh: boolean
+  /** Show a device frame for mobile/tablet viewports. */
+  deviceFrame: boolean
+}
+
+export type DesignSettingsPatchV1 = Partial<DesignSettingsV1>
 
 export type ClawGeneratedFileV1 = {
   path: string
@@ -1745,9 +2263,14 @@ export type TerminalSettingsPatchV1 = {
 
 export type AppSettingsV1 = {
   version: 1
-  locale: 'en' | 'zh'
+  /** Persisted independently from credentials so SDK/subscription providers do not reopen onboarding. */
+  initialSetupCompleted?: boolean
+  locale: AppLocale
   theme: 'system' | 'light' | 'dark'
   uiFontScale: UiFontScale
+  chatContentMaxWidthPx: ChatContentMaxWidthPx
+  /** Enter sends (default) or Shift+Enter sends; the other key inserts a newline. */
+  composerSendKey: ComposerSendKey
   cursorSpotlight?: boolean
   cursorSpotlightColor?: string
   provider: ModelProviderSettingsV1
@@ -1757,6 +2280,8 @@ export type AppSettingsV1 = {
   conversationWorkspaceRoot: string
   log: LogConfigV1
   checkpointCleanup: CheckpointCleanupConfigV1
+  /** Prefix applied when the branch picker creates a branch or worktree branch. */
+  gitBranchPrefix?: string
   notifications: NotificationConfigV1
   appBehavior: AppBehaviorConfigV1
   keyboardShortcuts: KeyboardShortcutsConfigV1
@@ -1764,6 +2289,7 @@ export type AppSettingsV1 = {
   claw: ClawSettingsV1
   schedule: ScheduleSettingsV1
   workflow: WorkflowSettingsV1
+  design: DesignSettingsV1
   guiUpdate: GuiUpdateConfigV1
   terminal: TerminalSettingsV1
   codePromptPrefix: string
@@ -1772,7 +2298,7 @@ export type AppSettingsV1 = {
 }
 
 export type AppSettingsPatch = Partial<
-  Omit<AppSettingsV1, 'provider' | 'agents' | 'log' | 'checkpointCleanup' | 'notifications' | 'appBehavior' | 'keyboardShortcuts' | 'write' | 'claw' | 'schedule' | 'workflow' | 'guiUpdate' | 'terminal'>
+  Omit<AppSettingsV1, 'provider' | 'agents' | 'log' | 'checkpointCleanup' | 'notifications' | 'appBehavior' | 'keyboardShortcuts' | 'write' | 'claw' | 'schedule' | 'design' | 'workflow' | 'guiUpdate' | 'terminal'>
 > & {
   provider?: ModelProviderSettingsPatchV1
   agents?: KunSettingsEnvelopePatchV1
@@ -1785,6 +2311,7 @@ export type AppSettingsPatch = Partial<
   claw?: ClawSettingsPatchV1
   schedule?: ScheduleSettingsPatchV1
   workflow?: WorkflowSettingsPatchV1
+  design?: DesignSettingsPatchV1
   guiUpdate?: Partial<GuiUpdateConfigV1>
   terminal?: TerminalSettingsPatchV1
 }

@@ -1,4 +1,5 @@
 import { useState, type ReactElement } from 'react'
+import { AudioLines, Image as ImageIcon, Music2, Video } from 'lucide-react'
 import {
   CUSTOM_MUSIC_GENERATION_PROVIDER_ID,
   CUSTOM_TEXT_TO_SPEECH_PROVIDER_ID,
@@ -11,11 +12,22 @@ import {
   VIDEO_GENERATION_PROTOCOLS,
   type VideoGenerationProtocol
 } from '@shared/app-settings'
-import { ModelSelect, SecretInput, SettingsCard, SettingRow, Toggle } from './settings-controls'
+import {
+  ModelSelect,
+  SecretInput,
+  SettingsCard,
+  SettingRow,
+  SettingsTabPanel,
+  SettingsTabs,
+  Toggle
+} from './settings-controls'
 import { ImageGenerationSettingsSection } from './settings-section-image-generation'
 
 const AUDIO_FORMATS = ['mp3', 'wav', 'flac'] as const
 const VIDEO_RESOLUTIONS = ['768P', '1080P'] as const
+const GROK_VIDEO_RESOLUTIONS = ['480P', '720P'] as const
+const GROK_VIDEO_DURATIONS = [6, 10] as const
+const VOLCENGINE_VIDEO_RESOLUTIONS = ['480P', '720P', '1080P', '4K'] as const
 
 const DEFAULT_TEXT_TO_SPEECH = {
   enabled: false,
@@ -67,6 +79,8 @@ type ProviderProfile = {
   video?: ProviderCapability
 }
 
+type MediaGenerationTab = 'image' | 'speech' | 'music' | 'video'
+
 const inputClass =
   'w-full min-w-0 rounded-xl border border-ds-border bg-ds-card px-3 py-2 text-[14px] text-ds-ink shadow-sm focus:border-accent/40 focus:outline-none focus:ring-1 focus:ring-accent/30'
 const compactInputClass =
@@ -99,6 +113,7 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
   const [showTtsApiKey, setShowTtsApiKey] = useState(false)
   const [showMusicApiKey, setShowMusicApiKey] = useState(false)
   const [showVideoApiKey, setShowVideoApiKey] = useState(false)
+  const [activeTab, setActiveTab] = useState<MediaGenerationTab>('image')
 
   const updateTextToSpeech = (patch: Record<string, unknown>): void => {
     updateKun({
@@ -143,18 +158,54 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
     providers: videoProviders,
     capabilityKey: 'video'
   })
+  const effectiveVideoProtocol = selectedVideo.capability?.protocol ?? videoGeneration.protocol
+  const isGrokVideo = effectiveVideoProtocol === 'grok-imagine-video'
+  const isVolcengineVideo = effectiveVideoProtocol === 'volcengine-ark-video'
+  const videoResolutionOptions: readonly string[] = isGrokVideo
+    ? GROK_VIDEO_RESOLUTIONS
+    : isVolcengineVideo
+      ? VOLCENGINE_VIDEO_RESOLUTIONS
+      : VIDEO_RESOLUTIONS
+  const effectiveVideoResolution = videoResolutionOptions.includes(videoGeneration.defaultResolution)
+    ? videoGeneration.defaultResolution
+    : isVolcengineVideo ? '720P' : videoResolutionOptions[0]
+  const effectiveVideoDuration = isGrokVideo && !GROK_VIDEO_DURATIONS.includes(
+    videoGeneration.defaultDuration as 6 | 10
+  )
+    ? GROK_VIDEO_DURATIONS[0]
+    : isVolcengineVideo
+      ? Math.min(15, Math.max(4, videoGeneration.defaultDuration))
+      : videoGeneration.defaultDuration
 
   return (
     <div className="grid gap-6">
-      <SettingsCard title={t('mediaGeneration')}>
-        <div className="px-5 py-4 text-[13px] leading-6 text-ds-muted">
-          {t('mediaGenerationDesc')}
-        </div>
-      </SettingsCard>
+      <SettingsTabs
+        baseId="media-generation-settings"
+        ariaLabel={t('mediaGeneration')}
+        items={[
+          { id: 'image', label: t('imageGen'), icon: ImageIcon },
+          { id: 'speech', label: t('textToSpeech'), icon: AudioLines },
+          { id: 'music', label: t('musicGeneration'), icon: Music2 },
+          { id: 'video', label: t('videoGeneration'), icon: Video }
+        ]}
+        value={activeTab}
+        onChange={setActiveTab}
+      />
 
-      <ImageGenerationSettingsSection ctx={ctx} />
+      <SettingsTabPanel
+        baseId="media-generation-settings"
+        tabId="image"
+        active={activeTab === 'image'}
+      >
+        <ImageGenerationSettingsSection ctx={ctx} />
+      </SettingsTabPanel>
 
-      <SettingsCard title={t('textToSpeech')}>
+      <SettingsTabPanel
+        baseId="media-generation-settings"
+        tabId="speech"
+        active={activeTab === 'speech'}
+      >
+        <SettingsCard title={t('textToSpeech')}>
         <SettingRow
           title={t('textToSpeechEnabled')}
           description={t('textToSpeechEnabledDesc')}
@@ -235,9 +286,15 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
             {renderTimeoutRow(t, 'textToSpeechTimeout', textToSpeech.timeoutMs, 10000, 900000, updateTextToSpeech)}
           </>
         ) : null}
-      </SettingsCard>
+        </SettingsCard>
+      </SettingsTabPanel>
 
-      <SettingsCard title={t('musicGeneration')}>
+      <SettingsTabPanel
+        baseId="media-generation-settings"
+        tabId="music"
+        active={activeTab === 'music'}
+      >
+        <SettingsCard title={t('musicGeneration')}>
         <SettingRow
           title={t('musicGenerationEnabled')}
           description={t('musicGenerationEnabledDesc')}
@@ -306,9 +363,15 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
             {renderTimeoutRow(t, 'musicGenerationTimeout', musicGeneration.timeoutMs, 10000, 1800000, updateMusicGeneration)}
           </>
         ) : null}
-      </SettingsCard>
+        </SettingsCard>
+      </SettingsTabPanel>
 
-      <SettingsCard title={t('videoGeneration')}>
+      <SettingsTabPanel
+        baseId="media-generation-settings"
+        tabId="video"
+        active={activeTab === 'video'}
+      >
+        <SettingsCard title={t('videoGeneration')}>
         <SettingRow
           title={t('videoGenerationEnabled')}
           description={t('videoGenerationEnabledDesc')}
@@ -347,15 +410,9 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
                       value={videoGeneration.protocol}
                       onChange={(e) => updateVideoGeneration({ protocol: e.target.value })}
                     >
-                      {VIDEO_GENERATION_PROTOCOLS.map((protocol) => {
-                        const labelKey: Record<VideoGenerationProtocol, string> = {
-                          'minimax-video': 'videoGenerationProtocolMiniMax',
-                          'agnes-video': 'videoGenerationProtocolAgnes'
-                        }
-                        return (
-                          <option key={protocol} value={protocol}>{t(labelKey[protocol])}</option>
-                        )
-                      })}
+                      {VIDEO_GENERATION_PROTOCOLS.map((protocol) => (
+                        <option key={protocol} value={protocol}>{videoGenerationProtocolLabel(t, protocol)}</option>
+                      ))}
                     </select>
                   }
                 />
@@ -383,15 +440,27 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
               title={t('videoGenerationDefaultDuration')}
               description={t('videoGenerationDefaultDurationDesc')}
               control={
-                <input
-                  type="number"
-                  min={1}
-                  max={30}
-                  step={1}
-                  className={compactInputClass}
-                  value={videoGeneration.defaultDuration}
-                  onChange={(e) => updateVideoGeneration({ defaultDuration: Number(e.target.value) })}
-                />
+                isGrokVideo ? (
+                  <select
+                    className={`${selectControlClass} md:max-w-[160px]`}
+                    value={effectiveVideoDuration}
+                    onChange={(e) => updateVideoGeneration({ defaultDuration: Number(e.target.value) })}
+                  >
+                    {GROK_VIDEO_DURATIONS.map((duration) => (
+                      <option key={duration} value={duration}>{duration}s</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="number"
+                    min={isVolcengineVideo ? 4 : 1}
+                    max={isVolcengineVideo ? 15 : 30}
+                    step={1}
+                    className={compactInputClass}
+                    value={effectiveVideoDuration}
+                    onChange={(e) => updateVideoGeneration({ defaultDuration: Number(e.target.value) })}
+                  />
+                )
               }
             />
             <SettingRow
@@ -400,10 +469,10 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
               control={
                 <select
                   className={`${selectControlClass} md:max-w-[160px]`}
-                  value={videoGeneration.defaultResolution}
+                  value={effectiveVideoResolution}
                   onChange={(e) => updateVideoGeneration({ defaultResolution: e.target.value })}
                 >
-                  {VIDEO_RESOLUTIONS.map((resolution) => (
+                  {videoResolutionOptions.map((resolution) => (
                     <option key={resolution} value={resolution}>{resolution}</option>
                   ))}
                 </select>
@@ -427,7 +496,8 @@ export function MediaGenerationSettingsSection({ ctx }: { ctx: Record<string, an
             />
           </>
         ) : null}
-      </SettingsCard>
+        </SettingsCard>
+      </SettingsTabPanel>
     </div>
   )
 }
@@ -490,7 +560,7 @@ function renderProviderRow(input: {
                   : capability?.protocol ?? input.defaultProtocol,
                 model: providerId === input.customProviderId
                   ? input.setting.model
-                  : capability?.models?.[0] ?? ''
+                  : preferredProviderCapabilityModel(capability, input.capabilityKey)
               })
             }}
           >
@@ -510,6 +580,20 @@ function renderProviderRow(input: {
       }
     />
   )
+}
+
+function preferredProviderCapabilityModel(
+  capability: ProviderCapability | undefined,
+  capabilityKey: 'textToSpeech' | 'music' | 'video'
+): string {
+  if (
+    capabilityKey === 'video' &&
+    capability?.protocol === 'grok-imagine-video' &&
+    capability.models.includes('grok-imagine-video-1.5-preview')
+  ) {
+    return 'grok-imagine-video-1.5-preview'
+  }
+  return capability?.models?.[0] ?? ''
 }
 
 function renderBaseUrlRow(
@@ -660,4 +744,14 @@ function textToSpeechProtocolLabel(
   if (protocol === 'minimax-t2a') return t('textToSpeechProtocolMiniMax')
   if (protocol === 'mimo-tts') return t('textToSpeechProtocolMimo')
   return t('textToSpeechProtocolOpenAi')
+}
+
+function videoGenerationProtocolLabel(
+  t: (key: string) => string,
+  protocol: string
+): string {
+  if (protocol === 'volcengine-ark-video') return t('videoGenerationProtocolVolcengineArk')
+  if (protocol === 'grok-imagine-video') return t('videoGenerationProtocolGrok')
+  if (protocol === 'agnes-video') return t('videoGenerationProtocolAgnes')
+  return t('videoGenerationProtocolMiniMax')
 }

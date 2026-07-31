@@ -107,7 +107,13 @@ describe('token economy', () => {
       ? currentToolResult.output
       : {}
 
-    expect(compacted.contextInstructions).toContain(TOKEN_ECONOMY_INSTRUCTION)
+    expect(compacted.contextInstructions?.[0]).toContain(
+      'Kun assembled the following dynamic context'
+    )
+    expect(compacted.contextInstructions?.at(-1)).toContain(
+      '<kun_context_block kind="token-economy" authority="runtime">'
+    )
+    expect(compacted.contextInstructions?.at(-1)).toContain(TOKEN_ECONOMY_INSTRUCTION)
     expect(compacted.tools[0]?.description).not.toContain('Please')
     expect(JSON.stringify(compacted.tools[0]?.inputSchema)).not.toContain('The path')
     expect(previousResult).toBe(previousToolResult)

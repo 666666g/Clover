@@ -1,0 +1,30 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "{{NAME}}",
+  "publisher": "{{PUBLISHER}}",
+  "version": "0.1.0",
+  "displayName": "{{DISPLAY_NAME_JSON}}",
+  "description": "A Kun Node extension",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "main": "dist/extension.js",
+  "activationEvents": [
+    "onCommand:hello"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "hello",
+        "title": "{{HELLO_TITLE_JSON}}"
+      }
+    ]
+  },
+  "permissions": [
+    "commands.register"
+  ],
+  "stateSchemaVersion": 1
+}

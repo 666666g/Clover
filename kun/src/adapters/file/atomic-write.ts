@@ -18,17 +18,17 @@ export async function atomicWriteFile(
   contents: string,
   options: AtomicWriteFileOptions = {}
 ): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   const tmp = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
   try {
-    await writeFile(tmp, contents, 'utf-8')
+    await writeFile(tmp, contents, { encoding: 'utf-8', mode: 0o600 })
     try {
       await renameWithRetry(tmp, path, options.renameRetry)
     } catch (error) {
       if (!shouldFallbackToDirectWrite(error)) {
         throw error
       }
-      await writeFile(path, contents, 'utf-8')
+      await writeFile(path, contents, { encoding: 'utf-8', mode: 0o600 })
     }
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => undefined)

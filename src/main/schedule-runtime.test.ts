@@ -1,6 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -21,6 +25,9 @@ import {
   scheduledThreadTitle
 } from './schedule-runtime'
 
+let testWorkspaceRoot = ''
+let clawWorkspaceRoot = ''
+
 function makeTask(patch: Partial<ScheduledTaskV1> = {}): ScheduledTaskV1 {
   const schedule = {
     kind: 'manual' as const,
@@ -34,7 +41,7 @@ function makeTask(patch: Partial<ScheduledTaskV1> = {}): ScheduledTaskV1 {
     title: 'Task 1',
     enabled: true,
     prompt: 'Run the task',
-    workspaceRoot: '/tmp/workspace',
+    workspaceRoot: testWorkspaceRoot,
     clawChannelId: '',
     model: 'auto',
     reasoningEffort: 'medium',
@@ -59,7 +66,7 @@ function makeClawChannel(patch: Partial<ClawImChannelV1> = {}): ClawImChannelV1 
     enabled: true,
     model: 'deepseek-v4-flash',
     threadId: '',
-    workspaceRoot: '/tmp/claw-workspace',
+    workspaceRoot: clawWorkspaceRoot,
     agentProfile: {
       name: 'Ops Claw',
       description: '',
@@ -84,6 +91,8 @@ function settingsWith(
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
@@ -91,10 +100,10 @@ function settingsWith(
         apiKey: 'test-key'
       }
     },
-    workspaceRoot: '/tmp/workspace',
+    workspaceRoot: testWorkspaceRoot,
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: true, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -106,6 +115,7 @@ function settingsWith(
       ...schedulePatch
     }),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
@@ -140,8 +150,19 @@ function createRuntime(initial: AppSettingsV1, runtimeRequest = vi.fn()) {
 }
 
 describe('ScheduleRuntime', () => {
+  beforeEach(() => {
+    testWorkspaceRoot = mkdtempSync(join(tmpdir(), 'kun-schedule-runtime-'))
+    clawWorkspaceRoot = mkdtempSync(join(testWorkspaceRoot, 'claw-'))
+  })
+
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.useRealTimers()
+    if (testWorkspaceRoot) {
+      rmSync(testWorkspaceRoot, { recursive: true, force: true })
+      testWorkspaceRoot = ''
+      clawWorkspaceRoot = ''
+    }
   })
 
   it('computes nextRunAt for supported schedule kinds', () => {
@@ -205,6 +226,7 @@ describe('ScheduleRuntime', () => {
 
   it('creates detected reminder requests into top-level schedule settings', async () => {
     const future = '2099-06-03T09:00:00.000Z'
+    const reminderWorkspaceRoot = mkdtempSync(join(testWorkspaceRoot, 'reminder-'))
     vi.stubGlobal('fetch', vi.fn(async () => ({
       ok: true,
       text: async () => JSON.stringify({
@@ -224,7 +246,7 @@ describe('ScheduleRuntime', () => {
     vi.spyOn(runtime, 'sync').mockImplementation(() => undefined)
 
     const result = await runtime.createScheduledTaskFromText('Remind me tomorrow to ship the review.', {
-      workspaceRoot: '/tmp/schedule',
+      workspaceRoot: reminderWorkspaceRoot,
       modelHint: 'deepseek-v4-flash',
       mode: 'plan'
     })
@@ -237,7 +259,7 @@ describe('ScheduleRuntime', () => {
     expect(store.read().schedule.enabled).toBe(true)
     expect(store.read().schedule.tasks[0]).toMatchObject({
       title: 'Ship review reminder',
-      workspaceRoot: '/tmp/schedule',
+      workspaceRoot: reminderWorkspaceRoot,
       providerId: 'deepseek',
       model: 'deepseek-v4-flash',
       reasoningEffort: 'max',
@@ -278,7 +300,7 @@ describe('ScheduleRuntime', () => {
     )?.[2]?.body
     expect(JSON.parse(String(createRequest))).toMatchObject({
       title: '[Scheduled task] Task',
-      workspace: '/tmp/workspace',
+      workspace: testWorkspaceRoot,
       model: 'deepseek-v4-flash',
       mode: 'agent'
     })
@@ -332,7 +354,7 @@ describe('ScheduleRuntime', () => {
       path === '/v1/threads/thr_claw/turns'
     )?.[2]?.body
     expect(JSON.parse(String(createRequest))).toMatchObject({
-      workspace: '/tmp/claw-workspace',
+      workspace: clawWorkspaceRoot,
       model: 'deepseek-v4-flash'
     })
     const turnBody = JSON.parse(String(turnRequest))
@@ -391,7 +413,7 @@ describe('ScheduleRuntime', () => {
     }).runPrompt(settingsWith([task]), {
       prompt: 'hello',
       title: 'demo',
-      workspaceRoot: '/tmp/workspace',
+      workspaceRoot: testWorkspaceRoot,
       model: 'auto',
       reasoningEffort: 'medium',
       mode: 'agent',
@@ -479,7 +501,7 @@ describe('ScheduleRuntime', () => {
     }).runPrompt(settingsWith([task]), {
       prompt: 'hello',
       title: 'demo',
-      workspaceRoot: '/tmp/workspace',
+      workspaceRoot: testWorkspaceRoot,
       model: 'auto',
       reasoningEffort: 'medium',
       mode: 'agent',
@@ -546,7 +568,7 @@ describe('ScheduleRuntime', () => {
     }).runPrompt(settingsWith([task]), {
       prompt: 'hello',
       title: 'demo',
-      workspaceRoot: '/tmp/workspace',
+      workspaceRoot: testWorkspaceRoot,
       model: 'auto',
       reasoningEffort: 'medium',
       mode: 'agent',
@@ -594,6 +616,56 @@ describe('ScheduleRuntime', () => {
     await (runtime as unknown as { tick: () => Promise<void> }).tick()
 
     expect(runtimeRequest).not.toHaveBeenCalled()
+  })
+
+  it('cancels an active result monitor and rejects new work after stop', async () => {
+    vi.useFakeTimers()
+    const task = makeTask()
+    let monitorSignal: AbortSignal | undefined
+    let monitorStarted!: () => void
+    const started = new Promise<void>((resolve) => { monitorStarted = resolve })
+    const runtimeRequest = vi.fn(async (
+      _settings: AppSettingsV1,
+      path: string,
+      init: { method?: string; signal?: AbortSignal }
+    ) => {
+      if (path === '/v1/threads') {
+        return { ok: true, status: 201, body: JSON.stringify({ id: 'thr_stop' }) }
+      }
+      if (path === '/v1/threads/thr_stop/turns') {
+        return { ok: true, status: 202, body: JSON.stringify({ turnId: 'turn_stop' }) }
+      }
+      if (path === '/v1/threads/thr_stop' && init.method === 'GET') {
+        monitorSignal = init.signal
+        monitorStarted()
+        return new Promise<{ ok: boolean; status: number; body: string }>((resolve) => {
+          init.signal?.addEventListener('abort', () => {
+            resolve({ ok: false, status: 0, body: 'aborted' })
+          }, { once: true })
+        })
+      }
+      throw new Error(`unexpected path ${path}`)
+    })
+    const { runtime } = createRuntime(settingsWith([task]), runtimeRequest)
+
+    await expect(runtime.runTask(task.id)).resolves.toMatchObject({
+      ok: true,
+      threadId: 'thr_stop',
+      turnId: 'turn_stop'
+    })
+    await vi.advanceTimersByTimeAsync(1_500)
+    await started
+    await runtime.stop()
+
+    expect(monitorSignal?.aborted).toBe(true)
+    await expect(runtime.status()).resolves.toMatchObject({
+      runningTaskIds: [],
+      queuedTaskIds: []
+    })
+    await expect(runtime.runTask(task.id)).resolves.toEqual({
+      ok: false,
+      message: 'Schedule runtime stopped.'
+    })
   })
 
   it('marks interrupted running tasks as errors during next-run recovery', async () => {
@@ -667,6 +739,7 @@ describe('ScheduleRuntime', () => {
     const acquireCalls: string[] = []
     const releasedSlots: Array<{ projectPath: string; poolIndex: number }> = []
     const slotState = new Map<number, { dirty: boolean }>()
+    const projectWorkspaceRoot = mkdtempSync(join(testWorkspaceRoot, 'project-'))
     slotState.set(0, { dirty: false })
 
     const acquireWorktreeMock = vi.fn(async (params: { projectPath: string; poolIndex: number; taskId: string }) => {
@@ -675,7 +748,7 @@ describe('ScheduleRuntime', () => {
       slotState.set(params.poolIndex, { dirty: true })
       return {
         poolIndex: params.poolIndex,
-        path: `/tmp/pool/pool-${params.poolIndex}`,
+        path: join(projectWorkspaceRoot, `.kun-worktrees/pool-${params.poolIndex}`),
         branch: `pool-${params.poolIndex}`,
         inUse: true,
         taskId: params.taskId,
@@ -699,7 +772,7 @@ describe('ScheduleRuntime', () => {
     const task = makeTask({
       id: 'wt-task',
       useWorktree: true,
-      workspaceRoot: '/tmp/project'
+      workspaceRoot: projectWorkspaceRoot
     })
     const { runtime } = createRuntime(settingsWith([task]))
 
@@ -721,9 +794,9 @@ describe('ScheduleRuntime', () => {
         ;(runtime as unknown as { runningTaskIds: Set<string> }).runningTaskIds.delete(currentTask.id)
         return { ok: false, message: 'No worktree pool slot is available.' }
       }
-      await acquireWorktreeMock({ projectPath: '/tmp/project', poolIndex, taskId: currentTask.id })
+      await acquireWorktreeMock({ projectPath: projectWorkspaceRoot, poolIndex, taskId: currentTask.id })
       // simulate a successful run that left changes behind
-      await releaseWorktreeMock({ projectPath: '/tmp/project', poolIndex })
+      await releaseWorktreeMock({ projectPath: projectWorkspaceRoot, poolIndex })
       ;(runtime as unknown as { runningTaskIds: Set<string> }).runningTaskIds.delete(currentTask.id)
       return { ok: true, threadId: `thr_${currentTask.id}` }
     })

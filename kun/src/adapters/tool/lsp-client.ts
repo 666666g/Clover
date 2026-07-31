@@ -14,6 +14,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
+import { shellSpawnEnv } from './builtin-tool-utils.js'
 import { getLanguageServer, resolveServerCommand } from './lsp-servers.js'
 import { handleNotification } from './lsp-notifications.js'
 
@@ -62,6 +63,7 @@ interface LspSession {
  * Promise.
  */
 const sessions = new Map<string, Promise<LspSession>>()
+const activeSessions = new Set<LspSession>()
 const brokenServers = new Map<string, number>()
 
 function sessionKey(workspaceRoot: string, serverKey: string): string {
@@ -89,6 +91,7 @@ function remainingCooldownMs(workspaceRoot: string, serverKey: string): number {
 }
 
 function disposeSession(session: LspSession, terminateProcess: boolean): void {
+  activeSessions.delete(session)
   if (session.closed) return
   session.closed = true
   if (session.cleanupTimer) {
@@ -108,9 +111,10 @@ function disposeSession(session: LspSession, terminateProcess: boolean): void {
     // already dead
   }
   // Force-kill after grace period.
-  setTimeout(() => {
+  const forceKillTimer = setTimeout(() => {
     try { session.process.kill('SIGKILL') } catch { /* ignore */ }
   }, 2_000)
+  forceKillTimer.unref?.()
 }
 
 function killSession(session: LspSession): void {
@@ -411,7 +415,10 @@ async function createSession(workspaceRoot: string, serverKey: string): Promise<
   const proc = spawn(cmd.command, cmd.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd: workspaceRoot,
-    env: process.env,
+    env: {
+      ...shellSpawnEnv(),
+      ...cmd.env
+    },
     windowsHide: true
   })
 
@@ -420,7 +427,7 @@ async function createSession(workspaceRoot: string, serverKey: string): Promise<
     workspaceRoot,
     serverKey,
     serverDisplayName: server.displayName,
-    pythonPath: process.env.PYTHON_PATH ?? 'python3',
+    pythonPath: 'python3',
     refCount: 1,
     cleanupTimer: null,
     stdoutBuffer: Buffer.alloc(0),
@@ -435,6 +442,7 @@ async function createSession(workspaceRoot: string, serverKey: string): Promise<
     closing: false,
     closed: false
   }
+  activeSessions.add(session)
 
   proc.stdout?.on('data', (chunk: Buffer) => {
     session.stdoutBuffer = Buffer.concat([session.stdoutBuffer, chunk])
@@ -497,12 +505,8 @@ async function createSession(workspaceRoot: string, serverKey: string): Promise<
  * to prevent orphaned language-server processes.
  */
 export function shutdownAllLspSessions(): void {
-  for (const [key, sessionPromise] of sessions) {
-    sessions.delete(key)
-    sessionPromise
-      .then((session) => killSession(session))
-      .catch(() => { /* session failed to init — nothing to kill */ })
-  }
+  sessions.clear()
+  for (const session of [...activeSessions]) killSession(session)
 }
 
 export function releaseLspSession(workspaceRoot: string, serverKey: string): void {
@@ -702,13 +706,10 @@ export async function lspGetDiagnostics(
  * host process (Electron / kun serve) terminates.
  */
 function syncKillAll(): void {
-  for (const [, sessionPromise] of sessions) {
-    sessionPromise
-      .then((session) => {
-        try { session.process.kill('SIGKILL') } catch { /* already dead */ }
-      })
-      .catch(() => { /* init failed — no process to kill */ })
+  for (const session of activeSessions) {
+    try { session.process.kill('SIGKILL') } catch { /* already dead */ }
   }
+  activeSessions.clear()
   sessions.clear()
 }
 

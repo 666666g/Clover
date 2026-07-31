@@ -15,10 +15,11 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   WORKFLOW_NODE_KINDS,
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -43,16 +44,30 @@ import {
   type WorkflowRuntime
 } from './workflow-runtime'
 
+const imageGenerateMock = vi.hoisted(() => vi.fn(async () => ({
+  data: Buffer.from('PNG-BYTES'),
+  mimeType: 'image/png'
+})))
+
 // The generate-image node lazily imports the kun image client. Replace it with a
 // stub so the test never hits a real provider (and never pulls native deps in).
 vi.mock('../../kun/src/adapters/tool/image-gen-tool-provider.js', () => ({
   createImageGenClient: () => ({
-    generate: async () => ({ data: Buffer.from('PNG-BYTES'), mimeType: 'image/png' })
-  })
+    generate: imageGenerateMock
+  }),
+  mapImageSize: (
+    _aspectRatio: string | undefined,
+    _imageSize: string | undefined,
+    _defaultSize: string | undefined,
+    defaultResolution: 'auto' | '1K' | '2K' = '1K'
+  ) => defaultResolution === 'auto'
+    ? 'auto'
+    : defaultResolution === '2K' ? '2048x2048' : '1024x1024'
 }))
 
 const NOW = '2026-06-19T00:00:00.000Z'
 const PYTHON_OK = spawnSync('python3', ['-c', 'pass']).status === 0
+let workflowWorkspaceRoot = ''
 
 // ---------------------------------------------------------------------------
 // Loose builders — the runtime normalizes raw input, so tests pass partial
@@ -106,12 +121,14 @@ function buildSettings(
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: { kun: { ...defaultKunRuntimeSettings(), model: 'test-model', apiKey: 'test-key' } },
-    workspaceRoot: '/tmp/workflow-workspace',
+    workspaceRoot: workflowWorkspaceRoot,
     conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: true, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -119,6 +136,7 @@ function buildSettings(
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: normalizeWorkflowSettings({ enabled: true, workflows, modules }),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
@@ -255,8 +273,16 @@ const FIELD = (over: Record<string, unknown>): Record<string, unknown> => ({
   ...over
 })
 
+beforeEach(() => {
+  workflowWorkspaceRoot = mkdtempSync(join(tmpdir(), 'kun-workflow-nodes-'))
+})
+
 afterEach(() => {
   vi.unstubAllGlobals()
+  if (workflowWorkspaceRoot) {
+    rmSync(workflowWorkspaceRoot, { recursive: true, force: true })
+    workflowWorkspaceRoot = ''
+  }
 })
 
 // ===========================================================================
@@ -424,6 +450,7 @@ describe('ai-agent', () => {
 
   it('passes the working directory in as a run parameter ({{json.dir}})', async () => {
     const rr = aiRuntimeRequest('ok')
+    const customWorkspaceRoot = mkdtempSync(join(workflowWorkspaceRoot, 'custom-'))
     const store = createStore(
       buildSettings([
         wf({
@@ -443,9 +470,9 @@ describe('ai-agent', () => {
     )
     const runtime = createWorkflowRuntime({ store: store as never, runtimeRequest: rr as never, logError: vi.fn() })
     try {
-      const result = await runtime.runWorkflowByRef('WS', { dir: '/tmp/custom-dir' })
+      const result = await runtime.runWorkflowByRef('WS', { dir: customWorkspaceRoot })
       expect(result.ok).toBe(true)
-      expect(threadWorkspace(rr)).toBe('/tmp/custom-dir')
+      expect(threadWorkspace(rr)).toBe(customWorkspaceRoot)
     } finally {
       runtime.stop()
     }
@@ -466,6 +493,7 @@ describe('ai-agent', () => {
 describe('generate-image', () => {
   it('generates an image and writes it to the output folder', async () => {
     cover('generate-image')
+    imageGenerateMock.mockClear()
     const dir = mkdtempSync(join(tmpdir(), 'wf-img-'))
     try {
       const result = await testNode(
@@ -483,7 +511,8 @@ describe('generate-image', () => {
                   providerId: '',
                   baseUrl: 'https://img.test/v1',
                   apiKey: 'sk-img',
-                  model: 'img-model'
+                  model: 'img-model',
+                  defaultResolution: '2K'
                 }
               }
             }
@@ -495,6 +524,7 @@ describe('generate-image', () => {
       expect(out.mimeType).toBe('image/png')
       expect(out.imagePath.endsWith('.png')).toBe(true)
       expect(existsSync(out.imagePath)).toBe(true)
+      expect(imageGenerateMock).toHaveBeenCalledWith(expect.objectContaining({ size: '2048x2048' }))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

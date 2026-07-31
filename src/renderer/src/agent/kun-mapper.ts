@@ -1,12 +1,18 @@
 import type {
+  ApprovalStatusPayload,
+  ApprovalReviewEventPayload,
   ChatBlock,
   CompactionEventPayload,
+  ComponentPrototypeMetadata,
+  DelegatedRuntimeState,
   GeneratedFileReference,
   NormalizedThread,
   ReviewBlock,
   ReviewEventPayload,
   ReviewOutput,
   ReviewTarget,
+  RequestContextSnapshot,
+  RuntimeChildMetadata,
   RuntimeErrorEventPayload,
   RuntimeStatusEventPayload,
   ThreadGoal,
@@ -18,9 +24,19 @@ import type {
   ThreadUsageSnapshot,
   ToolBlock,
   ToolEventPayload,
+  UserInputAnswer,
   UserInputQuestion
 } from './types'
+import { normalizeKunRuntimeEvent, type KunEventNormalizerDeps } from './kun-event-normalizer'
+import type { RuntimeProjectionAction } from './runtime-projection-actions'
 import { redactSecrets, redactSecretText } from '@shared/secret-redaction'
+import { applyClientUserMessageSourceMeta } from '@shared/background-shell-notice'
+import {
+  PRESENTATION_STUDIO_EXTENSION_ID,
+  PRESENTATION_STUDIO_WRITE_TOOL_NAMES,
+  presentationStudioCanonicalToolId,
+  presentationStudioModelAlias
+} from '@shared/presentation-artifact'
 import type {
   CoreChildRuntimeMetadataJson,
   CoreRuntimeEventJson,
@@ -32,6 +48,11 @@ import type {
   CoreReviewTargetJson,
   CoreUsageSnapshotJson
 } from './kun-contract'
+import {
+  ComposerContextAttachmentSchema,
+  MAX_COMPOSER_CONTEXT_ATTACHMENTS,
+  type ComposerContextAttachment
+} from '@kun/extension-api'
 
 export function buildQuery(options: Record<string, string | number | boolean | undefined>): string {
   const params = new URLSearchParams()
@@ -57,6 +78,8 @@ export function threadFromCore(thread: CoreThreadSummaryJson): NormalizedThread 
     status: thread.status,
     approvalPolicy: normalizeApprovalPolicy(thread.approvalPolicy),
     sandboxMode: normalizeSandboxMode(thread.sandboxMode),
+    approvalReviewer: normalizeApprovalReviewer(thread.approvalReviewer),
+    modelRequestCaptureEnabled: thread.modelRequestCaptureEnabled === true,
     archived: thread.status === 'archived',
     pinned: thread.pinned === true,
     ...(thread.providerId ? { providerId: thread.providerId } : {}),
@@ -98,6 +121,12 @@ function normalizeSandboxMode(value: string | undefined): NormalizedThread['sand
     default:
       return undefined
   }
+}
+
+function normalizeApprovalReviewer(
+  value: string | undefined
+): NormalizedThread['approvalReviewer'] {
+  return value === 'agent' ? 'agent' : 'user'
 }
 
 export function goalFromCore(goal: CoreThreadGoalJson): ThreadGoal {
@@ -168,12 +197,16 @@ function readStructuredString(record: Record<string, unknown>, ...keys: string[]
 
 const FILE_PATH_KEYS = [
   'absolute_path',
+  'output_path',
+  'outputPath',
+  'destination_path',
+  'destinationPath',
   'path',
   'file_path',
   'file',
   'relative_path',
   'target_path',
-  'destination_path'
+  'targetPath'
 ] as const
 
 const COMMAND_KEYS = ['command', 'cmd', 'script'] as const
@@ -219,20 +252,106 @@ function payloadFor(item: CoreTurnItemJson): Record<string, unknown> {
   return (item.arguments ?? {}) as Record<string, unknown>
 }
 
+function structuredPayloadsFor(item: CoreTurnItemJson): Record<string, unknown>[] {
+  const payloads: Record<string, unknown>[] = []
+  const seen = new Set<Record<string, unknown>>()
+  const visit = (value: unknown, depth: number): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return
+    const record = value as Record<string, unknown>
+    if (seen.has(record)) return
+    seen.add(record)
+    payloads.push(record)
+    if (depth >= 2) return
+    visit(record.result, depth + 1)
+    visit(record.content, depth + 1)
+  }
+  visit(payloadFor(item), 0)
+  return payloads
+}
+
+const PRESENTATION_STUDIO_WRITE_TOOL_IDS = new Set(
+  PRESENTATION_STUDIO_WRITE_TOOL_NAMES.map(presentationStudioCanonicalToolId)
+)
+const PRESENTATION_STUDIO_DIRECT_TOOL_IDS = new Map(
+  PRESENTATION_STUDIO_WRITE_TOOL_NAMES.map((name) => [
+    presentationStudioModelAlias(name),
+    presentationStudioCanonicalToolId(name)
+  ])
+)
+
+function gatewayPayloadFor(item: CoreTurnItemJson): Record<string, unknown> | null {
+  if (item.kind !== 'tool_result' || item.toolName !== 'extension_tool_call') return null
+  return payloadFor(item)
+}
+
+function presentationStudioWriteToolId(item: CoreTurnItemJson): string | undefined {
+  const direct = item.toolName ? PRESENTATION_STUDIO_DIRECT_TOOL_IDS.get(item.toolName) : undefined
+  if (direct) return direct
+  const canonicalToolId = gatewayPayloadFor(item)?.canonicalToolId
+  return typeof canonicalToolId === 'string' && PRESENTATION_STUDIO_WRITE_TOOL_IDS.has(canonicalToolId)
+    ? canonicalToolId
+    : undefined
+}
+
+function gatewayHasWorkspaceWriteSideEffect(item: CoreTurnItemJson): boolean {
+  return gatewayPayloadFor(item)?.sideEffect === 'workspace-write'
+}
+
+function readItemStructuredString(
+  item: CoreTurnItemJson,
+  ...keys: readonly string[]
+): string | undefined {
+  for (const payload of structuredPayloadsFor(item)) {
+    const value = readStructuredString(payload, ...keys)
+    if (value) return value
+  }
+  return undefined
+}
+
 function normalizeChildMetadata(
   child: CoreChildRuntimeMetadataJson | undefined
-): CoreChildRuntimeMetadataJson | undefined {
+): RuntimeChildMetadata | undefined {
   if (!child?.childId || !child.parentThreadId || !child.parentTurnId) return undefined
+  const activity = child.activity
+  const normalizedActivity = activity &&
+    ['starting', 'thinking', 'responding', 'tool', 'retrying', 'compacting', 'waiting']
+      .includes(activity.phase) &&
+    activity.label?.trim() &&
+    activity.startedAt &&
+    activity.updatedAt
+    ? {
+        phase: activity.phase,
+        label: activity.label.trim().slice(0, 500),
+        ...(activity.toolName?.trim()
+          ? { toolName: activity.toolName.trim().slice(0, 256) }
+          : {}),
+        startedAt: activity.startedAt,
+        updatedAt: activity.updatedAt
+      }
+    : undefined
   return {
     parentThreadId: child.parentThreadId,
     parentTurnId: child.parentTurnId,
     childId: child.childId,
     ...(child.childLabel ? { childLabel: child.childLabel } : {}),
     ...(child.childProfile ? { childProfile: child.childProfile } : {}),
+    ...(child.childProfileName ? { childProfileName: child.childProfileName } : {}),
     ...(child.childModel ? { childModel: child.childModel } : {}),
+    ...(child.childProviderId ? { childProviderId: child.childProviderId } : {}),
     ...(child.childToolPolicy ? { childToolPolicy: child.childToolPolicy } : {}),
     childStatus: child.childStatus,
-    childSeq: child.childSeq
+    childSeq: child.childSeq,
+    ...(child.detached !== undefined ? { detached: child.detached } : {}),
+    ...(child.prefixReused !== undefined ? { prefixReused: child.prefixReused } : {}),
+    ...(child.inheritedHistoryItems !== undefined ? { inheritedHistoryItems: child.inheritedHistoryItems } : {}),
+    ...(child.toolInvocations !== undefined ? { toolInvocations: child.toolInvocations } : {}),
+    ...(child.durationMs !== undefined ? { durationMs: child.durationMs } : {}),
+    ...(child.queuedMs !== undefined ? { queuedMs: child.queuedMs } : {}),
+    ...(child.totalTokens !== undefined ? { totalTokens: child.totalTokens } : {}),
+    ...(child.cacheHitRate !== undefined ? { cacheHitRate: child.cacheHitRate } : {}),
+    ...(child.costUsd !== undefined ? { costUsd: child.costUsd } : {}),
+    ...(child.costCny !== undefined ? { costCny: child.costCny } : {}),
+    ...(normalizedActivity ? { activity: normalizedActivity } : {})
   }
 }
 
@@ -278,6 +397,32 @@ function normalizeUserFileReferences(value: unknown): Array<{
   return references.length > 0 ? references : undefined
 }
 
+function normalizeInjectedMemorySummaries(
+  value: unknown
+): Array<{ id: string; content: string }> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const summaries = value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : ''
+      const content = typeof raw.content === 'string' && raw.content.trim() ? raw.content.trim() : ''
+      return id && content ? { id, content } : null
+    })
+    .filter((entry): entry is { id: string; content: string } => entry !== null)
+  return summaries.length > 0 ? summaries : undefined
+}
+
+function normalizeComposerContexts(value: unknown): ComposerContextAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const contexts = value
+    .slice(0, MAX_COMPOSER_CONTEXT_ATTACHMENTS)
+    .map((entry) => ComposerContextAttachmentSchema.safeParse(entry))
+    .filter((entry) => entry.success)
+    .map((entry) => entry.data)
+  return contexts.length > 0 ? contexts : undefined
+}
+
 function applyRuntimeDisclosureMeta(
   meta: Record<string, unknown>,
   item: CoreTurnItemJson,
@@ -290,20 +435,64 @@ function applyRuntimeDisclosureMeta(
   const attachmentIds = stringArray(item.attachmentIds)
   const activeSkillIds = stringArray(item.activeSkillIds)
   const injectedMemoryIds = stringArray(item.injectedMemoryIds)
+  const injectedMemorySummaries = normalizeInjectedMemorySummaries(item.injectedMemorySummaries)
+  const injectedInstructionSources = normalizeInjectedInstructionSources(item.injectedInstructionSources)
   const fileReferences = normalizeUserFileReferences(item.fileReferences)
+  const composerContexts = normalizeComposerContexts(item.composerContexts)
   const normalizedChild = normalizeChildMetadata(child)
   const displayText = typeof item.displayText === 'string' ? item.displayText.trim() : ''
   if (displayText && displayText !== item.text?.trim()) {
     meta.displayText = displayText
   }
+  if (item.role === 'user' && item.guiDesignCanvas === true) meta.guiDesignCanvas = true
+  if (item.role === 'user' && item.guiDesignMode === true) meta.guiDesignMode = true
+  applyClientUserMessageSourceMeta(meta, item.text ?? '')
+  if (
+    item.messageSource === 'background_shell' ||
+    item.messageSource === 'background_subagent' ||
+    item.messageSource === 'graph_runtime'
+  ) {
+    meta.messageSource = item.messageSource
+  }
   if (attachmentIds) meta.attachmentIds = attachmentIds
   if (fileReferences) meta.fileReferences = fileReferences
+  if (composerContexts) meta.composerContexts = composerContexts
   if (activeSkillIds) meta.activeSkillIds = activeSkillIds
   if (injectedMemoryIds) meta.injectedMemoryIds = injectedMemoryIds
+  if (injectedMemorySummaries) meta.injectedMemorySummaries = injectedMemorySummaries
+  if (injectedInstructionSources) meta.injectedInstructionSources = injectedInstructionSources
   if (typeof item.skillInjectionBytes === 'number') {
     meta.skillInjectionBytes = item.skillInjectionBytes
   }
+  if (typeof item.instructionInjectionBytes === 'number') {
+    meta.instructionInjectionBytes = item.instructionInjectionBytes
+  }
   if (normalizedChild) meta.child = normalizedChild
+}
+
+function normalizeInjectedInstructionSources(
+  value: unknown
+): Array<{ scope: 'global' | 'workspace'; path: string; bytes: number; truncated?: boolean }> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const sources = value
+    .map((raw) => {
+      if (!raw || typeof raw !== 'object') return null
+      const entry = raw as Record<string, unknown>
+      const scope = entry.scope === 'global' || entry.scope === 'workspace' ? entry.scope : null
+      const path = typeof entry.path === 'string' && entry.path.trim() ? entry.path.trim() : ''
+      const bytes = typeof entry.bytes === 'number' && Number.isFinite(entry.bytes)
+        ? Math.max(0, Math.trunc(entry.bytes))
+        : 0
+      if (!scope || !path) return null
+      return {
+        scope,
+        path,
+        bytes,
+        ...(entry.truncated === true ? { truncated: true } : {})
+      }
+    })
+    .filter((entry): entry is { scope: 'global' | 'workspace'; path: string; bytes: number; truncated?: boolean } => entry !== null)
+  return sources.length > 0 ? sources : undefined
 }
 
 function extractToolSources(item: CoreTurnItemJson): Array<Record<string, string>> | undefined {
@@ -357,8 +546,10 @@ function readGeneratedFileString(raw: Record<string, unknown>, ...keys: string[]
 function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference | null {
   if (!entry || typeof entry !== 'object') return null
   const raw = entry as Record<string, unknown>
-  const id = readGeneratedFileString(raw, 'id', 'attachmentId')
-  const name = readGeneratedFileString(raw, 'name', 'fileName', 'filename')
+  const artifactId = readGeneratedFileString(raw, 'artifactId')
+  const mediaHandleId = readGeneratedFileString(raw, 'mediaHandleId')
+  const id = readGeneratedFileString(raw, 'id', 'attachmentId', 'artifactId')
+  const name = readGeneratedFileString(raw, 'name', 'fileName', 'filename', 'displayName')
   const mimeType = readGeneratedFileString(raw, 'mimeType', 'type', 'mediaType')
   const previewUrl = readGeneratedFileString(raw, 'previewUrl', 'dataUrl', 'url')
   const path = readGeneratedFileString(raw, 'path', 'file')
@@ -367,13 +558,55 @@ function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference
   const byteSize = raw.byteSize
   const width = raw.width
   const height = raw.height
+  const durationMicros = raw.durationMicros
+  const availability = raw.availability === 'available' || raw.availability === 'unavailable'
+    ? raw.availability
+    : undefined
+  const mediaKind = raw.mediaKind === 'video' || raw.mediaKind === 'audio' ||
+    raw.mediaKind === 'image' || raw.mediaKind === 'subtitle' ||
+    raw.mediaKind === 'document' || raw.mediaKind === 'data' || raw.mediaKind === 'other'
+    ? raw.mediaKind
+    : undefined
+  const completionIdentity = readGeneratedFileString(raw, 'completionIdentity')
+  const ownerExtensionId = readGeneratedFileString(raw, 'ownerExtensionId')
+  const ownerExtensionVersion = readGeneratedFileString(raw, 'ownerExtensionVersion')
+  const workspaceId = readGeneratedFileString(raw, 'workspaceId')
+  const rawProvenance = raw.provenance && typeof raw.provenance === 'object' && !Array.isArray(raw.provenance)
+    ? raw.provenance as Record<string, unknown>
+    : undefined
+  const provenanceOperation = rawProvenance
+    ? readGeneratedFileString(rawProvenance, 'operation')
+    : undefined
+  const provenanceJobId = rawProvenance
+    ? readGeneratedFileString(rawProvenance, 'jobId')
+    : undefined
+  const provenanceInvocationId = rawProvenance
+    ? readGeneratedFileString(rawProvenance, 'invocationId')
+    : undefined
+  const provenance = rawProvenance && provenanceOperation
+    ? {
+        ...(provenanceJobId ? { jobId: provenanceJobId } : {}),
+        ...(provenanceInvocationId ? { invocationId: provenanceInvocationId } : {}),
+        operation: provenanceOperation
+      }
+    : undefined
   const normalized: GeneratedFileReference = {
     ...(id ? { id } : {}),
+    ...(artifactId ? { artifactId } : {}),
+    ...(mediaHandleId ? { mediaHandleId } : {}),
+    ...(availability ? { availability } : {}),
     ...(name ? { name } : {}),
     ...(mimeType ? { mimeType } : {}),
     ...(typeof byteSize === 'number' && Number.isFinite(byteSize) ? { byteSize } : {}),
     ...(typeof width === 'number' && Number.isFinite(width) ? { width } : {}),
     ...(typeof height === 'number' && Number.isFinite(height) ? { height } : {}),
+    ...(typeof durationMicros === 'number' && Number.isFinite(durationMicros) ? { durationMicros } : {}),
+    ...(mediaKind ? { mediaKind } : {}),
+    ...(completionIdentity ? { completionIdentity } : {}),
+    ...(ownerExtensionId ? { ownerExtensionId } : {}),
+    ...(ownerExtensionVersion ? { ownerExtensionVersion } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(provenance ? { provenance } : {}),
     ...(previewUrl ? { previewUrl } : {}),
     ...(path ? { path } : {}),
     ...(relativePath ? { relativePath } : {}),
@@ -382,12 +615,34 @@ function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference
   return Object.keys(normalized).length > 0 ? normalized : null
 }
 
+const GENERATED_FILE_TOOL_NAMES = new Set([
+  'generate_image',
+  'generate_speech',
+  'generate_music',
+  'generate_video'
+])
+
+function isGeneratedFileToolName(toolName: string | undefined): boolean {
+  const name = toolName?.trim()
+  if (!name) return false
+  if (GENERATED_FILE_TOOL_NAMES.has(name)) return true
+  const bridgedName = name.split('__').at(-1)
+  return Boolean(bridgedName && GENERATED_FILE_TOOL_NAMES.has(bridgedName))
+}
+
 function extractToolGeneratedFiles(item: CoreTurnItemJson): GeneratedFileReference[] | undefined {
   if (item.kind !== 'tool_result') return undefined
-  const payload = payloadFor(item)
+  const payloads = structuredPayloadsFor(item)
   const candidates = [
-    ...(Array.isArray(payload.files) ? payload.files : []),
-    ...(Array.isArray(payload.generatedFiles) ? payload.generatedFiles : [])
+    ...payloads.flatMap((payload) =>
+      Array.isArray(payload.generatedFiles) ? payload.generatedFiles : []
+    ),
+    ...payloads.flatMap((payload) =>
+      Array.isArray(payload.generatedArtifacts) ? payload.generatedArtifacts : []
+    ),
+    ...(isGeneratedFileToolName(item.toolName)
+      ? payloads.flatMap((payload) => Array.isArray(payload.files) ? payload.files : [])
+      : [])
   ]
   const generatedFiles: GeneratedFileReference[] = []
   const seen = new Set<string>()
@@ -395,6 +650,7 @@ function extractToolGeneratedFiles(item: CoreTurnItemJson): GeneratedFileReferen
     const normalized = normalizeGeneratedFileReference(candidate)
     if (!normalized) continue
     const key =
+      normalized.artifactId ??
       normalized.id ??
       normalized.absolutePath ??
       normalized.relativePath ??
@@ -406,6 +662,79 @@ function extractToolGeneratedFiles(item: CoreTurnItemJson): GeneratedFileReferen
     generatedFiles.push(normalized)
   }
   return generatedFiles.length > 0 ? generatedFiles : undefined
+}
+
+function extractComponentPrototype(item: CoreTurnItemJson): ComponentPrototypeMetadata | undefined {
+  if (item.toolName !== 'design_component') return undefined
+  const payload = payloadFor(item)
+  const raw = payload.componentPrototype
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const candidate = raw as Record<string, unknown>
+  if (candidate.version !== 1) return undefined
+  const status = candidate.status
+  if (status !== 'preparing' && status !== 'running' && status !== 'completed' && status !== 'failed') {
+    return undefined
+  }
+  const artifactId = typeof candidate.artifactId === 'string' ? candidate.artifactId.trim() : ''
+  const title = typeof candidate.title === 'string' ? candidate.title.trim().slice(0, 120) : ''
+  const relativePath = typeof candidate.relativePath === 'string'
+    ? candidate.relativePath.trim().replaceAll('\\', '/')
+    : ''
+  if (!/^component_[a-z0-9]+$/i.test(artifactId) || !title) return undefined
+  if (
+    !/^\.kun-design\/component-prototypes\/[^/]+\/prototype\.html$/i.test(relativePath) ||
+    relativePath.split('/').includes('..')
+  ) {
+    return undefined
+  }
+  const viewport = candidate.viewport && typeof candidate.viewport === 'object' && !Array.isArray(candidate.viewport)
+    ? candidate.viewport as Record<string, unknown>
+    : null
+  const width = viewport?.width
+  const height = viewport?.height
+  if (
+    typeof width !== 'number' || !Number.isInteger(width) || width < 280 || width > 1_200 ||
+    typeof height !== 'number' || !Number.isInteger(height) || height < 240 || height > 900
+  ) {
+    return undefined
+  }
+  const profile = candidate.profile === 'component-designer' ? 'component-designer' : undefined
+  const producer = candidate.producer === 'main-agent' || candidate.producer === 'component-designer'
+    ? candidate.producer
+    : profile === 'component-designer'
+      ? 'component-designer'
+      : undefined
+  if (!producer || (producer === 'main-agent' && profile)) return undefined
+  const childId = typeof candidate.childId === 'string' && candidate.childId.trim()
+    ? candidate.childId.trim().slice(0, 256)
+    : undefined
+  const byteSize = typeof candidate.byteSize === 'number' && Number.isInteger(candidate.byteSize) && candidate.byteSize >= 0
+    ? candidate.byteSize
+    : undefined
+  const contentHash = typeof candidate.contentHash === 'string' && /^[a-f0-9]{64}$/i.test(candidate.contentHash)
+    ? candidate.contentHash.toLowerCase()
+    : undefined
+  const summary = typeof candidate.summary === 'string' && candidate.summary.trim()
+    ? candidate.summary.trim().slice(0, 2_000)
+    : undefined
+  const error = typeof candidate.error === 'string' && candidate.error.trim()
+    ? candidate.error.trim().slice(0, 2_000)
+    : undefined
+  return {
+    version: 1,
+    status,
+    artifactId,
+    title,
+    relativePath,
+    viewport: { width, height },
+    producer,
+    ...(producer === 'component-designer' ? { profile: 'component-designer' as const } : {}),
+    ...(childId ? { childId } : {}),
+    ...(byteSize !== undefined ? { byteSize } : {}),
+    ...(contentHash ? { contentHash } : {}),
+    ...(summary ? { summary } : {}),
+    ...(error ? { error } : {})
+  }
 }
 
 function applyCommandResultMeta(meta: Record<string, unknown>, item: CoreTurnItemJson): void {
@@ -423,9 +752,16 @@ function inferToolPresentation(item: CoreTurnItemJson): {
   filePath?: string
   command?: string
 } {
-  const payload = payloadFor(item)
-  const filePath = readStructuredString(payload, ...FILE_PATH_KEYS)
-  const command = readStructuredString(payload, ...COMMAND_KEYS)
+  const filePath = readItemStructuredString(item, ...FILE_PATH_KEYS)
+  const command = readItemStructuredString(item, ...COMMAND_KEYS)
+
+  if (presentationStudioWriteToolId(item) || gatewayHasWorkspaceWriteSideEffect(item)) {
+    return {
+      toolKind: 'file_change',
+      ...(filePath ? { filePath } : {}),
+      ...(command ? { command } : {})
+    }
+  }
 
   if (
     item.toolKind === 'tool_call' ||
@@ -511,6 +847,7 @@ function toolBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
     (item.kind === 'tool_result' ? 'tool result' : 'tool')
   const meta: Record<string, unknown> = {
     sourceItemId: item.id,
+    sourceItemKind: item.kind,
     ...(item.callId ? { callId: item.callId } : {}),
     ...(item.toolName ? { toolName: item.toolName } : {})
   }
@@ -521,9 +858,25 @@ function toolBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
   if (attachments) meta.attachments = attachments
   const generatedFiles = extractToolGeneratedFiles(item)
   if (generatedFiles) meta.generatedFiles = generatedFiles
+  const componentPrototype = extractComponentPrototype(item)
+  if (componentPrototype) meta.componentPrototype = componentPrototype
+  const presentationStudioToolId = presentationStudioWriteToolId(item)
+  if (presentationStudioToolId) {
+    meta.canonicalToolId = presentationStudioToolId
+    meta.presentationArtifactProducer = PRESENTATION_STUDIO_EXTENSION_ID
+    const contentSha256 = readItemStructuredString(item, 'contentSha256')
+    if (contentSha256 && /^[a-f0-9]{64}$/i.test(contentSha256)) {
+      meta.presentationArtifactSha256 = contentSha256.toLowerCase()
+    }
+  }
   const presentation = inferToolPresentation(item)
+  const payload = payloadFor(item)
   if (presentation.command) meta.command = presentation.command
-  if (presentation.toolKind === 'command_execution') applyCommandResultMeta(meta, item)
+  if (presentation.toolKind === 'command_execution' || item.toolName === 'background_shell') {
+    applyCommandResultMeta(meta, item)
+  }
+  const action = readStructuredString(payload, 'action')
+  if (action) meta.action = action
   if (isPlan) {
     const plan = extractPlanMetadata(item)
     if (plan) meta.plan = plan
@@ -531,14 +884,37 @@ function toolBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
   return {
     kind: 'tool',
     id: toolBlockId(item),
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     summary,
-    status: toolStatus(item),
+    status: componentDesignStatusOverride(item, componentPrototype) ?? delegateTaskStatusOverride(item, payload) ?? toolStatus(item),
     toolKind: presentation.toolKind,
     ...(presentation.filePath ? { filePath: presentation.filePath } : {}),
     ...(detail ? { detail } : {}),
     meta
   }
+}
+
+function componentDesignStatusOverride(
+  item: CoreTurnItemJson,
+  prototype: ComponentPrototypeMetadata | undefined
+): ToolBlock['status'] | undefined {
+  if (item.toolName !== 'design_component' || !prototype) return undefined
+  if (prototype.status === 'preparing' || prototype.status === 'running') return 'running'
+  if (prototype.status === 'failed') return 'error'
+  return 'success'
+}
+
+function delegateTaskStatusOverride(
+  item: CoreTurnItemJson,
+  payload: Record<string, unknown>
+): ToolBlock['status'] | undefined {
+  if (item.toolName !== 'delegate_task' || payload.detached !== true) return undefined
+  const childStatus = typeof payload.status === 'string' ? payload.status : undefined
+  if (childStatus === 'queued' || childStatus === 'running') return 'running'
+  if (childStatus === 'failed' || childStatus === 'aborted') return 'error'
+  if (childStatus === 'completed') return 'success'
+  return undefined
 }
 
 export function mergeChatBlocks(blocks: ChatBlock[]): ChatBlock[] {
@@ -588,19 +964,32 @@ function questionsFromCore(
       .map((question) => normalizeUserInputQuestion(question))
       .filter((question): question is UserInputQuestion => question !== null)
   }
+  const promptText = typeof prompt === 'string' ? prompt.trim() : ''
+  if (!promptText) return []
   return [
     {
       header: 'Input',
       id: fallbackId,
-      question: prompt?.trim() || 'Input requested',
+      question: promptText,
       options: []
     }
   ]
 }
 
+function firstNonEmptyUserInputText(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const normalized = value.trim()
+    if (normalized) return normalized
+  }
+  return undefined
+}
+
 function normalizeUserInputQuestion(question: unknown): UserInputQuestion | null {
   if (!question || typeof question !== 'object') return null
   const raw = question as Record<string, unknown>
+  const text = firstNonEmptyUserInputText(raw.question, raw.prompt, raw.message)
+  if (!text) return null
   const options = Array.isArray(raw.options)
     ? raw.options
         .map((option) => normalizeUserInputOption(option))
@@ -609,9 +998,24 @@ function normalizeUserInputQuestion(question: unknown): UserInputQuestion | null
   return {
     header: typeof raw.header === 'string' && raw.header.trim() ? raw.header.trim() : 'Input',
     id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : 'input',
-    question: typeof raw.question === 'string' && raw.question.trim() ? raw.question.trim() : 'Input requested',
-    options
+    question: text,
+    options,
+    selectionMode: raw.selectionMode === 'multiple' && options.length > 0 ? 'multiple' : 'single',
+    ...(positiveInteger(raw.minSelections) ? { minSelections: positiveInteger(raw.minSelections) } : {}),
+    ...(positiveInteger(raw.maxSelections) ? { maxSelections: positiveInteger(raw.maxSelections) } : {})
   }
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const normalized = Math.floor(value)
+  return normalized > 0 ? normalized : undefined
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const normalized = Math.floor(value)
+  return normalized >= 0 ? normalized : undefined
 }
 
 function normalizeUserInputOption(option: unknown): UserInputQuestion['options'][number] | null {
@@ -622,6 +1026,37 @@ function normalizeUserInputOption(option: unknown): UserInputQuestion['options']
   return {
     label,
     description: typeof raw.description === 'string' ? raw.description : ''
+  }
+}
+
+function userInputAnswersFromCore(answers: unknown): UserInputAnswer[] | undefined {
+  if (!Array.isArray(answers)) return undefined
+  const normalized = answers
+    .map((answer) => normalizeUserInputAnswer(answer))
+    .filter((answer): answer is UserInputAnswer => answer !== null)
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function normalizeUserInputAnswer(answer: unknown): UserInputAnswer | null {
+  if (!answer || typeof answer !== 'object') return null
+  const raw = answer as Record<string, unknown>
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : null
+  const label = typeof raw.label === 'string' && raw.label.trim() ? raw.label.trim() : null
+  if (!id || !label) return null
+  const labels = Array.isArray(raw.labels)
+    ? raw.labels
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => value.trim())
+    : undefined
+  const values = Array.isArray(raw.values)
+    ? raw.values.filter((value): value is string => typeof value === 'string')
+    : undefined
+  return {
+    id,
+    label,
+    value: typeof raw.value === 'string' ? raw.value : label,
+    ...(labels && labels.length > 0 ? { labels } : {}),
+    ...(values && values.length > 0 ? { values } : {})
   }
 }
 
@@ -650,6 +1085,118 @@ function usageFromCore(usage: CoreUsageSnapshotJson): ThreadUsageSnapshot {
     costCny: usage.costCny ?? null,
     tokenEconomySavingsTokens: usage.tokenEconomySavingsTokens ?? 0,
     turns: usage.turns ?? 0
+  }
+}
+
+function contextSnapshotFromCore(event: CoreRuntimeEventJson): RequestContextSnapshot | null {
+  const threadId = event.threadId?.trim()
+  const model = event.model?.trim()
+  const contextWindowTokens = positiveInteger(event.contextWindowTokens)
+  const softThresholdTokens = positiveInteger(event.softThresholdTokens)
+  const hardThresholdTokens = positiveInteger(event.hardThresholdTokens)
+  const estimatedInputTokens = nonnegativeInteger(event.estimatedInputTokens)
+  const stepIndex = nonnegativeInteger(event.stepIndex)
+  const toolCount = nonnegativeInteger(event.toolCount)
+  const rawBreakdown = event.breakdown
+  const tools = nonnegativeInteger(rawBreakdown?.tools)
+  const system = nonnegativeInteger(rawBreakdown?.system)
+  const skills = nonnegativeInteger(rawBreakdown?.skills)
+  const messages = nonnegativeInteger(rawBreakdown?.messages)
+  const other = nonnegativeInteger(rawBreakdown?.other)
+  if (
+    !threadId ||
+    !model ||
+    contextWindowTokens === undefined ||
+    softThresholdTokens === undefined ||
+    hardThresholdTokens === undefined ||
+    estimatedInputTokens === undefined ||
+    stepIndex === undefined ||
+    toolCount === undefined ||
+    tools === undefined ||
+    system === undefined ||
+    skills === undefined ||
+    messages === undefined ||
+    other === undefined
+  ) {
+    return null
+  }
+  if (tools + system + skills + messages + other !== estimatedInputTokens) return null
+  return {
+    threadId,
+    ...(event.turnId?.trim() ? { turnId: event.turnId.trim() } : {}),
+    model,
+    ...(event.providerId?.trim() ? { providerId: event.providerId.trim() } : {}),
+    stepIndex,
+    contextWindowTokens,
+    softThresholdTokens,
+    hardThresholdTokens,
+    estimatedInputTokens,
+    breakdown: { tools, system, skills, messages, other },
+    toolCount,
+    activeSkillIds: Array.isArray(event.activeSkillIds)
+      ? event.activeSkillIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          .map((id) => id.trim())
+      : [],
+    ...(event.contextManagement === 'kun-managed' || event.contextManagement === 'sdk-managed'
+      ? { contextManagement: event.contextManagement }
+      : {}),
+    ...(event.nativeHistory === 'known' ||
+      event.nativeHistory === 'unknown' ||
+      event.nativeHistory === 'none'
+      ? { nativeHistory: event.nativeHistory }
+      : {})
+  }
+}
+
+function delegatedRuntimeFromCore(event: CoreRuntimeEventJson): DelegatedRuntimeState | null {
+  const threadId = event.threadId?.trim()
+  const providerId = event.providerId?.trim()
+  const providerKind = event.providerKind
+  const phase = event.phase
+  const capabilities = event.capabilities
+  if (
+    !threadId ||
+    !providerId ||
+    (
+      providerKind !== 'agent-sdk' &&
+      providerKind !== 'cursor-sdk' &&
+      providerKind !== 'antigravity-cli'
+    ) ||
+    (phase !== 'portable' && phase !== 'resumed' && phase !== 'rebased') ||
+    !capabilities ||
+    ![
+      capabilities.nativeResume,
+      capabilities.structuredStreaming,
+      capabilities.kunTools,
+      capabilities.externalApproval,
+      capabilities.liveSteering,
+      capabilities.nativeContextTelemetry,
+      capabilities.fork
+    ].every((value) => typeof value === 'boolean')
+  ) return null
+  const reason = event.reason
+  return {
+    threadId,
+    ...(event.turnId?.trim() ? { turnId: event.turnId.trim() } : {}),
+    providerKind,
+    providerId,
+    phase,
+    ...(reason === 'new' ||
+      reason === 'route_changed' ||
+      reason === 'capabilities_changed' ||
+      reason === 'history_changed' ||
+      reason === 'native_state_unavailable'
+      ? { reason }
+      : {}),
+    capabilities: {
+      nativeResume: capabilities.nativeResume!,
+      structuredStreaming: capabilities.structuredStreaming!,
+      kunTools: capabilities.kunTools!,
+      externalApproval: capabilities.externalApproval!,
+      liveSteering: capabilities.liveSteering!,
+      nativeContextTelemetry: capabilities.nativeContextTelemetry!,
+      fork: capabilities.fork!
+    }
   }
 }
 
@@ -685,7 +1232,13 @@ function assistantTextBlockFromItem(item: CoreTurnItemJson): ChatBlock | null {
 
 function reasoningBlockFromItem(item: CoreTurnItemJson): ChatBlock | null {
   if (!item.text?.trim()) return null
-  return { kind: 'reasoning', id: item.id, createdAt: itemCreatedAt(item), text: item.text }
+  return {
+    kind: 'reasoning',
+    id: item.id,
+    turnId: item.turnId,
+    createdAt: itemCreatedAt(item),
+    text: item.text
+  }
 }
 
 function approvalBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetadataJson): ChatBlock {
@@ -694,12 +1247,13 @@ function approvalBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeM
   return {
     kind: 'approval',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     approvalId: item.approvalId ?? item.id,
     summary: item.summary?.trim() || 'Approval required',
     toolName: item.toolName,
     status:
-      item.status === 'allowed' || item.status === 'denied'
+      item.status === 'allowed' || item.status === 'denied' || item.status === 'expired'
         ? item.status
         : item.status === 'failed'
           ? 'error'
@@ -708,18 +1262,82 @@ function approvalBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeM
   }
 }
 
-function userInputBlockFromItem(item: CoreTurnItemJson): ChatBlock {
+function approvalStatusFromEvent(event: CoreRuntimeEventJson): ApprovalStatusPayload | null {
+  const approvalId = event.approvalId ?? event.itemId ?? ''
+  if (!approvalId) return null
+  if (event.status !== 'allowed' && event.status !== 'denied' && event.status !== 'expired') {
+    return null
+  }
+  return {
+    approvalId,
+    status: event.status,
+    ...(event.status === 'expired' && event.reason?.trim()
+      ? { errorMessage: redactSecretText(event.reason.trim()) }
+      : {})
+  }
+}
+
+function approvalReviewFromEvent(
+  event: CoreRuntimeEventJson
+): ApprovalReviewEventPayload | null {
+  const reviewId = event.reviewId?.trim() ?? ''
+  const approvalId = event.approvalId?.trim() ?? ''
+  if (!reviewId || !approvalId || event.reviewer !== 'agent') return null
+  const status = event.status
+  if (
+    status !== 'in-progress' &&
+    status !== 'approved' &&
+    status !== 'denied' &&
+    status !== 'timed-out' &&
+    status !== 'failed-closed' &&
+    status !== 'aborted'
+  ) return null
+  const decision =
+    event.decision === 'allow' || event.decision === 'deny'
+      ? event.decision
+      : undefined
+  const riskLevel =
+    event.riskLevel === 'low' ||
+    event.riskLevel === 'medium' ||
+    event.riskLevel === 'high' ||
+    event.riskLevel === 'critical'
+      ? event.riskLevel
+      : undefined
+  return {
+    reviewId,
+    approvalId,
+    turnId: event.turnId,
+    createdAt: event.timestamp,
+    summary: redactSecretText(event.summary?.trim() || event.toolName?.trim() || 'Tool action'),
+    ...(event.toolName?.trim() ? { toolName: event.toolName.trim() } : {}),
+    status,
+    ...(decision ? { decision } : {}),
+    ...(riskLevel ? { riskLevel } : {}),
+    ...(event.rationale?.trim()
+      ? { rationale: redactSecretText(event.rationale.trim()) }
+      : {})
+  }
+}
+
+function userInputBlockFromItem(
+  item: CoreTurnItemJson
+): Extract<ChatBlock, { kind: 'user_input' }> {
+  const answers = userInputAnswersFromCore(item.answers)
   return {
     kind: 'user_input',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     requestId: item.inputId ?? item.id,
     questions: userInputQuestionsFromItem(item),
+    ...(answers ? { answers } : {}),
     status:
       item.status === 'failed'
         ? 'error'
-        : item.status === 'completed'
+        : item.status === 'submitted' || item.status === 'completed'
           ? 'submitted'
+          : item.status === 'cancelled' || item.status === 'aborted'
+            ? 'cancelled'
           : 'pending'
   }
 }
@@ -727,6 +1345,8 @@ function userInputBlockFromItem(item: CoreTurnItemJson): ChatBlock {
 function userInputRequestFromCore(input: {
   itemId?: string
   inputId?: string
+  turnId?: string
+  createdAt?: string
   prompt?: string
   questions?: CoreTurnItemJson['questions'] | CoreRuntimeEventJson['questions']
   seq?: number
@@ -734,6 +1354,8 @@ function userInputRequestFromCore(input: {
   const fallbackId = input.inputId ?? input.itemId ?? `input_${input.seq ?? Date.now()}`
   return {
     itemId: input.itemId ?? fallbackId,
+    ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     requestId: input.inputId ?? fallbackId,
     questions: questionsFromCore(input.questions, input.prompt, input.inputId ?? fallbackId)
   }
@@ -743,6 +1365,7 @@ function compactionBlockFromItem(item: CoreTurnItemJson): ChatBlock {
   return {
     kind: 'compaction',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     summary: item.summary?.trim() || 'Context compacted',
     status: item.status === 'failed' ? 'error' : 'success',
@@ -813,6 +1436,7 @@ function reviewBlockFromItem(item: CoreTurnItemJson): ReviewBlock {
   return {
     kind: 'review',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     title: item.title?.trim() || 'Code review',
     status: reviewStatus(item),
@@ -852,11 +1476,13 @@ function systemErrorBlockFromItem(item: CoreTurnItemJson): ChatBlock {
   return {
     kind: 'system',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     text: redactSecretText(message),
     ...(item.code ? { code: item.code } : {}),
     ...(detail ? { detail } : {}),
-    severity: errorSeverity(item.severity, item.code)
+    severity: errorSeverity(item.severity, item.code),
+    runtimeError: true
   }
 }
 
@@ -864,6 +1490,7 @@ function runtimeErrorFromItem(item: CoreTurnItemJson): RuntimeErrorEventPayload 
   const message = item.message ?? 'Runtime error'
   return {
     itemId: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     message: redactSecretText(message),
     ...(item.code ? { code: item.code } : {}),
@@ -880,6 +1507,7 @@ function runtimeErrorFromEvent(
   const itemId = event.itemId ?? `runtime_error_${event.turnId ?? event.threadId ?? event.seq ?? Date.now()}`
   return {
     itemId,
+    ...(event.turnId ? { turnId: event.turnId } : {}),
     createdAt: event.timestamp,
     message: redactSecretText(message),
     ...(event.code ? { code: event.code } : {}),
@@ -914,15 +1542,19 @@ export function chatBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRunti
     case 'tool_result':
       return toolBlockFromItem(item, child)
     case 'approval':
-      return approvalBlockFromItem(item, child)
-    case 'user_input':
-      return userInputBlockFromItem(item)
+      return item.decisionSource === 'agent' || item.approvalReviewer === 'agent'
+        ? null
+        : approvalBlockFromItem(item, child)
+    case 'user_input': {
+      const block = userInputBlockFromItem(item)
+      return block.questions.length > 0 ? block : null
+    }
     case 'compaction':
       return compactionBlockFromItem(item)
     case 'review':
       return reviewBlockFromItem(item)
     case 'error':
-      return systemErrorBlockFromItem(item)
+      return item.code === 'tool_catalog_changed' ? null : systemErrorBlockFromItem(item)
     default:
       return null
   }
@@ -932,6 +1564,8 @@ function toolEventFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
   const block = toolBlockFromItem(item, child)
   return {
     itemId: block.id,
+    turnId: item.turnId,
+    createdAt: block.createdAt,
     summary: block.summary,
     status: block.status,
     toolKind: block.toolKind,
@@ -941,9 +1575,36 @@ function toolEventFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
   }
 }
 
+function toolStatusFromChildStatus(status: CoreChildRuntimeMetadataJson['childStatus']): ToolEventPayload['status'] {
+  if (status === 'queued' || status === 'running') return 'running'
+  if (status === 'completed') return 'success'
+  return 'error'
+}
+
+function childLifecycleToolEventFromRuntimeEvent(event: CoreRuntimeEventJson): ToolEventPayload | null {
+  const child = normalizeChildMetadata(event.child)
+  if (!child) return null
+  return {
+    itemId: `child_lifecycle_${child.childId}`,
+    turnId: event.turnId ?? child.parentTurnId,
+    summary: child.childLabel || 'delegate_task',
+    status: toolStatusFromChildStatus(child.childStatus),
+    updateOnly: true,
+    createdAt: event.timestamp,
+    toolKind: 'tool_call',
+    detail: JSON.stringify({
+      childId: child.childId,
+      status: child.childStatus,
+      detached: child.detached === true
+    }),
+    meta: { child }
+  }
+}
+
 function compactionFromItem(item: CoreTurnItemJson): CompactionEventPayload {
   return {
     itemId: item.id,
+    turnId: item.turnId,
     summary: item.summary?.trim() || 'Context compacted',
     status: item.status === 'failed' ? 'error' : item.status === 'running' ? 'running' : 'success',
     createdAt: itemCreatedAt(item),
@@ -957,6 +1618,7 @@ function reviewFromItem(item: CoreTurnItemJson): ReviewEventPayload {
   const block = reviewBlockFromItem(item)
   return {
     itemId: block.id,
+    turnId: item.turnId,
     createdAt: block.createdAt,
     title: block.title,
     status: block.status,
@@ -971,50 +1633,7 @@ function reviewFromItem(item: CoreTurnItemJson): ReviewEventPayload {
  * `chatBlockFromItem` directly; this function maps item snapshots onto
  * the `ThreadEventSink` callbacks that the chat store understands.
  */
-function emitItem(
-  item: CoreTurnItemJson,
-  sink: ThreadEventSink,
-  child?: CoreChildRuntimeMetadataJson
-): void {
-  switch (item.kind) {
-    case 'user_message':
-      sink.onUserMessage(userMessageEventFromItem(item))
-      return
-    case 'assistant_text':
-    case 'assistant_reasoning':
-      // Live text/reasoning arrives through *_delta events. Item events are
-      // snapshots for replay/load paths and would duplicate streamed content.
-      return
-    case 'tool_call':
-    case 'tool_result':
-      sink.onTool(toolEventFromItem(item, child))
-      return
-    // Approval and user_input have dedicated runtime events; the
-    // generic item path would otherwise double-emit them.
-    case 'approval':
-    case 'user_input':
-      return
-    case 'compaction':
-      sink.onCompaction(compactionFromItem(item))
-      return
-    case 'review':
-      sink.onReview?.(reviewFromItem(item))
-      return
-    case 'error':
-      sink.onRuntimeError?.(runtimeErrorFromItem(item))
-      return
-  }
-}
 
-function emitDelta(
-  event: CoreRuntimeEventJson,
-  sink: ThreadEventSink,
-  kind: ThreadDeltaEvent['kind']
-): void {
-  const text = event.item?.text ?? ''
-  if (!text) return
-  sink.onDeltas([{ text, kind, seq: event.seq }])
-}
 
 function compactionFromEvent(
   event: CoreRuntimeEventJson,
@@ -1022,6 +1641,7 @@ function compactionFromEvent(
 ): CompactionEventPayload {
   return {
     itemId: event.itemId ?? `compaction_${event.seq ?? Date.now()}`,
+    turnId: event.turnId,
     summary: event.summary ?? 'Context compacted',
     status,
     createdAt: event.timestamp,
@@ -1037,6 +1657,8 @@ function toolReadyFromEvent(event: CoreRuntimeEventJson): ToolEventPayload | nul
   if (!callId || !toolName) return null
   return {
     itemId: `tool_${callId}`,
+    turnId: event.turnId,
+    createdAt: event.timestamp,
     summary: toolName,
     status: 'running',
     toolKind: 'tool_call',
@@ -1071,33 +1693,169 @@ function runtimeStatusFromEvent(event: CoreRuntimeEventJson): RuntimeStatusEvent
       toolResultCount: typeof event.toolResultCount === 'number' ? event.toolResultCount : 0
     }
   }
-	  if (event.kind === 'tool_catalog_changed') {
-	    const key = event.fingerprint ?? event.seq ?? Date.now()
-	    return {
-	      kind: 'tool_catalog_changed',
-	      itemId: `runtime_status_tool_catalog_${key}`,
-	      turnId: event.turnId,
-	      createdAt: event.timestamp,
-	      ...(event.changeKind ? { changeKind: event.changeKind } : {}),
-	      message: event.message
-	    }
-	  }
-	  if (event.kind === 'tool_storm_suppressed') {
-	    const callId = typeof event.callId === 'string' && event.callId.trim() ? event.callId.trim() : ''
-	    const toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : ''
-	    if (!callId || !toolName) return null
-	    return {
-	      kind: 'tool_storm_suppressed',
-	      itemId: event.itemId ?? `runtime_status_tool_storm_${callId}`,
-	      turnId: event.turnId,
-	      createdAt: event.timestamp,
-	      message: event.message,
-	      toolName,
-	      callId
-	    }
-	  }
-	  return null
-	}
+  if (event.kind === 'model_request_retry') {
+    const turnKey = event.turnId ?? event.threadId ?? event.seq ?? Date.now()
+    return {
+      kind: 'model_request_retry',
+      itemId: `runtime_status_${turnKey}_model_retry`,
+      turnId: event.turnId,
+      createdAt: event.timestamp,
+      ...(typeof event.status === 'number' ? { status: event.status } : {}),
+      attempt: typeof event.attempt === 'number' ? event.attempt : undefined,
+      maxAttempts: typeof event.maxAttempts === 'number' ? event.maxAttempts : undefined,
+      delayMs: typeof event.delayMs === 'number' ? event.delayMs : undefined,
+      retryReason: event.reason === 'network' || event.reason === 'stream_transport'
+        ? event.reason
+        : undefined
+    }
+  }
+  if (event.kind === 'tool_catalog_changed') {
+    const key = event.fingerprint ?? event.seq ?? Date.now()
+    return {
+      kind: 'tool_catalog_changed',
+      itemId: `runtime_status_tool_catalog_${key}`,
+      turnId: event.turnId,
+      createdAt: event.timestamp,
+      ...(event.changeKind ? { changeKind: event.changeKind } : {}),
+      message: event.message
+    }
+  }
+  if (event.kind === 'tool_storm_suppressed') {
+    const callId = typeof event.callId === 'string' && event.callId.trim() ? event.callId.trim() : ''
+    const toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : ''
+    if (!callId || !toolName) return null
+    return {
+      kind: 'tool_storm_suppressed',
+      itemId: event.itemId ?? `runtime_status_tool_storm_${callId}`,
+      turnId: event.turnId,
+      createdAt: event.timestamp,
+      message: event.message,
+      toolName,
+      callId
+    }
+  }
+  if (event.kind === 'required_tool_gate') {
+    const toolName = typeof event.toolName === 'string' && event.toolName.trim() ? event.toolName.trim() : ''
+    const phase = event.phase
+    const attempt = typeof event.attempt === 'number' && event.attempt > 0 ? event.attempt : undefined
+    const maxAttempts = typeof event.maxAttempts === 'number' && event.maxAttempts > 0
+      ? event.maxAttempts
+      : undefined
+    if (
+      !toolName ||
+      (phase !== 'preparing' && phase !== 'retrying' && phase !== 'succeeded' && phase !== 'failed') ||
+      attempt === undefined ||
+      maxAttempts === undefined
+    ) return null
+    const turnKey = event.turnId ?? event.threadId ?? event.seq ?? Date.now()
+    return {
+      kind: 'required_tool_gate',
+      itemId: `runtime_status_${turnKey}_required_tool_${toolName}`,
+      turnId: event.turnId,
+      createdAt: event.timestamp,
+      toolName,
+      phase,
+      attempt,
+      maxAttempts,
+      ...(typeof event.failureSummary === 'string' && event.failureSummary.trim()
+        ? { failureSummary: redactSecretText(event.failureSummary.trim()) }
+        : {}),
+      ...(typeof event.code === 'string' && event.code.trim() ? { code: event.code.trim() } : {})
+    }
+  }
+  return null
+}
+
+const kunEventNormalizerDeps: KunEventNormalizerDeps = {
+  userMessage: userMessageEventFromItem,
+  tool: toolEventFromItem,
+  compaction: compactionFromItem,
+  review: reviewFromItem,
+  itemRuntimeError: runtimeErrorFromItem,
+  childTool: childLifecycleToolEventFromRuntimeEvent,
+  readyTool: toolReadyFromEvent,
+  runtimeStatus: runtimeStatusFromEvent,
+  approvalAction: (event) => ({ type: 'approval_requested', event }),
+  approvalStatus: approvalStatusFromEvent,
+  approvalReview: approvalReviewFromEvent,
+  userInputRequest: (event) => userInputRequestFromCore({
+    itemId: event.itemId,
+    inputId: event.inputId,
+    turnId: event.turnId,
+    createdAt: event.timestamp,
+    prompt: event.prompt,
+    questions: event.questions,
+    seq: event.seq
+  }),
+  userInputAnswers: userInputAnswersFromCore,
+  compactionAction: (event, status) => ({
+    type: 'compaction_updated',
+    payload: compactionFromEvent(event, status)
+  }),
+  goalAction: (event, cleared) => ({
+    type: 'goal_changed',
+    payload: cleared
+      ? { threadId: event.threadId ?? '', goal: null, cleared: true, createdAt: event.timestamp }
+      : {
+          threadId: event.threadId ?? event.goal?.threadId ?? '',
+          goal: event.goal ? goalFromCore(event.goal) : null,
+          createdAt: event.timestamp
+        }
+  }),
+  todosAction: (event, cleared) => ({
+    type: 'todos_changed',
+    payload: cleared
+      ? { threadId: event.threadId ?? '', todos: null, cleared: true, createdAt: event.timestamp }
+      : {
+          threadId: event.threadId ?? event.todos?.threadId ?? '',
+          todos: event.todos ? todosFromCore(event.todos) : null,
+          createdAt: event.timestamp
+        }
+  }),
+  contextSnapshot: contextSnapshotFromCore,
+  delegatedRuntime: delegatedRuntimeFromCore,
+  usage: (event) => event.usage ? usageFromCore(event.usage) : null,
+  runtimeError: runtimeErrorFromEvent,
+  errorFromRuntime: errorForRuntimeEvent
+}
+
+export function runtimeProjectionActionsFromEvent(
+  event: CoreRuntimeEventJson
+): RuntimeProjectionAction[] {
+  return normalizeKunRuntimeEvent(event, kunEventNormalizerDeps)
+}
+
+async function applyRuntimeProjectionAction(
+  action: RuntimeProjectionAction,
+  sink: ThreadEventSink,
+  handleApprovalRequest: (event: CoreRuntimeEventJson, sink: ThreadEventSink) => Promise<void>
+): Promise<void> {
+  switch (action.type) {
+    case 'seq_observed': sink.onSeq(action.seq); return
+    case 'deltas_received': sink.onDeltas(action.deltas); return
+    case 'assistant_item_upserted': sink.onAssistantItem?.(action.payload); return
+    case 'user_message_received': sink.onUserMessage(action.payload); return
+    case 'tool_updated': sink.onTool(action.payload); return
+    case 'compaction_updated': sink.onCompaction(action.payload); return
+    case 'review_updated': sink.onReview?.(action.payload); return
+    case 'approval_requested': await handleApprovalRequest(action.event, sink); return
+    case 'approval_received': sink.onApproval(action.payload); return
+    case 'approval_status_changed': sink.onApprovalStatus?.(action.payload); return
+    case 'approval_review_updated': sink.onApprovalReview?.(action.payload); return
+    case 'user_input_requested': sink.onUserInput(action.payload); return
+    case 'user_input_status_changed': sink.onUserInputStatus(action.payload); return
+    case 'runtime_status_received': sink.onRuntimeStatus?.(action.payload); return
+    case 'runtime_error_received': sink.onRuntimeError?.(action.payload); return
+    case 'goal_changed': sink.onGoal(action.payload); return
+    case 'todos_changed': sink.onTodos?.(action.payload); return
+    case 'thread_metadata_changed': sink.onThreadUpdated?.(action.payload); return
+    case 'context_snapshot_received': sink.onContextSnapshot?.(action.payload); return
+    case 'delegated_runtime_received': sink.onDelegatedRuntimeState?.(action.payload); return
+    case 'usage_received': sink.onUsage?.(action.payload); return
+    case 'turn_completed': sink.onTurnComplete(); return
+    case 'turn_failed': sink.onError(action.error, action.options); return
+  }
+}
 
 /**
  * Dispatches a batch of runtime events, coalescing consecutive text and
@@ -1110,10 +1868,15 @@ export async function dispatchKunRuntimeEvents(
   handleApprovalRequest: (event: CoreRuntimeEventJson, sink: ThreadEventSink) => Promise<void>
 ): Promise<void> {
   let pendingDeltas: ThreadDeltaEvent[] = []
-  const flushDeltas = (): void => {
+  const flushDeltas = async (): Promise<void> => {
     if (pendingDeltas.length === 0) return
-    sink.onDeltas(pendingDeltas)
+    const deltas = pendingDeltas
     pendingDeltas = []
+    await applyRuntimeProjectionAction(
+      { type: 'deltas_received', deltas },
+      sink,
+      handleApprovalRequest
+    )
   }
   for (const event of events) {
     if (event.kind === 'assistant_text_delta' || event.kind === 'assistant_reasoning_delta') {
@@ -1122,15 +1885,19 @@ export async function dispatchKunRuntimeEvents(
         pendingDeltas.push({
           text,
           kind: event.kind === 'assistant_text_delta' ? 'agent_message' : 'agent_reasoning',
-          seq: event.seq
+          seq: event.seq,
+          threadId: event.threadId ?? event.item?.threadId,
+          turnId: event.turnId ?? event.item?.turnId,
+          itemId: event.itemId ?? event.item?.id,
+          createdAt: event.timestamp ?? event.item?.createdAt
         })
       }
       continue
     }
-    flushDeltas()
+    await flushDeltas()
     await dispatchKunRuntimeEvent(event, sink, handleApprovalRequest)
   }
-  flushDeltas()
+  await flushDeltas()
 }
 
 export async function dispatchKunRuntimeEvent(
@@ -1138,126 +1905,22 @@ export async function dispatchKunRuntimeEvent(
   sink: ThreadEventSink,
   handleApprovalRequest: (event: CoreRuntimeEventJson, sink: ThreadEventSink) => Promise<void>
 ): Promise<void> {
-  switch (event.kind) {
-    case 'assistant_text_delta':
-      emitDelta(event, sink, 'agent_message')
-      return
-    case 'assistant_reasoning_delta':
-      emitDelta(event, sink, 'agent_reasoning')
-      return
-    case 'item_created':
-    case 'item_updated':
-    case 'item_completed':
-    case 'tool_call_started':
-    case 'tool_call_finished':
-      if (event.item) emitItem(event.item, sink, event.child)
-      return
-    case 'tool_call_ready': {
-      const tool = toolReadyFromEvent(event)
-      if (tool) sink.onTool(tool)
-      return
-    }
-    case 'tool_result_upload_wait': {
-      const status = runtimeStatusFromEvent(event)
-      if (status) sink.onRuntimeStatus?.(status)
-      return
-    }
-	    case 'tool_catalog_changed': {
-	      const status = runtimeStatusFromEvent(event)
-	      if (status) sink.onRuntimeStatus?.(status)
-	      return
-	    }
-	    case 'tool_storm_suppressed': {
-	      const status = runtimeStatusFromEvent(event)
-	      if (status) sink.onRuntimeStatus?.(status)
-	      return
-	    }
-    case 'approval_requested':
-      await handleApprovalRequest(event, sink)
-      return
-    case 'user_input_requested':
-      sink.onUserInput(
-        userInputRequestFromCore({
-          itemId: event.itemId,
-          inputId: event.inputId,
-          prompt: event.prompt,
-          questions: event.questions,
-          seq: event.seq
-        })
-      )
-      return
-    case 'user_input_resolved':
-      sink.onUserInputStatus({
-        itemId: event.itemId ?? event.inputId ?? `input_${event.seq ?? Date.now()}`,
-        status: event.status === 'cancelled' ? 'cancelled' : 'submitted'
-      })
-      return
-    case 'compaction_started':
-      sink.onCompaction(compactionFromEvent(event, 'running'))
-      return
-    case 'compaction_completed':
-      sink.onCompaction(compactionFromEvent(event, 'success'))
-      return
-    case 'goal_updated':
-      sink.onGoal({
-        threadId: event.threadId ?? event.goal?.threadId ?? '',
-        goal: event.goal ? goalFromCore(event.goal) : null,
-        createdAt: event.timestamp
-      })
-      return
-    case 'goal_cleared':
-      sink.onGoal({
-        threadId: event.threadId ?? '',
-        goal: null,
-        cleared: true,
-        createdAt: event.timestamp
-      })
-      return
-    case 'todos_updated':
-      sink.onTodos?.({
-        threadId: event.threadId ?? event.todos?.threadId ?? '',
-        todos: event.todos ? todosFromCore(event.todos) : null,
-        createdAt: event.timestamp
-      })
-      return
-    case 'todos_cleared':
-      sink.onTodos?.({
-        threadId: event.threadId ?? '',
-        todos: null,
-        cleared: true,
-        createdAt: event.timestamp
-      })
-      return
-    case 'usage':
-      if (event.usage) sink.onUsage?.(usageFromCore(event.usage))
-      return
-    case 'thread_updated':
-      sink.onThreadUpdated?.({
-        threadId: event.threadId ?? '',
-        ...(event.title !== undefined ? { title: event.title } : {}),
-        ...(event.titleAuto !== undefined ? { titleAuto: event.titleAuto } : {}),
-        ...(event.status !== undefined ? { status: event.status } : {})
-      })
-      return
-    case 'turn_completed':
-    case 'turn_aborted':
-      sink.onTurnComplete()
-      return
-    case 'turn_failed': {
-      const payload = runtimeErrorFromEvent(event, 'Kun turn failed')
-      sink.onRuntimeError?.(payload)
-      sink.onError(errorForRuntimeEvent(payload), { terminal: true })
-      return
-    }
-    case 'error':
-      if (event.code === 'compaction_summary_fallback') {
-        const status = runtimeStatusFromEvent(event)
-        if (status) sink.onRuntimeStatus?.(status)
-        return
-      }
-      sink.onRuntimeError?.(runtimeErrorFromEvent(event, 'Runtime error'))
-      return
-    default:
-      return
+  const child = normalizeChildMetadata(event.child)
+  if (child) {
+    sink.onChildRuntimeEvent?.({
+      child,
+      ...(typeof event.seq === 'number' ? { seq: event.seq } : {}),
+      ...(event.timestamp ? { timestamp: event.timestamp } : {})
+    })
+  }
+  if (event.kind === 'graph_event' && event.graph !== undefined) {
+    sink.onGraphEvent?.(event.graph)
+  }
+  if (event.kind === 'graph_planning' && event.planning !== undefined) {
+    sink.onGraphPlanningEvent?.(event.planning)
+  }
+  const actions = runtimeProjectionActionsFromEvent(event)
+  for (const action of actions) {
+    await applyRuntimeProjectionAction(action, sink, handleApprovalRequest)
   }
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  hookMatcherCacheForTesting,
   hookMatchesTool,
+  MAX_HOOK_MATCHER_CACHE_ENTRIES,
   runObserverHooks,
   runPostToolUseHooks,
   runPreToolUseHooks,
@@ -53,6 +55,14 @@ describe('hookMatchesTool', () => {
     expect(hookMatchesTool({ toolNames: ['bash'], matcher: 'mcp__*' }, 'bash')).toBe(true)
     expect(hookMatchesTool({ toolNames: ['bash'], matcher: 'mcp__*' }, 'mcp__a')).toBe(true)
     expect(hookMatchesTool({ toolNames: ['bash'], matcher: 'mcp__*' }, 'read_file')).toBe(false)
+  })
+
+  it('bounds compiled matcher entries under changing hook configurations', () => {
+    hookMatcherCacheForTesting.clear()
+    for (let index = 0; index < MAX_HOOK_MATCHER_CACHE_ENTRIES + 32; index += 1) {
+      expect(hookMatchesTool({ matcher: `tool_${index}` }, `tool_${index}`)).toBe(true)
+    }
+    expect(hookMatcherCacheForTesting.size()).toBe(MAX_HOOK_MATCHER_CACHE_ENTRIES)
   })
 })
 
@@ -297,6 +307,32 @@ describe('command hooks', () => {
       prompt: 'ship it'
     })
     expect(outcome.additionalContext).toEqual(['remember: deploy freeze today'])
+  })
+
+  it('does not expose runtime credentials to command hooks', async () => {
+    const previousRuntimeToken = process.env.KUN_RUNTIME_TOKEN
+    const previousApiKey = process.env.DEEPSEEK_API_KEY
+    process.env.KUN_RUNTIME_TOKEN = 'runtime-secret'
+    process.env.DEEPSEEK_API_KEY = 'model-secret'
+    try {
+      const hooks = resolveConfiguredHooks([
+        {
+          phase: 'UserPromptSubmit',
+          command: `node -e "console.log([process.env.KUN_RUNTIME_TOKEN || 'missing', process.env.DEEPSEEK_API_KEY || 'missing'].join('|'))"`
+        }
+      ])
+      const outcome = await runUserPromptSubmitHooks(hooks, {
+        threadId: 'th',
+        turnId: 'tu',
+        prompt: 'ship it'
+      })
+      expect(outcome.additionalContext).toEqual(['missing|missing'])
+    } finally {
+      if (previousRuntimeToken === undefined) delete process.env.KUN_RUNTIME_TOKEN
+      else process.env.KUN_RUNTIME_TOKEN = previousRuntimeToken
+      if (previousApiKey === undefined) delete process.env.DEEPSEEK_API_KEY
+      else process.env.DEEPSEEK_API_KEY = previousApiKey
+    }
   })
 
   it('kills timed-out command hooks and propagates the timeout for tool phases', async () => {

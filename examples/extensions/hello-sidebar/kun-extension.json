@@ -1,0 +1,33 @@
+{
+  "$schema": "https://kun.dev/schemas/extensions/manifest/v1.json",
+  "manifestVersion": 1,
+  "apiVersion": "1.0.0",
+  "name": "hello-sidebar",
+  "publisher": "kun-examples",
+  "version": "0.1.0",
+  "displayName": "Hello Sidebar",
+  "description": "A minimal sandboxed Kun sidebar with persisted View state.",
+  "license": "MIT",
+  "engines": {
+    "kun": ">=0.1.0"
+  },
+  "browser": "dist/webview/index.html",
+  "activationEvents": [
+    "onView:hello"
+  ],
+  "contributes": {
+    "views.rightSidebar": [
+      {
+        "id": "hello",
+        "title": "Hello Kun",
+        "entry": "dist/webview/index.html",
+        "localResourceRoots": ["dist/webview"]
+      }
+    ]
+  },
+  "permissions": [
+    "ui.views",
+    "webview"
+  ],
+  "stateSchemaVersion": 1
+}

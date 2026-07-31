@@ -1,25 +1,101 @@
 import { describe, expect, it } from 'vitest'
+import { CONVERSATION_EXPORT_MAX_MARKDOWN_CHARS } from '../../shared/conversation-export'
 import {
   clawImInstallPollPayloadSchema,
   clawTaskFromTextPayloadSchema,
+  conversationExportPayloadSchema,
+  cursorSubscriptionDiscoveryPayloadSchema,
   isSafeOpenExternalUrl,
+  modelsDevCatalogPayloadSchema,
+  notificationPayloadSchema,
   runtimeRequestPayloadSchema,
   scheduleTaskFromTextPayloadSchema,
   settingsPatchSchema,
   shellOpenExternalUrlSchema,
   skillGithubImportPayloadSchema,
   skillListPayloadSchema,
+  sseAckPayloadSchema,
   sseStartPayloadSchema,
   workspaceDirectoryCreatePayloadSchema,
   workspaceDirectoryTargetPayloadSchema,
   workspaceEntryDeletePayloadSchema,
   workspaceEntryRenamePayloadSchema,
+  workspaceImageBytesSavePayloadSchema,
+  workspaceImagePickPayloadSchema,
   writeExportPayloadSchema,
   writeRichClipboardPayloadSchema,
   writeInlineCompletionPayloadSchema
 } from './app-ipc-schemas'
 
 describe('app-ipc-schemas', () => {
+  it('accepts only modeled completion notification sources', () => {
+    expect(notificationPayloadSchema.parse({
+      threadId: 'thread-main',
+      source: 'main-agent',
+      title: 'Kun',
+      body: 'Done'
+    }).source).toBe('main-agent')
+    expect(notificationPayloadSchema.parse({
+      threadId: 'thread-child',
+      source: 'subagent',
+      title: 'Kun',
+      body: 'Done'
+    }).source).toBe('subagent')
+    expect(() => notificationPayloadSchema.parse({
+      threadId: 'thread-other',
+      source: 'extension',
+      title: 'Kun',
+      body: 'Done'
+    })).toThrow()
+  })
+
+  it('accepts only a bounded Cursor API key for subscription discovery', () => {
+    expect(cursorSubscriptionDiscoveryPayloadSchema.parse({
+      apiKey: ' cursor-key '
+    })).toEqual({ apiKey: 'cursor-key' })
+    expect(() => cursorSubscriptionDiscoveryPayloadSchema.parse({
+      apiKey: 'cursor-key',
+      endpoint: 'https://private.cursor.example'
+    })).toThrow()
+    expect(() => cursorSubscriptionDiscoveryPayloadSchema.parse({ apiKey: '' })).toThrow()
+  })
+
+  it('accepts only provider identity and refresh fields for models.dev lookup', () => {
+    expect(modelsDevCatalogPayloadSchema.parse({
+      providerId: 'xiaomi-token-plan',
+      baseUrl: ' https://token-plan-cn.xiaomimimo.com/v1 ',
+      forceRefresh: true,
+      modelHints: [{ id: 'gpt-5.5', aliases: ['gpt-latest'] }]
+    })).toEqual({
+      providerId: 'xiaomi-token-plan',
+      baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+      forceRefresh: true,
+      modelHints: [{ id: 'gpt-5.5', aliases: ['gpt-latest'] }]
+    })
+    expect(modelsDevCatalogPayloadSchema.parse({
+      providerId: 'cursor-subscription',
+      baseUrl: '',
+      modelHints: [{ id: 'gemini-3.6-flash' }]
+    })).toEqual({
+      providerId: 'cursor-subscription',
+      baseUrl: '',
+      modelHints: [{ id: 'gemini-3.6-flash' }]
+    })
+    expect(() => modelsDevCatalogPayloadSchema.parse({
+      providerId: 'xiaomi-token-plan',
+      baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
+      apiKey: 'must-not-cross-this-boundary'
+    })).toThrow()
+  })
+
+  it('accepts a named local model gateway provider', () => {
+    expect(settingsPatchSchema.parse({
+      provider: {
+        localGateway: { enabled: true, name: ' Team Relay ' }
+      }
+    }).provider?.localGateway).toEqual({ enabled: true, name: 'Team Relay' })
+  })
+
   it('normalizes runtime request paths', () => {
     const payload = runtimeRequestPayloadSchema.parse({
       path: 'v1/threads?limit=1',
@@ -45,6 +121,80 @@ describe('app-ipc-schemas', () => {
     })
 
     expect(payload.path).toBe('/v1/runtime/tools')
+  })
+
+  it('accepts only the modeled Kun model connection operations', () => {
+    for (const payload of [
+      { path: '/v1/model-connections', method: 'GET' },
+      { path: '/v1/model-connections', method: 'PATCH', body: '{}' },
+      { path: '/v1/model-connections/events?since_revision=1', method: 'GET' },
+      { path: '/v1/model-connections/connect', method: 'POST', body: '{}' },
+      { path: '/v1/model-connections/select', method: 'POST', body: '{}' },
+      { path: '/v1/model-connections/oauth/start', method: 'POST', body: '{}' },
+      { path: '/v1/model-connections/oauth/session_1', method: 'GET' },
+      { path: '/v1/model-connections/oauth/session_1', method: 'DELETE' },
+      {
+        path: '/v1/model-connections/oauth/session_1/submit',
+        method: 'POST',
+        body: '{}'
+      },
+      { path: '/v1/model-connections/claude/sdk', method: 'GET' },
+      { path: '/v1/model-connections/claude/sdk/install', method: 'POST', body: '{}' },
+      { path: '/v1/model-connections/provider-a', method: 'PATCH', body: '{}' },
+      { path: '/v1/model-connections/provider-a', method: 'DELETE' },
+      {
+        path: '/v1/model-connections/provider-a/credential',
+        method: 'PUT',
+        body: '{}'
+      },
+      { path: '/v1/model-connections/provider-a/credential', method: 'DELETE' },
+      { path: '/v1/model-connections/provider-a/probe', method: 'POST', body: '{}' }
+    ] as const) {
+      expect(runtimeRequestPayloadSchema.parse(payload).path).toBe(payload.path)
+    }
+    expect(() => runtimeRequestPayloadSchema.parse({
+      path: '/v1/model-connections/events',
+      method: 'DELETE'
+    })).toThrow(/runtime request path is not allowed/)
+  })
+
+  it('accepts only the modeled Kun route diagnostics operations', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/model-routes',
+      method: 'GET'
+    }).path).toBe('/v1/model-routes')
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/model-routes/kimi%20pool/test',
+      method: 'POST'
+    }).path).toBe('/v1/model-routes/kimi%20pool/test')
+    expect(() => runtimeRequestPayloadSchema.parse({
+      path: '/v1/model-routes',
+      method: 'DELETE'
+    })).toThrow(/runtime request path is not allowed/)
+  })
+
+  it('accepts Kun supply-chain audit endpoints', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/supply-chain/audit',
+      method: 'POST',
+      body: '{}'
+    }).path).toBe('/v1/supply-chain/audit')
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/supply-chain/update-check',
+      method: 'POST',
+      body: '{}'
+    }).path).toBe('/v1/supply-chain/update-check')
+  })
+
+  it('accepts Kun MCP OAuth status and token reset endpoints', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/mcp/oauth',
+      method: 'GET'
+    }).path).toBe('/v1/mcp/oauth')
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/mcp/oauth/google_drive',
+      method: 'DELETE'
+    }).path).toBe('/v1/mcp/oauth/google_drive')
   })
 
   it('accepts the Kun skills endpoint', () => {
@@ -129,12 +279,132 @@ describe('app-ipc-schemas', () => {
     }).path).toBe('/v1/threads/thr_1/goal')
   })
 
+  it('accepts the Kun delegation profiles endpoint', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/delegation/profiles',
+      method: 'GET'
+    }).path).toBe('/v1/delegation/profiles')
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/delegation/profiles?workspace=%2Ftmp%2Fproject',
+      method: 'GET'
+    }).path).toBe('/v1/delegation/profiles?workspace=%2Ftmp%2Fproject')
+    expect(() => runtimeRequestPayloadSchema.parse({
+      path: '/v1/delegation/profiles',
+      method: 'POST'
+    })).toThrow(/runtime request path is not allowed/)
+  })
+
+  it('accepts only the modeled Kun Graph workbench endpoints', () => {
+    for (const payload of [
+      { path: '/v1/graphs?thread_id=thread_1', method: 'GET' },
+      { path: '/v1/graph-drafts?thread_id=thread_1', method: 'GET' },
+      { path: '/v1/graph-drafts/draft%201', method: 'GET' },
+      {
+        path: '/v1/graph-drafts/draft_1/resume',
+        method: 'POST',
+        body: '{"expectedRevision":2}'
+      },
+      {
+        path: '/v1/graph-drafts/draft_1/cancel',
+        method: 'POST',
+        body: '{"expectedRevision":2}'
+      },
+      { path: '/v1/graphs/run%201', method: 'GET' },
+      { path: '/v1/graphs/run_1/events?since_seq=3', method: 'GET' },
+      { path: '/v1/graphs/run_1/artifacts/artifact%201?offset=0', method: 'GET' },
+      { path: '/v1/graphs/run_1/start', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/pause', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/resume', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/cleanup', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/cancel', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/retry', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/steer', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/patch', method: 'POST', body: '{}' },
+      { path: '/v1/graphs/run_1/reviews', method: 'POST', body: '{}' },
+      {
+        path: '/v1/graph-projects/identity?workspace=%2Ftmp%2Fproject',
+        method: 'GET'
+      },
+      {
+        path: '/v1/graph-projects/project_1/agents?include_archived=true',
+        method: 'GET'
+      },
+      { path: '/v1/graph-projects/project_1/evidence', method: 'GET' },
+      { path: '/v1/graph-projects/project_1/scores', method: 'GET' },
+      { path: '/v1/graph-projects/project_1/audit', method: 'GET' },
+      { path: '/v1/graph-projects/project_1/candidates', method: 'GET' },
+      { path: '/v1/graph-projects/project_1/jobs', method: 'GET' },
+      {
+        path: '/v1/graph-projects/project_1/agents/profile_1/lifecycle',
+        method: 'POST',
+        body: '{}'
+      },
+      {
+        path: '/v1/graph-projects/project_1/agents/profile_1/export',
+        method: 'GET'
+      },
+      {
+        path: '/v1/graph-projects/project_1/agents/import',
+        method: 'POST',
+        body: '{}'
+      },
+      {
+        path: '/v1/graph-projects/project_1/agents/merge',
+        method: 'POST',
+        body: '{}'
+      },
+      {
+        path: '/v1/graph-projects/project_1/candidates/candidate_1/action',
+        method: 'POST',
+        body: '{}'
+      },
+      {
+        path: '/v1/graph-projects/project_1/consolidate',
+        method: 'POST',
+        body: '{}'
+      }
+    ] as const) {
+      expect(runtimeRequestPayloadSchema.parse(payload).path).toBe(payload.path)
+    }
+
+    for (const payload of [
+      { path: '/v1/graphs', method: 'POST' },
+      { path: '/v1/graph-drafts', method: 'POST' },
+      { path: '/v1/graph-drafts/draft_1', method: 'DELETE' },
+      { path: '/v1/graph-drafts/draft_1/resume', method: 'GET' },
+      { path: '/v1/graph-drafts/draft_1/cancel', method: 'DELETE' },
+      { path: '/v1/graphs/run_1/start', method: 'DELETE' },
+      { path: '/v1/graph-projects/identity', method: 'POST' },
+      {
+        path: '/v1/graph-projects/project_1/agents/profile_1/lifecycle',
+        method: 'GET'
+      },
+      { path: '/v1/graphs/run_1/secrets', method: 'GET' },
+      { path: '/v1/graph-projects/project_1/admin', method: 'GET' }
+    ] as const) {
+      expect(() => runtimeRequestPayloadSchema.parse(payload)).toThrow(
+        /runtime request path is not allowed/
+      )
+    }
+  })
+
   it('accepts the Kun thread review endpoint', () => {
     expect(runtimeRequestPayloadSchema.parse({
       path: '/v1/threads/thr_1/review',
       method: 'POST',
       body: '{"target":{"kind":"uncommittedChanges"}}'
     }).path).toBe('/v1/threads/thr_1/review')
+  })
+
+  it('accepts the read-only Kun turn status endpoint', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/threads/thr_1/turns/turn_1',
+      method: 'GET'
+    }).path).toBe('/v1/threads/thr_1/turns/turn_1')
+    expect(() => runtimeRequestPayloadSchema.parse({
+      path: '/v1/threads/thr_1/turns/turn_1',
+      method: 'DELETE'
+    })).toThrow(/runtime request path is not allowed/)
   })
 
   it('accepts the LLM debug rounds endpoint', () => {
@@ -162,6 +432,36 @@ describe('app-ipc-schemas', () => {
     ).toThrow(/runtime request path is not allowed/)
   })
 
+  it('keeps approval decisions off the generic runtime request bridge', () => {
+    expect(() =>
+      runtimeRequestPayloadSchema.parse({
+        path: '/v1/approvals/appr_1',
+        method: 'POST',
+        body: '{"decision":"allow"}'
+      })
+    ).toThrow(/runtime request path is not allowed/)
+  })
+
+  it('keeps extension workbench and configuration operations off the generic runtime bridge', () => {
+    for (const payload of [
+      { path: '/v1/extensions/workbench', method: 'GET' },
+      {
+        path: '/v1/extensions/configuration/snapshot',
+        method: 'POST',
+        body: '{"contributionIds":[]}'
+      },
+      {
+        path: '/v1/extensions/configuration',
+        method: 'PUT',
+        body: '{}'
+      }
+    ] as const) {
+      expect(() => runtimeRequestPayloadSchema.parse(payload)).toThrow(
+        /runtime request path is not allowed/
+      )
+    }
+  })
+
   it('accepts a valid settings patch for kun and write settings', () => {
     const payload = settingsPatchSchema.parse({
       theme: 'dark',
@@ -169,6 +469,7 @@ describe('app-ipc-schemas', () => {
         kun: {
           port: 19000,
           model: 'deepseek-chat',
+          approvalReviewer: 'agent',
           modelProfiles: {
             'custom-vision-model': {
               aliases: ['custom-vision'],
@@ -186,10 +487,20 @@ describe('app-ipc-schemas', () => {
             historyHygiene: {
               maxToolResultTokens: 4000
             }
+          },
+          toolOutputLimits: {
+            maxLines: 30000,
+            maxBytes: 1048576
+          },
+          subagents: {
+            useExistingAgents: false,
+            maxParallel: 256
           }
         }
       },
       write: {
+        autoSaveEnabled: false,
+        autoSaveDelayMs: 180000,
         inlineCompletion: {
           model: 'deepseek-v4-pro',
           maxTokens: 128
@@ -202,17 +513,41 @@ describe('app-ipc-schemas', () => {
           ]
         }
       },
+      design: {
+        brandColor: '#3b82d8',
+        tone: ['专业', '科技感'],
+        designSystemPreset: 'shadcn'
+      },
+      notifications: {
+        mainAgentTurnComplete: false,
+        subagentTurnComplete: true
+      },
       disabledSkillIds: ['test-skill-08']
     })
 
     expect(payload.agents?.kun?.port).toBe(19000)
+    expect(payload.agents?.kun?.approvalReviewer).toBe('agent')
     expect(payload.agents?.kun?.modelProfiles?.['custom-vision-model']?.inputModalities).toEqual(['text', 'image'])
     expect(payload.agents?.kun?.modelProfiles?.['custom-vision-model']?.maxOutputTokens).toBe(32000)
     expect(payload.agents?.kun?.tokenEconomy?.enabled).toBe(true)
     expect(payload.agents?.kun?.tokenEconomy?.historyHygiene?.maxToolResultTokens).toBe(4000)
+    expect(payload.agents?.kun?.toolOutputLimits?.maxLines).toBe(30000)
+    expect(payload.agents?.kun?.toolOutputLimits?.maxBytes).toBe(1048576)
+    expect(payload.agents?.kun?.subagents).toEqual({
+      useExistingAgents: false,
+      maxParallel: 256
+    })
+    expect(payload.write?.autoSaveEnabled).toBe(false)
+    expect(payload.write?.autoSaveDelayMs).toBe(180000)
     expect(payload.write?.inlineCompletion?.model).toBe('deepseek-v4-pro')
     expect(payload.write?.selectionAssist?.infographicPrompt).toBe('手绘风格信息图。')
     expect(payload.write?.selectionAssist?.quickActions).toHaveLength(2)
+    expect(payload.design?.brandColor).toBe('#3b82d8')
+    expect(payload.design?.designSystemPreset).toBe('shadcn')
+    expect(payload.notifications).toEqual({
+      mainAgentTurnComplete: false,
+      subagentTurnComplete: true
+    })
     expect(payload.disabledSkillIds).toEqual(['test-skill-08'])
   })
 
@@ -228,6 +563,12 @@ describe('app-ipc-schemas', () => {
     })).toThrow()
     expect(() => settingsPatchSchema.parse({
       workflow: { webhookPort: 9999 }
+    })).toThrow()
+  })
+
+  it('rejects unknown approval reviewers', () => {
+    expect(() => settingsPatchSchema.parse({
+      agents: { kun: { approvalReviewer: 'operator' } }
     })).toThrow()
   })
 
@@ -303,6 +644,39 @@ describe('app-ipc-schemas', () => {
     expect(payload.agents?.kun?.videoGeneration?.defaultResolution).toBe('1080P')
   })
 
+  it('accepts provider and resolved runtime retry settings', () => {
+    const payload = settingsPatchSchema.parse({
+      provider: {
+        providers: [{
+          id: 'deepseek',
+          name: 'DeepSeek',
+          apiKey: 'sk-test',
+          baseUrl: 'https://api.deepseek.com',
+          endpointFormat: 'chat_completions',
+          retry: {
+            maxAttempts: 3,
+            initialDelayMs: 3000,
+            httpStatusCodes: [429, 503]
+          },
+          models: ['deepseek-chat'],
+          modelProfiles: {}
+        }]
+      },
+      agents: {
+        kun: {
+          retry: {
+            maxAttempts: 3,
+            initialDelayMs: 3000,
+            httpStatusCodes: [429, 503]
+          }
+        }
+      }
+    })
+
+    expect(payload.provider?.providers?.[0]?.retry?.maxAttempts).toBe(3)
+    expect(payload.agents?.kun?.retry?.httpStatusCodes).toEqual([429, 503])
+  })
+
   it('accepts long provider model ids imported from upstream catalogs', () => {
     const longModelId = `openrouter/${'provider-routed-model-id-'.repeat(6)}preview`
 
@@ -339,7 +713,9 @@ describe('app-ipc-schemas', () => {
             }
           },
           imageGeneration: {
-            model: longModelId
+            model: longModelId,
+            defaultResolution: '2K',
+            quality: 'high'
           }
         }
       },
@@ -353,8 +729,16 @@ describe('app-ipc-schemas', () => {
 
     expect(payload.provider?.providers?.[0]?.models).toEqual([longModelId])
     expect(payload.agents?.kun?.model).toBe(longModelId)
+    expect(payload.agents?.kun?.imageGeneration?.defaultResolution).toBe('2K')
+    expect(payload.agents?.kun?.imageGeneration?.quality).toBe('high')
     expect(payload.schedule?.model).toBe(longModelId)
     expect(payload.workflow?.model).toBe(longModelId)
+    expect(settingsPatchSchema.parse({
+      agents: { kun: { imageGeneration: { defaultResolution: '4K' } } }
+    }).agents?.kun?.imageGeneration?.defaultResolution).toBe('4K')
+    expect(() => settingsPatchSchema.parse({
+      agents: { kun: { imageGeneration: { defaultResolution: '8K' } } }
+    })).toThrow()
   })
 
   it('accepts schedule settings patches and task payloads', () => {
@@ -472,6 +856,17 @@ describe('app-ipc-schemas', () => {
     expect('quickChat' in (payload.agents ?? {})).toBe(false)
   })
 
+  it.each(['en', 'zh', 'ru', 'hi', 'th', 'ja', 'ko'] as const)(
+    'accepts the %s application locale in settings patches',
+    (locale) => {
+      expect(settingsPatchSchema.parse({ locale }).locale).toBe(locale)
+    }
+  )
+
+  it('rejects unsupported application locales', () => {
+    expect(() => settingsPatchSchema.parse({ locale: 'fr' })).toThrow()
+  })
+
   it('accepts persisted claw channel welcome markers in full settings snapshots', () => {
     const payload = settingsPatchSchema.parse({
       claw: {
@@ -564,10 +959,76 @@ describe('app-ipc-schemas', () => {
     expect(payload.agents?.kun?.runtimeTuning?.streamIdleTimeoutMs).toBe(300000)
   })
 
+  it('accepts a configurable maximum turn duration in runtime tuning patches', () => {
+    const payload = settingsPatchSchema.parse({
+      agents: {
+        kun: {
+          runtimeTuning: {
+            maxWallTimeMs: 7_200_000
+          }
+        }
+      }
+    })
+
+    expect(payload.agents?.kun?.runtimeTuning?.maxWallTimeMs).toBe(7_200_000)
+  })
+
+  it('accepts the maximum concurrent turns cap in runtime tuning patches', () => {
+    const payload = settingsPatchSchema.parse({
+      agents: {
+        kun: {
+          runtimeTuning: {
+            maxConcurrentTurns: 256
+          }
+        }
+      }
+    })
+
+    expect(payload.agents?.kun?.runtimeTuning?.maxConcurrentTurns).toBe(256)
+  })
+
+  it('accepts the Agent Perspective capture default', () => {
+    const payload = settingsPatchSchema.parse({
+      agents: {
+        kun: {
+          llmDebug: {
+            defaultThreadCaptureEnabled: true
+          }
+        }
+      }
+    })
+
+    expect(payload.agents?.kun?.llmDebug?.defaultThreadCaptureEnabled).toBe(true)
+  })
+
+  it('rejects an out-of-range maximum turn duration', () => {
+    expect(() =>
+      settingsPatchSchema.parse({
+        agents: { kun: { runtimeTuning: { maxWallTimeMs: 86_400_001 } } }
+      })
+    ).toThrow()
+  })
+
+  it('rejects an out-of-range maximum concurrent turns cap', () => {
+    expect(() =>
+      settingsPatchSchema.parse({
+        agents: { kun: { runtimeTuning: { maxConcurrentTurns: 257 } } }
+      })
+    ).toThrow()
+  })
+
   it('rejects an out-of-range stream idle timeout', () => {
     expect(() =>
       settingsPatchSchema.parse({
         agents: { kun: { runtimeTuning: { streamIdleTimeoutMs: -1 } } }
+      })
+    ).toThrow()
+  })
+
+  it('rejects out-of-range tool output limits', () => {
+    expect(() =>
+      settingsPatchSchema.parse({
+        agents: { kun: { toolOutputLimits: { maxBytes: 128 * 1024 * 1024 } } }
       })
     ).toThrow()
   })
@@ -617,6 +1078,16 @@ describe('app-ipc-schemas', () => {
         sinceSeq: -1
       })
     ).toThrow()
+    expect(sseStartPayloadSchema.parse({
+      threadId: 'thread-1',
+      sinceSeq: 0,
+      acknowledgedBatches: true
+    }).acknowledgedBatches).toBe(true)
+    expect(sseAckPayloadSchema.parse({ streamId: 'stream-1', batchId: 'batch-1' })).toEqual({
+      streamId: 'stream-1',
+      batchId: 'batch-1'
+    })
+    expect(() => sseAckPayloadSchema.parse({ streamId: 'stream-1', batchId: '' })).toThrow()
   })
 
   it('accepts long Feishu install device codes', () => {
@@ -753,6 +1224,38 @@ describe('app-ipc-schemas', () => {
     expect(payload.content).toBe('# Draft')
   })
 
+  it('accepts content-only export payloads', () => {
+    const payload = writeExportPayloadSchema.parse({
+      title: 'Kun answer',
+      workspaceRoot: '/tmp/workspace',
+      format: 'png',
+      content: '# Answer'
+    })
+
+    expect(payload.title).toBe('Kun answer')
+    expect(payload.format).toBe('png')
+  })
+
+  it('validates conversation export payloads and rejects oversized transcripts', () => {
+    const payload = conversationExportPayloadSchema.parse({
+      title: 'Thread',
+      format: 'pdf',
+      markdown: '# Thread',
+      defaultFileName: 'Thread-2026-07-19'
+    })
+
+    expect(payload.format).toBe('pdf')
+    expect(payload.markdown).toBe('# Thread')
+    expect(() => conversationExportPayloadSchema.parse({
+      ...payload,
+      markdown: 'x'.repeat(CONVERSATION_EXPORT_MAX_MARKDOWN_CHARS + 1)
+    })).toThrow()
+    expect(() => conversationExportPayloadSchema.parse({
+      ...payload,
+      unexpected: true
+    })).toThrow()
+  })
+
   it('accepts write rich clipboard payloads', () => {
     const payload = writeRichClipboardPayloadSchema.parse({
       path: '/tmp/workspace/draft.md',
@@ -762,5 +1265,45 @@ describe('app-ipc-schemas', () => {
 
     expect(payload.path).toBe('/tmp/workspace/draft.md')
     expect(payload.content).toBe('# Draft')
+  })
+
+  it('accepts workspace image pick payloads and rejects extra fields', () => {
+    const payload = workspaceImagePickPayloadSchema.parse({
+      workspaceRoot: '/tmp/workspace',
+      currentFilePath: '/tmp/workspace/.kun-design/abc/v1.html',
+      imageDirectory: 'img'
+    })
+    expect(payload.workspaceRoot).toBe('/tmp/workspace')
+    expect(payload.currentFilePath).toBe('/tmp/workspace/.kun-design/abc/v1.html')
+    expect(payload.imageDirectory).toBe('img')
+    expect(
+      workspaceImagePickPayloadSchema.parse({
+        workspaceRoot: '/tmp/workspace',
+        imageDirectory: 'img'
+      })
+    ).toEqual({
+      workspaceRoot: '/tmp/workspace',
+      imageDirectory: 'img'
+    })
+    // .strict() must reject unknown keys so settings sync can't be poisoned.
+    expect(() =>
+      workspaceImagePickPayloadSchema.parse({
+        workspaceRoot: '/tmp/workspace',
+        currentFilePath: '/tmp/workspace/v1.html',
+        somethingExtra: 'nope'
+      })
+    ).toThrow()
+  })
+
+  it('accepts an exact filename for workspace image bytes', () => {
+    expect(workspaceImageBytesSavePayloadSchema.parse({
+      workspaceRoot: '/tmp/workspace',
+      dataBase64: 'aW1hZ2U=',
+      mimeType: 'image/png',
+      imageDirectory: '.deepseekgui-images',
+      fileName: 'architecture-a1b2c3.png'
+    })).toMatchObject({
+      fileName: 'architecture-a1b2c3.png'
+    })
   })
 })

@@ -1,12 +1,20 @@
 import { spawn } from 'node:child_process'
-import { access } from 'node:fs/promises'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { shellSpawnEnv } from './builtin-tool-utils.js'
 
 const SERVER_PROBE_TIMEOUT = 3_000
+const KUN_PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+const BUNDLED_TYPESCRIPT_LANGUAGE_SERVER_CLI = resolve(
+  KUN_PACKAGE_ROOT,
+  'node_modules/typescript-language-server/lib/cli.mjs'
+)
 
 export type LspServerCommand = {
   command: string
   args: string[]
+  env?: NodeJS.ProcessEnv
 }
 
 export interface LanguageServerDef {
@@ -24,23 +32,6 @@ function normalizeExtension(filePath: string): string {
   return filePath.toLowerCase()
 }
 
-async function resolveLocalOrPath(
-  workspaceRoot: string,
-  binary: string,
-  args: string[]
-): Promise<LspServerCommand | null> {
-  const localBinary = process.platform === 'win32' ? `${binary}.cmd` : binary
-  const localPath = join(workspaceRoot, 'node_modules', '.bin', localBinary)
-  try {
-    await access(localPath)
-    return { command: localPath, args }
-  } catch {
-    // fall through to PATH lookup
-  }
-  const found = await probeServerBinary(binary)
-  return found ? { command: binary, args } : null
-}
-
 async function resolvePathOnly(binary: string, args: string[] = []): Promise<LspServerCommand | null> {
   const found = await probeServerBinary(binary)
   return found ? { command: binary, args } : null
@@ -52,9 +43,17 @@ function registerDefaultLanguageServers(): void {
       key: 'typescript',
       displayName: 'TypeScript/JavaScript',
       extensions: ['.ts', '.tsx', '.js', '.jsx', '.mts', '.mjs', '.cts', '.cjs'],
-      installHint: 'Install with: npm install -g typescript-language-server typescript',
-      resolveCommand: async (workspaceRoot) => {
-        return resolveLocalOrPath(workspaceRoot, 'typescript-language-server', ['--stdio'])
+      installHint:
+        'Reinstall Kun to restore its bundled TypeScript language server, or install a compatible typescript-language-server on PATH.',
+      resolveCommand: async () => {
+        if (existsSync(BUNDLED_TYPESCRIPT_LANGUAGE_SERVER_CLI)) {
+          return {
+            command: process.execPath,
+            args: [BUNDLED_TYPESCRIPT_LANGUAGE_SERVER_CLI, '--stdio'],
+            env: { ELECTRON_RUN_AS_NODE: '1' }
+          }
+        }
+        return resolvePathOnly('typescript-language-server', ['--stdio'])
       },
       languageIdForFile: (filePath) => {
         const normalized = normalizeExtension(filePath)
@@ -140,8 +139,8 @@ function registerDefaultLanguageServers(): void {
       displayName: 'JSON',
       extensions: ['.json', '.jsonc'],
       installHint: 'Install with: npm install -g vscode-langservers-extracted',
-      resolveCommand: async (workspaceRoot) => {
-        return resolveLocalOrPath(workspaceRoot, 'vscode-json-language-server', ['--stdio'])
+      resolveCommand: async () => {
+        return resolvePathOnly('vscode-json-language-server', ['--stdio'])
       },
       languageIdForFile: (filePath) => (
         normalizeExtension(filePath).endsWith('.jsonc') ? 'jsonc' : 'json'
@@ -155,8 +154,8 @@ function registerDefaultLanguageServers(): void {
       displayName: 'YAML',
       extensions: ['.yaml', '.yml'],
       installHint: 'Install with: npm install -g yaml-language-server',
-      resolveCommand: async (workspaceRoot) => {
-        return resolveLocalOrPath(workspaceRoot, 'yaml-language-server', ['--stdio'])
+      resolveCommand: async () => {
+        return resolvePathOnly('yaml-language-server', ['--stdio'])
       },
       languageIdForFile: () => 'yaml'
     })
@@ -202,6 +201,7 @@ export async function probeServerBinary(binary: string): Promise<string | null> 
     const command = process.platform === 'win32' ? 'where' : 'which'
     const child = spawn(command, [binary], {
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: shellSpawnEnv(),
       timeout: SERVER_PROBE_TIMEOUT,
       windowsHide: true
     })

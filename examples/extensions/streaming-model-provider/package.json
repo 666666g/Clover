@@ -1,0 +1,21 @@
+{
+  "name": "@kun-examples/streaming-model-provider",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test dist/extension.test.js",
+    "validate": "node ../run-repository-kun-cli.mjs extension validate .",
+    "pack": "npm run build && node ../run-repository-kun-cli.mjs extension pack ."
+  },
+  "dependencies": {
+    "@kun/extension-api": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.2"
+  }
+}

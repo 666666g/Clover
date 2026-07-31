@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CompatModelClient } from '../src/adapters/model/compat-model-client.js'
+import {
+  CompatModelClient,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS
+} from '../src/adapters/model/compat-model-client.js'
 import {
   makeAssistantReasoningItem,
   makeAssistantTextItem,
@@ -95,6 +98,10 @@ function sseStream(payloads: Array<Record<string, unknown> | '[DONE]'>): Readabl
 }
 
 describe('CompatModelClient', () => {
+  it('uses the current 7.5 minute stream idle timeout by default', () => {
+    expect(DEFAULT_STREAM_IDLE_TIMEOUT_MS).toBe(450_000)
+  })
+
   it('uses request.model over client default model', async () => {
     const response = {
       id: 'r2',
@@ -230,6 +237,92 @@ describe('CompatModelClient', () => {
       expect.objectContaining({ kind: 'usage', usage: expect.objectContaining({ promptTokens: 2, completionTokens: 3 }) }),
       { kind: 'completed', stopReason: 'stop' }
     ])
+  })
+
+  it('sends Codex subscription reasoning max as xhigh with summaries enabled', async () => {
+    const sentUrls: string[] = []
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (url, init) => {
+      sentUrls.push(String(url))
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'resp_codex',
+        status: 'completed',
+        output_text: 'done'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      apiKey: 'codex-access',
+      model: 'gpt-5.5',
+      endpointFormat: 'custom_endpoint',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'gpt-5.5'
+    request.reasoningEffort = 'max'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentUrls[0]).toBe('https://chatgpt.com/backend-api/codex/responses')
+    expect(sentBodies[0]).toMatchObject({
+      model: 'gpt-5.5',
+      stream: false,
+      instructions: ' ',
+      input: [{
+        role: 'system',
+        content: 'You are a helpful assistant.'
+      }],
+      store: false,
+      reasoning: { effort: 'xhigh', summary: 'auto' },
+      include: ['reasoning.encrypted_content']
+    })
+    expect(sentBodies[0]).not.toHaveProperty('messages')
+    expect(sentBodies[0]?.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'image_generation' })
+    ]))
+  })
+
+  it('does not add Codex native image generation for gpt-5.3-codex-spark', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'resp_codex_spark',
+        status: 'completed',
+        output_text: 'done'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      apiKey: 'codex-access',
+      model: 'gpt-5.3-codex-spark',
+      endpointFormat: 'custom_endpoint',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'gpt-5.3-codex-spark'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    const tools = sentBodies[0]?.tools as Array<Record<string, unknown>> | undefined
+    expect(tools).toEqual([
+      expect.objectContaining({
+        type: 'function',
+        name: 'echo'
+      })
+    ])
+    expect(tools?.some((tool) => tool.type === 'image_generation')).toBe(false)
   })
 
   it('injects read-tool images as chat completions image parts for vision models', async () => {
@@ -1033,14 +1126,16 @@ describe('CompatModelClient', () => {
       // drain
     }
     expect(sentAccept[0]).toBe('application/json')
+    // Non-DeepSeek OpenAI-compat hosts must not receive DeepSeek-only `thinking`
+    // (see compat-request-builder nativeDeepSeekHost scoping / issue #26).
     expect(sentBodies[0]).toMatchObject({
       model: 'deepseek-v4-flash',
       stream: false,
       max_tokens: 96,
       temperature: 0,
-      response_format: { type: 'json_object' },
-      thinking: { type: 'disabled' }
+      response_format: { type: 'json_object' }
     })
+    expect(sentBodies[0]).not.toHaveProperty('thinking')
   })
 
   it('requests usage in streaming responses', async () => {
@@ -1077,7 +1172,7 @@ describe('CompatModelClient', () => {
     expect(sentHeaders[0]?.Accept).toBeUndefined()
   })
 
-  it('keeps requiredToolName as loop metadata instead of sending provider tool_choice', async () => {
+  it('serializes requiredToolName as an exact provider-native tool choice', async () => {
     const response = {
       id: 'required-tool-metadata',
       model: 'deepseek-chat',
@@ -1110,7 +1205,10 @@ describe('CompatModelClient', () => {
       // drain
     }
     expect(sentBodies[0]).toHaveProperty('tools')
-    expect(sentBodies[0]).not.toHaveProperty('tool_choice')
+    expect(sentBodies[0]).toHaveProperty('tool_choice', {
+      type: 'function',
+      function: { name: 'echo' }
+    })
   })
 
   it('passes the request abort signal to fetch', async () => {
@@ -2118,10 +2216,11 @@ describe('CompatModelClient', () => {
     expect(chunks[0].kind).toBe('error')
     expect(chunks[0]).toMatchObject({
       kind: 'error',
-      message: `model request failed with status 400: ${body}`,
+      message: expect.stringContaining('model request failed with status 400: {"error":{"code":"400","message":"Not supported model mimo-v2.5-pro-ultraspeed'),
       code: 'http_400'
     })
-    expect(JSON.stringify(chunks[0])).toContain(providerMessage)
+    expect(JSON.stringify(chunks[0])).toContain('...')
+    expect(JSON.stringify(chunks[0])).not.toContain(providerMessage)
   })
 
   it('adds a proxy hint when a proxied model request fails before receiving a response', async () => {
@@ -2133,6 +2232,7 @@ describe('CompatModelClient', () => {
       apiKey: 'k',
       model: 'deepseek-v4-pro',
       modelProxyUrl: 'http://127.0.0.1:7890',
+      retry: { maxAttempts: 0 },
       fetchImpl
     })
     const chunks: ModelStreamChunk[] = []
@@ -2383,6 +2483,141 @@ describe('CompatModelClient', () => {
     expect(sentBodies[1]).not.toHaveProperty('stream_options')
     expect(text).toBe('retried')
     expect(usage && usage.kind === 'usage' ? usage.usage.totalTokens : 0).toBe(7)
+  })
+
+  it('retries configured HTTP statuses before streaming starts', async () => {
+    const statuses = [429, 200]
+    const fetchImpl: typeof fetch = async () => {
+      const status = statuses.shift() ?? 200
+      if (status !== 200) return new Response('rate limited', { status })
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"retried"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } }
+      )
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/beta',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      fetchImpl,
+      retry: {
+        maxAttempts: 1,
+        initialDelayMs: 0,
+        httpStatusCodes: [429]
+      }
+    })
+    const chunks = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    const text = chunks
+      .filter((c) => c.kind === 'assistant_text_delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    expect(text).toBe('retried')
+    expect(statuses).toHaveLength(0)
+  })
+
+  it('uses Retry-After before retrying configured HTTP statuses', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        if (fetchImpl.mock.calls.length === 1) {
+          return new Response('rate limited', { status: 429, headers: { 'retry-after': '2' } })
+        }
+        return new Response('{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop","index":0}]}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      })
+      const client = new CompatModelClient({
+        baseUrl: 'https://example.com/beta',
+        apiKey: 'k',
+        model: 'deepseek-chat',
+        fetchImpl,
+        nonStreaming: true,
+        retry: {
+          maxAttempts: 1,
+          initialDelayMs: 0,
+          httpStatusCodes: [429]
+        }
+      })
+      const chunksPromise = (async () => {
+        const chunks = []
+        for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+          chunks.push(chunk)
+        }
+        return chunks
+      })()
+
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1))
+      await vi.advanceTimersByTimeAsync(1_999)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      const chunks = await chunksPromise
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2)
+      expect(chunks.some((chunk) => chunk.kind === 'assistant_text_delta')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('uses exponential backoff when Retry-After is absent', async () => {
+    vi.useFakeTimers()
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    try {
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        if (fetchImpl.mock.calls.length <= 2) {
+          return new Response('rate limited', { status: 429 })
+        }
+        return new Response('{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop","index":0}]}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      })
+      const client = new CompatModelClient({
+        baseUrl: 'https://example.com/beta',
+        apiKey: 'k',
+        model: 'deepseek-chat',
+        fetchImpl,
+        nonStreaming: true,
+        retry: {
+          maxAttempts: 2,
+          initialDelayMs: 3000,
+          httpStatusCodes: [429]
+        }
+      })
+      const chunksPromise = (async () => {
+        const chunks: ModelStreamChunk[] = []
+        for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+          chunks.push(chunk)
+        }
+        return chunks
+      })()
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(2999)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(fetchImpl).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(5999)
+      expect(fetchImpl).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
+      const chunks = await chunksPromise
+
+      expect(fetchImpl).toHaveBeenCalledTimes(3)
+      expect(chunks.filter((chunk) => chunk.kind === 'retrying')).toEqual([
+        { kind: 'retrying', status: 429, attempt: 1, maxAttempts: 2, delayMs: 3000 },
+        { kind: 'retrying', status: 429, attempt: 2, maxAttempts: 2, delayMs: 6000 }
+      ])
+      expect(chunks.some((chunk) => chunk.kind === 'assistant_text_delta')).toBe(true)
+    } finally {
+      randomSpy.mockRestore()
+      vi.useRealTimers()
+    }
   })
 
   it('merges streamed tool-call deltas by index when the provider id arrives later', async () => {

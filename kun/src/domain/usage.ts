@@ -10,12 +10,14 @@ export function zeroUsage(): UsageSnapshot {
 export function addUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapshot {
   const promptTokens = into.promptTokens + delta.promptTokens
   const completionTokens = into.completionTokens + delta.completionTokens
+  const reasoningTokens = sumOptional(into.reasoningTokens, delta.reasoningTokens)
   const totalTokens = promptTokens + completionTokens
   const cachedTokens = (into.cachedTokens ?? 0) + (delta.cachedTokens ?? 0)
   const cacheHitTokens =
     (into.cacheHitTokens ?? 0) + (delta.cacheHitTokens ?? 0)
   const cacheMissTokens =
     (into.cacheMissTokens ?? 0) + (delta.cacheMissTokens ?? 0)
+  const cacheWriteTokens = sumOptional(into.cacheWriteTokens, delta.cacheWriteTokens)
   const cacheTotal = cacheHitTokens + cacheMissTokens
   const cacheHitRate =
     cacheTotal === 0
@@ -41,6 +43,7 @@ export function addUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapsh
     into.costCny === undefined && delta.costCny === undefined
       ? undefined
       : (into.costCny ?? 0) + (delta.costCny ?? 0)
+  const costByCurrency = mergeCurrencyCosts(into.costByCurrency, delta.costByCurrency)
   const cacheSavingsUsd =
     into.cacheSavingsUsd === undefined && delta.cacheSavingsUsd === undefined
       ? undefined
@@ -62,10 +65,12 @@ export function addUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapsh
   return {
     promptTokens,
     completionTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     totalTokens,
     cachedTokens,
     cacheHitTokens,
     cacheMissTokens,
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
     cacheHitRate,
     cacheableTokenHitRate,
     totalInputTokenHitRate,
@@ -74,12 +79,29 @@ export function addUsage(into: UsageSnapshot, delta: UsageSnapshot): UsageSnapsh
     turns,
     costUsd,
     costCny,
+    ...(costByCurrency ? { costByCurrency } : {}),
     cacheSavingsUsd,
     cacheSavingsCny,
     tokenEconomySavingsTokens,
     tokenEconomySavingsUsd,
     tokenEconomySavingsCny
   }
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0)
+}
+
+function mergeCurrencyCosts(
+  left: Record<string, number> | undefined,
+  right: Record<string, number> | undefined
+): Record<string, number> | undefined {
+  if (!left && !right) return undefined
+  const merged: Record<string, number> = { ...(left ?? {}) }
+  for (const [currency, cost] of Object.entries(right ?? {})) {
+    merged[currency] = (merged[currency] ?? 0) + cost
+  }
+  return merged
 }
 
 /**

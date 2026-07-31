@@ -5,6 +5,7 @@ import type {
   ModelProviderImageCapabilityV1,
   ModelProviderMusicCapabilityV1,
   ModelProviderModelProfileV1,
+  ModelProviderPresetMode,
   ModelProviderProfileV1,
   ModelProviderReasoningCapabilityV1,
   ModelProviderSpeechCapabilityV1,
@@ -14,6 +15,11 @@ import type {
   TextToSpeechProtocol,
   VideoGenerationProtocol
 } from './app-settings-types'
+import {
+  DEFAULT_MODEL_REQUEST_RETRY_HTTP_STATUS_CODES,
+  DEFAULT_MODEL_REQUEST_RETRY_INITIAL_DELAY_MS,
+  DEFAULT_MODEL_REQUEST_RETRY_MAX_ATTEMPTS
+} from './app-settings-types'
 
 export type ModelProviderPresetId =
   | 'litellm'
@@ -21,8 +27,17 @@ export type ModelProviderPresetId =
   | 'zhipu-coding-plan'
   | 'zai-coding-plan'
   | 'kimi-code'
+  | 'volcengine'
+  | 'volcengine-agent-plan'
   | 'volcengine-coding-plan'
   | 'opencode-go'
+  | 'codex'
+  | 'claude-subscription'
+  | 'gemini-subscription'
+  | 'gemini-cli-subscription'
+  | 'cursor-subscription'
+  | 'ollama'
+  | 'grok-subscription'
   | 'moonshot-cn'
   | 'moonshot-global'
   | 'xiaomi'
@@ -31,14 +46,88 @@ export type ModelProviderPresetId =
   | 'aliyun'
   | 'tencentcloud'
   | 'vercel-ai-gateway'
-  | 'claude-subscription'
 
 export const TOKEN_PLAN_PROVIDER_ID_SUFFIX = '-token-plan'
+
+export const CHATGPT_SUBSCRIPTION_PROVIDER_ID = 'codex'
+export const CHATGPT_SUBSCRIPTION_LEGACY_NAME = 'Codex (ChatGPT)'
+export const CHATGPT_SUBSCRIPTION_NAME = 'ChatGPT 订阅'
+export const GROK_SUBSCRIPTION_PROVIDER_ID = 'grok-subscription'
+export const GROK_SUBSCRIPTION_NAME = 'Grok 订阅'
+export const GEMINI_SUBSCRIPTION_PROVIDER_ID = 'gemini-subscription'
+export const GEMINI_SUBSCRIPTION_NAME = 'Google Antigravity 订阅'
+export const GEMINI_CLI_SUBSCRIPTION_PROVIDER_ID = 'gemini-cli-subscription'
+export const GEMINI_CLI_SUBSCRIPTION_NAME = 'Gemini CLI 订阅（API）'
+export const CURSOR_SUBSCRIPTION_PROVIDER_ID = 'cursor-subscription'
+export const CURSOR_SUBSCRIPTION_NAME = 'Cursor 订阅'
+export const CURSOR_SUBSCRIPTION_MODEL_IDS = ['auto'] as const
+export const OLLAMA_CLOUD_PROVIDER_ID = 'ollama'
+export const OLLAMA_CLOUD_PROVIDER_NAME = 'Ollama Cloud'
+// Bootstrap snapshot from Ollama Cloud's official GET /v1/models response.
+// The live endpoint remains authoritative and Settings can import additions.
+export const OLLAMA_CLOUD_MODEL_IDS = [
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'gemma4:31b',
+  'glm-5.1',
+  'glm-5.2',
+  'gpt-oss:120b',
+  'gpt-oss:20b',
+  'kimi-k2.5',
+  'kimi-k2.6',
+  'kimi-k2.7-code',
+  'minimax-m2.5',
+  'minimax-m2.7',
+  'minimax-m3',
+  'mistral-large-3:675b',
+  'nemotron-3-nano:30b',
+  'nemotron-3-super',
+  'nemotron-3-ultra',
+  'qwen3.5:397b'
+] as const
+export const GEMINI_SUBSCRIPTION_MODEL_IDS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.1-pro'
+] as const
+// Concrete model ids accepted by the official Gemini CLI Code Assist API
+// path. Keep this catalog independent from Antigravity's `agy models` output:
+// the two transports can expose different releases to the same Google account.
+export const GEMINI_CLI_SUBSCRIPTION_MODEL_IDS = [
+  'gemini-3.1-pro-preview',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-pro',
+  'gemini-2.5-flash'
+] as const
+export const GROK_SUBSCRIPTION_MODEL_IDS = [
+  'grok-4.5',
+  'grok-4-1-fast-reasoning',
+  'grok-4-1-fast-non-reasoning',
+  'grok-code-fast-1'
+] as const
+export const CHATGPT_SUBSCRIPTION_LEGACY_MODEL_IDS = [
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.3-codex-spark'
+] as const
+export const CHATGPT_SUBSCRIPTION_MODEL_IDS = [
+  'gpt-5.5',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.3-codex-spark'
+] as const
 
 export type ModelProviderTokenPlanRegion = {
   id: string
   baseUrl: string
 }
+
+export type ModelProviderSubscriptionRegion = 'china' | 'united-states'
 
 /**
  * Subscription ("Token Plan") access mode. Providers issue separate keys for
@@ -94,10 +183,18 @@ export type ModelProviderPreset = {
    */
   category?: 'api' | 'subscription'
   /**
-   * 传输类型。'agent-sdk' = 把整轮委托给内置的官方 Claude Agent SDK(消耗 Claude
-   * Pro/Max 订阅额度,合规路径);缺省按 HTTP 模型客户端走 baseUrl。
+   * 套餐订阅筛选所使用的供应商归属地区。仅用于预设选择器展示，不写入 provider profile。
+   * 同一个预设的 Token Plan 入口沿用这里的地区。
    */
-  kind?: 'agent-sdk'
+  subscriptionRegion?: ModelProviderSubscriptionRegion
+  /**
+   * 传输类型。'agent-sdk' = 把整轮委托给内置的官方 Claude Agent SDK(消耗 Claude
+   * Pro/Max 订阅额度,合规路径);'antigravity-cli' = 把整轮委托给 Google 官方
+   * Antigravity CLI(使用 Gemini 订阅);'gemini-cli-api' = 复用官方 Gemini CLI
+   * OAuth 登录并直接调用 Code Assist API,由 Kun 保留 agent loop;'cursor-sdk' =
+   * 使用 Cursor API Key 把整轮委托给官方 Cursor SDK;缺省按 HTTP 模型客户端走 baseUrl。
+   */
+  kind?: 'agent-sdk' | 'antigravity-cli' | 'gemini-cli-api' | 'cursor-sdk'
   baseUrl: string
   endpointFormat: ModelEndpointFormat
   models: string[]
@@ -158,24 +255,77 @@ const GLM_REASONING: ModelProviderReasoningCapabilityV1 = {
   requestProtocol: 'glm-chat-completions'
 }
 
-// 通义千问 / 混元 / 豆包的「思考」开关各家用私有 body 字段,无法用现有 requestProtocol 精确映射,
-// 这里统一按「内置推理」建模(requestProtocol: 'none'):只展示 effort 开关、不向上游发送特定协议字段,避免请求被拒。
-const QWEN_REASONING: ModelProviderReasoningCapabilityV1 = {
-  supportedEfforts: ['auto', 'off'],
-  defaultEffort: 'auto',
+const CODEX_RESPONSES_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['low', 'medium', 'high', 'max'],
+  defaultEffort: 'high',
+  requestProtocol: 'openai-responses'
+}
+
+const GROK_RESPONSES_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['low', 'medium', 'high'],
+  defaultEffort: 'high',
+  requestProtocol: 'openai-responses'
+}
+
+const KIMI_K3_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['low', 'high', 'max'],
+  defaultEffort: 'high',
+  requestProtocol: 'openai-chat-completions'
+}
+
+const CLAUDE_ADAPTIVE_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['low', 'medium', 'high', 'max'],
+  defaultEffort: 'high',
+  requestProtocol: 'anthropic-thinking'
+}
+
+const DEEPSEEK_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['off', 'high', 'max'],
+  defaultEffort: 'max',
+  requestProtocol: 'deepseek-chat-completions'
+}
+
+const ANTIGRAVITY_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['low', 'medium', 'high'],
+  defaultEffort: 'medium',
+  // The delegated runtime maps this to `agy --effort`; the HTTP request
+  // protocol is intentionally unused.
   requestProtocol: 'none'
 }
 
+const GEMINI_CLI_API_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['off', 'low', 'medium', 'high'],
+  defaultEffort: 'medium',
+  // The dedicated Gemini CLI API adapter maps this to generationConfig.thinkingConfig.
+  requestProtocol: 'none'
+}
+
+export const CURSOR_SDK_ADAPTIVE_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['auto'],
+  defaultEffort: 'auto',
+  // Cursor's Agent SDK owns the model-specific thinking parameters. Omitting
+  // explicit SDK params preserves its adaptive default for every model family.
+  requestProtocol: 'none'
+}
+
+// Mixed-thinking Qwen models use the DashScope-compatible enable_thinking flag.
+const QWEN_REASONING: ModelProviderReasoningCapabilityV1 = {
+  supportedEfforts: ['auto', 'off'],
+  defaultEffort: 'auto',
+  requestProtocol: 'qwen-chat-completions'
+}
+
+// Tencent and Volcano OpenAI-compatible endpoints expose the thinking object.
 const HUNYUAN_REASONING: ModelProviderReasoningCapabilityV1 = {
   supportedEfforts: ['auto', 'off'],
   defaultEffort: 'auto',
-  requestProtocol: 'none'
+  requestProtocol: 'thinking-toggle-chat-completions'
 }
 
 const DOUBAO_REASONING: ModelProviderReasoningCapabilityV1 = {
   supportedEfforts: ['auto', 'off'],
   defaultEffort: 'auto',
-  requestProtocol: 'none'
+  requestProtocol: 'thinking-toggle-chat-completions'
 }
 
 const ZHIPU_CODING_PLAN_MODELS = [
@@ -204,6 +354,33 @@ const MOONSHOT_CHAT_MODELS = [
   'moonshot-v1-8k'
 ]
 
+const VOLCENGINE_CHAT_MODELS = [
+  'doubao-seed-2-1-pro-260628',
+  'doubao-seed-2-1-turbo-260628',
+  'doubao-seed-evolving',
+  'doubao-seed-2-0-lite-260428',
+  'doubao-seed-2-0-mini-260428'
+]
+
+const VOLCENGINE_AGENT_PLAN_CHAT_MODELS = [
+  'doubao-seed-2.1-turbo',
+  'doubao-seed-evolving',
+  'doubao-seed-2.0-lite',
+  'doubao-seed-2.0-mini'
+]
+
+const VOLCENGINE_IMAGE_MODELS = [
+  'doubao-seedream-5-0-pro-260628',
+  'doubao-seedream-5-0-260128',
+  'doubao-seedream-5-0-lite-260128'
+]
+
+const VOLCENGINE_VIDEO_MODELS = [
+  'doubao-seedance-2-0-260128',
+  'doubao-seedance-2-0-fast-260128',
+  'doubao-seedance-2-0-mini-260615'
+]
+
 export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
   {
     id: 'litellm',
@@ -230,6 +407,7 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     id: 'claude-subscription',
     name: 'Claude (Pro/Max 订阅)',
     category: 'subscription',
+    subscriptionRegion: 'united-states',
     // Delegates whole turns to the official Claude Agent SDK so requests draw on
     // the user's Claude subscription. baseUrl is unused for this kind (kept for
     // display); auth comes from the host's Claude Code login or a pasted
@@ -245,17 +423,97 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     // the agent-sdk path (the SDK enforces the real limit); preset profiles are
     // authoritative, so edit them here.
     modelProfiles: {
-      'claude-opus-4-8': visionChatProfile(1_000_000),
-      'claude-sonnet-4-6': visionChatProfile(1_000_000),
+      'claude-opus-4-8': visionChatProfile(1_000_000, CLAUDE_ADAPTIVE_REASONING),
+      'claude-sonnet-4-6': visionChatProfile(1_000_000, CLAUDE_ADAPTIVE_REASONING),
       'claude-haiku-4-5': visionChatProfile(200_000)
     },
     docsUrl: 'https://code.claude.com/docs/en/authentication',
     apiKeyUrl: 'https://claude.ai'
   },
   {
+    id: GEMINI_SUBSCRIPTION_PROVIDER_ID,
+    name: GEMINI_SUBSCRIPTION_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    // Antigravity subscription models are served by Google's official
+    // Antigravity CLI. Do not route this provider's ids through the separate
+    // Gemini CLI Code Assist API transport or the public API-key endpoint.
+    kind: 'antigravity-cli',
+    baseUrl: '',
+    endpointFormat: 'custom_endpoint',
+    models: [...GEMINI_SUBSCRIPTION_MODEL_IDS],
+    modelProfiles: Object.fromEntries(
+      GEMINI_SUBSCRIPTION_MODEL_IDS.map((model) => [
+        model,
+        visionChatProfile(1_048_576, ANTIGRAVITY_REASONING)
+      ])
+    ),
+    docsUrl: 'https://github.com/google-antigravity/antigravity-cli',
+    apiKeyUrl: 'https://antigravity.google'
+  },
+  {
+    id: GEMINI_CLI_SUBSCRIPTION_PROVIDER_ID,
+    name: GEMINI_CLI_SUBSCRIPTION_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    // Reuses the official Gemini CLI's OAuth credential and direct Code Assist
+    // API contract. This is a native Kun model transport, not an Antigravity
+    // whole-turn delegation and not the public API-key endpoint.
+    kind: 'gemini-cli-api',
+    baseUrl: '',
+    endpointFormat: 'custom_endpoint',
+    models: [...GEMINI_CLI_SUBSCRIPTION_MODEL_IDS],
+    modelProfiles: Object.fromEntries(
+      GEMINI_CLI_SUBSCRIPTION_MODEL_IDS.map((model) => [
+        model,
+        visionChatProfile(1_048_576, GEMINI_CLI_API_REASONING)
+      ])
+    ),
+    speech: {
+      protocol: 'gemini-cli-audio',
+      baseUrl: '',
+      models: [...GEMINI_CLI_SUBSCRIPTION_MODEL_IDS]
+    },
+    docsUrl: 'https://github.com/google-gemini/gemini-cli',
+    apiKeyUrl: 'https://github.com/google-gemini/gemini-cli#authentication-options'
+  },
+  {
+    id: CURSOR_SUBSCRIPTION_PROVIDER_ID,
+    name: CURSOR_SUBSCRIPTION_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    // Cursor exposes an official Agent SDK instead of an OpenAI-compatible
+    // subscription endpoint. Account-visible models are pulled after the user
+    // supplies a Cursor API key; `auto` remains the offline fallback.
+    kind: 'cursor-sdk',
+    baseUrl: '',
+    endpointFormat: 'custom_endpoint',
+    models: [...CURSOR_SUBSCRIPTION_MODEL_IDS],
+    modelProfiles: {
+      auto: textChatProfile(undefined, CURSOR_SDK_ADAPTIVE_REASONING)
+    },
+    docsUrl: 'https://cursor.com/docs/api/sdk/typescript',
+    apiKeyUrl: 'https://cursor.com/dashboard/api?section=user-keys#user-api-keys'
+  },
+  {
+    id: OLLAMA_CLOUD_PROVIDER_ID,
+    name: OLLAMA_CLOUD_PROVIDER_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    // Ollama Cloud documents an OpenAI-compatible surface, so Kun can retain
+    // its single HTTP model loop (streaming, tools, images, and usage) instead
+    // of adding a parallel native /api/chat transport.
+    baseUrl: 'https://ollama.com/v1',
+    endpointFormat: 'chat_completions',
+    models: [...OLLAMA_CLOUD_MODEL_IDS],
+    docsUrl: 'https://docs.ollama.com/cloud',
+    apiKeyUrl: 'https://ollama.com/settings/keys'
+  },
+  {
     id: 'zhipu-coding-plan',
     name: 'Zhipu Coding Plan',
     category: 'subscription',
+    subscriptionRegion: 'china',
     baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
     endpointFormat: 'custom_endpoint',
     models: [...ZHIPU_CODING_PLAN_MODELS],
@@ -273,6 +531,7 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     id: 'zai-coding-plan',
     name: 'Z.ai Coding Plan',
     category: 'subscription',
+    subscriptionRegion: 'china',
     baseUrl: 'https://api.z.ai/api/coding/paas/v4/chat/completions',
     endpointFormat: 'custom_endpoint',
     models: [...ZAI_CODING_PLAN_MODELS],
@@ -291,19 +550,78 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     id: 'kimi-code',
     name: 'Kimi Code',
     category: 'subscription',
+    subscriptionRegion: 'china',
     baseUrl: 'https://api.kimi.com/coding/v1',
     endpointFormat: 'chat_completions',
-    models: ['kimi-for-coding'],
+    models: ['k3', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
     modelProfiles: {
-      'kimi-for-coding': textChatProfile()
+      k3: visionChatProfile(1_000_000, KIMI_K3_REASONING),
+      'kimi-for-coding': textChatProfile(262_144),
+      'kimi-for-coding-highspeed': textChatProfile(262_144)
     },
     docsUrl: 'https://www.kimi.com/code/docs/en/',
     apiKeyUrl: 'https://www.kimi.com/code'
   },
   {
+    id: 'volcengine',
+    name: 'Volcano Ark API',
+    subscriptionRegion: 'china',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    endpointFormat: 'chat_completions',
+    models: [...VOLCENGINE_CHAT_MODELS],
+    modelProfiles: {
+      'doubao-seed-2-1-pro-260628': visionChatProfile(256_000, DOUBAO_REASONING),
+      'doubao-seed-2-1-turbo-260628': visionChatProfile(256_000, DOUBAO_REASONING),
+      'doubao-seed-evolving': visionChatProfile(1_024_000, DOUBAO_REASONING),
+      'doubao-seed-2-0-lite-260428': visionChatProfile(256_000, DOUBAO_REASONING),
+      'doubao-seed-2-0-mini-260428': visionChatProfile(256_000, DOUBAO_REASONING)
+    },
+    image: {
+      protocol: 'volcengine-ark-image',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      models: [...VOLCENGINE_IMAGE_MODELS]
+    },
+    video: {
+      protocol: 'volcengine-ark-video',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      models: [...VOLCENGINE_VIDEO_MODELS]
+    },
+    docsUrl: 'https://www.volcengine.com/docs/82379/1330310',
+    apiKeyUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey'
+  },
+  {
+    id: 'volcengine-agent-plan',
+    name: 'Volcano Ark Agent Plan',
+    category: 'subscription',
+    subscriptionRegion: 'china',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+    endpointFormat: 'chat_completions',
+    models: [...VOLCENGINE_AGENT_PLAN_CHAT_MODELS],
+    modelProfiles: {
+      'doubao-seed-2.1-turbo': visionChatProfile(256_000, DOUBAO_REASONING),
+      'doubao-seed-evolving': visionChatProfile(1_024_000, DOUBAO_REASONING),
+      'doubao-seed-2.0-lite': visionChatProfile(256_000, DOUBAO_REASONING),
+      'doubao-seed-2.0-mini': visionChatProfile(256_000, DOUBAO_REASONING)
+    },
+    image: {
+      protocol: 'volcengine-ark-image',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      models: ['doubao-seedream-5.0-lite']
+    },
+    video: {
+      protocol: 'volcengine-ark-video',
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3',
+      models: ['doubao-seedance-2.0', 'doubao-seedance-2.0-fast', 'doubao-seedance-2.0-mini']
+    },
+    docsUrl: 'https://www.volcengine.com/docs/82379/2366394',
+    apiKeyUrl:
+      'https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&OpenModelVisible=false&advancedActiveKey=agentPlan'
+  },
+  {
     id: 'volcengine-coding-plan',
     name: 'Volcano Ark Coding Plan',
     category: 'subscription',
+    subscriptionRegion: 'china',
     // 火山方舟 Coding Plan 与按量付费共用同一个 API Key,但套餐额度只在 /api/coding 网关上消费;
     // 用按量 base(/api/v3)调用会按量计费。官方注明套餐额度仅限编程工具(Claude Code / Cursor 等)使用。
     baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3',
@@ -320,12 +638,14 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     id: 'opencode-go',
     name: 'OpenCode Go',
     category: 'subscription',
+    subscriptionRegion: 'united-states',
     // 网关默认走 chat_completions;MiniMax / Qwen 系列在 OpenCode Go 上以
     // Anthropic Messages 格式提供,故按模型用 endpointFormat:'messages' 覆盖
     // (请求改打 …/zen/go/v1/messages)。
     baseUrl: 'https://opencode.ai/zen/go/v1',
     endpointFormat: 'chat_completions',
     models: [
+      'glm-5.2',
       'glm-5.1',
       'glm-5',
       'kimi-k2.7',
@@ -346,13 +666,14 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
       'qwen3.5-plus'
     ],
     modelProfiles: {
-      'glm-5.1': visionChatProfile(131_072),
-      'glm-5': visionChatProfile(131_072),
+      'glm-5.2': visionChatProfile(1_000_000, GLM_REASONING),
+      'glm-5.1': visionChatProfile(131_072, GLM_REASONING),
+      'glm-5': visionChatProfile(131_072, GLM_REASONING),
       'kimi-k2.7': textChatProfile(131_072),
       'kimi-k2.7-code': textChatProfile(131_072),
       'kimi-k2.6': textChatProfile(131_072),
-      'deepseek-v4-pro': textChatProfile(131_072),
-      'deepseek-v4-flash': textChatProfile(131_072),
+      'deepseek-v4-pro': textChatProfile(1_000_000, DEEPSEEK_REASONING),
+      'deepseek-v4-flash': textChatProfile(1_000_000, DEEPSEEK_REASONING),
       'mimo-v2.5': textChatProfile(131_072),
       'mimo-v2.5-pro': textChatProfile(131_072),
       'mimo-v2-pro': textChatProfile(131_072),
@@ -405,17 +726,16 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
   {
     id: 'xiaomi',
     name: 'Xiaomi',
+    subscriptionRegion: 'china',
     baseUrl: 'https://api.xiaomimimo.com/v1',
     endpointFormat: 'chat_completions',
     models: [
-      'mimo-v2.5-pro-ultraspeed',
       'mimo-v2.5-pro',
       'mimo-v2.5',
       'mimo-v2-pro',
       'mimo-v2-omni'
     ],
     modelProfiles: {
-      'mimo-v2.5-pro-ultraspeed': xiaomiTextChatProfile(1_000_000),
       'mimo-v2.5-pro': xiaomiTextChatProfile(1_000_000),
       'mimo-v2.5': xiaomiVisionChatProfile(1_000_000),
       'mimo-v2-pro': xiaomiTextChatProfile(1_000_000),
@@ -440,14 +760,12 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
       ],
       endpointFormat: 'chat_completions',
       models: [
-        'mimo-v2.5-pro-ultraspeed',
         'mimo-v2.5-pro',
         'mimo-v2.5',
         'mimo-v2-pro',
         'mimo-v2-omni'
       ],
       modelProfiles: {
-        'mimo-v2.5-pro-ultraspeed': xiaomiTextChatProfile(1_000_000),
         'mimo-v2.5-pro': xiaomiTextChatProfile(1_000_000),
         'mimo-v2.5': xiaomiVisionChatProfile(1_000_000),
         'mimo-v2-pro': xiaomiTextChatProfile(1_000_000),
@@ -470,6 +788,7 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
   {
     id: 'minimax',
     name: 'MiniMax',
+    subscriptionRegion: 'china',
     baseUrl: 'https://api.minimaxi.com/anthropic',
     endpointFormat: 'messages',
     models: [
@@ -589,6 +908,7 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
   {
     id: 'aliyun',
     name: 'Aliyun',
+    subscriptionRegion: 'china',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     endpointFormat: 'chat_completions',
     models: [
@@ -643,6 +963,7 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
   {
     id: 'tencentcloud',
     name: 'Tencent Cloud',
+    subscriptionRegion: 'china',
     baseUrl: 'https://api.hunyuan.cloud.tencent.com/v1',
     endpointFormat: 'chat_completions',
     models: ['hunyuan-turbos-latest', 'hunyuan-t1-latest', 'hunyuan-lite'],
@@ -668,6 +989,71 @@ export const MODEL_PROVIDER_PRESETS: ModelProviderPreset[] = [
     apiKeyUrl: 'https://console.cloud.tencent.com/hunyuan/start'
   },
   {
+    id: CHATGPT_SUBSCRIPTION_PROVIDER_ID,
+    name: CHATGPT_SUBSCRIPTION_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    baseUrl: 'https://chatgpt.com/backend-api/codex/responses',
+    endpointFormat: 'custom_endpoint',
+    models: [...CHATGPT_SUBSCRIPTION_MODEL_IDS],
+    modelProfiles: {
+      'gpt-5.5': withPriorityServiceTier(
+        visionChatProfile(1_000_000, CODEX_RESPONSES_REASONING)
+      ),
+      'gpt-5.6-sol': withPriorityServiceTier(codexLiteVisionChatProfile(372_000)),
+      'gpt-5.6-terra': withPriorityServiceTier(codexLiteVisionChatProfile(372_000)),
+      'gpt-5.6-luna': withPriorityServiceTier(codexLiteVisionChatProfile(372_000)),
+      'gpt-5.4': withPriorityServiceTier(
+        visionChatProfile(1_000_000, CODEX_RESPONSES_REASONING)
+      ),
+      'gpt-5.4-mini': visionChatProfile(1_000_000, CODEX_RESPONSES_REASONING),
+      'gpt-5.3-codex-spark': textChatProfile(128_000, CODEX_RESPONSES_REASONING)
+    },
+    image: {
+      protocol: 'codex-responses-image',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      models: ['gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini']
+    },
+    docsUrl: 'https://openai.com/index/codex/',
+    apiKeyUrl: 'https://chatgpt.com'
+  },
+  {
+    id: GROK_SUBSCRIPTION_PROVIDER_ID,
+    name: GROK_SUBSCRIPTION_NAME,
+    category: 'subscription',
+    subscriptionRegion: 'united-states',
+    // Session OAuth tokens must hit cli-chat-proxy (subscription quota). Pay-as-you-go
+    // XAI_API_KEY traffic uses https://api.x.ai/v1 instead — keep them separate.
+    baseUrl: 'https://cli-chat-proxy.grok.com/v1',
+    endpointFormat: 'responses',
+    models: [...GROK_SUBSCRIPTION_MODEL_IDS],
+    modelProfiles: {
+      'grok-4.5': visionChatProfile(500_000, GROK_RESPONSES_REASONING),
+      'grok-4-1-fast-reasoning': visionChatProfile(2_000_000),
+      'grok-4-1-fast-non-reasoning': visionChatProfile(2_000_000),
+      'grok-code-fast-1': textChatProfile(256_000)
+    },
+    // Grok Build deliberately sends subscription OAuth bearers directly to the
+    // public xAI media API. Chat remains on cli-chat-proxy above.
+    image: {
+      protocol: 'grok-imagine-image',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-imagine-image-quality', 'grok-imagine-image']
+    },
+    video: {
+      protocol: 'grok-imagine-video',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-imagine-video-1.5-preview', 'grok-imagine-video']
+    },
+    speech: {
+      protocol: 'xai-stt',
+      baseUrl: 'https://api.x.ai/v1',
+      models: ['grok-transcribe']
+    },
+    docsUrl: 'https://docs.x.ai/',
+    apiKeyUrl: 'https://accounts.x.ai'
+  },
+  {
     id: 'vercel-ai-gateway',
     name: 'Vercel AI Gateway',
     baseUrl: 'https://ai-gateway.vercel.sh/v1',
@@ -682,6 +1068,14 @@ export function getModelProviderPreset(id: string): ModelProviderPreset | null {
   return MODEL_PROVIDER_PRESETS.find((preset) => preset.id === id) ?? null
 }
 
+function defaultPresetRetrySettings() {
+  return {
+    maxAttempts: DEFAULT_MODEL_REQUEST_RETRY_MAX_ATTEMPTS,
+    initialDelayMs: DEFAULT_MODEL_REQUEST_RETRY_INITIAL_DELAY_MS,
+    httpStatusCodes: [...DEFAULT_MODEL_REQUEST_RETRY_HTTP_STATUS_CODES]
+  }
+}
+
 export function modelProviderPresetProfile(
   preset: ModelProviderPreset,
   apiKey = ''
@@ -689,9 +1083,13 @@ export function modelProviderPresetProfile(
   return {
     id: preset.id,
     name: preset.name,
+    presetSource: { presetId: preset.id, mode: 'api' },
     apiKey: apiKey.trim(),
     baseUrl: preset.baseUrl,
     endpointFormat: preset.endpointFormat,
+    // Subscription and API transports share the same bounded default. An
+    // explicit provider setting can still reduce or disable retries.
+    retry: defaultPresetRetrySettings(),
     ...(preset.kind ? { kind: preset.kind } : {}),
     models: [...preset.models],
     modelProfiles: copyModelProfiles(preset.modelProfiles),
@@ -720,9 +1118,11 @@ export function modelProviderTokenPlanProfile(
   return {
     id: tokenPlanProviderId(preset.id),
     name: `${preset.name} Token Plan`,
+    presetSource: { presetId: preset.id, mode: 'token-plan' },
     apiKey: apiKey.trim(),
     baseUrl: resolvedBaseUrl,
     endpointFormat: tokenPlan.endpointFormat,
+    retry: defaultPresetRetrySettings(),
     models: [...tokenPlan.models],
     modelProfiles: copyModelProfiles(tokenPlan.modelProfiles),
     ...(tokenPlan.image
@@ -771,6 +1171,90 @@ export function modelProviderTokenPlanProfile(
         }
       : {})
   }
+}
+
+export type ResolvedModelProviderPresetSource = {
+  preset: ModelProviderPreset
+  mode: ModelProviderPresetMode
+}
+
+/**
+ * Resolves a persisted profile back to its built-in preset. Explicit source
+ * metadata supports multi-account ids; exact legacy ids remain compatible.
+ */
+export function resolveModelProviderPresetSource(
+  profile: Pick<ModelProviderProfileV1, 'id' | 'presetSource'>
+): ResolvedModelProviderPresetSource | null {
+  const explicit = profile.presetSource
+  if (explicit) {
+    const preset = getModelProviderPreset(explicit.presetId)
+    if (!preset || (explicit.mode === 'token-plan' && !preset.tokenPlan)) return null
+    return { preset, mode: explicit.mode }
+  }
+  const direct = getModelProviderPreset(profile.id)
+  if (direct) return { preset: direct, mode: 'api' }
+  if (!profile.id.endsWith(TOKEN_PLAN_PROVIDER_ID_SUFFIX)) return null
+  const preset = getModelProviderPreset(profile.id.slice(0, -TOKEN_PLAN_PROVIDER_ID_SUFFIX.length))
+  return preset?.tokenPlan ? { preset, mode: 'token-plan' } : null
+}
+
+export function isMultiAccountProviderPreset(
+  preset: ModelProviderPreset,
+  mode: ModelProviderPresetMode
+): boolean {
+  return mode === 'token-plan' || preset.category === 'subscription'
+}
+
+export function modelProviderPresetAccountCount(
+  preset: ModelProviderPreset,
+  mode: ModelProviderPresetMode,
+  providers: readonly Pick<ModelProviderProfileV1, 'id' | 'name' | 'presetSource'>[]
+): number {
+  return providers.filter((provider) => {
+    const source = resolveModelProviderPresetSource(provider)
+    return source?.preset.id === preset.id && source.mode === mode
+  }).length
+}
+
+/** Builds the next independent account profile for a preset/mode family. */
+export function modelProviderPresetAccountProfile(
+  preset: ModelProviderPreset,
+  mode: ModelProviderPresetMode,
+  providers: readonly Pick<ModelProviderProfileV1, 'id' | 'name' | 'presetSource'>[]
+): ModelProviderProfileV1 | null {
+  const base = mode === 'token-plan'
+    ? modelProviderTokenPlanProfile(preset)
+    : modelProviderPresetProfile(preset)
+  if (!base) return null
+  const family = providers.filter((provider) => {
+    const source = resolveModelProviderPresetSource(provider)
+    return source?.preset.id === preset.id && source.mode === mode
+  })
+  const idPattern = new RegExp(`^${escapeRegExp(base.id)}-(\\d+)$`)
+  const namePattern = new RegExp(`^${escapeRegExp(base.name)} (\\d+)$`, 'i')
+  let highestOrdinal = 0
+  for (const provider of family) {
+    highestOrdinal = Math.max(
+      highestOrdinal,
+      provider.id === base.id ? 1 : Number(idPattern.exec(provider.id)?.[1] ?? 0),
+      provider.name.toLowerCase() === base.name.toLowerCase() ? 1 : Number(namePattern.exec(provider.name)?.[1] ?? 0)
+    )
+  }
+  let ordinal = family.length === 0 ? 1 : Math.max(highestOrdinal, family.length) + 1
+  const usedIds = new Set(providers.map((provider) => provider.id.toLowerCase()))
+  const usedNames = new Set(providers.map((provider) => provider.name.trim().toLowerCase()).filter(Boolean))
+  while (true) {
+    const id = ordinal === 1 ? base.id : `${base.id}-${ordinal}`
+    const name = ordinal === 1 ? base.name : `${base.name} ${ordinal}`
+    if (!usedIds.has(id.toLowerCase()) && !usedNames.has(name.toLowerCase())) {
+      return { ...base, id, name }
+    }
+    ordinal += 1
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function tokenPlanCapabilityBaseUrl(
@@ -858,6 +1342,22 @@ function visionChatProfile(
   }
 }
 
+function codexLiteVisionChatProfile(contextWindowTokens: number): ModelProviderModelProfileV1 {
+  return {
+    ...visionChatProfile(contextWindowTokens, CODEX_RESPONSES_REASONING),
+    responsesMode: 'lite'
+  }
+}
+
+function withPriorityServiceTier(
+  profile: ModelProviderModelProfileV1
+): ModelProviderModelProfileV1 {
+  return {
+    ...profile,
+    serviceTiers: ['priority']
+  }
+}
+
 function copyModelProfiles(
   profiles: Record<string, ModelProviderModelProfileV1> | undefined
 ): Record<string, ModelProviderModelProfileV1> {
@@ -871,6 +1371,7 @@ function copyModelProfiles(
         inputModalities: [...profile.inputModalities],
         outputModalities: [...profile.outputModalities],
         messageParts: [...profile.messageParts],
+        ...(profile.serviceTiers ? { serviceTiers: [...profile.serviceTiers] } : {}),
         ...(profile.reasoning
           ? {
               reasoning: {

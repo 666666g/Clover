@@ -70,7 +70,7 @@ export function FloatingComposerAgentPicker({ compact = false, disabled }: Props
   }
 
   return (
-    <div ref={rootRef} className="ds-no-drag relative">
+    <div ref={rootRef} className="ds-composer-agent-picker ds-no-drag relative">
       <button
         type="button"
         disabled={disabled}

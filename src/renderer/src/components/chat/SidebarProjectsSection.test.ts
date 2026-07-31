@@ -1,24 +1,37 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { act, create as createRenderer, type ReactTestRenderer } from 'react-test-renderer'
 import { describe, expect, it, vi } from 'vitest'
 import type { NormalizedThread } from '../../agent/types'
 import type { SddDraftHistoryItem } from '../../sdd/sdd-draft-history'
+import { SidebarConversationsSection } from './SidebarConversationsSection'
 import {
+  buildSidebarThreadMoveTargets,
   buildSidebarDraftWorkspacePaths,
   buildSidebarWorkspaceGroups,
   filterEmptySddAssistantThreadsFromSidebar,
   filterSddDraftHistoryItems,
+  isSidebarThreadMoveBlocked,
   mergeSidebarWorkspaceGroupsWithDraftHistory,
+  MoveThreadDialog,
   resolveThreadPreviewPosition,
+  sddDraftHistorySavedRevision,
+  sidebarOverlayPortalHost,
+  SidebarProjectsSection,
   sortSidebarThreads,
   SddDraftHistoryRows,
+  SidebarActionDialog,
   ThreadRow,
   ThreadRenameDialog
 } from './SidebarProjectsSection'
+import { SIDEBAR_ORDER_STORAGE_KEY } from './sidebar-order'
+import { SIDEBAR_FOLDERS_STORAGE_KEY } from './sidebar-folders'
+import { SIDEBAR_COLLAPSE_STORAGE_KEY } from './sidebar-collapse'
 
 vi.mock('react-i18next', async (importOriginal) => ({
   ...(await importOriginal<typeof import('react-i18next')>()),
   useTranslation: () => ({
+    i18n: { language: 'en-US' },
     t: (key: string, opts?: Record<string, unknown>) =>
       key === 'sidebarThreadWorktree' ? `Worktree ${String(opts?.branch)}` : key
   })
@@ -54,6 +67,147 @@ function draft(overrides: Partial<SddDraftHistoryItem> & Pick<SddDraftHistoryIte
     ...(overrides.searchText ? { searchText: overrides.searchText } : {})
   }
 }
+
+function createSidebarTestStorage(initial: Record<string, string> = {}): Storage {
+  const items = new Map(Object.entries(initial))
+  return {
+    get length() {
+      return items.size
+    },
+    clear: () => items.clear(),
+    getItem: (key) => items.get(key) ?? null,
+    key: (index) => [...items.keys()][index] ?? null,
+    removeItem: (key) => items.delete(key),
+    setItem: (key, value) => items.set(key, value)
+  }
+}
+
+function sidebarProjectProps(overrides: Record<string, unknown> = {}) {
+  return {
+    threads: [],
+    activeView: 'chat' as const,
+    activeThreadId: null,
+    runtimeReady: true,
+    searchQuery: '',
+    showArchived: false,
+    workspaceRoot: '/Users/zxy/project-a',
+    workspaceRoots: ['/Users/zxy/project-a'],
+    conversationRoot: '/Users/zxy/Documents/Kun',
+    busy: false,
+    watchTurnCompletion: {},
+    unreadThreadIds: {},
+    locale: 'en-US',
+    onPickWorkspace: vi.fn(),
+    onRemoveWorkspace: vi.fn(async () => undefined),
+    onCreateThreadInWorkspace: vi.fn(),
+    onSelectThread: vi.fn(),
+    onRenameThread: vi.fn(async () => undefined),
+    onPinThread: vi.fn(async () => undefined),
+    onArchiveThread: vi.fn(async () => undefined),
+    onDeleteThread: vi.fn(async () => undefined),
+    onRestoreThread: vi.fn(async () => undefined),
+    onSearchQueryChange: vi.fn(),
+    t: (key: string) => key,
+    ...overrides
+  }
+}
+
+describe('SidebarProjectsSection collapse memory', () => {
+  it('restores collapsed projects and project-scoped folders from storage', () => {
+    const storage = createSidebarTestStorage({
+      [SIDEBAR_COLLAPSE_STORAGE_KEY]: JSON.stringify({
+        version: 1,
+        collapsedWorkspaceScopes: ['/users/zxy/project-a'],
+        collapsedFolderIdsByScope: {
+          '/users/zxy/project-b': ['folder-research']
+        }
+      }),
+      [SIDEBAR_FOLDERS_STORAGE_KEY]: JSON.stringify({
+        version: 1,
+        foldersByScope: {
+          '/users/zxy/project-b': [{
+            id: 'folder-research',
+            name: 'Research',
+            parentId: null,
+            threadIds: ['thread-folder']
+          }]
+        }
+      })
+    })
+    vi.stubGlobal('localStorage', storage)
+    try {
+      const html = renderToStaticMarkup(createElement(SidebarProjectsSection, sidebarProjectProps({
+        threads: [
+          thread({ id: 'thread-collapsed-project', title: 'Hidden project thread', workspace: '/Users/zxy/project-a' }),
+          thread({ id: 'thread-folder', title: 'Hidden folder thread', workspace: '/Users/zxy/project-b' }),
+          thread({ id: 'thread-root', title: 'Visible root thread', workspace: '/Users/zxy/project-b' })
+        ],
+        workspaceRoots: ['/Users/zxy/project-a', '/Users/zxy/project-b']
+      })))
+
+      expect(html).toContain('title="/Users/zxy/project-a"')
+      expect(html).not.toContain('Hidden project thread')
+      expect(html).toContain('title="Research"')
+      expect(html).not.toContain('Hidden folder thread')
+      expect(html).toContain('Visible root thread')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('persists project and folder collapse when their rows are clicked', async () => {
+    const storage = createSidebarTestStorage({
+      [SIDEBAR_FOLDERS_STORAGE_KEY]: JSON.stringify({
+        version: 1,
+        foldersByScope: {
+          '/users/zxy/project-a': [{
+            id: 'folder-research',
+            name: 'Research',
+            parentId: null,
+            threadIds: []
+          }]
+        }
+      })
+    })
+    vi.stubGlobal('localStorage', storage)
+    let renderer: ReactTestRenderer | null = null
+    try {
+      await act(async () => {
+        renderer = createRenderer(createElement(SidebarProjectsSection, sidebarProjectProps()))
+      })
+      const projectRow = renderer!.root.find((node) =>
+        node.type === 'div' && node.props.title === '/Users/zxy/project-a'
+      )
+
+      await act(async () => {
+        projectRow.findAllByType('button')[0]?.props.onClick()
+      })
+      await act(async () => {
+        const currentProjectRow = renderer!.root.find((node) =>
+          node.type === 'div' && node.props.title === '/Users/zxy/project-a'
+        )
+        currentProjectRow.findAllByType('button')[0]?.props.onClick()
+      })
+      await act(async () => {
+        const currentFolderRow = renderer!.root.find((node) =>
+          node.type === 'div' && node.props.title === 'Research'
+        )
+        currentFolderRow.findAllByType('button')[0]?.props.onClick()
+      })
+
+      expect(JSON.parse(storage.getItem(SIDEBAR_COLLAPSE_STORAGE_KEY) ?? '{}')).toEqual({
+        version: 1,
+        collapsedWorkspaceScopes: [],
+        collapsedFolderIdsByScope: {
+          '/users/zxy/project-a': ['folder-research']
+        }
+      })
+    } finally {
+      ;(renderer as ReactTestRenderer | null)?.unmount()
+      vi.unstubAllGlobals()
+    }
+  })
+})
 
 describe('SidebarProjectsSection groups', () => {
   it('keeps remembered code workspaces visible even when the runtime lists only one workspace', () => {
@@ -241,6 +395,30 @@ describe('SidebarProjectsSection groups', () => {
     expect(groups[0]?.[1].map((item) => item.id)).toEqual(['project-thread'])
   })
 
+  it('excludes internal design workspaces from project groups and remembered roots', () => {
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [
+        thread({ id: 'project-thread', workspace: '/Users/zxy/project-a' }),
+        thread({
+          id: 'design-assistant',
+          title: 'Design Assistant',
+          workspace: '/Users/zxy/.kun/design-workspace'
+        })
+      ],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: '/Users/zxy/.kun/design-workspace',
+      conversationRoot: '',
+      workspaceRoots: [
+        '/Users/zxy/project-a',
+        '/Users/zxy/.kun/design-workspace'
+      ]
+    })
+
+    expect(groups.map(([workspace]) => workspace)).toEqual(['/Users/zxy/project-a'])
+    expect(groups[0]?.[1].map((item) => item.id)).toEqual(['project-thread'])
+  })
+
   it('merges requirement-only search matches into displayed groups', () => {
     const groups = buildSidebarWorkspaceGroups({
       threads: [thread({ id: 'reasonix-current', workspace: '/Users/zxy/project-a' })],
@@ -336,6 +514,117 @@ describe('SidebarProjectsSection groups', () => {
   })
 })
 
+describe('requirement history saved revision', () => {
+  it('changes when a requirement is created or successfully saved', () => {
+    const created = {
+      id: 'draft-a',
+      updatedAt: '2026-07-30T01:00:00.000Z'
+    }
+    const saved = {
+      ...created,
+      updatedAt: '2026-07-30T01:01:00.000Z'
+    }
+
+    expect(sddDraftHistorySavedRevision(null)).toBe('')
+    expect(sddDraftHistorySavedRevision(created)).not.toBe('')
+    expect(sddDraftHistorySavedRevision(saved)).not.toBe(
+      sddDraftHistorySavedRevision(created)
+    )
+  })
+
+  it('does not depend on unsaved requirement content', () => {
+    const draftRevision = {
+      id: 'draft-a',
+      updatedAt: '2026-07-30T01:00:00.000Z'
+    }
+
+    expect(sddDraftHistorySavedRevision(draftRevision)).toBe(
+      sddDraftHistorySavedRevision({ ...draftRevision })
+    )
+  })
+})
+
+describe('sidebar thread move helpers', () => {
+  it('excludes the current workspace from move targets', () => {
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [thread({ id: 'thread-a', workspace: '/Users/zxy/project-a' })],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
+      workspaceRoots: ['/Users/zxy/project-a', '/Users/zxy/project-b']
+    })
+
+    expect(
+      buildSidebarThreadMoveTargets({
+        thread: thread({ id: 'thread-a', workspace: '/Users/zxy/project-a' }),
+        groups
+      })
+    ).toEqual(['/Users/zxy/project-b'])
+  })
+
+  it('includes remembered empty project workspaces as move targets', () => {
+    const groups = buildSidebarWorkspaceGroups({
+      threads: [thread({ id: 'thread-a', workspace: '/Users/zxy/project-a' })],
+      searchQuery: '',
+      showArchived: false,
+      workspaceRoot: '/Users/zxy/project-a',
+      conversationRoot: '',
+      workspaceRoots: [
+        '/Users/zxy/project-a',
+        '/Users/zxy/project-b',
+        '/Users/zxy/project-c'
+      ]
+    })
+
+    expect(
+      buildSidebarThreadMoveTargets({
+        thread: thread({ id: 'thread-a', workspace: '/Users/zxy/project-a' }),
+        groups
+      })
+    ).toEqual(['/Users/zxy/project-b', '/Users/zxy/project-c'])
+  })
+
+  it('blocks moving a running thread', () => {
+    expect(
+      isSidebarThreadMoveBlocked({
+        thread: thread({ id: 'thread-running', workspace: '/Users/zxy/project-a', status: 'running' })
+      })
+    ).toBe(true)
+  })
+
+  it('blocks moving a watched thread', () => {
+    expect(
+      isSidebarThreadMoveBlocked({
+        thread: thread({ id: 'thread-watch', workspace: '/Users/zxy/project-a' }),
+        watchTurnCompletion: { 'thread-watch': true }
+      })
+    ).toBe(true)
+  })
+
+  it('blocks moving the active thread while globally busy', () => {
+    expect(
+      isSidebarThreadMoveBlocked({
+        thread: thread({ id: 'thread-active', workspace: '/Users/zxy/project-a' }),
+        activeThreadId: 'thread-active',
+        busy: true
+      })
+    ).toBe(true)
+  })
+
+  it('blocks moving a worktree-linked thread', () => {
+    expect(
+      isSidebarThreadMoveBlocked({
+        thread: thread({ id: 'thread-worktree', workspace: '/Users/zxy/.kun/worktrees/abcd/project-a' }),
+        worktreeRecord: {
+          projectPath: '/Users/zxy/project-a',
+          worktreePath: '/Users/zxy/.kun/worktrees/abcd/project-a'
+        }
+      })
+    ).toBe(true)
+  })
+})
+
 describe('ThreadRenameDialog', () => {
   it('renders an in-app rename form with the current thread title prefilled', () => {
     const html = renderToStaticMarkup(
@@ -363,7 +652,147 @@ describe('ThreadRenameDialog', () => {
   })
 })
 
+describe('SidebarActionDialog', () => {
+  it('mounts sidebar overlays on the document body so the sidebar cannot clip them', () => {
+    const body = {} as HTMLElement
+    const currentDocument = { body } as Document
+
+    expect(sidebarOverlayPortalHost(currentDocument)).toBe(body)
+    expect(sidebarOverlayPortalHost(undefined)).toBeNull()
+  })
+
+  it('uses an opaque card and stronger backdrop so sidebar controls cannot bleed through', () => {
+    const html = renderToStaticMarkup(
+      createElement(SidebarActionDialog, {
+        state: {
+          title: 'Remove AI training?',
+          description: 'This removes the project from Kun.',
+          detail: 'Files on disk will not be deleted.',
+          confirmLabel: 'Remove',
+          danger: true,
+          submitting: false,
+          onConfirm: async () => undefined
+        },
+        onClose: vi.fn(),
+        onConfirm: vi.fn(),
+        t: (key: string) => key
+      })
+    )
+
+    expect(html).toContain('bg-slate-950/28')
+    expect(html).toContain('dark:bg-black/45')
+    expect(html).toContain('bg-[var(--surface-3)]')
+    expect(html).not.toContain('bg-ds-elevated')
+    expect(html).not.toContain('bg-ds-card/96')
+  })
+})
+
+describe('MoveThreadDialog', () => {
+  it('renders the target project picker', () => {
+    const html = renderToStaticMarkup(
+      createElement(MoveThreadDialog, {
+        state: {
+          thread: thread({
+            id: 'thr_move',
+            title: 'Move me',
+            workspace: '/Users/zxy/project-a'
+          }),
+          targets: ['/Users/zxy/project-b'],
+          targetWorkspace: null,
+          submitting: false
+        },
+        onClose: vi.fn(),
+        onPickTarget: vi.fn(),
+        onConfirm: vi.fn(async () => undefined),
+        t: (key: string) => key
+      })
+    )
+
+    expect(html).toContain('sidebarThreadMovePickerTitle')
+    expect(html).toContain('/Users/zxy/project-b')
+    expect(html).toContain('project-b')
+  })
+
+  it('renders the empty state when no targets are available', () => {
+    const html = renderToStaticMarkup(
+      createElement(MoveThreadDialog, {
+        state: {
+          thread: thread({
+            id: 'thr_move_empty',
+            title: 'Move me',
+            workspace: '/Users/zxy/project-a'
+          }),
+          targets: [],
+          targetWorkspace: null,
+          submitting: false
+        },
+        onClose: vi.fn(),
+        onPickTarget: vi.fn(),
+        onConfirm: vi.fn(async () => undefined),
+        t: (key: string) => key
+      })
+    )
+
+    expect(html).toContain('sidebarThreadMoveNoTargets')
+  })
+
+  it('shows the metadata-only scope before confirming a move', () => {
+    const html = renderToStaticMarkup(
+      createElement(MoveThreadDialog, {
+        state: {
+          thread: thread({
+            id: 'thr_move_confirm',
+            title: 'Move me',
+            workspace: '/Users/zxy/project-a'
+          }),
+          targets: ['/Users/zxy/project-b'],
+          targetWorkspace: '/Users/zxy/project-b',
+          submitting: false
+        },
+        onClose: vi.fn(),
+        onPickTarget: vi.fn(),
+        onConfirm: vi.fn(async () => undefined),
+        t: (key: string) => key
+      })
+    )
+
+    expect(html).toContain('sidebarThreadMoveDialogDetail')
+    expect(html).toContain('sidebarThreadMoveMetadataOnlyDetail')
+    expect(html).toContain('sidebarThreadMoveConfirmButton')
+  })
+})
+
 describe('ThreadRow', () => {
+  it('retains active styling for the thread identified by the conversation title bar', () => {
+    const html = renderToStaticMarkup(
+      createElement(ThreadRow, {
+        thread: thread({
+          id: 'thr_active',
+          title: 'Active conversation',
+          workspace: '/Users/zxy/project-a'
+        }),
+        active: true,
+        deleting: false,
+        locale: 'en-US',
+        showRunning: false,
+        showUnread: false,
+        onSelect: vi.fn(),
+        onContextMenu: vi.fn(),
+        onPreviewOpen: vi.fn(),
+        onPreviewClose: vi.fn(),
+        onPin: vi.fn(),
+        onRename: vi.fn(),
+        onArchive: vi.fn(),
+        onDelete: vi.fn(),
+        onRestore: vi.fn()
+      })
+    )
+
+    expect(html).toContain('data-active="true"')
+    expect(html).toContain('bg-[var(--ds-sidebar-row-active)]')
+    expect(html).toContain('Active conversation')
+  })
+
   it('anchors the preview beside the row instead of following the pointer', () => {
     expect(
       resolveThreadPreviewPosition(
@@ -457,6 +886,328 @@ describe('ThreadRow', () => {
 
     expect(html).toContain('sidebarThreadPinned')
     expect(html).toContain('sidebarThreadUnpin')
+    expect(html).toContain('border-[var(--ds-sidebar-row-ring)]')
+    expect(html).toContain('bg-[var(--ds-sidebar-row-active)]')
+  })
+
+  it('renders draggable and before-target feedback states', () => {
+    const html = renderToStaticMarkup(
+      createElement(ThreadRow, {
+        thread: thread({ id: 'thr_drag', workspace: '/Users/zxy/project-a' }),
+        active: false,
+        deleting: false,
+        locale: 'en-US',
+        showRunning: false,
+        showUnread: false,
+        draggable: true,
+        dragging: true,
+        dropPosition: 'before',
+        onSelect: vi.fn(),
+        onContextMenu: vi.fn(),
+        onPreviewOpen: vi.fn(),
+        onPreviewClose: vi.fn(),
+        onPin: vi.fn(),
+        onRename: vi.fn(),
+        onArchive: vi.fn(),
+        onDelete: vi.fn(),
+        onRestore: vi.fn()
+      })
+    )
+
+    expect(html).toContain('draggable="true"')
+    expect(html).toContain('opacity-55')
+    expect(html).toContain('before:bg-accent')
+  })
+})
+
+describe('SidebarProjectsSection drag ordering', () => {
+  it('renders requirement drafts as ordinary sessions without a draft folder', () => {
+    const html = renderToStaticMarkup(
+      createElement(SidebarProjectsSection, sidebarProjectProps({
+        threads: [
+          thread({
+            id: 'thread-requirement',
+            title: 'Checkout requirement',
+            workspace: '/Users/zxy/project-a'
+          })
+        ]
+      }))
+    )
+
+    expect(html).toContain('Checkout requirement')
+    expect(html).not.toContain('sddDraftHistoryTitle')
+    expect(html).not.toContain('sddDraftHistoryExpand')
+  })
+
+  it('restores saved workspace order and renders workspace headers as draggable', () => {
+    const storageValue = JSON.stringify({
+      version: 1,
+      workspacePaths: ['/Users/zxy/project-b', '/Users/zxy/project-a'],
+      threadIdsByScope: {}
+    })
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === SIDEBAR_ORDER_STORAGE_KEY ? storageValue : null,
+      setItem: vi.fn()
+    })
+    try {
+      const html = renderToStaticMarkup(
+        createElement(SidebarProjectsSection, {
+          threads: [],
+          activeView: 'chat',
+          activeThreadId: null,
+          runtimeReady: true,
+          searchQuery: '',
+          showArchived: false,
+          workspaceRoot: '/Users/zxy/project-a',
+          workspaceRoots: ['/Users/zxy/project-a', '/Users/zxy/project-b'],
+          conversationRoot: '/Users/zxy/Documents/Kun',
+          busy: false,
+          watchTurnCompletion: {},
+          unreadThreadIds: {},
+          locale: 'en-US',
+          onPickWorkspace: vi.fn(),
+          onRemoveWorkspace: vi.fn(async () => undefined),
+          onCreateThreadInWorkspace: vi.fn(),
+          onSelectThread: vi.fn(),
+          onRenameThread: vi.fn(async () => undefined),
+          onPinThread: vi.fn(async () => undefined),
+          onArchiveThread: vi.fn(async () => undefined),
+          onDeleteThread: vi.fn(async () => undefined),
+          onRestoreThread: vi.fn(async () => undefined),
+          onSearchQueryChange: vi.fn(),
+          t: (key: string) => key
+        })
+      )
+
+      expect(html.indexOf('title="/Users/zxy/project-b"')).toBeLessThan(
+        html.indexOf('title="/Users/zxy/project-a"')
+      )
+      expect(html.match(/draggable="true"/g)).toHaveLength(2)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('renders project-local virtual folders without changing thread workspaces', () => {
+    const folderStorageValue = JSON.stringify({
+      version: 1,
+      foldersByScope: {
+        '/users/zxy/project-a': [
+          {
+            id: 'folder-research',
+            name: 'Research',
+            threadIds: ['thread-a']
+          },
+          {
+            id: 'folder-notes',
+            name: 'Notes',
+            parentId: 'folder-research',
+            threadIds: ['thread-c']
+          }
+        ]
+      }
+    })
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === SIDEBAR_FOLDERS_STORAGE_KEY ? folderStorageValue : null,
+      setItem: vi.fn()
+    })
+    try {
+      const html = renderToStaticMarkup(
+        createElement(SidebarProjectsSection, {
+          threads: [
+            thread({
+              id: 'thread-a',
+              title: 'Folder thread',
+              workspace: '/Users/zxy/project-a'
+            }),
+            thread({
+              id: 'thread-b',
+              title: 'Root thread',
+              workspace: '/Users/zxy/project-a'
+            }),
+            thread({
+              id: 'thread-c',
+              title: 'Nested thread',
+              workspace: '/Users/zxy/project-a'
+            })
+          ],
+          activeView: 'chat',
+          activeThreadId: null,
+          runtimeReady: true,
+          searchQuery: '',
+          showArchived: false,
+          workspaceRoot: '/Users/zxy/project-a',
+          workspaceRoots: ['/Users/zxy/project-a'],
+          conversationRoot: '/Users/zxy/Documents/Kun',
+          busy: false,
+          watchTurnCompletion: {},
+          unreadThreadIds: {},
+          locale: 'en-US',
+          onPickWorkspace: vi.fn(),
+          onRemoveWorkspace: vi.fn(async () => undefined),
+          onCreateThreadInWorkspace: vi.fn(),
+          onSelectThread: vi.fn(),
+          onRenameThread: vi.fn(async () => undefined),
+          onPinThread: vi.fn(async () => undefined),
+          onArchiveThread: vi.fn(async () => undefined),
+          onDeleteThread: vi.fn(async () => undefined),
+          onRestoreThread: vi.fn(async () => undefined),
+          onSearchQueryChange: vi.fn(),
+          t: (key: string) => key
+        })
+      )
+
+      expect(html).toContain('title="Research"')
+      expect(html).toContain('title="Notes"')
+      expect(html.indexOf('title="Notes"')).toBeGreaterThan(html.indexOf('title="Research"'))
+      expect(html.indexOf('Nested thread')).toBeGreaterThan(html.indexOf('title="Notes"'))
+      expect(html.indexOf('Folder thread')).toBeGreaterThan(html.indexOf('Nested thread'))
+      expect(html.indexOf('Root thread')).toBeGreaterThan(html.indexOf('Folder thread'))
+      expect(html).toContain('sidebarFolderCreateChild')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('assigns a newly created thread directly to the selected folder', async () => {
+    const folderStorageValue = JSON.stringify({
+      version: 1,
+      foldersByScope: {
+        '/users/zxy/project-a': [{
+          id: 'folder-research',
+          name: 'Research',
+          threadIds: []
+        }]
+      }
+    })
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === SIDEBAR_FOLDERS_STORAGE_KEY ? folderStorageValue : null,
+      setItem
+    })
+    const onCreateThreadInWorkspace = vi.fn(async () => 'thread-new')
+    let renderer: ReactTestRenderer | null = null
+    try {
+      await act(async () => {
+        renderer = createRenderer(createElement(SidebarProjectsSection, {
+          threads: [],
+          activeView: 'chat',
+          activeThreadId: null,
+          runtimeReady: true,
+          searchQuery: '',
+          showArchived: false,
+          workspaceRoot: '/Users/zxy/project-a',
+          workspaceRoots: ['/Users/zxy/project-a'],
+          conversationRoot: '/Users/zxy/Documents/Kun',
+          busy: false,
+          watchTurnCompletion: {},
+          unreadThreadIds: {},
+          locale: 'en-US',
+          onPickWorkspace: vi.fn(),
+          onRemoveWorkspace: vi.fn(async () => undefined),
+          onCreateThreadInWorkspace,
+          onSelectThread: vi.fn(),
+          onRenameThread: vi.fn(async () => undefined),
+          onPinThread: vi.fn(async () => undefined),
+          onArchiveThread: vi.fn(async () => undefined),
+          onDeleteThread: vi.fn(async () => undefined),
+          onRestoreThread: vi.fn(async () => undefined),
+          onSearchQueryChange: vi.fn(),
+          t: (key: string) => key
+        }))
+      })
+
+      const newThreadButtons = renderer!.root.findAll((node) =>
+        node.type === 'button' && node.props.title === 'sidebarWorkspaceNewThread'
+      )
+      expect(newThreadButtons).toHaveLength(2)
+      await act(async () => {
+        newThreadButtons[1]?.props.onClick({ stopPropagation: vi.fn() })
+        await Promise.resolve()
+      })
+
+      expect(onCreateThreadInWorkspace).toHaveBeenCalledWith(
+        '/Users/zxy/project-a',
+        { forceNew: true }
+      )
+      const saved = setItem.mock.calls
+        .filter(([key]) => key === SIDEBAR_FOLDERS_STORAGE_KEY)
+        .at(-1)?.[1]
+      expect(JSON.parse(String(saved)).foldersByScope['/users/zxy/project-a'][0].threadIds)
+        .toEqual(['thread-new'])
+    } finally {
+      ;(renderer as ReactTestRenderer | null)?.unmount()
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('SidebarConversationsSection drag ordering', () => {
+  it('starts collapsed, then restores saved conversation order and renders conversations as draggable', async () => {
+    const storageValue = JSON.stringify({
+      version: 1,
+      workspacePaths: [],
+      threadIdsByScope: {
+        '/users/zxy/documents/kun': ['conversation-b', 'conversation-a']
+      }
+    })
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === SIDEBAR_ORDER_STORAGE_KEY ? storageValue : null,
+      setItem: vi.fn()
+    })
+    let renderer: ReactTestRenderer | null = null
+    try {
+      await act(async () => {
+        renderer = createRenderer(
+          createElement(SidebarConversationsSection, {
+          threads: [
+            thread({
+              id: 'conversation-a',
+              title: 'Conversation A',
+              workspace: '/Users/zxy/Documents/Kun/conversation-a'
+            }),
+            thread({
+              id: 'conversation-b',
+              title: 'Conversation B',
+              workspace: '/Users/zxy/Documents/Kun/conversation-b'
+            })
+          ],
+          activeThreadId: null,
+          runtimeReady: true,
+          conversationRoot: '/Users/zxy/Documents/Kun',
+          onNewConversation: vi.fn(),
+          onSelectThread: vi.fn(),
+          onRenameThread: vi.fn(async () => undefined),
+          onPinThread: vi.fn(async () => undefined),
+          onArchiveThread: vi.fn(async () => undefined),
+          onDeleteThread: vi.fn(async () => undefined),
+          onRestoreThread: vi.fn(async () => undefined),
+          t: (key: string) => key
+          })
+        )
+      })
+
+      expect(renderer!.root.findAll((node) => node.props.title === 'Conversation A')).toHaveLength(0)
+      expect(renderer!.root.findAll((node) => node.props.title === 'Conversation B')).toHaveLength(0)
+
+      const sectionToggle = renderer!.root.find((node) =>
+        node.type === 'button' && node.props.title === 'sidebarConversations'
+      )
+      await act(async () => {
+        sectionToggle.props.onClick()
+      })
+
+      const conversationRows = renderer!.root.findAll((node) =>
+        node.type === 'div' && node.props.draggable === true
+      )
+      expect(conversationRows.map((node) => node.props.title)).toEqual([
+        'Conversation B',
+        'Conversation A'
+      ])
+    } finally {
+      ;(renderer as ReactTestRenderer | null)?.unmount()
+      vi.unstubAllGlobals()
+    }
   })
 })
 

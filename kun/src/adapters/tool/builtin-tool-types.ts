@@ -1,12 +1,20 @@
 import { stat } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 import type { LocalTool } from './local-tool-host.js'
 
 export type FsStats = NonNullable<Awaited<ReturnType<typeof stat>>>
 
-export const DEFAULT_BASH_TIMEOUT_SECONDS = 120
+export const DEFAULT_BASH_TIMEOUT_SECONDS = 24 * 60 * 60
 export const DEFAULT_SEARCH_LIMIT = 100
 export const DEFAULT_LIST_LIMIT = 500
 export const DEFAULT_FIND_LIMIT = 1000
+/** Hard input cap before the read tool creates a full in-memory buffer. */
+export const DEFAULT_READ_MAX_FILE_BYTES = 4 * 1024 * 1024
+/** Per-file and per-call budgets for the grep fallback/context reader. */
+export const DEFAULT_GREP_MAX_FILE_BYTES = 2 * 1024 * 1024
+export const DEFAULT_GREP_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+export const DEFAULT_GREP_MAX_CONTEXT_LINES = 20
+export const DEFAULT_GREP_MAX_MATCHES = 1_000
 export const DEFAULT_IMAGE_MAX_DIMENSION = 2000
 export const DEFAULT_IMAGE_MAX_BASE64_BYTES = 4.5 * 1024 * 1024
 export const FD_EXECUTABLE_CANDIDATES = [
@@ -95,20 +103,28 @@ export type BuiltinToolName =
   | 'edit'
   | 'write'
   | 'grep'
+  | 'glob'
   | 'find'
   | 'ls'
   | 'lsp'
+  | 'repo_map'
+  | 'git_inspect'
   | 'verify_changes'
+  | 'send_im_attachment'
 export const allBuiltinToolNames: Set<BuiltinToolName> = new Set([
   'read',
   'bash',
   'edit',
   'write',
   'grep',
+  'glob',
   'find',
   'ls',
   'lsp',
-  'verify_changes'
+  'repo_map',
+  'git_inspect',
+  'verify_changes',
+  'send_im_attachment'
 ])
 export type ToolName = BuiltinToolName
 export const allToolNames: Set<ToolName> = allBuiltinToolNames
@@ -116,13 +132,50 @@ export const allToolNames: Set<ToolName> = allBuiltinToolNames
 export type ReadLocalToolOptions = {
   maxLines?: number
   maxBytes?: number
+  /** Maximum file size accepted before allocating a full read buffer. */
+  maxFileBytes?: number
   autoResizeImages?: boolean
   operations?: ReadLocalToolOperations
 }
 
+export type BackgroundShellRecordInput = {
+  id: string
+  threadId: string
+  turnId: string
+  command: string
+  cwd: string
+  shell: string
+  status: 'running' | 'completed' | 'stopped' | 'failed'
+  startedAt: string
+  finishedAt?: string
+  exitCode: number | null
+  output: string
+  outputTruncated?: boolean
+  outputFilePath?: string
+  error?: string
+  detached: boolean
+}
+
+export type BackgroundShellHooks = {
+  onSessionStarted?: (record: BackgroundShellRecordInput) => void | Promise<void>
+  onSessionUpdated?: (record: BackgroundShellRecordInput) => void | Promise<void>
+  onSessionSettled?: (record: BackgroundShellRecordInput) => void | Promise<void>
+  isDetachedSession?: (sessionId: string) => boolean
+}
+
 export type BashLocalToolOptions = {
   defaultTimeoutSeconds?: number
+  maxLines?: number
+  maxBytes?: number
+  /** Process-wide cap for concurrently running detached shell sessions. */
+  maxBackgroundSessions?: number
+  /** Per-thread cap for concurrently running detached shell sessions. */
+  maxBackgroundSessionsPerThread?: number
+  /** Maximum accepted timeout for a detached shell session. */
+  maxBackgroundTimeoutSeconds?: number
   operations?: BashLocalToolOperations
+  backgroundShell?: BackgroundShellHooks
+  backgroundShellDataDir?: string
 }
 
 export type WriteLocalToolOptions = {
@@ -134,6 +187,10 @@ export type EditLocalToolOptions = {
 
 export type GrepLocalToolOptions = {
   defaultLimit?: number
+  /** Maximum size of one file read for scan fallback or context lines. */
+  maxFileBytes?: number
+  /** Total bytes grep may read itself while scanning/contextualizing results. */
+  maxTotalBytes?: number
   rgExecutableCandidates?: string[]
   operations?: GrepLocalToolOperations
 }
@@ -156,6 +213,7 @@ export type BuiltinLocalToolsOptions = {
   write?: WriteLocalToolOptions
   edit?: EditLocalToolOptions
   grep?: GrepLocalToolOptions
+  glob?: FindLocalToolOptions
   find?: FindLocalToolOptions
   ls?: LsLocalToolOptions
 }
@@ -183,11 +241,15 @@ export interface BashLocalToolOperations {
 export interface WriteLocalToolOperations {
   mkdir?: (path: string) => Promise<void>
   writeFile?: (path: string, content: string) => Promise<void>
+  /** Test/composition seam; the returned handle is always identity-verified before use. */
+  openExternal?: (path: string, flags: number) => Promise<FileHandle>
 }
 
 export interface EditLocalToolOperations {
   readFile?: (path: string) => Promise<string>
   writeFile?: (path: string, content: string) => Promise<void>
+  /** Test/composition seam; the returned handle is always identity-verified before use. */
+  openExternal?: (path: string, flags: number) => Promise<FileHandle>
 }
 
 export interface GrepLocalToolOperations {
